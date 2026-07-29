@@ -35,6 +35,8 @@ pub struct PmState {
     pub samples: Vec<Sample>,
     /// Flow control: next request index to jump to.
     pub next_request: Option<usize>,
+    /// Names of all items in order (for setNextRequest by name).
+    pub request_names: Vec<String>,
     /// Whether to skip the remaining tests.
     pub skip_tests: bool,
     /// Requests queued by pm.sendRequest for async execution.
@@ -61,6 +63,7 @@ impl PmState {
             custom: HashMap::new(),
             samples: Vec::new(),
             next_request: None,
+            request_names: Vec::new(),
             skip_tests: false,
             pending_requests: Vec::new(),
         }
@@ -82,6 +85,11 @@ impl PmState {
             timestamp: std::time::SystemTime::now(),
             sample_type: tropel_core::types::SampleType::Rate,
         });
+    }
+
+    /// Set the list of request names in order (for resolving setNextRequest by name).
+    pub fn set_request_names(&mut self, names: Vec<String>) {
+        self.request_names = names;
     }
 }
 

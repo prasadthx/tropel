@@ -229,14 +229,31 @@ impl PmBridge {
             );
 
             // ── Flow Control ──
+            // setNextRequest accepts either a numeric index (legacy) or a
+            // request name. If the argument parses as usize, use it as an
+            // index directly. Otherwise, look up the name in request_names
+            // (populated from scenario items by the runner).
             let state_clone = state.clone();
             let _ = globals.set(
                 "__tropel_pm_set_next_request",
                 Func::from(move |request_id: String| {
-                    let idx: Option<usize> = request_id.parse().ok();
-                    if let Some(index) = idx {
-                        let mut st = state_clone.lock().unwrap();
+                    let mut st = state_clone.lock().unwrap();
+
+                    // skipRequest passes null — clear any pending jump
+                    if request_id == "null" || request_id.is_empty() {
+                        st.next_request = None;
+                        return;
+                    }
+
+                    // Try numeric index first (backward compat)
+                    if let Ok(index) = request_id.parse::<usize>() {
                         st.next_request = Some(index);
+                        return;
+                    }
+
+                    // Look up by name in the request list
+                    if let Some(pos) = st.request_names.iter().position(|n| n == &request_id) {
+                        st.next_request = Some(pos);
                     }
                 }),
             );

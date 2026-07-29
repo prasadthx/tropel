@@ -45,9 +45,16 @@ pub struct VURunner {
 impl VURunner {
     /// Create a new VU runner.
     pub fn new(scenario: Arc<Scenario>, http: Arc<HttpProtocol>) -> Self {
+        // Extract all item names in order for setNextRequest resolution
+        let names: Vec<String> = scenario.items.iter().map(|item| item.name.clone()).collect();
+        let pm_state = Arc::new(Mutex::new(PmState::new()));
+        {
+            let mut state = pm_state.lock().unwrap();
+            state.set_request_names(names);
+        }
         Self {
             scenario,
-            pm_state: Arc::new(Mutex::new(PmState::new())),
+            pm_state,
             http,
             config: RunnerConfig::default(),
             js_ctx: None,
