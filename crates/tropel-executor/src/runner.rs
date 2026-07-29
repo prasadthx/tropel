@@ -173,14 +173,15 @@ impl VURunner {
                 tracing::trace!("VU runner: executing request to {}", resolved_req.url);
 
                 // Execute the request via HTTP protocol
-                let sample_result = self.http.execute_item_with_request(&resolved_req, auth_signer.as_deref()).await;
+                let http_result = self.http.execute_item_with_request(&resolved_req, auth_signer.as_deref()).await;
 
                 tracing::trace!("VU runner: request to {} completed", resolved_req.url);
 
-                match sample_result {
-                    Ok(sample) => {
-                        // Set response in PM state for test scripts
-                        if let Some(http_response) = self.http.client().last_response().await {
+                match http_result {
+                    Ok((sample, http_response)) => {
+                        // Set response in PM state (directly from the returned value,
+                        // not from a shared slot — avoids race conditions with other VUs)
+                        {
                             let mut state = self.pm_state.lock().unwrap();
                             state.response = Some(http_response);
                         }

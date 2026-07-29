@@ -1,8 +1,6 @@
 use crate::auth::AuthSigner;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 use tropel_core::config::HttpConfig;
 use tropel_core::types::*;
 use tropel_core::Result;
@@ -14,7 +12,6 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone)]
 pub struct HttpClient {
     inner: reqwest::Client,
-    last_response: Arc<Mutex<Option<tropel_core::types::Response>>>,
 }
 
 impl HttpClient {
@@ -49,7 +46,6 @@ impl HttpClient {
 
         Ok(Self {
             inner,
-            last_response: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -166,19 +162,7 @@ impl HttpClient {
             size,
         };
 
-        // Store the last response for PM state
-        {
-            let mut last = self.last_response.lock().await;
-            *last = Some(tropel_core::types::Response::from(&response));
-        }
-
         Ok(response)
-    }
-
-    /// Get the last response (for the PM bridge to access).
-    pub async fn last_response(&self) -> Option<tropel_core::types::Response> {
-        let last = self.last_response.lock().await;
-        last.clone()
     }
 
     /// Get an auth signer based on the auth config.

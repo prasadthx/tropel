@@ -39,21 +39,25 @@ impl HttpProtocol {
             timeout: request.timeout,
         };
 
-        self.execute_item_with_request(&resolved_req, auth_signer).await
+        self.execute_item_with_request(&resolved_req, auth_signer).await.map(|(sample, _)| sample)
     }
 
-    /// Execute a fully-resolved request and return a duration sample.
+    /// Execute a fully-resolved request and return a duration sample along with
+    /// the full response data. The response is returned directly to avoid a race
+    /// condition where multiple VUs sharing the same HttpClient would overwrite
+    /// each other's responses in a shared last_response slot.
     pub async fn execute_item_with_request(
         &self,
         resolved_req: &Request,
         auth_signer: Option<&dyn AuthSigner>,
-    ) -> Result<Sample> {
+    ) -> Result<(Sample, tropel_core::types::Response)> {
         let start = std::time::Instant::now();
 
         // Execute the request
         let response = self.client.execute(resolved_req, auth_signer).await?;
 
         let duration = start.elapsed();
+        let http_response = tropel_core::types::Response::from(&response);
 
         // Build a sample from the response
         let mut tags = std::collections::HashMap::new();
@@ -66,12 +70,12 @@ impl HttpProtocol {
         let sample = Sample {
             metric: "http_req_duration".to_string(),
             value: duration.as_micros() as f64, // microseconds (histogram records in μs)
-            tags: tags.clone(),
+            tags,
             timestamp: std::time::SystemTime::now(),
             sample_type: SampleType::Trend,
         };
 
-        Ok(sample)
+        Ok((sample, http_response))
     }
 
     /// Get the underlying HTTP client (for direct use by the PM bridge).
