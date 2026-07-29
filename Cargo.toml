@@ -1,0 +1,124 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tropel",
+    "crates/tropel-engine",
+    "crates/tropel-core",
+    "crates/tropel-collection",
+    "crates/tropel-variables",
+    "crates/tropel-js",
+    "crates/tropel-pm",
+    "crates/tropel-native",
+    "crates/tropel-http",
+    "crates/tropel-executor",
+    "crates/tropel-metrics",
+    "crates/tropel-report",
+    "crates/tropel-ext",
+    "crates/tropel-build",
+    "crates/inputs/tropel-input-postman",
+    "crates/extensions/tropel-x-grpc",
+    "crates/extensions/tropel-x-websocket",
+    "crates/extensions/tropel-x-prometheus",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tropel/tropel"
+rust-version = "1.82"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal"] }
+
+# JS engine
+rquickjs = { version = "0.9", features = ["full-async", "parallel"] }
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "gzip", "brotli", "http2", "json", "stream"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Metrics
+hdrhistogram = "7"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Extension registration
+inventory = "0.3"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Hashing / crypto
+sha2 = "0.10"
+sha1 = "0.10"
+sha3 = "0.10"
+md-5 = "0.10"
+hmac = "0.12"
+aes = "0.8"
+aes-gcm = "0.10"
+cbc = "0.1"
+
+# Encoding
+base64 = "0.22"
+hex = "0.4"
+percent-encoding = "2"
+
+# UUID / random
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+
+# Regex
+regex = "1"
+
+# Async helpers
+futures = "0.3"
+async-trait = "0.1"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Allocator
+mimalloc = { version = "0.1", default-features = false }
+
+# Testing
+wiremock = "0.6"
+insta = "1"
+
+# IndexMap for preserving insertion order
+indexmap = { version = "2", features = ["serde"] }
+
+# URL parsing
+url = { version = "2", features = ["serde"] }
+
+# MIME types
+mime = "0.3"
+mime_guess = "2"
+
+# ── Internal workspace crate paths ────────────────────
+tropel-core = { path = "crates/tropel-core" }
+tropel-collection = { path = "crates/tropel-collection" }
+tropel-variables = { path = "crates/tropel-variables" }
+tropel-js = { path = "crates/tropel-js" }
+tropel-native = { path = "crates/tropel-native" }
+tropel-pm = { path = "crates/tropel-pm" }
+tropel-http = { path = "crates/tropel-http" }
+tropel-executor = { path = "crates/tropel-executor" }
+tropel-metrics = { path = "crates/tropel-metrics" }
+tropel-report = { path = "crates/tropel-report" }
+tropel-ext = { path = "crates/tropel-ext" }
+tropel-engine = { path = "crates/tropel-engine" }
+tropel-build = { path = "crates/tropel-build" }
+tropel-input-postman = { path = "crates/inputs/tropel-input-postman" }
+tropel-x-grpc = { path = "crates/extensions/tropel-x-grpc" }
+tropel-x-websocket = { path = "crates/extensions/tropel-x-websocket" }
+tropel-x-prometheus = { path = "crates/extensions/tropel-x-prometheus" }

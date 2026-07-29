@@ -1,0 +1,24 @@
+[package]
+name = "tropel-executor"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tropel-core.workspace = true
+tropel-pm.workspace = true
+tropel-js.workspace = true
+tropel-http.workspace = true
+tropel-metrics.workspace = true
+tropel-variables.workspace = true
+tropel-native.workspace = true
+tropel-collection.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+futures.workspace = true

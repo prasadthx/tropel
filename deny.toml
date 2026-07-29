@@ -1,0 +1,25 @@
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "MIT OR Apache-2.0",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+]
+
+[advisories]
+vulnerability = "deny"
+unmaintained = "warn"
+notice = "warn"
+unsound = "deny"
+
+[advisories.ignore]
+# Add temporary advisory ignores here with expiry dates
+
+[sources]
+allow-unknown-registries = false
+unknown-registry-fallback = "deny"

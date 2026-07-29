@@ -1,0 +1,21 @@
+[package]
+name = "tropel-pm"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tropel-core.workspace = true
+tropel-js.workspace = true
+tropel-native.workspace = true
+tropel-variables.workspace = true
+tropel-http.workspace = true
+tropel-ext.workspace = true
+rquickjs.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true

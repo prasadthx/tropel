@@ -1,0 +1,74 @@
+# ── Rust / Cargo ──────────────────────────────────────────────
+target/
+**/*.rs.bk
+
+# Cargo.lock is committed for this binary application,
+# so it is NOT ignored here.
+
+# ── IDE / Editors ─────────────────────────────────────────────
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+*.orig
+.Directory
+.fleet/
+.history/
+
+# ── OS cruft ──────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+
+# ── Tropel output / reports ───────────────────────────────────
+*.csv
+*.json
+results/
+output/
+
+# ── Environment & secrets ─────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# ── Node / JS vendored deps ───────────────────────────────────
+node_modules/
+js/node_modules/
+
+# ── Python tooling ────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ── Logs ──────────────────────────────────────────────────────
+*.log
+*.trace
+
+# ── Build artifacts (outside target/) ─────────────────────────
+*.o
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+
+# ── Benchmark data ────────────────────────────────────────────
+benches/**/output/
+benches/**/results/
+**/*.bench
+
+# ── CI / temporary ────────────────────────────────────────────
+tmp/
+temp/
