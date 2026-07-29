@@ -1,8 +1,19 @@
 use std::collections::HashMap;
 use crate::bridge::{PendingRequest, SharedPmState};
 use rquickjs::function::Func;
+use serde_json::Value;
 use tropel_core::Result;
 use tropel_js::JsContext;
+
+/// Convert a serde_json::Value to a string suitable for JS consumption.
+/// Always JSON-encodes the value so the JS shim can JSON.parse() to
+/// restore the correct type. This ensures "123" (string) survives as
+/// the string "123" rather than being parsed as the number 123.
+/// Environment variables (plain HashMap<String, String>) bypass this
+/// and return the raw string; the JS try/catch handles those correctly.
+fn variable_value_to_string(val: &Value) -> String {
+    serde_json::to_string(val).unwrap_or_default()
+}
 
 /// Register all `pm.*` bridge functions as global JS functions in a JsContext.
 /// Functions like `__tropel_pm_test`, `__tropel_pm_environment_get`, etc.
@@ -64,20 +75,25 @@ impl PmBridge {
                 }),
             );
 
-            // ── Variables (string-only for JS compat) ──
+            // ── Variables ──
+            // Returns Option<String>: strings return the inner value directly,
+            // non-strings (objects, arrays, numbers, booleans) return JSON-encoded.
+            // The JS shim calls JSON.parse() to restore non-string types.
             let state_clone = state.clone();
             let _ = globals.set(
                 "__tropel_pm_variables_get",
                 Func::from(move |key: String| -> Option<String> {
                     let st = state_clone.lock().unwrap();
+                    // Environment variables are always plain strings
                     if let Some(val) = st.environment.get(&key) {
                         return Some(val.clone());
                     }
+                    // Collection and global variables are serde_json::Value
                     if let Some(val) = st.collection_vars.get(&key) {
-                        return Some(serde_json::to_string(val).unwrap_or_default());
+                        return Some(variable_value_to_string(val));
                     }
                     st.globals.get(&key)
-                        .map(|v| serde_json::to_string(v).unwrap_or_default())
+                        .map(|v| variable_value_to_string(v))
                 }),
             );
 

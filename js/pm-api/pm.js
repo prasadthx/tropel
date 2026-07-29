@@ -35,7 +35,13 @@ pm.environment = {
 pm.variables = {
     get: function (key) {
         if (typeof __tropel_pm_variables_get === 'function') {
-            return __tropel_pm_variables_get(key);
+            var raw = __tropel_pm_variables_get(key);
+            if (raw === null || raw === undefined) return null;
+            // Try JSON.parse — non-string values (objects, arrays, numbers,
+            // booleans) come JSON-encoded from the bridge. If parse fails,
+            // it's a plain string (return as-is).
+            try { return JSON.parse(raw); }
+            catch (e) { return raw; }
         }
         return null;
     },
