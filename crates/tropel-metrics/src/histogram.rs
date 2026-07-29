@@ -76,6 +76,12 @@ impl LatencyHistogram {
         self.percentile(99.0)
     }
 
+    /// Merge another histogram into this one.
+    /// All recorded values from `other` are added to this histogram.
+    pub fn merge(&mut self, other: &LatencyHistogram) {
+        self.inner.add(&other.inner).ok();
+    }
+
     /// Export histogram statistics.
     pub fn stats(&self) -> HistogramStats {
         HistogramStats {

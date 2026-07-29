@@ -104,6 +104,9 @@ impl MetricsCollector {
         let mut data_received: f64 = 0.0;
         let mut data_sent: f64 = 0.0;
 
+        // Merge all http_req_duration* histograms into one for the headline value
+        let mut merged_http_dur: Option<MetricSet> = None;
+
         for (key, set) in data.iter() {
             let stats = set.histogram.stats();
             let summary = MetricSummary {
@@ -121,7 +124,17 @@ impl MetricsCollector {
 
             // Derive headline values from the metric key prefix
             if key.starts_with("http_req_duration") {
-                http_req_duration = Some(summary.clone());
+                // Merge this tagged histogram into the global aggregate
+                match &mut merged_http_dur {
+                    Some(ref mut merged) => {
+                        merged.histogram.merge(&set.histogram);
+                        merged.count += set.count;
+                        merged.sum += set.sum;
+                    }
+                    None => {
+                        merged_http_dur = Some(set.clone());
+                    }
+                }
             } else if key.starts_with("http_reqs") {
                 http_reqs += set.count as u64;
             } else if key.starts_with("errors") {
@@ -143,6 +156,23 @@ impl MetricsCollector {
             }
 
             metrics.push(summary);
+        }
+
+        // Build the headline http_req_duration from the merged histogram
+        if let Some(ref merged) = merged_http_dur {
+            let stats = merged.histogram.stats();
+            http_req_duration = Some(MetricSummary {
+                key: "http_req_duration".to_string(),
+                count: merged.count as u64,
+                sum: merged.sum,
+                mean: merged.mean(),
+                min: stats.min,
+                max: stats.max,
+                p50: stats.p50,
+                p90: stats.p90,
+                p95: stats.p95,
+                p99: stats.p99,
+            });
         }
 
         // Fallback to totals map for counters not captured in per-key metrics
