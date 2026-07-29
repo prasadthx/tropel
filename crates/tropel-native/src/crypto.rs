@@ -58,6 +58,14 @@ impl NativeModule for CryptoModule {
                 hmac_sha1(&key, &data)
             }));
 
+            let _ = globals.set("__tropel_native_hmac_sha512", Func::from(|key: Vec<u8>, data: Vec<u8>| -> Vec<u8> {
+                hmac_sha512(&key, &data)
+            }));
+
+            let _ = globals.set("__tropel_native_hmac_md5", Func::from(|key: Vec<u8>, data: Vec<u8>| -> Vec<u8> {
+                hmac_md5(&key, &data)
+            }));
+
             // ── AES-256-GCM (authenticated encryption) ──
             let _ = globals.set(
                 "__tropel_native_aes_gcm_encrypt",
@@ -168,6 +176,24 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
 pub fn hmac_sha1(key: &[u8], data: &[u8]) -> Vec<u8> {
     use hmac::Mac;
     let mut mac = <hmac::Hmac::<sha1::Sha1> as Mac>::new_from_slice(key)
+        .expect("HMAC key length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// Compute HMAC-SHA512.
+pub fn hmac_sha512(key: &[u8], data: &[u8]) -> Vec<u8> {
+    use hmac::Mac;
+    let mut mac = <hmac::Hmac::<sha2::Sha512> as Mac>::new_from_slice(key)
+        .expect("HMAC key length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// Compute HMAC-MD5.
+pub fn hmac_md5(key: &[u8], data: &[u8]) -> Vec<u8> {
+    use hmac::Mac;
+    let mut mac = <hmac::Hmac::<md5::Md5> as Mac>::new_from_slice(key)
         .expect("HMAC key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()

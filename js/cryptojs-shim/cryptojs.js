@@ -332,11 +332,31 @@ var CryptoJS = CryptoJS || {};
     };
 
     CryptoJS.HmacMD5 = function (message, key) {
-        return CryptoJS.HmacSHA256(message, key); // Simplified - uses SHA256 as fallback
+        var msgBytes = typeof message === 'string'
+            ? bytesFromWordArray(CryptoJS.enc.Utf8.parse(message))
+            : bytesFromWordArray(message);
+        var keyBytes = typeof key === 'string'
+            ? bytesFromWordArray(CryptoJS.enc.Utf8.parse(key))
+            : bytesFromWordArray(key);
+
+        if (typeof __tropel_native_hmac_md5 === 'function') {
+            return wordArrayFromBytes(__tropel_native_hmac_md5(keyBytes, msgBytes));
+        }
+        throw new Error('HMAC-MD5 native function not available');
     };
 
     CryptoJS.HmacSHA512 = function (message, key) {
-        return CryptoJS.HmacSHA256(message, key); // Simplified
+        var msgBytes = typeof message === 'string'
+            ? bytesFromWordArray(CryptoJS.enc.Utf8.parse(message))
+            : bytesFromWordArray(message);
+        var keyBytes = typeof key === 'string'
+            ? bytesFromWordArray(CryptoJS.enc.Utf8.parse(key))
+            : bytesFromWordArray(key);
+
+        if (typeof __tropel_native_hmac_sha512 === 'function') {
+            return wordArrayFromBytes(__tropel_native_hmac_sha512(keyBytes, msgBytes));
+        }
+        throw new Error('HMAC-SHA512 native function not available');
     };
 
     // ── EncryptedMessage helpers ──
