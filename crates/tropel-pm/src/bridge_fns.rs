@@ -183,14 +183,22 @@ impl PmBridge {
 
             // ── Response JSON (returns JSON string, parsed by JS shim) ──
             // rquickjs 0.12 still doesn't support returning serde_json::Value directly,
-            // but returning Option<String> (JSON text) works. The pm.js shim now parses
+            // but returning Option<String> (JSON text) works. The pm.js shim parses
             // this string via JSON.parse() to produce the expected object.
+            // We validate the body is valid JSON first — if it fails to parse, return None
+            // so the JS shim can throw a descriptive error.
             let state_clone = state.clone();
             let _ = globals.set(
                 "__tropel_pm_response_json",
                 Func::from(move || -> Option<String> {
                     let st = state_clone.lock().unwrap();
-                    st.response.as_ref().and_then(|r| r.body_text.clone())
+                    st.response.as_ref().and_then(|r| {
+                        r.body_text.as_ref().and_then(|text| {
+                            // Validate that the body is valid JSON before returning
+                            serde_json::from_str::<serde_json::Value>(text).ok()?;
+                            Some(text.clone())
+                        })
+                    })
                 }),
             );
 

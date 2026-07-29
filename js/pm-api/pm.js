@@ -83,12 +83,11 @@ pm.response = {
         if (typeof __tropel_pm_response_json === 'function') {
             var raw = __tropel_pm_response_json();
             if (raw) {
-                try { return JSON.parse(raw); }
-                catch (e) { return null; }
+                return JSON.parse(raw);
             }
-            return null;
+            throw new Error('pm.response.json() — response body is not valid JSON or no response available');
         }
-        return null;
+        throw new Error('pm.response.json() is not available in this runtime');
     },
     headers: function () {
         if (typeof __tropel_pm_response_headers === 'function') {
