@@ -729,9 +729,9 @@ var _ = _ || {};
         for (var i = 0; i < n; i++) result.push(iteratee(i));
         return result;
     };
-    _.uniqueId = function (prefix) {
+    _.uniqueId = function () {
         var id = 0;
-        return function () {
+        return function (prefix) {
             return (prefix || '') + (++id);
         };
     }();
