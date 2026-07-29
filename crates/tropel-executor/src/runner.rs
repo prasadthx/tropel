@@ -90,6 +90,12 @@ impl VURunner {
             ..Default::default()
         };
 
+        // Set iteration data in PM state for pm.iterationData access
+        {
+            let mut state = self.pm_state.lock().unwrap();
+            state.set_iteration_data(data_row.clone());
+        }
+
         // Build variable scope for this iteration
         let _scope = self.build_scope(data_row.clone(), env_vars).await;
         let resolver = tropel_variables::VariableResolver::new();

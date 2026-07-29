@@ -143,8 +143,9 @@ impl PmApi {
     // ── Iteration Data ──
 
     /// Get the current iteration data value.
-    pub fn iteration_data_get(&self, _key: &str) -> Option<Value> {
-        None
+    pub fn iteration_data_get(&self, key: &str) -> Option<Value> {
+        let state = self.state.lock().unwrap();
+        state.iteration_data.as_ref().and_then(|data| data.get(key).cloned())
     }
 
     // ── Flow Control ──

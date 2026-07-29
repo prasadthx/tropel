@@ -37,6 +37,8 @@ pub struct PmState {
     pub next_request: Option<usize>,
     /// Names of all items in order (for setNextRequest by name).
     pub request_names: Vec<String>,
+    /// Iteration data (from CSV/JSON data file), set per-iteration.
+    pub iteration_data: Option<HashMap<String, Value>>,
     /// Whether to skip the remaining tests.
     pub skip_tests: bool,
     /// Requests queued by pm.sendRequest for async execution.
@@ -64,6 +66,7 @@ impl PmState {
             samples: Vec::new(),
             next_request: None,
             request_names: Vec::new(),
+            iteration_data: None,
             skip_tests: false,
             pending_requests: Vec::new(),
         }
@@ -90,6 +93,11 @@ impl PmState {
     /// Set the list of request names in order (for resolving setNextRequest by name).
     pub fn set_request_names(&mut self, names: Vec<String>) {
         self.request_names = names;
+    }
+
+    /// Set the iteration data for the current iteration.
+    pub fn set_iteration_data(&mut self, data: Option<HashMap<String, Value>>) {
+        self.iteration_data = data;
     }
 }
 

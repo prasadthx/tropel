@@ -236,7 +236,11 @@ pm.expect = function (actual) {
 pm.iterationData = {
     get: function (key) {
         if (typeof __tropel_pm_iteration_data_get === 'function') {
-            return __tropel_pm_iteration_data_get(key);
+            var raw = __tropel_pm_iteration_data_get(key);
+            if (raw === null || raw === undefined) return null;
+            // Values come JSON-encoded from the bridge — parse to restore type
+            try { return JSON.parse(raw); }
+            catch (e) { return raw; }
         }
         return null;
     }

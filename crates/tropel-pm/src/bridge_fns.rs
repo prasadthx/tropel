@@ -218,6 +218,20 @@ impl PmBridge {
                 }),
             );
 
+            // ── Iteration Data ──
+            // Returns Option<String>: JSON-encoded value so the JS shim can
+            // JSON.parse() to restore the correct type.
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_iteration_data_get",
+                Func::from(move |key: String| -> Option<String> {
+                    let st = state_clone.lock().unwrap();
+                    st.iteration_data.as_ref().and_then(|data| {
+                        data.get(&key).map(|val| variable_value_to_string(val))
+                    })
+                }),
+            );
+
             // ── Test ──
             let state_clone = state.clone();
             let _ = globals.set(
