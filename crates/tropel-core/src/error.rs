@@ -21,6 +21,9 @@ pub enum TropelError {
     #[error("JavaScript error: {0}")]
     Js(String),
 
+    #[error("Crypto error: {0}")]
+    Crypto(String),
+
     #[error("HTTP error: {0}")]
     Http(String),
 
