@@ -61,9 +61,11 @@ pub struct FolderItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestDetail {
     pub method: String,
+    #[serde(default)]
     pub header: Vec<Header>,
     pub body: Option<RequestBody>,
-    pub url: UrlDetail,
+    #[serde(default)]
+    pub url: Option<UrlDetail>,
     pub auth: Option<CollectionAuth>,
     pub description: Option<String>,
 }
@@ -236,6 +238,7 @@ pub struct ResponseDetail {
     pub name: Option<String>,
     pub status: Option<String>,
     pub code: u16,
+    #[serde(default)]
     pub header: Vec<Header>,
     pub body: Option<String>,
     pub content_type: Option<String>,

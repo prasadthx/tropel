@@ -128,11 +128,15 @@ fn convert_request(detail: &RequestDetail, item_auth: &Option<CollectionAuth>) -
 
     let query_params: HashMap<String, String> = detail
         .url
-        .query
-        .iter()
-        .filter(|q| !q.disabled)
-        .map(|q| (q.key.clone(), q.value.clone().unwrap_or_default()))
-        .collect();
+        .as_ref()
+        .map(|u| {
+            u.query
+                .iter()
+                .filter(|q| !q.disabled)
+                .map(|q| (q.key.clone(), q.value.clone().unwrap_or_default()))
+                .collect()
+        })
+        .unwrap_or_default();
 
     let body = convert_body(detail.body.as_ref());
 
@@ -148,24 +152,28 @@ fn convert_request(detail: &RequestDetail, item_auth: &Option<CollectionAuth>) -
 }
 
 fn build_url(detail: &RequestDetail) -> String {
-    if let Some(raw) = &detail.url.raw {
+    let url = match detail.url.as_ref() {
+        Some(u) => u,
+        None => return String::new(),
+    };
+
+    if let Some(raw) = &url.raw {
         if !raw.is_empty() {
             return raw.clone();
         }
     }
 
-    let proto = detail.url.protocol.as_deref().unwrap_or("https");
-    let host = detail.url.host.join(".");
-    let port = detail
-        .url
+    let proto = url.protocol.as_deref().unwrap_or("https");
+    let host = url.host.join(".");
+    let port = url
         .port
         .as_ref()
         .map(|p| format!(":{}", p))
         .unwrap_or_default();
-    let path = if detail.url.path.is_empty() {
+    let path = if url.path.is_empty() {
         String::new()
     } else {
-        format!("/{}", detail.url.path.join("/"))
+        format!("/{}", url.path.join("/"))
     };
 
     format!("{}://{}{}{}", proto, host, port, path)
