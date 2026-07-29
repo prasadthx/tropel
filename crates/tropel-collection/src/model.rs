@@ -57,9 +57,14 @@ pub struct FolderItem {
     pub variable: Vec<Variable>,
 }
 
+fn default_method() -> String {
+    "GET".to_string()
+}
+
 /// Request details.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestDetail {
+    #[serde(default = "default_method")]
     pub method: String,
     #[serde(default)]
     pub header: Vec<Header>,

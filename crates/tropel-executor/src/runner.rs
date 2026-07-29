@@ -6,7 +6,6 @@ use std::time::Duration;
 use tropel_core::scenario::Scenario;
 use tropel_core::types::{Sample, SampleType, AuthConfig};
 use tropel_core::Result;
-use tropel_http::client::HttpClient;
 use tropel_http::protocol::HttpProtocol;
 use tropel_js::JsContext;
 use tropel_pm::bridge::{PmState, SharedPmState};
@@ -39,19 +38,17 @@ pub struct VURunner {
     scenario: Arc<Scenario>,
     pm_state: SharedPmState,
     http: Arc<HttpProtocol>,
-    _client: HttpClient,
     config: RunnerConfig,
     js_ctx: Option<Arc<JsContext>>,
 }
 
 impl VURunner {
     /// Create a new VU runner.
-    pub fn new(scenario: Arc<Scenario>, http: Arc<HttpProtocol>, client: HttpClient) -> Self {
+    pub fn new(scenario: Arc<Scenario>, http: Arc<HttpProtocol>) -> Self {
         Self {
             scenario,
             pm_state: Arc::new(Mutex::new(PmState::new())),
             http,
-            _client: client,
             config: RunnerConfig::default(),
             js_ctx: None,
         }

@@ -7,7 +7,6 @@ use tropel_core::{Result, TropelError};
 use tropel_executor::runner::VURunner;
 use tropel_executor::scheduler::VUScheduler;
 use tropel_ext::registry::ExtensionRegistry;
-use tropel_http::client::HttpClient;
 use tropel_http::protocol::HttpProtocol;
 use tropel_metrics::collector::MetricsCollector;
 use tropel_report::{create_reporter, Reporter};
@@ -78,18 +77,8 @@ impl Engine {
                 // Increment active VU count on start
                 sched.add_active_vu(1).await;
 
-                // Create a dedicated HTTP client for this VU
-                let client = match HttpClient::new(&tropel_core::config::HttpConfig::default()) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!("VU {}: Failed to create HTTP client: {}", vu_id, e);
-                        sched.remove_active_vu(1).await;
-                        return;
-                    }
-                };
-
-                // Create VU runner
-                let mut runner = VURunner::new(scenario, http, client);
+                // Create VU runner (HTTP client shared via HttpProtocol)
+                let mut runner = VURunner::new(scenario, http);
                 let pm_state = runner.state_handle();
 
                 // Create JS context and attach to runner
