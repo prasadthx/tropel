@@ -14,10 +14,20 @@ impl NativeModule for AssertModule {
         ctx.with_ctx(|rq_ctx| {
             let globals = rq_ctx.globals();
 
-            // deep_equal requires serde_json::Value which isn't directly
-            // supported by rquickjs Func::from — the JS chai-shim falls
-            // back to JSON.stringify comparison, which is sufficient for now.
-            let _ = globals.set("__tropel_native_assert_ready", Func::from(|| -> bool { true }));
+            // deep_equal via JSON-string bridge: JS serializes both values
+            // to JSON strings, Rust parses them and compares via serde_json
+            // PartialEq (key-order-independent). NaN/undefined are handled
+            // in the JS shim before calling this function.
+            let _ = globals.set(
+                "__tropel_native_deep_equal",
+                Func::from(|a_json: String, b_json: String| -> bool {
+                    match (serde_json::from_str::<serde_json::Value>(&a_json),
+                           serde_json::from_str::<serde_json::Value>(&b_json)) {
+                        (Ok(a), Ok(b)) => deep_equal(&a, &b),
+                        _ => false,
+                    }
+                }),
+            );
         });
 
         tracing::debug!("Installed assert native module");

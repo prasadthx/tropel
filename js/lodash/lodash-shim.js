@@ -381,11 +381,41 @@ var _ = _ || {};
         return JSON.parse(JSON.stringify(value));
     };
 
-    _.isEqual = function (a, b) {
-        if (typeof __tropel_native_deep_equal === 'function') {
-            return __tropel_native_deep_equal(a, b);
+    function isEqualDeep(a, b) {
+        if (a === b) return true;
+        if (typeof a === 'number' && typeof b === 'number' && isNaN(a) && isNaN(b)) return true;
+        if (a === null || b === null || a === undefined || b === undefined) return a === b;
+        if (typeof a !== typeof b) return false;
+        if (Array.isArray(a)) {
+            if (!Array.isArray(b) || a.length !== b.length) return false;
+            for (var i = 0; i < a.length; i++) {
+                if (!isEqualDeep(a[i], b[i])) return false;
+            }
+            return true;
         }
-        return JSON.stringify(a) === JSON.stringify(b);
+        if (typeof a === 'object') {
+            if (Array.isArray(b) || b === null || b === undefined) return false;
+            var keysA = Object.keys(a).sort();
+            var keysB = Object.keys(b).sort();
+            if (keysA.length !== keysB.length) return false;
+            for (var i = 0; i < keysA.length; i++) {
+                if (keysA[i] !== keysB[i]) return false;
+                if (!isEqualDeep(a[keysA[i]], b[keysB[i]])) return false;
+            }
+            return true;
+        }
+        return a === b;
+    }
+
+    _.isEqual = function (a, b) {
+        // Use native deep-equal via JSON-string bridge if available
+        if (typeof __tropel_native_deep_equal === 'function') {
+            if (typeof a === 'number' && typeof b === 'number' && isNaN(a) && isNaN(b)) return true;
+            if (a === b) return true;
+            if (a === null || a === undefined || b === null || b === undefined) return a === b;
+            return __tropel_native_deep_equal(JSON.stringify(a), JSON.stringify(b));
+        }
+        return isEqualDeep(a, b);
     };
 
     _.isEmpty = function (value) {
