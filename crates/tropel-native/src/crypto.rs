@@ -45,6 +45,10 @@ impl NativeModule for CryptoModule {
                 sha3_256(&data)
             }));
 
+            let _ = globals.set("__tropel_native_ripemd160", Func::from(|data: Vec<u8>| -> Vec<u8> {
+                ripemd160(&data)
+            }));
+
             // ── HMACs ──
             let _ = globals.set("__tropel_native_hmac_sha256", Func::from(|key: Vec<u8>, data: Vec<u8>| -> Vec<u8> {
                 hmac_sha256(&key, &data)
@@ -139,6 +143,14 @@ pub fn md5(data: &[u8]) -> Vec<u8> {
 pub fn sha3_256(data: &[u8]) -> Vec<u8> {
     use sha3::Digest;
     let mut hasher = sha3::Sha3_256::new();
+    hasher.update(data);
+    hasher.finalize().to_vec()
+}
+
+/// Compute RIPEMD-160 hash.
+pub fn ripemd160(data: &[u8]) -> Vec<u8> {
+    use ripemd::Digest;
+    let mut hasher = ripemd::Ripemd160::new();
     hasher.update(data);
     hasher.finalize().to_vec()
 }

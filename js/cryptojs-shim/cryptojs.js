@@ -230,8 +230,11 @@ var CryptoJS = CryptoJS || {};
                 }
                 break;
             case 'RIPEMD160':
-                // Fallback
-                result = this._fallbackHash(allBytes, 'RIPEMD160');
+                if (typeof __tropel_native_ripemd160 === 'function') {
+                    result = wordArrayFromBytes(__tropel_native_ripemd160(allBytes));
+                } else {
+                    result = this._fallbackHash(allBytes, 'RIPEMD160');
+                }
                 break;
             default:
                 throw new Error('Unknown algorithm: ' + this._algorithm);
