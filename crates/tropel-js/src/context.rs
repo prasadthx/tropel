@@ -1,8 +1,9 @@
 use crate::error::*;
 use rquickjs::function::Func;
 use rquickjs::{Context, Runtime};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 static NEXT_CTX_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -10,6 +11,19 @@ static NEXT_CTX_ID: AtomicU64 = AtomicU64::new(1);
 pub struct JsContext {
     ctx: Context,
     context_id: u64,
+    /// Shared deadline (epoch nanos) for the interrupt handler.
+    /// Reset before each eval/eval_async to allow per-script timeouts.
+    interrupt_deadline: Arc<AtomicU64>,
+    /// Maximum execution time per script eval.
+    max_execution_time: Duration,
+}
+
+/// Get the current time as nanoseconds since UNIX epoch.
+fn now_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
 }
 
 impl JsContext {
@@ -23,12 +37,14 @@ impl JsContext {
             runtime.set_memory_limit(limit);
         }
 
-        // Set interrupt handler for execution time limit
-        let start = Instant::now();
-        let duration = max_execution_time.unwrap_or(Duration::from_secs(10));
+        let max_execution_time = max_execution_time.unwrap_or(Duration::from_secs(10));
+        let initial_deadline = now_nanos() + max_execution_time.as_nanos() as u64;
+        let interrupt_deadline = Arc::new(AtomicU64::new(initial_deadline));
 
+        // Set interrupt handler using atomic deadline (reset per-eval)
+        let deadline = interrupt_deadline.clone();
         runtime.set_interrupt_handler(Some(Box::new(move || {
-            start.elapsed() > duration
+            now_nanos() > deadline.load(Ordering::Relaxed)
         })));
 
         // Create a full-featured context
@@ -55,11 +71,24 @@ impl JsContext {
 
         let context_id = NEXT_CTX_ID.fetch_add(1, Ordering::SeqCst);
 
-        Ok(Self { ctx, context_id })
+        Ok(Self {
+            ctx,
+            context_id,
+            interrupt_deadline,
+            max_execution_time,
+        })
+    }
+
+    /// Reset the interrupt deadline to now + max_execution_time.
+    /// Called before each eval/eval_async to ensure per-script timeouts.
+    fn reset_interrupt(&self) {
+        let deadline = now_nanos() + self.max_execution_time.as_nanos() as u64;
+        self.interrupt_deadline.store(deadline, Ordering::Relaxed);
     }
 
     /// Evaluate JavaScript code and return the result as a string.
     pub async fn eval(&self, code: &str) -> Result<String> {
+        self.reset_interrupt();
         let code = code.to_string();
         self.ctx
             .with(move |ctx| {
@@ -73,6 +102,7 @@ impl JsContext {
 
     /// Evaluate a script that returns a Promise and resolve it.
     pub async fn eval_async(&self, code: &str) -> Result<String> {
+        self.reset_interrupt();
         let code = code.to_string();
         self.ctx
             .with(move |ctx| {
