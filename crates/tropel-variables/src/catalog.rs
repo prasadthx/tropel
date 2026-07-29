@@ -200,25 +200,8 @@ fn random_string(rng: &mut impl Rng, length: usize, charset: &str) -> String {
 }
 
 fn chrono_now_iso() -> String {
-    // Simple fallback without chrono
-    let now = std::time::SystemTime::now();
-    let dur = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    let secs = dur.as_secs();
-
-    // Simple conversion for approximate ISO 8601
-    let days = secs / 86400;
-    let time_secs = secs % 86400;
-    let hours = time_secs / 3600;
-    let minutes = (time_secs % 3600) / 60;
-    let seconds = time_secs % 60;
-
-    // Approximate date from Unix epoch (1970-01-01)
-    let day = 1 + days as u32;
-
-    format!("1970-{:02}-{:02}T{:02}:{:02}:{:02}Z", 
-        (day / 28).min(12).max(1), 
-        ((day % 28).max(1)), 
-        hours, minutes, seconds)
+    let now = chrono::Utc::now();
+    now.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 #[cfg(test)]

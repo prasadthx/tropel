@@ -2551,6 +2551,7 @@ dependencies = [
 name = "tropel-variables"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "rand 0.8.7",
  "regex",
  "serde",
