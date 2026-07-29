@@ -257,6 +257,8 @@ pub struct MetricsResult {
     pub data_received: f64,
     pub data_sent: f64,
     pub errors: u64,
+    /// Iterations dropped because the VU pool was saturated (arrival-rate mode).
+    pub dropped_iterations: u64,
 }
 
 impl Default for MetricsResult {
@@ -272,6 +274,7 @@ impl Default for MetricsResult {
             data_received: 0.0,
             data_sent: 0.0,
             errors: 0,
+            dropped_iterations: 0,
         }
     }
 }

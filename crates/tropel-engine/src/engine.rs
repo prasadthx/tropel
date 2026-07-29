@@ -115,6 +115,18 @@ impl Engine {
                                 Some(data_rows[row_idx].clone())
                             };
 
+                            // Arrival-rate gate: consume a token before each iteration.
+                            // The ticker adds tokens at the configured rate; if none
+                            // available, the VU waits until one arrives.
+                            // (No-op for non-arriral modes where tokens stay at 0.)
+                            loop {
+                                if sched.try_acquire_arrival_token() {
+                                    break;
+                                }
+                                // No token available — wait for ticker to add one
+                                sched.arrival_notify().notified().await;
+                            }
+
                             tracing::debug!("VU {} running iteration {}", vu_id, iteration_index);
                             let iter_result = runner.run_iteration(iteration_index, data_row, &vu_env).await;
                             tracing::debug!("VU {} iteration {} completed with {} samples", vu_id, iteration_index, iter_result.samples.len());
@@ -173,7 +185,10 @@ impl Engine {
         }
 
         // Collect and aggregate metrics
-        let results = metrics.results().await;
+        let mut results = metrics.results().await;
+
+        // Include dropped iterations from arrival-rate scheduler
+        results.dropped_iterations = executor.take_dropped_iterations();
 
         // Report results
         let reporters = self.create_reporters(&config.output);

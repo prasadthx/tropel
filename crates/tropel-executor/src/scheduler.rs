@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time;
@@ -11,6 +12,12 @@ pub struct VUScheduler {
     active_vus: Arc<Mutex<u32>>,
     total_iterations: Arc<Mutex<u64>>,
     stop_signal: Arc<tokio::sync::Notify>,
+    /// Token bucket count for arrival-rate mode (atomic, so ticker and VUs can share).
+    arrival_tokens: Arc<AtomicU64>,
+    /// Notify for waking VUs when a new token is available.
+    arrival_notify: Arc<tokio::sync::Notify>,
+    /// Dropped iterations counter for arrival-rate mode.
+    arrival_dropped: Arc<AtomicU64>,
 }
 
 impl VUScheduler {
@@ -21,12 +28,34 @@ impl VUScheduler {
             active_vus: Arc::new(Mutex::new(0)),
             total_iterations: Arc::new(Mutex::new(0)),
             stop_signal: Arc::new(tokio::sync::Notify::new()),
+            arrival_tokens: Arc::new(AtomicU64::new(0)),
+            arrival_notify: Arc::new(tokio::sync::Notify::new()),
+            arrival_dropped: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// Get the stop signal.
     pub fn stop_signal(&self) -> Arc<tokio::sync::Notify> {
         self.stop_signal.clone()
+    }
+
+    /// Try to consume one arrival-rate token. Returns true if a token was available.
+    pub fn try_acquire_arrival_token(&self) -> bool {
+        let current = self.arrival_tokens.load(Ordering::Relaxed);
+        current > 0
+            && self.arrival_tokens.compare_exchange(
+                current, current - 1, Ordering::Relaxed, Ordering::Relaxed,
+            ).is_ok()
+    }
+
+    /// Get the Notify for waking VUs when tokens are added.
+    pub fn arrival_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.arrival_notify.clone()
+    }
+
+    /// Get and reset the dropped iterations counter.
+    pub fn take_dropped_iterations(&self) -> u64 {
+        self.arrival_dropped.swap(0, Ordering::Relaxed)
     }
 
     /// Get active VU count.
@@ -198,25 +227,39 @@ impl VUScheduler {
     }
 
     /// Run with constant arrival rate.
-    async fn run_arrival_rate<F>(&self, rate: f64, _pre_alloc: u32, max_vus: u32, duration: Duration, run_vu: &F)
+    /// Uses a VU pool + token-bucket semaphore for rate-independent pacing.
+    async fn run_arrival_rate<F>(&self, rate: f64, pre_alloc: u32, max_vus: u32, duration: Duration, run_vu: &F)
     where
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
         let interval = Duration::from_secs_f64(1.0 / rate);
+        let max_tokens = max_vus as u64;
+        let dropped = self.arrival_dropped.clone();
+
+        tracing::info!(
+            "Starting constant arrival rate: {}/s for {:?} (pre_alloc={}, max_vus={})",
+            rate, duration, pre_alloc, max_vus
+        );
+
+        // Pre-spawn VUs — each runs iterations, consuming a token before each iteration
         let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-        let mut vu_counter = 0u32;
+        for vu_id in 0..pre_alloc.max(1) {
+            let handle = run_vu(self.shared_clone(), vu_id);
+            handles.push(handle);
+        }
+
+        // Ticker loop: add tokens at the configured rate (token bucket)
         let start = time::Instant::now();
-
-        tracing::info!("Starting constant arrival rate: {}/s for {:?}", rate, duration);
-
         while start.elapsed() < duration {
-            if vu_counter < max_vus {
-                let handle = run_vu(self.shared_clone(), vu_counter);
-                handles.push(handle);
-                vu_counter += 1;
-            }
-
             time::sleep(interval).await;
+
+            if self.arrival_tokens.load(Ordering::Relaxed) < max_tokens {
+                self.arrival_tokens.fetch_add(1, Ordering::Relaxed);
+                self.arrival_notify.notify_one();
+            } else {
+                // Pool is saturated — all VUs busy, drop this iteration
+                dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         self.stop_signal.notify_waiters();
@@ -225,7 +268,8 @@ impl VUScheduler {
             handle.await.ok();
         }
 
-        tracing::info!("Constant arrival rate finished");
+        let dropped_total = self.arrival_dropped.load(Ordering::Relaxed);
+        tracing::info!("Constant arrival rate finished (dropped: {})", dropped_total);
     }
 
     /// Create a shared clone of this scheduler for passing to VU tasks.
@@ -235,6 +279,9 @@ impl VUScheduler {
             active_vus: self.active_vus.clone(),
             total_iterations: self.total_iterations.clone(),
             stop_signal: self.stop_signal.clone(),
+            arrival_tokens: self.arrival_tokens.clone(),
+            arrival_notify: self.arrival_notify.clone(),
+            arrival_dropped: self.arrival_dropped.clone(),
         })
     }
 }
