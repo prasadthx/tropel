@@ -239,66 +239,45 @@ pm.iterationData = {
 
 // ── pm.sendRequest (for chaining requests within a test) ──
 pm.sendRequest = function (options, callback) {
-    // Delegate to native implementation if available
+    // Delegate to native implementation
     if (typeof __tropel_pm_send_request === 'function') {
-        return __tropel_pm_send_request(options, callback);
-    }
+        // Extract request fields as strings (bridge doesn't accept JS objects)
+        var url = (options && options.url) || (typeof options === 'string' ? options : '');
+        var method = (options && options.method) || 'GET';
+        var headers = (options && options.headers) || {};
+        var body = (options && options.body) || '';
 
-    // Fallback: attempt a simple XMLHttpRequest
-    try {
-        var xhr = new XMLHttpRequest();
-        var method = (options.method || 'GET').toUpperCase();
-        var url = options.url || options;
+        var resultJson = __tropel_pm_send_request(
+            method.toUpperCase(),
+            url,
+            JSON.stringify(headers),
+            typeof body === 'string' ? body : JSON.stringify(body)
+        );
 
-        xhr.open(method, url, true);
-
-        if (options.headers) {
-            for (var key in options.headers) {
-                if (options.headers.hasOwnProperty(key)) {
-                    xhr.setRequestHeader(key, options.headers[key]);
-                }
-            }
-        }
-
-        if (options.body) {
-            xhr.send(options.body);
-        } else {
-            xhr.send();
-        }
-
-        xhr.onload = function () {
-            if (callback) {
+        // Fire callback with the response
+        if (callback) {
+            try {
+                var result = JSON.parse(resultJson);
                 callback(null, {
-                    code: xhr.status,
-                    text: function () { return xhr.responseText; },
+                    code: result.code || 0,
+                    status: result.statusText || '',
+                    text: function () { return result.body || ''; },
                     json: function () {
-                        try { return JSON.parse(xhr.responseText); }
+                        try { return JSON.parse(result.body || '{}'); }
                         catch (e) { return null; }
                     },
-                    headers: function () {
-                        var h = {};
-                        xhr.getAllResponseHeaders().split('\r\n').forEach(function (line) {
-                            var parts = line.split(': ');
-                            if (parts.length >= 2) {
-                                h[parts[0].toLowerCase()] = parts.slice(1).join(': ');
-                            }
-                        });
-                        return h;
-                    }
+                    headers: function () { return result.headers || {}; },
+                    responseTime: result.responseTime || 0
                 });
+            } catch (e) {
+                callback(new Error('Failed to parse sendRequest response: ' + e.message), null);
             }
-        };
-
-        xhr.onerror = function () {
-            if (callback) {
-                callback(new Error('Request failed'), null);
-            }
-        };
-    } catch (e) {
-        if (callback) {
-            callback(e, null);
         }
+        return;
     }
+
+    // No native function available - throw a clear error
+    throw new Error('pm.sendRequest is not available in this runtime (native __tropel_pm_send_request not found)');
 };
 
 // ── pm.execution ──

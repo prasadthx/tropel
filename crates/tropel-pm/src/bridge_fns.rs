@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use crate::bridge::SharedPmState;
+use crate::bridge::{PendingRequest, SharedPmState};
 use rquickjs::function::Func;
 use tropel_core::Result;
 use tropel_js::JsContext;
@@ -224,6 +224,38 @@ impl PmBridge {
                     let mut st = state_clone.lock().unwrap();
                     st.skip_tests = true;
                 }),
+            );
+
+            // ── sendRequest ──
+            // Queues a request for later async execution. Returns a JSON error
+            // response since true async sendRequest isn't implemented yet.
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_send_request",
+                Func::from(
+                    move |method: String, url: String, headers_json: String, body: String| -> String {
+                        let headers: HashMap<String, String> =
+                            serde_json::from_str(&headers_json).unwrap_or_default();
+                        {
+                            let mut st = state_clone.lock().unwrap();
+                            st.pending_requests.push(PendingRequest {
+                                method: method.clone(),
+                                url: url.clone(),
+                                headers,
+                                body: if body.is_empty() { None } else { Some(body) },
+                            });
+                        }
+                        // Return a JSON response indicating queued status
+                        serde_json::json!({
+                            "status": "queued",
+                            "code": 0,
+                            "statusText": "Request queued — async sendRequest will be processed in a future iteration",
+                            "body": "",
+                            "headers": {},
+                            "responseTime": 0
+                        }).to_string()
+                    },
+                ),
             );
         });
 
