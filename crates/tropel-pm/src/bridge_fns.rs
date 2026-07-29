@@ -168,12 +168,12 @@ impl PmBridge {
                 }),
             );
 
-            // ── Response Cookies (simplified to name-value pairs) ──
-            // rquickjs 0.12+ supports Vec<(String,String)> as IntoJs -> JS array of [key,value] pairs
+            // ── Response Cookies (name → value map)
+            // rquickjs 0.12+ supports HashMap<String,String> as IntoJs -> JS object
             let state_clone = state.clone();
             let _ = globals.set(
                 "__tropel_pm_response_cookies",
-                Func::from(move || -> Vec<(String, String)> {
+                Func::from(move || -> HashMap<String, String> {
                     let st = state_clone.lock().unwrap();
                     st.response.as_ref().map(|r| {
                         r.cookies.iter().map(|c| (c.name.clone(), c.value.clone())).collect()
