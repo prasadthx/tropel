@@ -242,6 +242,7 @@ async fn run(cli: Cli) -> Result<()> {
         threshold_map.insert(name, ThresholdConfig {
             expression: t.clone(),
             abort_on_fail: false,
+            delay_abort_eval: None,
         });
     }
 

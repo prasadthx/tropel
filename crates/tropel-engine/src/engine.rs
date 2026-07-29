@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tropel_collection::{collection_to_scenario, parse_collection_file};
 use tropel_core::config::{ExecutionConfig, JobConfig, OutputConfig};
 use tropel_core::scenario::Scenario;
@@ -9,6 +9,7 @@ use tropel_executor::scheduler::VUScheduler;
 use tropel_ext::registry::ExtensionRegistry;
 use tropel_http::protocol::HttpProtocol;
 use tropel_metrics::collector::MetricsCollector;
+use tropel_metrics::thresholds::check_abort_on_fail;
 use tropel_report::{create_reporter, Reporter};
 
 /// The engine orchestrates a complete load test job.
@@ -56,6 +57,10 @@ impl Engine {
         };
         let vus = vus.max(1);
 
+        let test_start = Instant::now();
+        let has_abort_thresholds = config.thresholds.values().any(|t| t.abort_on_fail);
+        let thresholds = config.thresholds.clone();
+
         let metrics_clone = metrics.clone();
         let scenario_clone = scenario.clone();
         let http_protocol_clone = http_protocol.clone();
@@ -72,6 +77,9 @@ impl Engine {
             let vu_env = env_clone.clone();
             let data_rows = data_rows.clone();
             let _vus_count = vus;
+            let thresholds = thresholds.clone();
+            let test_start = test_start;
+            let has_abort_thresholds = has_abort_thresholds;
 
             tokio::spawn(async move {
                 // Increment active VU count on start
@@ -114,6 +122,24 @@ impl Engine {
                             // Record all samples from this iteration
                             if !iter_result.samples.is_empty() {
                                 metrics.record_batch(&iter_result.samples).await;
+                            }
+
+                            // Mid-run threshold check: abort if any abortOnFail threshold breached
+                            // Check at most once per 2-second slot to avoid hammering metrics.results()
+                            if has_abort_thresholds {
+                                let elapsed = test_start.elapsed();
+                                // Only check if at least the shortest delay_abort_eval has passed
+                                if elapsed > Duration::from_secs(1) {
+                                    // 2-second slot throttle — distributes checks across VUs
+                                    let current_slot = elapsed.as_secs() / 2;
+                                    let prev_slot = (elapsed - Duration::from_millis(100)).as_secs() / 2;
+                                    if current_slot != prev_slot {
+                                        let results = metrics.results().await;
+                                        if check_abort_on_fail(&thresholds, &results, elapsed) {
+                                            stop.notify_waiters();
+                                        }
+                                    }
+                                }
                             }
 
                             sched.increment_iterations().await;

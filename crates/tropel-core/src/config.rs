@@ -87,6 +87,10 @@ pub struct ThresholdConfig {
     /// Whether to abort the test on failure.
     #[serde(default)]
     pub abort_on_fail: bool,
+    /// Grace period before abortOnFail activates (e.g. "30s").
+    /// During this time metrics are collected but failures won't abort.
+    #[serde(default, alias = "delayAbortEval")]
+    pub delay_abort_eval: Option<String>,
 }
 
 /// Output/reporter configuration.

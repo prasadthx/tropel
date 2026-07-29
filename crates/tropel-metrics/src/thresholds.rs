@@ -1,4 +1,6 @@
 use crate::collector::MetricsResult;
+use std::collections::HashMap;
+use std::time::Duration;
 use tropel_core::config::ThresholdConfig;
 
 /// Result of threshold evaluation.
@@ -10,11 +12,12 @@ pub struct ThresholdResult {
     pub actual: f64,
     pub threshold: f64,
     pub abort_on_fail: bool,
+    pub delay_abort_eval: Option<Duration>,
 }
 
 /// Evaluate thresholds against aggregated metrics.
 pub fn evaluate_thresholds(
-    thresholds: &std::collections::HashMap<String, ThresholdConfig>,
+    thresholds: &HashMap<String, ThresholdConfig>,
     metrics: &MetricsResult,
 ) -> Vec<ThresholdResult> {
     let mut results = Vec::new();
@@ -28,10 +31,68 @@ pub fn evaluate_thresholds(
             actual: result.1,
             threshold: result.2,
             abort_on_fail: config.abort_on_fail,
+            delay_abort_eval: config.delay_abort_eval.as_ref()
+                .and_then(|s| parse_duration(s).ok()),
         });
     }
 
     results
+}
+
+/// Check if any abort-on-fail threshold has been breached (mid-run evaluation).
+/// Returns `true` if the test should be aborted immediately.
+/// Respects `delay_abort_eval` — thresholds in their grace period won't abort.
+pub fn check_abort_on_fail(
+    thresholds: &HashMap<String, ThresholdConfig>,
+    metrics: &MetricsResult,
+    elapsed: Duration,
+) -> bool {
+    for (name, config) in thresholds {
+        if !config.abort_on_fail {
+            continue;
+        }
+
+        // Check if delayAbortEval grace period is still active
+        if let Some(ref delay_str) = config.delay_abort_eval {
+            if let Ok(delay) = parse_duration(delay_str) {
+                if elapsed < delay {
+                    continue; // Still in grace period — don't abort yet
+                }
+            }
+        }
+
+        let (passed, _, _) = evaluate_single_threshold(&config.expression, metrics);
+        if !passed {
+            tracing::error!(
+                "Threshold '{}' ({}) breached with abortOnFail — aborting test",
+                name, config.expression
+            );
+            return true;
+        }
+    }
+    false
+}
+
+/// Parse a duration string like "30s", "1m", "500ms" into a Duration.
+fn parse_duration(s: &str) -> std::result::Result<Duration, ()> {
+    let s = s.trim();
+    if let Some(num_str) = s.strip_suffix("ms") {
+        let ms: u64 = num_str.parse().map_err(|_| ())?;
+        Ok(Duration::from_millis(ms))
+    } else if let Some(num_str) = s.strip_suffix('s') {
+        let secs: f64 = num_str.parse().map_err(|_| ())?;
+        Ok(Duration::from_secs_f64(secs))
+    } else if let Some(num_str) = s.strip_suffix('m') {
+        let mins: f64 = num_str.parse().map_err(|_| ())?;
+        Ok(Duration::from_secs_f64(mins * 60.0))
+    } else if let Some(num_str) = s.strip_suffix('h') {
+        let hours: f64 = num_str.parse().map_err(|_| ())?;
+        Ok(Duration::from_secs_f64(hours * 3600.0))
+    } else {
+        // Default to seconds
+        let secs: f64 = s.parse().map_err(|_| ())?;
+        Ok(Duration::from_secs_f64(secs))
+    }
 }
 
 /// Evaluate a single threshold expression against real metrics.
