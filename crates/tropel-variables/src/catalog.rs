@@ -13,55 +13,55 @@ impl DynamicCatalog {
     }
 
     /// Resolve all dynamic variables in a string.
+    /// Each occurrence of a dynamic variable generates a fresh value.
     pub fn resolve(&self, s: &str) -> String {
         let mut result = s.to_string();
         let mut rng = rand::thread_rng();
 
-        // Simple sequential string replacement for each pattern
-        // Using a simpler approach that avoids closure lifetime issues
-
-        // {{$guid}}
+        // {{$guid}} — fresh UUID per occurrence
         if result.contains("{{$guid}}") {
-            let guid = uuid::Uuid::new_v4().to_string();
-            result = result.replace("{{$guid}}", &guid);
+            let re = Regex::new(r"\{\{\$guid\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| uuid::Uuid::new_v4().to_string());
         }
 
-        // {{$timestamp}}
+        // {{$timestamp}} — fresh Unix timestamp per occurrence
         if result.contains("{{$timestamp}}") {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            result = result.replace("{{$timestamp}}", &now.to_string());
+            let re = Regex::new(r"\{\{\$timestamp\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .to_string()
+            });
         }
 
-        // {{$isoTimestamp}}
+        // {{$isoTimestamp}} — fresh ISO timestamp per occurrence
         if result.contains("{{$isoTimestamp}}") {
-            let iso = chrono_now_iso();
-            result = result.replace("{{$isoTimestamp}}", &iso);
+            let re = Regex::new(r"\{\{\$isoTimestamp\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| chrono_now_iso());
         }
 
-        // {{$randomUUID}}
+        // {{$randomUUID}} — fresh UUID per occurrence
         if result.contains("{{$randomUUID}}") {
-            let guid = uuid::Uuid::new_v4().to_string();
-            result = result.replace("{{$randomUUID}}", &guid);
+            let re = Regex::new(r"\{\{\$randomUUID\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| uuid::Uuid::new_v4().to_string());
         }
 
-        // {{$randomInt}}
+        // {{$randomInt}} — fresh random integer per occurrence
         if result.contains("{{$randomInt}}") {
-            let n: u32 = rng.gen_range(0..1000);
-            result = result.replace("{{$randomInt}}", &n.to_string());
+            let re = Regex::new(r"\{\{\$randomInt\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| rng.gen_range(0..1000u32).to_string());
         }
 
-        // {{$randomFloat}}
+        // {{$randomFloat}} — fresh random float per occurrence
         if result.contains("{{$randomFloat}}") {
-            let f = rng.gen::<f64>() * 1000.0;
-            result = result.replace("{{$randomFloat}}", &format!("{:.6}", f));
+            let re = Regex::new(r"\{\{\$randomFloat\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| format!("{:.6}", rng.gen::<f64>() * 1000.0));
         }
 
         // {{$randomString[:length]}}
         if result.contains("{{$randomString") {
-            // Use a regex finder approach
             let re = Regex::new(r"\{\{\$randomString(?::(\d+))?\}\}").unwrap();
             result = self.replace_with_func(&result, &re, |caps| {
                 let len = caps.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(10);
@@ -87,10 +87,10 @@ impl DynamicCatalog {
             });
         }
 
-        // {{$randomBoolean}}
+        // {{$randomBoolean}} — fresh random bool per occurrence
         if result.contains("{{$randomBoolean}}") {
-            let val = rng.gen_bool(0.5);
-            result = result.replace("{{$randomBoolean}}", &val.to_string());
+            let re = Regex::new(r"\{\{\$randomBoolean\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| rng.gen_bool(0.5).to_string());
         }
 
         // {{$randomHex[:length]}}
@@ -102,55 +102,76 @@ impl DynamicCatalog {
             });
         }
 
-        // {{$randomEmail}}
+        // {{$randomEmail}} — fresh email per occurrence
         if result.contains("{{$randomEmail}}") {
-            let name = random_string(&mut rng, 8, "abcdefghijklmnopqrstuvwxyz");
-            let domain = random_string(&mut rng, 6, "abcdefghijklmnopqrstuvwxyz");
-            result = result.replace("{{$randomEmail}}", &format!("{}@{}.com", name, domain));
+            let re = Regex::new(r"\{\{\$randomEmail\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| {
+                let name = random_string(&mut rng, 8, "abcdefghijklmnopqrstuvwxyz");
+                let domain = random_string(&mut rng, 6, "abcdefghijklmnopqrstuvwxyz");
+                format!("{}@{}.com", name, domain)
+            });
         }
 
-        // {{$randomIP}}
+        // {{$randomIP}} — fresh IP per occurrence
         if result.contains("{{$randomIP}}") {
-            let ip = format!("{}.{}.{}.{}", rng.gen_range(1..255), rng.gen_range(0..255), rng.gen_range(0..255), rng.gen_range(1..255));
-            result = result.replace("{{$randomIP}}", &ip);
+            let re = Regex::new(r"\{\{\$randomIP\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| {
+                format!("{}.{}.{}.{}", rng.gen_range(1..255u32), rng.gen_range(0..255u32), rng.gen_range(0..255u32), rng.gen_range(1..255u32))
+            });
         }
 
         // {{$randomCity}}, {{$randomCountry}}, {{$randomStreet}}, {{$randomPostcode}},
-        // {{$randomFullName}}, {{$randomName}}, {{$randomColor}}
+        // {{$randomNameFullName}}, {{$randomNameFirstName}}, {{$randomNameLastName}},
+        // {{$randomName}}, {{$randomColor}}, {{$randomMAC}}
         if result.contains("{{$randomCity}}") {
-            result = result.replace("{{$randomCity}}", &random_string(&mut rng, 8, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+            let re = Regex::new(r"\{\{\$randomCity\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| random_string(&mut rng, 8, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
         }
         if result.contains("{{$randomCountry}}") {
-            result = result.replace("{{$randomCountry}}", &random_string(&mut rng, 8, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+            let re = Regex::new(r"\{\{\$randomCountry\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| random_string(&mut rng, 8, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
         }
         if result.contains("{{$randomStreet}}") {
-            result = result.replace("{{$randomStreet}}", &random_string(&mut rng, 8, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+            let re = Regex::new(r"\{\{\$randomStreet\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| random_string(&mut rng, 8, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
         }
         if result.contains("{{$randomPostcode}}") {
-            result = result.replace("{{$randomPostcode}}", &random_string(&mut rng, 5, "0123456789"));
+            let re = Regex::new(r"\{\{\$randomPostcode\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| random_string(&mut rng, 5, "0123456789"));
         }
         if result.contains("{{$randomName}}") {
-            result = result.replace("{{$randomName}}", &random_string(&mut rng, 8, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+            // Note: {{$randomName}} is the base pattern; longer forms like
+            // {{$randomNameFullName}} are handled later with more specific regexes.
+            let re = Regex::new(r"\{\{\$randomName\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| random_string(&mut rng, 8, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
         }
         if result.contains("{{$randomNameFullName}}") {
-            result = result.replace("{{$randomNameFullName}}", &format!("{} {}", 
-                random_string(&mut rng, 6, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"),
-                random_string(&mut rng, 8, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
-            ));
+            let re = Regex::new(r"\{\{\$randomNameFullName\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| {
+                format!("{} {}", 
+                    random_string(&mut rng, 6, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+                    random_string(&mut rng, 8, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+                )
+            });
         }
         if result.contains("{{$randomNameFirstName}}") {
-            result = result.replace("{{$randomNameFirstName}}", &random_string(&mut rng, 6, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+            let re = Regex::new(r"\{\{\$randomNameFirstName\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| random_string(&mut rng, 6, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
         }
         if result.contains("{{$randomNameLastName}}") {
-            result = result.replace("{{$randomNameLastName}}", &random_string(&mut rng, 8, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+            let re = Regex::new(r"\{\{\$randomNameLastName\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| random_string(&mut rng, 8, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
         }
         if result.contains("{{$randomColor}}") {
-            result = result.replace("{{$randomColor}}", &random_string(&mut rng, 6, "0123456789abcdef"));
+            let re = Regex::new(r"\{\{\$randomColor\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| random_string(&mut rng, 6, "0123456789abcdef"));
         }
         if result.contains("{{$randomMAC}}") {
-            let hex = random_string(&mut rng, 12, "0123456789abcdef");
-            let mac = hex.chars().collect::<Vec<_>>().chunks(2).map(|c| c.iter().collect::<String>()).collect::<Vec<_>>().join(":");
-            result = result.replace("{{$randomMAC}}", &mac);
+            let re = Regex::new(r"\{\{\$randomMAC\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| {
+                let hex = random_string(&mut rng, 12, "0123456789abcdef");
+                hex.chars().collect::<Vec<_>>().chunks(2).map(|c| c.iter().collect::<String>()).collect::<Vec<_>>().join(":")
+            });
         }
 
         // {{$randomPassword[:length]}}
@@ -244,11 +265,47 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_same_var() {
+    fn test_multiple_same_var_fresh_values() {
         let catalog = DynamicCatalog::new();
-        let result = catalog.resolve("{{$guid}}-{{$guid}}");
-        // Both should be replaced, but likely with the same value since we use replace()
+        // Use | as separator since neither UUIDs nor the placeholder contain it
+        let result = catalog.resolve("{{$guid}}|{{$guid}}");
         assert!(!result.contains("{{$guid}}"));
+        let parts: Vec<&str> = result.split('|').collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].len(), 36);
+        assert_eq!(parts[1].len(), 36);
+        // They should be different UUIDs (extremely unlikely to collide)
+        assert_ne!(parts[0], parts[1], "{{$guid}}-{{$guid}} should produce two different values");
+    }
+
+    #[test]
+    fn test_repeated_timestamp_fresh_values() {
+        let catalog = DynamicCatalog::new();
+        let result = catalog.resolve("{{$timestamp}}-{{$timestamp}}");
+        assert!(!result.contains("{{$timestamp}}"));
+        let parts: Vec<&str> = result.split('-').collect();
+        assert_eq!(parts.len(), 2);
+        // Both should be valid timestamps
+        let t1: u64 = parts[0].parse().expect("First should be a number");
+        let t2: u64 = parts[1].parse().expect("Second should be a number");
+        assert!(t1 > 1700000000);
+        assert!(t2 > 1700000000);
+    }
+
+    #[test]
+    fn test_repeated_random_int_fresh_values() {
+        let catalog = DynamicCatalog::new();
+        let result = catalog.resolve("{{$randomInt}}-{{$randomInt}}");
+        assert!(!result.contains("{{$randomInt}}"));
+        let parts: Vec<&str> = result.split('-').collect();
+        assert_eq!(parts.len(), 2);
+        // Both should be valid integers < 1000
+        let n1: u32 = parts[0].parse().expect("First should be a number");
+        let n2: u32 = parts[1].parse().expect("Second should be a number");
+        assert!(n1 < 1000);
+        assert!(n2 < 1000);
+        // They may rarely collide (1/1000 chance), but that's OK — the important
+        // thing is they're both parsed as valid ints and the placeholder is gone.
     }
 
     #[test]
