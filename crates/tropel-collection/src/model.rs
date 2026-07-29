@@ -73,11 +73,14 @@ pub struct RequestDetail {
 pub struct UrlDetail {
     pub raw: Option<String>,
     pub protocol: Option<String>,
+    #[serde(default)]
     pub host: Vec<String>,
     pub port: Option<String>,
+    #[serde(default)]
     pub path: Vec<String>,
     #[serde(default)]
     pub query: Vec<QueryParam>,
+    #[serde(default)]
     pub variable: Vec<UrlVariable>,
     pub hash: Option<String>,
 }

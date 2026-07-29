@@ -2,7 +2,6 @@ use crate::client::HttpClient;
 use crate::auth::AuthSigner;
 use tropel_core::config::HttpConfig;
 use tropel_core::types::*;
-use tropel_core::scenario::ScenarioItem;
 use tropel_core::Result;
 use tropel_core::TropelError;
 
@@ -18,19 +17,16 @@ impl HttpProtocol {
         Ok(Self { client })
     }
 
-    /// Execute a single request item and return a sample.
+    /// Execute a request item — resolves variables in URL only (legacy path).
     pub async fn execute_item(
         &self,
-        item: &ScenarioItem,
+        item: &tropel_core::scenario::ScenarioItem,
         resolved_url: &str,
         auth_signer: Option<&dyn AuthSigner>,
     ) -> Result<Sample> {
         let request = item.request.as_ref()
             .ok_or_else(|| TropelError::Http("Item has no request".into()))?;
 
-        let start = std::time::Instant::now();
-
-        // Build a resolved request with the substituted URL
         let resolved_req = Request {
             url: resolved_url.to_string(),
             method: request.method.clone(),
@@ -43,30 +39,38 @@ impl HttpProtocol {
             timeout: request.timeout,
         };
 
+        self.execute_item_with_request(&resolved_req, auth_signer).await
+    }
+
+    /// Execute a fully-resolved request and return a duration sample.
+    pub async fn execute_item_with_request(
+        &self,
+        resolved_req: &Request,
+        auth_signer: Option<&dyn AuthSigner>,
+    ) -> Result<Sample> {
+        let start = std::time::Instant::now();
+
         // Execute the request
-        let response = self.client.execute(&resolved_req, auth_signer).await?;
+        let response = self.client.execute(resolved_req, auth_signer).await?;
 
         let duration = start.elapsed();
 
         // Build a sample from the response
         let mut tags = std::collections::HashMap::new();
-        tags.insert("url".to_string(), resolved_url.to_string());
-        tags.insert("method".to_string(), request.method.to_string());
+        tags.insert("url".to_string(), resolved_req.url.clone());
+        tags.insert("method".to_string(), resolved_req.method.to_string());
         tags.insert("status_code".to_string(), response.status_code.to_string());
-        tags.insert("name".to_string(), item.name.clone());
+        tags.insert("name".to_string(), resolved_req.url.clone());
         tags.insert("group".to_string(), "http".to_string());
 
         let sample = Sample {
             metric: "http_req_duration".to_string(),
-            value: duration.as_secs_f64() * 1000.0, // milliseconds
+            value: duration.as_micros() as f64, // microseconds (histogram records in μs)
             tags: tags.clone(),
             timestamp: std::time::SystemTime::now(),
             sample_type: SampleType::Trend,
         };
 
-        // Note: The caller is responsible for also emitting a counter sample.
-        // We return only the duration sample; the executor collects the counter.
-        // _ = Sample { metric: "http_reqs", value: 1.0, ... }
         Ok(sample)
     }
 

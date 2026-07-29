@@ -1,4 +1,5 @@
 use crate::NativeModule;
+use rquickjs::function::Func;
 use tropel_core::Result;
 use tropel_js::JsContext;
 
@@ -9,7 +10,19 @@ impl NativeModule for ExtraFunctionsModule {
         "__tropel_native_fn"
     }
 
-    fn install(&self, _ctx: &JsContext) -> Result<()> {
+    fn install(&self, ctx: &JsContext) -> Result<()> {
+        ctx.with_ctx(|rq_ctx| {
+            let globals = rq_ctx.globals();
+
+            let _ = globals.set("__tropel_native_random_int", Func::from(|| -> i64 {
+                random_int(0, 1000)
+            }));
+
+            let _ = globals.set("__tropel_native_random_float", Func::from(|| -> f64 {
+                random_float()
+            }));
+        });
+
         tracing::debug!("Installed extra functions native module");
         Ok(())
     }

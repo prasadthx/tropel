@@ -26,7 +26,7 @@ impl Reporter for StdoutReporter {
 
         if let Some(duration) = &result.http_req_duration {
             println!("\n  HTTP request duration:");
-            println!("    avg:    {:.2}ms", duration.mean);
+            println!("    avg:    {:.2}ms", duration.mean / 1000.0);
             println!("    min:    {}μs", duration.min);
             println!("    max:    {}ms", duration.max / 1000);
             println!("    p50:    {}ms", duration.p50 / 1000);

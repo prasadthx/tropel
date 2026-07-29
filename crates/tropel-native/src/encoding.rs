@@ -1,4 +1,5 @@
 use crate::NativeModule;
+use rquickjs::function::Func;
 use tropel_core::Result;
 use tropel_js::JsContext;
 
@@ -9,7 +10,23 @@ impl NativeModule for EncodingModule {
         "__tropel_native_encoding"
     }
 
-    fn install(&self, _ctx: &JsContext) -> Result<()> {
+    fn install(&self, ctx: &JsContext) -> Result<()> {
+        ctx.with_ctx(|rq_ctx| {
+            let globals = rq_ctx.globals();
+
+            let _ = globals.set("__tropel_native_base64_encode", Func::from(|data: Vec<u8>| -> String {
+                base64_encode(&data)
+            }));
+
+            let _ = globals.set("__tropel_native_hex_encode", Func::from(|data: Vec<u8>| -> String {
+                hex_encode(&data)
+            }));
+
+            let _ = globals.set("__tropel_native_url_encode", Func::from(|data: String| -> String {
+                url_encode(&data)
+            }));
+        });
+
         tracing::debug!("Installed encoding native module");
         Ok(())
     }

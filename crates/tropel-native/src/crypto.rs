@@ -1,4 +1,5 @@
 use crate::NativeModule;
+use rquickjs::function::Func;
 use tropel_core::Result;
 use tropel_js::JsContext;
 
@@ -9,12 +10,26 @@ impl NativeModule for CryptoModule {
         "__tropel_native_crypto"
     }
 
-    fn install(&self, _ctx: &JsContext) -> Result<()> {
-        // Note: In a full implementation, we would install native async functions
-        // into the JS context using the rquickjs API.
-        //
-        // For now, we register the module identity so the JS shims can detect it.
-        // Full binding will use rquickjs async_with and Function::new_closure.
+    fn install(&self, ctx: &JsContext) -> Result<()> {
+        ctx.with_ctx(|rq_ctx| {
+            let globals = rq_ctx.globals();
+
+            let _ = globals.set("__tropel_native_sha256", Func::from(|data: Vec<u8>| -> Vec<u8> {
+                sha256(&data)
+            }));
+
+            let _ = globals.set("__tropel_native_sha1", Func::from(|data: Vec<u8>| -> Vec<u8> {
+                sha1(&data)
+            }));
+
+            let _ = globals.set("__tropel_native_md5", Func::from(|data: Vec<u8>| -> Vec<u8> {
+                md5(&data)
+            }));
+
+            let _ = globals.set("__tropel_native_hmac_sha256", Func::from(|key: Vec<u8>, data: Vec<u8>| -> Vec<u8> {
+                hmac_sha256(&key, &data)
+            }));
+        });
 
         tracing::debug!("Installed crypto native module");
         Ok(())

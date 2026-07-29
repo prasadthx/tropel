@@ -6,6 +6,8 @@
 
 pub mod api;
 pub mod bridge;
+pub mod bridge_fns;
 
 pub use api::*;
 pub use bridge::*;
+pub use bridge_fns::*;

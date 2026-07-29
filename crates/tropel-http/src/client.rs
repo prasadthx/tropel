@@ -8,11 +8,13 @@ use tropel_core::types::*;
 use tropel_core::Result;
 use tropel_core::TropelError;
 
-/// Per-VU HTTP client with cookie jar and auth.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-VU HTTP client with auth and response tracking.
 #[derive(Clone)]
 pub struct HttpClient {
     inner: reqwest::Client,
-    cookie_store: Arc<Mutex<HashMap<String, Vec<Cookie>>>>,
+    last_response: Arc<Mutex<Option<tropel_core::types::Response>>>,
 }
 
 impl HttpClient {
@@ -20,10 +22,8 @@ impl HttpClient {
     pub fn new(config: &HttpConfig) -> Result<Self> {
         let mut builder = reqwest::Client::builder()
             .user_agent(&config.user_agent)
-            .danger_accept_invalid_certs(false)
             .pool_max_idle_per_host(config.max_idle_connections)
-            .http2_prior_knowledge()
-            .http2_adaptive_window(true);
+            .timeout(DEFAULT_REQUEST_TIMEOUT);
 
         if !config.decompress {
             builder = builder.no_deflate();
@@ -49,7 +49,7 @@ impl HttpClient {
 
         Ok(Self {
             inner,
-            cookie_store: Arc::new(Mutex::new(HashMap::new())),
+            last_response: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -107,11 +107,9 @@ impl HttpClient {
             req_builder = req_builder.query(&request.query_params);
         }
 
-        // Set timeout
+        // Set timeout (client-level timeout is already set, request can override shorter)
         if let Some(timeout) = request.timeout {
             req_builder = req_builder.timeout(timeout);
-        } else {
-            req_builder = req_builder.timeout(Duration::from_secs(60));
         }
 
         // Apply auth — sign takes ownership and returns a new builder
@@ -168,7 +166,19 @@ impl HttpClient {
             size,
         };
 
+        // Store the last response for PM state
+        {
+            let mut last = self.last_response.lock().await;
+            *last = Some(tropel_core::types::Response::from(&response));
+        }
+
         Ok(response)
+    }
+
+    /// Get the last response (for the PM bridge to access).
+    pub async fn last_response(&self) -> Option<tropel_core::types::Response> {
+        let last = self.last_response.lock().await;
+        last.clone()
     }
 
     /// Get an auth signer based on the auth config.
@@ -198,6 +208,23 @@ pub struct HttpResponse {
     pub timings: Option<Timings>,
     pub cookies: Vec<Cookie>,
     pub size: u64,
+}
+
+impl From<&HttpResponse> for tropel_core::types::Response {
+    fn from(resp: &HttpResponse) -> Self {
+        tropel_core::types::Response {
+            status_code: resp.status_code,
+            status_text: resp.status_text.clone(),
+            headers: resp.headers.clone(),
+            body: resp.body.clone(),
+            body_text: resp.body_text.clone(),
+            body_json: resp.body_json.clone(),
+            response_time: resp.response_time,
+            timings: resp.timings.clone(),
+            cookies: resp.cookies.clone(),
+            size: resp.size,
+        }
+    }
 }
 
 fn body_to_reqwest(body: &Body) -> reqwest::Body {
@@ -249,7 +276,6 @@ fn parse_duration(s: &str) -> Result<Duration> {
 
 /// Re-export serde_urlencoded for form body encoding.
 mod serde_urlencoded {
-    use std::collections::HashMap;
 
     pub fn to_string(pairs: Vec<(String, String)>) -> Result<String, std::convert::Infallible> {
         let encoded: Vec<String> = pairs
@@ -276,20 +302,20 @@ mod serde_urlencoded {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::time::Duration;
 
     #[test]
     fn test_parse_duration() {
-        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
-        assert_eq!(parse_duration("5s").unwrap(), Duration::from_secs(5));
-        assert_eq!(parse_duration("1.5s").unwrap(), Duration::from_millis(1500));
-        assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
-        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+        assert_eq!(super::parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(super::parse_duration("5s").unwrap(), Duration::from_secs(5));
+        assert_eq!(super::parse_duration("1.5s").unwrap(), Duration::from_millis(1500));
+        assert_eq!(super::parse_duration("2m").unwrap(), Duration::from_secs(120));
+        assert_eq!(super::parse_duration("1h").unwrap(), Duration::from_secs(3600));
     }
 
     #[test]
     fn test_form_urlencoding() {
-        let result = serde_urlencoded::to_string(vec![
+        let result = super::serde_urlencoded::to_string(vec![
             ("key".to_string(), "value".to_string()),
             ("name".to_string(), "hello world".to_string()),
         ]).unwrap();

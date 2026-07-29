@@ -81,7 +81,12 @@ pm.response = {
     },
     json: function () {
         if (typeof __tropel_pm_response_json === 'function') {
-            return __tropel_pm_response_json();
+            var raw = __tropel_pm_response_json();
+            if (raw) {
+                try { return JSON.parse(raw); }
+                catch (e) { return null; }
+            }
+            return null;
         }
         return null;
     },

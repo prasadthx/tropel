@@ -34,6 +34,18 @@ impl VUScheduler {
         *self.active_vus.lock().await
     }
 
+    /// Increment active VU count.
+    pub async fn add_active_vu(&self, delta: u32) {
+        let mut vus = self.active_vus.lock().await;
+        *vus += delta;
+    }
+
+    /// Decrement active VU count.
+    pub async fn remove_active_vu(&self, delta: u32) {
+        let mut vus = self.active_vus.lock().await;
+        *vus = vus.saturating_sub(delta);
+    }
+
     /// Get total iterations completed.
     pub async fn total_iterations(&self) -> u64 {
         *self.total_iterations.lock().await
@@ -80,12 +92,11 @@ impl VUScheduler {
     {
         tracing::info!("Starting constant VUs: {} for {:?}", vus, duration);
 
-        // Spawn VUs
+        // Spawn VUs (active count incremented by each VU task itself)
         let mut handles = Vec::new();
         for vu_id in 0..vus {
             let handle = run_vu(self.shared_clone(), vu_id);
             handles.push(handle);
-            *self.active_vus.lock().await += 1;
         }
 
         // Wait for the duration
@@ -112,11 +123,10 @@ impl VUScheduler {
         let mut current_vus = start_vus;
         let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-        // Start initial VUs
+        // Start initial VUs (active count incremented by each VU task itself)
         for vu_id in 0..current_vus {
             let handle = run_vu(self.shared_clone(), vu_id);
             handles.push(handle);
-            *self.active_vus.lock().await += 1;
         }
 
         // Process each stage
@@ -129,20 +139,22 @@ impl VUScheduler {
             let step_delay = stage_duration / steps as u32;
 
             if target > current_vus {
-                // Ramp up
+                // Ramp up (active count incremented by each VU task itself)
                 for _ in 0..(target - current_vus) {
                     let vu_id = current_vus;
                     let handle = run_vu(self.shared_clone(), vu_id);
                     handles.push(handle);
-                    *self.active_vus.lock().await += 1;
                     current_vus += 1;
                     time::sleep(step_delay).await;
                 }
             } else {
-                // Ramp down: signal VUs to stop
-                let _ = current_vus - target;
-                self.stop_signal.notify_waiters(); // Signal all VUs
-                time::sleep(Duration::from_secs(1)).await; // Give them time to notice
+                // Ramp down: use per-VU cancellation via the decrement + notify pattern
+                let to_stop = current_vus - target;
+                // Signal all VUs; each VU checks remaining capacity
+                self.stop_signal.notify_waiters();
+                time::sleep(Duration::from_millis(500)).await; // Brief wait for VUs to notice
+                // Decrement active count — VUs that exit will decrement themselves
+                self.remove_active_vu(to_stop).await;
                 current_vus = target;
             }
         }
@@ -175,7 +187,6 @@ impl VUScheduler {
         for vu_id in 0..vus {
             let handle = run_vu(self.shared_clone(), vu_id);
             handles.push(handle);
-            *self.active_vus.lock().await += 1;
         }
 
         // Wait for all VUs to complete (they check shared iterations)
@@ -202,7 +213,6 @@ impl VUScheduler {
             if vu_counter < max_vus {
                 let handle = run_vu(self.shared_clone(), vu_counter);
                 handles.push(handle);
-                *self.active_vus.lock().await += 1;
                 vu_counter += 1;
             }
 
@@ -229,7 +239,7 @@ impl VUScheduler {
     }
 }
 
-fn parse_duration(s: &str) -> Result<Duration> {
+fn parse_duration(s: &str    ) -> Result<Duration> {
     let s = s.trim();
     if let Some(num) = s.strip_suffix("ms") {
         let v: u64 = num.parse().map_err(|_| tropel_core::TropelError::Config(format!("Invalid duration: {}", s)))?;

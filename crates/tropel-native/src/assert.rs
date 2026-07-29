@@ -1,5 +1,5 @@
 use crate::NativeModule;
-use serde_json::Value;
+use rquickjs::function::Func;
 use tropel_core::Result;
 use tropel_js::JsContext;
 
@@ -10,57 +10,41 @@ impl NativeModule for AssertModule {
         "__tropel_native_assert"
     }
 
-    fn install(&self, _ctx: &JsContext) -> Result<()> {
+    fn install(&self, ctx: &JsContext) -> Result<()> {
+        ctx.with_ctx(|rq_ctx| {
+            let globals = rq_ctx.globals();
+
+            // deep_equal requires serde_json::Value which isn't directly
+            // supported by rquickjs Func::from — the JS chai-shim falls
+            // back to JSON.stringify comparison, which is sufficient for now.
+            let _ = globals.set("__tropel_native_assert_ready", Func::from(|| -> bool { true }));
+        });
+
         tracing::debug!("Installed assert native module");
         Ok(())
     }
 }
 
 /// Deep equality check between two JSON values.
-pub fn deep_equal(a: &Value, b: &Value) -> bool {
+pub fn deep_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
     a == b
 }
 
-/// Type check: is the value a string?
-pub fn is_string(val: &Value) -> bool {
-    val.is_string()
-}
+pub fn is_string(val: &serde_json::Value) -> bool { val.is_string() }
+pub fn is_number(val: &serde_json::Value) -> bool { val.is_number() }
+pub fn is_array(val: &serde_json::Value) -> bool { val.is_array() }
+pub fn is_object(val: &serde_json::Value) -> bool { val.is_object() }
+pub fn is_null(val: &serde_json::Value) -> bool { val.is_null() }
+pub fn is_boolean(val: &serde_json::Value) -> bool { val.is_boolean() }
 
-/// Type check: is the value a number?
-pub fn is_number(val: &Value) -> bool {
-    val.is_number()
-}
-
-/// Type check: is the value an array?
-pub fn is_array(val: &Value) -> bool {
-    val.is_array()
-}
-
-/// Type check: is the value an object?
-pub fn is_object(val: &Value) -> bool {
-    val.is_object()
-}
-
-/// Type check: is the value null?
-pub fn is_null(val: &Value) -> bool {
-    val.is_null()
-}
-
-/// Type check: is the value boolean?
-pub fn is_boolean(val: &Value) -> bool {
-    val.is_boolean()
-}
-
-/// Get the length of a string or array.
-pub fn length(val: &Value) -> Option<usize> {
+pub fn length(val: &serde_json::Value) -> Option<usize> {
     match val {
-        Value::String(s) => Some(s.len()),
-        Value::Array(arr) => Some(arr.len()),
+        serde_json::Value::String(s) => Some(s.len()),
+        serde_json::Value::Array(arr) => Some(arr.len()),
         _ => None,
     }
 }
 
-/// Check that a string matches a regex pattern.
 pub fn matches(value: &str, pattern: &str) -> Result<bool> {
     let re = regex::Regex::new(pattern)
         .map_err(|e| tropel_core::TropelError::Parse(format!("Invalid regex '{}': {}", pattern, e)))?;
@@ -70,34 +54,36 @@ pub fn matches(value: &str, pattern: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn test_deep_equal() {
-        assert!(deep_equal(&json!({"a": 1}), &json!({"a": 1})));
-        assert!(!deep_equal(&json!({"a": 1}), &json!({"a": 2})));
+        let a = serde_json::json!({"a": 1});
+        let b = serde_json::json!({"a": 1});
+        let c = serde_json::json!({"a": 2});
+        assert!(deep_equal(&a, &b));
+        assert!(!deep_equal(&a, &c));
     }
 
     #[test]
     fn test_type_checks() {
-        assert!(is_string(&json!("hello")));
-        assert!(is_number(&json!(42)));
-        assert!(is_array(&json!([1, 2, 3])));
-        assert!(is_object(&json!({"a": 1})));
-        assert!(is_null(&json!(null)));
-        assert!(is_boolean(&json!(true)));
+        assert!(is_string(&serde_json::json!("hello")));
+        assert!(is_number(&serde_json::json!(42)));
+        assert!(is_array(&serde_json::json!([1, 2, 3])));
+        assert!(is_object(&serde_json::json!({"a": 1})));
+        assert!(is_null(&serde_json::json!(null)));
+        assert!(is_boolean(&serde_json::json!(true)));
     }
 
     #[test]
     fn test_length() {
-        assert_eq!(length(&json!("hello")), Some(5));
-        assert_eq!(length(&json!([1, 2, 3])), Some(3));
-        assert_eq!(length(&json!(42)), None);
+        assert_eq!(length(&serde_json::json!("hello")), Some(5));
+        assert_eq!(length(&serde_json::json!([1, 2, 3])), Some(3));
+        assert_eq!(length(&serde_json::json!(42)), None);
     }
 
     #[test]
     fn test_matches() {
-        assert!(matches("hello123", r"^[a-z]+\d+$").unwrap());
-        assert!(!matches("123abc", r"^[a-z]+\d+$").unwrap());
+        assert!(matches("hello123", "^[a-z]+\\d+$").unwrap());
+        assert!(!matches("123abc", "^[a-z]+\\d+$").unwrap());
     }
 }

@@ -1,12 +1,10 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 use tropel_collection::{collection_to_scenario, parse_collection_file};
 use tropel_core::config::{ExecutionConfig, JobConfig, OutputConfig};
 use tropel_core::scenario::Scenario;
-use tropel_core::types::SampleType;
 use tropel_core::{Result, TropelError};
+use tropel_executor::runner::VURunner;
 use tropel_executor::scheduler::VUScheduler;
 use tropel_ext::registry::ExtensionRegistry;
 use tropel_http::client::HttpClient;
@@ -27,13 +25,6 @@ impl Engine {
         }
     }
 
-    /// Create a new engine with an empty extension registry.
-    pub fn default() -> Self {
-        Self {
-            extension_registry: ExtensionRegistry::new(),
-        }
-    }
-
     /// Run a complete load test job.
     pub async fn run(&self, config: &JobConfig) -> Result<EngineResult> {
         tracing::info!("Starting Tropel load test: {}", config.input);
@@ -42,8 +33,7 @@ impl Engine {
         let scenario = self.parse_input(&config.input, config).await?;
         let scenario = Arc::new(scenario);
 
-        // Create HTTP client
-        let http_client = HttpClient::new(&config.http)?;
+        // Create shared HTTP protocol (used by all VUs)
         let http_protocol = Arc::new(HttpProtocol::new(&config.http)?);
 
         // Create metrics collector
@@ -53,40 +43,64 @@ impl Engine {
         let executor = VUScheduler::new(&config.execution);
         let stop_signal = executor.stop_signal();
 
-        // Shared iteration counter for shared-iterations mode
-        let shared_iterations = Arc::new(Mutex::new(0u64));
         let total_iterations = match &config.execution {
             ExecutionConfig::SharedIterations { iterations, .. } => *iterations,
             _ => u64::MAX,
         };
 
-        // Number of VUs
+        // Count VUs for iteration data sharding
         let vus = match &config.execution {
             ExecutionConfig::ConstantVus { vus, .. } => *vus,
             ExecutionConfig::RampingVus { start_vus, .. } => *start_vus,
             ExecutionConfig::SharedIterations { vus, .. } => *vus,
             ExecutionConfig::ConstantArrivalRate { pre_alloc_vus, .. } => *pre_alloc_vus,
         };
+        let vus = vus.max(1);
 
-        // Run the executor
         let metrics_clone = metrics.clone();
         let scenario_clone = scenario.clone();
         let http_protocol_clone = http_protocol.clone();
         let stop_signal_clone = stop_signal.clone();
-        let shared_iterations_clone = shared_iterations.clone();
         let env_clone = config.env.clone();
+        let data_rows = config.iteration_data.clone();
 
         executor.run(move |sched, vu_id| {
             let metrics = metrics_clone.clone();
             let scenario = scenario_clone.clone();
             let http = http_protocol_clone.clone();
             let stop = stop_signal_clone.clone();
-            let shared_iters = shared_iterations_clone.clone();
             let total_iters = total_iterations;
             let vu_env = env_clone.clone();
+            let data_rows = data_rows.clone();
+            let _vus_count = vus;
 
             tokio::spawn(async move {
+                // Increment active VU count on start
+                sched.add_active_vu(1).await;
+
+                // Create a dedicated HTTP client for this VU
+                let client = match HttpClient::new(&tropel_core::config::HttpConfig::default()) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("VU {}: Failed to create HTTP client: {}", vu_id, e);
+                        sched.remove_active_vu(1).await;
+                        return;
+                    }
+                };
+
+                // Create VU runner
+                let mut runner = VURunner::new(scenario, http, client);
+                let pm_state = runner.state_handle();
+
+                // Create JS context and attach to runner
+                let js_ctx = create_vu_js_context(vu_id, &pm_state).await;
+                if let Some(ctx) = js_ctx {
+                    runner = runner.with_js_context(Arc::new(ctx));
+                    tracing::debug!("VU {}: JS context attached for script execution", vu_id);
+                }
+
                 let mut iteration_index = 0u64;
+                tracing::debug!("VU {} starting iteration loop at index 0", vu_id);
 
                 loop {
                     // Check if we should stop
@@ -95,27 +109,53 @@ impl Engine {
                             tracing::debug!("VU {} stopping (signal)", vu_id);
                             break;
                         }
-                        _ = run_iteration(&scenario, &http, &metrics, vu_id, iteration_index, &vu_env) => {}
+                        result = async {
+                            // Get iteration data row (sharded by VU and iteration)
+                            let data_row = if data_rows.is_empty() {
+                                None
+                            } else {
+                                let row_idx = (iteration_index as usize + vu_id as usize) % data_rows.len();
+                                Some(data_rows[row_idx].clone())
+                            };
+
+                            tracing::debug!("VU {} running iteration {}", vu_id, iteration_index);
+                            let iter_result = runner.run_iteration(iteration_index, data_row, &vu_env).await;
+                            tracing::debug!("VU {} iteration {} completed with {} samples", vu_id, iteration_index, iter_result.samples.len());
+
+                            // Record all samples from this iteration
+                            if !iter_result.samples.is_empty() {
+                                metrics.record_batch(&iter_result.samples).await;
+                            }
+
+                            sched.increment_iterations().await;
+
+                            iteration_index
+                        } => { iteration_index = result + 1; }
                     }
 
-                    iteration_index += 1;
-
-                    // Update iteration count
+                    // Check iteration limit for shared-iterations mode
                     if total_iters != u64::MAX {
-                        let mut count = shared_iters.lock().await;
-                        *count += 1;
-                        if *count >= total_iters {
+                        let current_iters = sched.total_iterations().await;
+                        if current_iters >= total_iters {
                             break;
                         }
                     }
-
-                    // Check scheduler
-                    if sched.active_vus().await == 0 {
-                        break;
-                    }
                 }
+
+                // Decrement active VU count on exit
+                sched.remove_active_vu(1).await;
+                tracing::debug!("VU {} finished ({} iterations)", vu_id, iteration_index);
             })
         }).await?;
+
+        // Wait for active VUs to reach zero (all finished)
+        loop {
+            let active = executor.active_vus().await;
+            if active == 0 {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
 
         // Collect and aggregate metrics
         let results = metrics.results().await;
@@ -133,7 +173,6 @@ impl Engine {
 
     /// Parse an input file into a Scenario.
     async fn parse_input(&self, input_path: &str, config: &JobConfig) -> Result<Scenario> {
-        // Try to detect and parse using the appropriate adapter
         let collection = parse_collection_file(input_path)
             .map_err(|e| TropelError::Parse(format!("Failed to parse collection: {}", e)))?;
 
@@ -148,14 +187,10 @@ impl Engine {
         for name in &config.reporters {
             if let Some(reporter) = create_reporter(name) {
                 reporters.push(reporter);
+            } else if let Some(_ext) = self.extension_registry.get_output(name) {
+                tracing::warn!("Extension reporter '{}' not yet supported in engine runner", name);
             } else {
-                // Check extension registry for custom reporters
-                if let Some(_ext) = self.extension_registry.get_output(name) {
-                    // Extension reporters are not yet fully integrated here
-                    tracing::warn!("Extension reporter '{}' not yet supported in engine runner", name);
-                } else {
-                    tracing::warn!("Unknown reporter: {}", name);
-                }
+                tracing::warn!("Unknown reporter: {}", name);
             }
         }
 
@@ -168,80 +203,66 @@ impl Engine {
     }
 }
 
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new(ExtensionRegistry::new())
+    }
+}
+
 /// Result of a full engine run.
 #[derive(Debug)]
 pub struct EngineResult {
     pub metrics: tropel_metrics::collector::MetricsResult,
 }
 
-/// Run a single VU iteration.
-async fn run_iteration(
-    scenario: &Scenario,
-    http: &HttpProtocol,
-    metrics: &MetricsCollector,
-    vu_id: u32,
-    iteration: u64,
-    env_vars: &HashMap<String, String>,
-) {
-    tracing::trace!("VU {} iteration {} starting", vu_id, iteration);
-
-    let scope = tropel_variables::VariableScope {
-        data: HashMap::new(),
-        env: env_vars.clone(),
-        collection: scenario.variables.iter().map(|(k, v)| {
-            (k.clone(), v.clone())
-        }).collect(),
-        globals: HashMap::new(),
-    };
-    let resolver = tropel_variables::VariableResolver::new();
-
-    // Walk through items in order
-    for item in &scenario.items {
-        let resolved_url = item.request.as_ref().map(|req| {
-            resolver.resolve_deep(&req.url, &scope, 5)
-        }).unwrap_or_default();
-
-        // Execute via HTTP
-        let sample = http.execute_item(item, &resolved_url, None).await;
-
-        match sample {
-            Ok(sample) => {
-                // Collect the duration sample
-                let tags = sample.tags.clone();
-                metrics.record(&sample).await;
-
-                // Also emit a counter
-                let count_sample = tropel_core::types::Sample {
-                    metric: "http_reqs".to_string(),
-                    value: 1.0,
-                    tags,
-                    timestamp: std::time::SystemTime::now(),
-                    sample_type: SampleType::Counter,
-                };
-                metrics.record(&count_sample).await;
-            }
-            Err(e) => {
-                tracing::warn!("VU {} request '{}' failed: {}", vu_id, item.name, e);
-                let err_tags = std::collections::HashMap::from([
-                    ("url".to_string(), resolved_url),
-                    ("method".to_string(), item.request.as_ref().map(|r| r.method.to_string()).unwrap_or_default()),
-                    ("name".to_string(), item.name.clone()),
-                    ("error".to_string(), e.to_string()),
-                ]);
-                let error_sample = tropel_core::types::Sample {
-                    metric: "errors".to_string(),
-                    value: 1.0,
-                    tags: err_tags,
-                    timestamp: std::time::SystemTime::now(),
-                    sample_type: SampleType::Counter,
-                };
-                metrics.record(&error_sample).await;
-            }
+/// Create a JS context for a VU and bootstrap the vendored JS libraries.
+async fn create_vu_js_context(vu_id: u32, pm_state: &tropel_pm::bridge::SharedPmState) -> Option<tropel_js::JsContext> {
+    // Create the JS context with a 10 MB memory limit and 10s execution timeout
+    let ctx = match tropel_js::JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10))).await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            tracing::warn!("VU {}: Failed to create JS context: {} (scripts will be skipped)", vu_id, e);
+            return None;
         }
+    };
 
-        // Brief pause between requests within a VU
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    // Bootstrap the vendored JS libraries
+    let js_libraries: [(&str, &str); 2] = [
+        ("pm-api", include_str!("../../../js/pm-api/pm.js")),
+        ("chai-shim", include_str!("../../../js/chai/chai-shim.js")),
+    ];
+
+    // To keep things practical, we also include lodash and cryptojs shims
+    let lodash_code: &str = include_str!("../../../js/lodash/lodash-shim.js");
+    let cryptojs_code: &str = include_str!("../../../js/cryptojs-shim/cryptojs.js");
+
+    // Bootstrap all libraries
+    for (name, code) in &js_libraries {
+        if let Err(e) = ctx.bootstrap_library(code).await {
+            tracing::warn!("VU {}: Failed to bootstrap JS library '{}': {}", vu_id, name, e);
+        }
     }
 
-    tracing::trace!("VU {} iteration {} finished", vu_id, iteration);
+    // Bootstrap lodash and cryptojs
+    for (name, code) in &[
+        ("lodash-shim", lodash_code),
+        ("cryptojs-shim", cryptojs_code),
+    ] {
+        if let Err(e) = ctx.bootstrap_library(code).await {
+            tracing::warn!("VU {}: Failed to bootstrap JS library '{}': {}", vu_id, name, e);
+        }
+    }
+
+    // Install native module functions (crypto, hash, encoding, assert, json, fn)
+    if let Err(e) = tropel_native::install_all(&ctx).await {
+        tracing::warn!("VU {}: Failed to install native modules: {}", vu_id, e);
+    }
+
+    // Install pm.* bridge functions so JS shims can call __tropel_pm_* functions
+    let bridge = tropel_pm::bridge_fns::PmBridge::new(pm_state.clone());
+    if let Err(e) = bridge.install(&ctx) {
+        tracing::warn!("VU {}: Failed to install PM bridge functions: {}", vu_id, e);
+    }
+
+    Some(ctx)
 }

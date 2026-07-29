@@ -1,7 +1,7 @@
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 use tropel_core::types::{Request, Response, Sample};
 /// The mutable state for a single VU's pm.* API.
 /// Shared between the JS context and the native executor.

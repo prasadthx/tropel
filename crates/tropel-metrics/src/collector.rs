@@ -93,11 +93,20 @@ impl MetricsCollector {
     /// Get aggregated results.
     pub async fn results(&self) -> MetricsResult {
         let data = self.data.lock().await;
+        let totals = self.totals.lock().await;
         let mut metrics = Vec::new();
+        let mut http_reqs: u64 = 0;
+        let mut http_req_duration: Option<MetricSummary> = None;
+        let mut errors: u64 = 0;
+        let mut checks_total: u64 = 0;
+        let mut checks_passed: u64 = 0;
+        let mut checks_failed: u64 = 0;
+        let mut data_received: f64 = 0.0;
+        let mut data_sent: f64 = 0.0;
 
         for (key, set) in data.iter() {
             let stats = set.histogram.stats();
-            metrics.push(MetricSummary {
+            let summary = MetricSummary {
                 key: key.clone(),
                 count: set.count as u64,
                 sum: set.sum,
@@ -108,11 +117,58 @@ impl MetricsCollector {
                 p90: stats.p90,
                 p95: stats.p95,
                 p99: stats.p99,
-            });
+            };
+
+            // Derive headline values from the metric key prefix
+            if key.starts_with("http_req_duration") {
+                http_req_duration = Some(summary.clone());
+            } else if key.starts_with("http_reqs") {
+                http_reqs += set.count as u64;
+            } else if key.starts_with("errors") {
+                errors += set.count as u64;
+            } else if key.starts_with("checks") {
+                // Each check sample: value 1.0 = pass, 0.0 = fail
+                // set.count = total checks, set.sum = total pass value
+                checks_total += set.count as u64;
+                checks_passed += set.sum as u64;
+                checks_failed += if set.count > set.sum {
+                    (set.count - set.sum) as u64
+                } else {
+                    0
+                }
+            } else if key.starts_with("data_received") {
+                data_received += set.sum;
+            } else if key.starts_with("data_sent") {
+                data_sent += set.sum;
+            }
+
+            metrics.push(summary);
+        }
+
+        // Fallback to totals map for counters not captured in per-key metrics
+        if http_reqs == 0 {
+            http_reqs = totals.get("http_reqs").copied().unwrap_or(0.0) as u64;
+        }
+        if errors == 0 {
+            errors = totals.get("errors").copied().unwrap_or(0.0) as u64;
+        }
+        if data_received == 0.0 {
+            data_received = totals.get("data_received").copied().unwrap_or(0.0);
+        }
+        if data_sent == 0.0 {
+            data_sent = totals.get("data_sent").copied().unwrap_or(0.0);
         }
 
         MetricsResult {
             metrics,
+            checks_total,
+            checks_passed,
+            checks_failed,
+            http_reqs,
+            http_req_duration,
+            data_received,
+            data_sent,
+            errors,
             ..Default::default()
         }
     }

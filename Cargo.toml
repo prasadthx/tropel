@@ -24,7 +24,7 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/tropel/tropel"
+repository = "https://github.com/prasadthx/tropel"
 rust-version = "1.82"
 
 [workspace.dependencies]
@@ -32,7 +32,7 @@ rust-version = "1.82"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal"] }
 
 # JS engine
-rquickjs = { version = "0.9", features = ["full-async", "parallel"] }
+rquickjs = { version = "0.12.2", features = ["full-async", "parallel"] }
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "gzip", "brotli", "http2", "json", "stream"] }

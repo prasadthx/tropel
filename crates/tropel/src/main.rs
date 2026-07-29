@@ -10,6 +10,7 @@ use tropel_core::config::*;
 use tropel_core::Result;
 use tropel_engine::engine::Engine;
 use tropel_ext::registry::ExtensionRegistry;
+use tropel_metrics::thresholds::evaluate_thresholds;
 
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -158,9 +159,33 @@ async fn run(cli: Cli) -> Result<()> {
 
     // Load environment file if provided
     if let Some(env_path) = &env_file {
-        if let Ok(content) = std::fs::read_to_string(env_path) {
-            if let Ok(json_env) = serde_json::from_str::<HashMap<String, String>>(&content) {
-                env_map.extend(json_env);
+        match std::fs::read_to_string(env_path) {
+            Ok(content) => {
+                // Try Postman environment format first: {"values":[{"key":...,"value":...,"enabled":true}]}
+                if let Ok(postman_env) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(values) = postman_env.get("values").and_then(|v| v.as_array()) {
+                        for entry in values {
+                            if let (Some(key), Some(value)) = (
+                                entry.get("key").and_then(|k| k.as_str()),
+                                entry.get("value").and_then(|v| v.as_str()),
+                            ) {
+                                // Only add if enabled (default: enabled if not specified)
+                                let enabled = entry.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true);
+                                if enabled {
+                                    env_map.insert(key.to_string(), value.to_string());
+                                }
+                            }
+                        }
+                    } else if let Ok(flat_env) = serde_json::from_value::<HashMap<String, String>>(postman_env.clone()) {
+                        // Fallback: flat JSON format
+                        env_map.extend(flat_env);
+                    } else {
+                        tracing::warn!("Unrecognized env-file format in '{}': expected Postman env or flat JSON", env_path.display());
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to read env-file '{}': {}", env_path.display(), e);
             }
         }
     }
@@ -220,11 +245,25 @@ async fn run(cli: Cli) -> Result<()> {
         });
     }
 
+    // Load data file if provided
+    let iteration_data = if let Some(data_path) = &data_file {
+        match load_data_file(data_path) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!("Failed to load data-file '{}': {}", data_path.display(), e);
+                vec![]
+            }
+        }
+    } else {
+        vec![]
+    };
+
     // Build the full job config
     let config = JobConfig {
         input: input.to_string_lossy().to_string(),
         execution,
         env: env_map,
+        iteration_data,
         output: OutputConfig {
             reporters: reporters.clone(),
             output_file: output.map(|p| p.to_string_lossy().to_string()),
@@ -247,7 +286,27 @@ async fn run(cli: Cli) -> Result<()> {
     tracing::info!("Load test completed: {} total requests", result.metrics.http_reqs);
     tracing::info!("Checks: {}/{} passed", result.metrics.checks_passed, result.metrics.checks_total);
 
-    Ok(())
+    // Evaluate thresholds and drive exit code
+    let threshold_results = evaluate_thresholds(&config.thresholds, &result.metrics);
+    let mut any_failed = false;
+    for tr in &threshold_results {
+        if tr.passed {
+            tracing::info!("  ✓ Threshold '{}': {:.2} {} {:.2} (PASS)", tr.name, tr.actual, tr.expression.split_whitespace().nth(1).unwrap_or("<?>"), tr.threshold);
+        } else {
+            tracing::error!("  ✗ Threshold '{}': {:.2} {} {:.2} (FAIL)", tr.name, tr.actual, tr.expression.split_whitespace().nth(1).unwrap_or("<?>"), tr.threshold);
+            any_failed = true;
+            if tr.abort_on_fail {
+                tracing::error!("Aborting due to threshold '{}'", tr.name);
+                return Err(tropel_core::TropelError::Other(format!("Threshold '{}' failed (abort-on-fail)", tr.name)));
+            }
+        }
+    }
+
+    if any_failed {
+        Err(tropel_core::TropelError::Other("One or more thresholds failed".into()))
+    } else {
+        Ok(())
+    }
 }
 
 async fn list_extensions() -> Result<()> {
@@ -259,7 +318,52 @@ async fn list_extensions() -> Result<()> {
 
 fn print_version() -> Result<()> {
     println!("Tropel v{}", env!("CARGO_PKG_VERSION"));
-    println!("Repository: https://github.com/tropel/tropel");
+    println!("Repository: https://github.com/prasadthx/tropel");
     println!("License: MIT OR Apache-2.0");
     Ok(())
+}
+
+/// Load iteration data from a CSV or JSON file.
+fn load_data_file(path: &PathBuf) -> Result<Vec<HashMap<String, serde_json::Value>>> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| tropel_core::TropelError::Io(e))?;
+
+    let trimmed = content.trim();
+
+    // Try JSON array first: [{"key":"val"}, ...]
+    if trimmed.starts_with('[') {
+        let data: Vec<HashMap<String, serde_json::Value>> = serde_json::from_str(trimmed)
+            .map_err(|e| tropel_core::TropelError::Parse(format!("JSON data-file parse error: {}", e)))?;
+        return Ok(data);
+    }
+
+    // Try CSV: header row + data rows
+    if trimmed.contains(',') || trimmed.starts_with('"') {
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .from_reader(content.as_bytes());
+
+        let headers: Vec<String> = reader.headers()
+            .map_err(|e| tropel_core::TropelError::Parse(format!("CSV header error: {}", e)))?
+            .iter()
+            .map(|h| h.to_string())
+            .collect();
+
+        let mut rows = Vec::new();
+        for result in reader.records() {
+            let record = result
+                .map_err(|e| tropel_core::TropelError::Parse(format!("CSV record error: {}", e)))?;
+            let mut map = HashMap::new();
+            for (i, field) in record.iter().enumerate() {
+                if i < headers.len() {
+                    map.insert(headers[i].clone(), serde_json::Value::String(field.to_string()));
+                }
+            }
+            rows.push(map);
+        }
+        return Ok(rows);
+    }
+
+    Ok(vec![])
 }
