@@ -95,9 +95,70 @@ fn parse_duration(s: &str) -> std::result::Result<Duration, ()> {
     }
 }
 
+/// Parse a tag-scoped metric reference like `"http_req_duration{status=200}.p95"`
+/// into its components: (metric_name, tags, stat).
+///
+/// Returns:
+/// - `metric_name`: the base metric name before any `{...}` or `.stat` suffix
+/// - `tags`: vector of `(key, value)` pairs extracted from `{key=value,...}` (empty if none)
+/// - `stat`: the statistic part after `.` (None if absent)
+///
+/// Examples:
+///   "http_req_duration{status=200}.p95" → ("http_req_duration", [(status, 200)], "p95")
+///   "http_reqs"                        → ("http_reqs", [], None)
+///   "checks.pass_rate"                 → ("checks", [], "pass_rate")
+fn parse_metric_ref(metric_ref: &str) -> (&str, Vec<(&str, &str)>, Option<&str>) {
+    // Step 1: Find the tag block boundaries
+    let (brace_start, brace_close) = {
+        let start = metric_ref.find('{');
+        let end = start.and_then(|s| metric_ref[s..].find('}').map(|i| s + i));
+        (start, end)
+    };
+
+    // Step 2: Extract tags from inside `{...}`
+    let tags = if let (Some(bs), Some(bc)) = (brace_start, brace_close) {
+        metric_ref[bs+1..bc]
+            .split(',')
+            .filter_map(|pair| {
+                let pair = pair.trim();
+                if pair.is_empty() {
+                    return None;
+                }
+                // Support both `:` and `=` as key=value separators
+                let sep = if pair.contains(':') { ':' } else { '=' };
+                pair.split_once(sep).map(|(k, v)| (k.trim(), v.trim()))
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+
+    // Step 3: Extract metric name and stat suffix
+    // The metric name is the text before `{` (or the whole string if no tags).
+    // The stat suffix can be after `}` (e.g. `{status=200}.p95`) or
+    // after the name but before `{` (e.g. `.p95{status=200}`).
+    let before = &metric_ref[..brace_start.unwrap_or(metric_ref.len())];
+    let after = &metric_ref[brace_close.map(|bc| bc + 1).unwrap_or(metric_ref.len())..];
+
+    // Find stat: prefer after `}` (more common), fall back to before `{`
+    let (name, stat) = if let Some(dot) = after.rfind('.') {
+        // Stat is after `}` — name is the part before `{`
+        (before, Some(&after[dot + 1..]))
+    } else if let Some(dot) = before.rfind('.') {
+        // Stat is before `{` — strip it from the name
+        (&before[..dot], Some(&before[dot + 1..]))
+    } else {
+        // No stat suffix
+        (before, None)
+    };
+
+    (name, tags, stat)
+}
+
 /// Evaluate a single threshold expression against real metrics.
 /// Supports expressions like:
 ///   "http_req_duration.p95 < 500"
+///   "http_req_duration{status=200}.p95 < 500"
 ///   "http_reqs > 100"
 ///   "checks.pass_rate > 0.99"
 ///   "errors < 10"
@@ -109,7 +170,8 @@ fn evaluate_single_threshold(expression: &str, metrics: &MetricsResult) -> (bool
     }
 
     // Format: "metric_ref operator value"
-    // metric_ref can be "http_req_duration.p95" or just "http_reqs"
+    // metric_ref can be "http_req_duration.p95", "http_req_duration{status=200}.p95",
+    // or just "http_reqs"
     let metric_ref = parts[0];
     let operator = parts[1];
     let threshold: f64 = match parts[2].parse() {
@@ -120,17 +182,17 @@ fn evaluate_single_threshold(expression: &str, metrics: &MetricsResult) -> (bool
         }
     };
 
-    // Extract metric name and optional statistic
-    let (metric_name, stat) = if let Some(dot) = metric_ref.rfind('.') {
-        let name = &metric_ref[..dot];
-        let s = &metric_ref[dot+1..];
-        (name, Some(s))
-    } else {
-        (metric_ref, None)
-    };
+    // Parse metric reference into (metric_name, tags, stat)
+    let (metric_name, tag_filters, stat) = parse_metric_ref(metric_ref);
 
     // Look up the actual metric value
-    let actual = get_metric_value(metrics, metric_name, stat);
+    let actual = if !tag_filters.is_empty() {
+        // Tag-scoped threshold: search metrics.metrics for matching entries
+        get_tag_scoped_metric_value(metrics, metric_name, &tag_filters, stat)
+    } else {
+        // No tag filter — use the existing top-level lookup
+        get_metric_value(metrics, metric_name, stat)
+    };
 
     let passed = match operator {
         "<" => actual < threshold,
@@ -146,6 +208,48 @@ fn evaluate_single_threshold(expression: &str, metrics: &MetricsResult) -> (bool
     };
 
     (passed, actual, threshold)
+}
+
+/// Get a metric value for a tag-scoped threshold by searching the metrics list.
+/// Looks for entries whose key starts with the metric name and contains all
+/// the specified tag key=value pairs.
+fn get_tag_scoped_metric_value(
+    metrics: &MetricsResult,
+    metric_name: &str,
+    tag_filters: &[(&str, &str)],
+    stat: Option<&str>,
+) -> f64 {
+    for m in &metrics.metrics {
+        // Check if this entry's key starts with the metric name
+        if !m.key.starts_with(metric_name) {
+            continue;
+        }
+        // Check if all tag filters are present in the key string
+        // The key format is like "http_req_duration{status=200}{method=GET}"
+        let all_tags_match = tag_filters.iter().all(|(key, val)| {
+            let pattern = format!("{{{}={}}}", key, val);
+            m.key.contains(&pattern)
+        });
+        if !all_tags_match {
+            continue;
+        }
+        return match stat {
+            Some("avg") => m.mean,
+            Some("min") => m.min as f64,
+            Some("max") => m.max as f64,
+            Some("p50") | Some("median") => m.p50 as f64,
+            Some("p90") => m.p90 as f64,
+            Some("p95") => m.p95 as f64,
+            Some("p99") => m.p99 as f64,
+            Some("count") => m.count as f64,
+            Some("rate") => m.rate,
+            Some("sum") => m.sum,
+            Some("last") => m.last,
+            _ => m.mean,
+        };
+    }
+    // No matching metric found
+    0.0
 }
 
 /// Extract a metric value from the MetricsResult by name and optional statistic.
@@ -272,6 +376,141 @@ mod tests {
         let metrics = make_metrics();
         let result = evaluate_single_threshold("checks.pass_rate > 0.8", &metrics);
         assert!(result.0, "pass rate 0.9 should be > 0.8");
+    }
+
+    // ── Tag-scoped threshold tests ──
+
+    fn make_tag_scoped_metrics() -> MetricsResult {
+        // Build MetricsResult with per-tag http_req_duration entries
+        let mut metrics = MetricsResult::default();
+        metrics.metrics.push(MetricSummary {
+            key: "http_req_duration{status=200}".into(),
+            metric_type: MetricType::Trend,
+            count: 80,
+            sum: 32000.0,
+            mean: 400.0,
+            min: 50,
+            max: 1500,
+            p50: 350,
+            p90: 700,
+            p95: 900,
+            p99: 1400,
+            last: 0.0,
+            rate: 0.0,
+        });
+        metrics.metrics.push(MetricSummary {
+            key: "http_req_duration{status=500}".into(),
+            metric_type: MetricType::Trend,
+            count: 10,
+            sum: 15000.0,
+            mean: 1500.0,
+            min: 500,
+            max: 3000,
+            p50: 1200,
+            p90: 2500,
+            p95: 2800,
+            p99: 3000,
+            last: 0.0,
+            rate: 0.0,
+        });
+        metrics
+    }
+
+    #[test]
+    fn test_tag_scoped_p95_under() {
+        let metrics = make_tag_scoped_metrics();
+        // http_req_duration{status=200}.p95 < 1000
+        let result = evaluate_single_threshold("http_req_duration{status=200}.p95 < 1000", &metrics);
+        assert!(result.0, "p95 900 should be < 1000");
+        assert_eq!(result.1, 900.0);
+        assert_eq!(result.2, 1000.0);
+    }
+
+    #[test]
+    fn test_tag_scoped_p95_over() {
+        let metrics = make_tag_scoped_metrics();
+        // http_req_duration{status=500}.p95 < 2000
+        let result = evaluate_single_threshold("http_req_duration{status=500}.p95 < 2000", &metrics);
+        assert!(!result.0, "p95 2800 should NOT be < 2000");
+        assert_eq!(result.1, 2800.0);
+        assert_eq!(result.2, 2000.0);
+    }
+
+    #[test]
+    fn test_tag_scoped_mean() {
+        let metrics = make_tag_scoped_metrics();
+        // http_req_duration{status=200}.avg < 500
+        let result = evaluate_single_threshold("http_req_duration{status=200}.avg < 500", &metrics);
+        assert!(result.0, "mean 400 should be < 500");
+        assert!((result.1 - 400.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_tag_scoped_no_stat_defaults_to_mean() {
+        let metrics = make_tag_scoped_metrics();
+        // http_req_duration{status=200} < 500 — no stat, defaults to mean
+        let result = evaluate_single_threshold("http_req_duration{status=200} < 500", &metrics);
+        assert!(result.0, "mean 400 should be < 500");
+    }
+
+    #[test]
+    fn test_tag_scoped_colon_syntax() {
+        let metrics = make_tag_scoped_metrics();
+        // Use colon syntax: {status:200}
+        let result = evaluate_single_threshold("http_req_duration{status:200}.p95 < 1000", &metrics);
+        assert!(result.0, "colon syntax should work");
+        assert_eq!(result.1, 900.0);
+    }
+
+    #[test]
+    fn test_tag_scoped_nonexistent_tag() {
+        let metrics = make_tag_scoped_metrics();
+        // Tag that doesn't exist in the metrics — should return 0.0
+        let result = evaluate_single_threshold("http_req_duration{status=404}.p95 < 100", &metrics);
+        assert!(result.0, "missing tag should return 0.0, which is < 100");
+        assert_eq!(result.1, 0.0);
+    }
+
+    #[test]
+    fn test_parse_metric_ref_no_tags() {
+        let (name, tags, stat) = parse_metric_ref("http_req_duration.p95");
+        assert_eq!(name, "http_req_duration");
+        assert!(tags.is_empty());
+        assert_eq!(stat, Some("p95"));
+    }
+
+    #[test]
+    fn test_parse_metric_ref_with_tags() {
+        let (name, tags, stat) = parse_metric_ref("http_req_duration{status=200}.p95");
+        assert_eq!(name, "http_req_duration");
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0], ("status", "200"));
+        assert_eq!(stat, Some("p95"));
+    }
+
+    #[test]
+    fn test_parse_metric_ref_colon_tags() {
+        let (name, tags, stat) = parse_metric_ref("http_req_duration{status:200}.p95");
+        assert_eq!(name, "http_req_duration");
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0], ("status", "200"));
+        assert_eq!(stat, Some("p95"));
+    }
+
+    #[test]
+    fn test_parse_metric_ref_no_stat() {
+        let (name, tags, stat) = parse_metric_ref("http_reqs");
+        assert_eq!(name, "http_reqs");
+        assert!(tags.is_empty());
+        assert_eq!(stat, None);
+    }
+
+    #[test]
+    fn test_parse_metric_ref_stat_only() {
+        let (name, tags, stat) = parse_metric_ref("checks.pass_rate");
+        assert_eq!(name, "checks");
+        assert!(tags.is_empty());
+        assert_eq!(stat, Some("pass_rate"));
     }
 }
 
