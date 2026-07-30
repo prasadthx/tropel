@@ -504,6 +504,83 @@ pm.visualizer = {
     }
 };
 
+// ── k6-style Custom Metric Constructors ──
+// These provide the k6/metrics API: create a metric object, then
+// call .add(value, tags) to record a sample with optional tags.
+//
+// Usage:
+//   var counter = new Counter('my_counter');
+//   counter.add(1);
+//   counter.add(1, { status: '200' });
+//
+//   var trend = new Trend('my_trend');
+//   trend.add(15.5);
+//   trend.add(15.5, { status: '200' });
+
+function Counter(name) {
+    if (!name || typeof name !== 'string') {
+        throw new Error('Counter requires a metric name');
+    }
+    this._name = name;
+    this._type = 'counter';
+}
+
+Counter.prototype.add = function (value, tags) {
+    if (typeof __tropel_pm_custom_metric_add === 'function') {
+        var tagsStr = tags ? JSON.stringify(tags) : '{}';
+        __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type);
+    }
+    return this;
+};
+
+function Gauge(name) {
+    if (!name || typeof name !== 'string') {
+        throw new Error('Gauge requires a metric name');
+    }
+    this._name = name;
+    this._type = 'gauge';
+}
+
+Gauge.prototype.add = function (value, tags) {
+    if (typeof __tropel_pm_custom_metric_add === 'function') {
+        var tagsStr = tags ? JSON.stringify(tags) : '{}';
+        __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type);
+    }
+    return this;
+};
+
+function Rate(name) {
+    if (!name || typeof name !== 'string') {
+        throw new Error('Rate requires a metric name');
+    }
+    this._name = name;
+    this._type = 'rate';
+}
+
+Rate.prototype.add = function (value, tags) {
+    if (typeof __tropel_pm_custom_metric_add === 'function') {
+        var tagsStr = tags ? JSON.stringify(tags) : '{}';
+        __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type);
+    }
+    return this;
+};
+
+function Trend(name) {
+    if (!name || typeof name !== 'string') {
+        throw new Error('Trend requires a metric name');
+    }
+    this._name = name;
+    this._type = 'trend';
+}
+
+Trend.prototype.add = function (value, tags) {
+    if (typeof __tropel_pm_custom_metric_add === 'function') {
+        var tagsStr = tags ? JSON.stringify(tags) : '{}';
+        __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type);
+    }
+    return this;
+};
+
 // ── Export for module systems ──
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = pm;

@@ -452,6 +452,7 @@ impl PmBridge {
             );
 
             // ── Custom Metrics ──
+            // Add a custom metric sample (Postman-style, no tags).
             let state_clone = state.clone();
             let _ = globals.set(
                 "__tropel_pm_metrics_add",
@@ -467,7 +468,7 @@ impl PmBridge {
                         _ => tropel_core::types::SampleType::Trend,
                     };
                     st.samples.push(tropel_core::types::Sample {
-                        metric: format!("custom_{}", name),
+                        metric: name,
                         value,
                         tags: tropel_core::types::TagMap::new(),
                         timestamp: std::time::SystemTime::now(),
@@ -482,6 +483,44 @@ impl PmBridge {
                 Func::from(move |name: String| -> Option<f64> {
                     let st = state_clone.lock().unwrap();
                     st.custom_metrics.get(&name).copied()
+                }),
+            );
+
+            // ── Custom Metric with Tags (k6-style .add(value, tags)) ──
+            // Called by Counter/Gauge/Rate/Trend JS constructors.
+            // tags_json is a JSON-encoded object like '{"status":"200","method":"GET"}'.
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_custom_metric_add",
+                Func::from(move |name: String, value: f64, tags_json: String, metric_type_str: String| {
+                    let mut st = state_clone.lock().unwrap();
+                    // Parse tags from JSON string
+                    let tags = if tags_json.is_empty() || tags_json == "{}" {
+                        tropel_core::types::TagMap::new()
+                    } else {
+                        let parsed: std::collections::HashMap<String, String> =
+                            serde_json::from_str(&tags_json).unwrap_or_default();
+                        tropel_core::types::TagMap::from_pairs(parsed)
+                    };
+
+                    // Track the current value per metric+tags combo
+                    st.custom_metrics.insert(name.clone(), value);
+
+                    // Determine sample type from type string
+                    let sample_type = match metric_type_str.as_str() {
+                        "counter" => tropel_core::types::SampleType::Counter,
+                        "gauge" => tropel_core::types::SampleType::Point,
+                        "rate" => tropel_core::types::SampleType::Rate,
+                        _ => tropel_core::types::SampleType::Trend,
+                    };
+
+                    st.samples.push(tropel_core::types::Sample {
+                        metric: name,
+                        value,
+                        tags,
+                        timestamp: std::time::SystemTime::now(),
+                        sample_type,
+                    });
                 }),
             );
 
