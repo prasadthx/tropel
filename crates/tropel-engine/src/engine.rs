@@ -2,8 +2,9 @@ use crate::worker::VUWorkerPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use rand::Rng;
 use tropel_collection::{collection_to_scenario, parse_collection_file};
-use tropel_core::config::{ExecutionConfig, JobConfig, OutputConfig};
+use tropel_core::config::{ExecutionConfig, JobConfig, OutputConfig, ThinkTimeConfig};
 use tropel_core::scenario::Scenario;
 use tropel_core::{Result, TropelError};
 use tropel_executor::runner::VURunner;
@@ -133,6 +134,14 @@ impl Engine {
                 let thresholds_clone = thresholds.clone();
                 let vu_env_clone = vu_env.clone();
 
+                // Extract think time config for this scenario
+                let think_time_cfg = match &exec_cfg {
+                    ExecutionConfig::ConstantVus { think_time, .. } => think_time.clone(),
+                    ExecutionConfig::RampingVus { think_time, .. } => think_time.clone(),
+                    ExecutionConfig::ConstantArrivalRate { think_time, .. } => think_time.clone(),
+                    ExecutionConfig::SharedIterations { think_time, .. } => think_time.clone(),
+                };
+
                 executor.run(move |sched, vu_id| {
                     let metrics = metrics_clone.clone();
                     let scenario = scenario_clone.clone();
@@ -145,6 +154,7 @@ impl Engine {
                     let test_start = test_start;
                     let has_abort_thresholds = has_abort_thresholds;
                     let pool = pool_clone.clone();
+                    let think_time = think_time_cfg.clone();
 
                     let (_, handle) = pool.spawn(async move {
                         sched.add_active_vu(1).await;
@@ -183,6 +193,8 @@ impl Engine {
                                     break;
                                 }
                             }
+
+                            let iter_start = Instant::now();
 
                             tokio::select! {
                                 _ = stop.notified() => { break; }
@@ -228,6 +240,13 @@ impl Engine {
                                     sched.increment_iterations().await;
                                     iteration_index
                                 } => { iteration_index = result + 1; }
+                            }
+
+                            // Apply iteration pacing AFTER the iteration:
+                            // if iteration_pacing is set, wait to hit the target duration.
+                            if !sched.is_arrival_rate() {
+                                let iter_duration = iter_start.elapsed();
+                                apply_think_time(&think_time, Some(iter_duration)).await;
                             }
 
                             if total_iters != u64::MAX {
@@ -355,6 +374,56 @@ fn parse_duration_str(s: &str) -> Result<Duration> {
     }
 }
 
+/// Apply think time / pacing delay based on configuration.
+///
+/// - `iteration_pacing`: if set and `iter_duration` is provided, wait for the
+///   remaining time to hit the target pacing duration.
+/// - `delay`: fixed delay after each iteration.
+/// - `min_delay` / `max_delay`: random delay in range [min, max].
+/// - If both `delay` and min/max are set, `delay` wins.
+/// - If neither is set and no pacing is configured, this is a no-op.
+/// - In arrival-rate mode, this is skipped (rate control handles pacing).
+async fn apply_think_time(config: &ThinkTimeConfig, iter_duration: Option<Duration>) {
+    // If iteration_pacing is set, wait only to hit the target duration.
+    // Pacing replaces think time — no additional delay after pacing.
+    if let Some(pacing_str) = &config.iteration_pacing {
+        if let Ok(pacing) = parse_duration_str(pacing_str) {
+            if let Some(actual_dur) = iter_duration {
+                if actual_dur < pacing {
+                    let remaining = pacing - actual_dur;
+                    if remaining > Duration::from_millis(1) {
+                        tokio::time::sleep(remaining).await;
+                    }
+                }
+            }
+            return; // pacing replaces think time
+        }
+    }
+
+    // No pacing — apply fixed delay or random range.
+    // These are mutually exclusive: fixed delay wins if set.
+    if let Some(delay_str) = &config.delay {
+        if let Ok(delay) = parse_duration_str(delay_str) {
+            if delay > Duration::from_millis(1) {
+                tokio::time::sleep(delay).await;
+                return;
+            }
+        }
+    }
+
+    // Random range [min_delay, max_delay]
+    if let (Some(min_str), Some(max_str)) = (&config.min_delay, &config.max_delay) {
+        if let (Ok(min), Ok(max)) = (parse_duration_str(min_str), parse_duration_str(max_str)) {
+            if max > Duration::ZERO && max > min {
+                let range_ms = (max - min).as_millis() as u64;
+                let rand_ms = rand::thread_rng().gen_range(0..=range_ms);
+                let delay = min + Duration::from_millis(rand_ms);
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
 /// Create a JS context for a VU and bootstrap the vendored JS libraries.
 async fn create_vu_js_context(
     vu_id: u32,
@@ -408,6 +477,38 @@ async fn create_vu_js_context(
     if let Err(e) = bridge.install(&ctx) {
         tracing::warn!("VU {}: Failed to install PM bridge functions: {}", vu_id, e);
     }
+
+    // Install __tropel_native_sleep for script-level sleep(ms).
+    // Blocks the current thread via std::thread::sleep. In the thread-per-core
+    // architecture each VU runs on its own tokio runtime thread, so blocking
+    // the OS thread only pauses this VU — other VUs on other cores are unaffected.
+    // This matches k6's behavior where sleep() blocks the goroutine.
+    ctx.with_ctx(|rq_ctx| {
+        let globals = rq_ctx.globals();
+        let _ = globals.set(
+            "__tropel_native_sleep",
+            rquickjs::function::Func::from(move |ms: f64| {
+                if ms > 0.0 {
+                    let dur = Duration::from_secs_f64(ms / 1000.0);
+                    std::thread::sleep(dur);
+                }
+            }),
+        );
+    });
+
+    // Register a user-facing sleep(seconds) wrapper.
+    // Users call `sleep(1)` in their scripts (seconds), the wrapper
+    // converts to milliseconds and delegates to the native bridge.
+    let sleep_code = [
+        "if (typeof sleep === 'undefined') {",
+        "  function sleep(seconds) {",
+        "    if (typeof __tropel_native_sleep === 'function') {",
+        "      __tropel_native_sleep(seconds * 1000);",
+        "    }",
+        "  }",
+        "}",
+    ].join("\n");
+    let _ = ctx.eval(&sleep_code).await;
 
     Some(ctx)
 }

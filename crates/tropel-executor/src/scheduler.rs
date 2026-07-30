@@ -173,13 +173,13 @@ impl VUScheduler {
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
         match &self.config {
-            ExecutionConfig::ConstantVus { vus, duration, graceful_stop } => {
+            ExecutionConfig::ConstantVus { vus, duration, graceful_stop, .. } => {
                 let duration = parse_duration(duration)?;
                 let grace = graceful_stop_duration(graceful_stop);
                 self.run_constant(*vus, duration, grace, &run_vu).await;
                 Ok(())
             }
-            ExecutionConfig::RampingVus { stages, start_vus, graceful_ramp_down, graceful_stop } => {
+            ExecutionConfig::RampingVus { stages, start_vus, graceful_ramp_down, graceful_stop, .. } => {
                 let grace_rd = graceful_stop_duration(graceful_ramp_down);
                 let grace = graceful_stop_duration(graceful_stop);
                 self.run_ramping(*start_vus, stages, grace_rd, grace, &run_vu).await;
@@ -188,12 +188,14 @@ impl VUScheduler {
             ExecutionConfig::SharedIterations { iterations, max_duration, graceful_stop, .. } => {
                 let max_dur = max_duration.as_ref().and_then(|d| parse_duration(d).ok());
                 let grace = graceful_stop_duration(graceful_stop);
+                // Duration::ZERO here — think_time/pacing is handled in the VU loop in engine.rs
                 self.run_shared_iterations(*iterations, max_dur, grace, &run_vu).await;
                 Ok(())
             }
             ExecutionConfig::ConstantArrivalRate { rate, duration, pre_alloc_vus, max_vus, graceful_stop, .. } => {
                 let duration = parse_duration(duration)?;
                 let grace = graceful_stop_duration(graceful_stop);
+                // Duration::ZERO here — think_time/pacing is handled in the VU loop in engine.rs
                 self.run_arrival_rate(*rate, *pre_alloc_vus, *max_vus, duration, grace, &run_vu).await;
                 Ok(())
             }

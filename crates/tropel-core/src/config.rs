@@ -1,6 +1,43 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Configuration for think time / pacing between iterations.
+///
+/// Controls how long a VU waits before starting the next iteration.
+/// - `delay`: fixed delay after each iteration (e.g. "2s")
+/// - `min_delay` / `max_delay`: random delay in range [min, max]
+/// - `iteration_pacing`: target iteration duration. If the iteration
+///   finishes faster than this, the VU waits to hit the target.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThinkTimeConfig {
+    /// Fixed delay after each iteration (e.g., "2s", "500ms").
+    /// If set, min/max_delay are ignored.
+    pub delay: Option<String>,
+    /// Minimum delay for random range (e.g., "1s").
+    #[serde(alias = "minDelay")]
+    pub min_delay: Option<String>,
+    /// Maximum delay for random range (e.g., "3s").
+    #[serde(alias = "maxDelay")]
+    pub max_delay: Option<String>,
+    /// Target iteration duration for pacing (e.g., "5s").
+    /// If the iteration finishes faster than this, the VU waits
+    /// to hit the target duration before starting the next iteration.
+    #[serde(alias = "iterationPacing")]
+    pub iteration_pacing: Option<String>,
+}
+
+impl Default for ThinkTimeConfig {
+    fn default() -> Self {
+        Self {
+            delay: None,
+            min_delay: None,
+            max_delay: None,
+            iteration_pacing: None,
+        }
+    }
+}
+
 /// Configuration for a single named scenario within a multi-scenario run.
 /// Each scenario has its own executor, input, env, tags, and optional start time.
 /// When only a single scenario is running, the top-level `execution` field is used
@@ -81,6 +118,9 @@ pub enum ExecutionConfig {
         /// test duration expires. Defaults to 30s if not set.
         #[serde(default, alias = "gracefulStop")]
         graceful_stop: Option<String>,
+        /// Think time / pacing configuration between iterations.
+        #[serde(default, alias = "thinkTime")]
+        think_time: ThinkTimeConfig,
     },
     #[serde(rename = "ramping-vus")]
     RampingVus {
@@ -94,6 +134,9 @@ pub enum ExecutionConfig {
         /// final stage completes. Defaults to 30s.
         #[serde(default, alias = "gracefulStop")]
         graceful_stop: Option<String>,
+        /// Think time / pacing configuration between iterations.
+        #[serde(default, alias = "thinkTime")]
+        think_time: ThinkTimeConfig,
     },
     #[serde(rename = "constant-arrival-rate")]
     ConstantArrivalRate {
@@ -106,6 +149,9 @@ pub enum ExecutionConfig {
         /// test duration expires. Defaults to 30s if not set.
         #[serde(default, alias = "gracefulStop")]
         graceful_stop: Option<String>,
+        /// Think time / pacing configuration between iterations.
+        #[serde(default, alias = "thinkTime")]
+        think_time: ThinkTimeConfig,
     },
     #[serde(rename = "shared-iterations")]
     SharedIterations {
@@ -116,6 +162,9 @@ pub enum ExecutionConfig {
         /// iteration budget is exhausted or max_duration is reached.
         #[serde(default, alias = "gracefulStop")]
         graceful_stop: Option<String>,
+        /// Think time / pacing configuration between iterations.
+        #[serde(default, alias = "thinkTime")]
+        think_time: ThinkTimeConfig,
     },
 }
 
@@ -241,6 +290,7 @@ impl Default for JobConfig {
                 vus: 1,
                 duration: "30s".to_string(),
                 graceful_stop: Some("30s".to_string()),
+                think_time: ThinkTimeConfig::default(),
             },
             scenarios: HashMap::new(),
             env: HashMap::new(),
