@@ -47,7 +47,17 @@ impl CachedScript {
 }
 
 /// A per-VU JavaScript execution context backed by rquickjs.
+///
+/// # Drop-order safety
+/// Field order is deliberate: `script_cache` (Persistent<Function>) is declared
+/// before `ctx` (Context/Runtime) so Rust drops the cache (Persistents) first,
+/// then the Runtime. If ctx were dropped first, live Persistents would reference
+/// freed heap memory and rquickjs would abort the process.
 pub struct JsContext {
+    /// Compiled script cache: source-hash → persistent function.
+    /// Declared FIRST so it is dropped BEFORE ctx.
+    /// Avoids re-parsing scripts on every iteration.
+    script_cache: Mutex<HashMap<u64, CachedScript>>,
     ctx: Context,
     context_id: u64,
     /// Shared deadline (epoch nanos) for the interrupt handler.
@@ -55,9 +65,6 @@ pub struct JsContext {
     interrupt_deadline: Arc<AtomicU64>,
     /// Maximum execution time per script eval.
     max_execution_time: Duration,
-    /// Compiled script cache: source-hash → persistent function.
-    /// Avoids re-parsing scripts on every iteration.
-    script_cache: Mutex<HashMap<u64, CachedScript>>,
 }
 
 // Safety: each JsContext owns its own rquickjs Runtime, and thread-per-core
