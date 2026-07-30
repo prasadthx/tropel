@@ -1,16 +1,44 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Configuration for a single named scenario within a multi-scenario run.
+/// Each scenario has its own executor, input, env, tags, and optional start time.
+/// When only a single scenario is running, the top-level `execution` field is used
+/// instead and no `ScenarioConfig` is needed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScenarioConfig {
+    /// Which executor to use.
+    pub execution: ExecutionConfig,
+    /// Optional input file override (defaults to the job-level `input`).
+    pub input: Option<String>,
+    /// Per-scenario environment variables (merged with job-level env).
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Per-scenario tags applied to all metrics emitted by this scenario.
+    #[serde(default)]
+    pub tags: HashMap<String, String>,
+    /// When to start this scenario (e.g. "5s", "30s").
+    /// Defaults to "0s" — starts immediately alongside other scenarios.
+    /// Use staggered values to sequence scenario start times.
+    #[serde(default)]
+    pub start_time: String,
+}
+
 /// Full configuration for a load test job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobConfig {
-    /// Input file path.
+    /// Input file path (used as default for all scenarios, or directly for single-scenario mode).
     pub input: String,
     /// Input type (auto-detect if not specified).
     pub input_type: Option<String>,
-    /// Execution configuration.
+    /// Execution configuration (used when no scenarios are defined — single-scenario mode).
     pub execution: ExecutionConfig,
-    /// Environment variables.
+    /// Named scenarios for multi-scenario runs. When present, each scenario runs
+    /// independently with its own executor, env, and optional startTime.
+    /// The top-level `execution` field is ignored when scenarios are defined.
+    #[serde(default)]
+    pub scenarios: HashMap<String, ScenarioConfig>,
+    /// Environment variables (merged with per-scenario env).
     #[serde(default)]
     pub env: HashMap<String, String>,
     /// Global variables.
@@ -194,6 +222,7 @@ impl Default for JobConfig {
                 vus: 1,
                 duration: "30s".to_string(),
             },
+            scenarios: HashMap::new(),
             env: HashMap::new(),
             globals: HashMap::new(),
             collection_vars: HashMap::new(),
