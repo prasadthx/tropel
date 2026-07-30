@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use std::sync::Arc;
 use tropel_core::config::*;
 use tropel_core::{Result, TropelError};
 use tropel_ext::registry::ExtensionRegistry;
@@ -90,6 +91,15 @@ pub enum Commands {
         #[arg(long = "iterations")]
         iterations: Option<u64>,
 
+        /// Subprocess adapter command (e.g. `--subprocess-adapter "python3 my-adapter.py"`).
+        /// Runs the command for each detect/parse call, passing bytes on stdin
+        /// and reading a JSON Scenario from stdout.
+        /// Note: when using this flag, you should also pass `--format subprocess:<cmd>`
+        /// to select the subprocess adapter (auto-detection from bytes won't work
+        /// until the adapter processes its first input).
+        #[arg(long = "subprocess-adapter")]
+        subprocess_adapter: Vec<String>,
+
         /// Build extensions (for `tropel build` — used here for uniform parsing)
         #[arg(long = "with")]
         with_extensions: Vec<String>,
@@ -159,7 +169,7 @@ async fn run_command(cli: Cli) -> Result<()> {
     let Commands::Run {
         input, format, vus, duration, env, env_file, data_file,
         reporter, output, threshold, insecure, verbose: _,
-        mode, stages, iterations, ..
+        mode, stages, iterations, subprocess_adapter, ..
     } = &cli.command else {
         return Err(TropelError::Other("Not a Run command".into()));
     };
@@ -315,10 +325,23 @@ async fn run_command(cli: Cli) -> Result<()> {
         ..Default::default()
     };
 
-    tracing::info!("Execution config: {:?}", config.execution);
+    tracing::info!("Execution config: {:?}", config.execution);    // Create the engine with extension registry
+    let mut registry = ExtensionRegistry::new();
 
-    // Create the engine and run
-    let engine = Engine::new(ExtensionRegistry::new());
+    // Register any subprocess adapters specified via --subprocess-adapter
+    for cmd in subprocess_adapter {
+        let id = format!("subprocess:{}", cmd);
+        tracing::info!("Registering subprocess adapter (command: {})", cmd);
+        let cmd_clone = cmd.clone();
+        registry.register_adapter_factory(
+            &id,
+            Arc::new(move || {
+                Box::new(tropel_input_subprocess::SubprocessAdapter::new(&cmd_clone))
+            }),
+        );
+    }
+
+    let engine = Engine::new(registry);
     let result = engine.run(&config).await?;
 
     tracing::info!("Load test completed: {} total requests", result.metrics.http_reqs);

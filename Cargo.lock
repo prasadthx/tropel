@@ -3114,6 +3114,7 @@ dependencies = [
  "tropel-input-k6",
  "tropel-input-openapi",
  "tropel-input-postman",
+ "tropel-input-subprocess",
  "tropel-js",
  "tropel-metrics",
  "tropel-native",
@@ -3244,6 +3245,18 @@ version = "0.1.0"
 dependencies = [
  "inventory",
  "tropel-collection",
+ "tropel-core",
+ "tropel-ext",
+]
+
+[[package]]
+name = "tropel-input-subprocess"
+version = "0.1.0"
+dependencies = [
+ "inventory",
+ "rand 0.8.7",
+ "serde_json",
+ "tracing",
  "tropel-core",
  "tropel-ext",
 ]

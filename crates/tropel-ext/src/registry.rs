@@ -10,6 +10,12 @@ pub struct ExtensionRegistry {
     js_modules: HashMap<String, Arc<JsModuleRegistration>>,
     auth_signers: HashMap<String, Arc<AuthSignerRegistration>>,
     input_adapters: HashMap<String, Arc<InputAdapterRegistration>>,
+    // Runtime-constructed adapter instances (e.g. subprocess adapters).
+    // These bypass the fn-pointer restriction of InputAdapterRegistration.
+    // Runtime factory functions for adapters that need configuration at startup.
+    // Unlike InputAdapterRegistration (fn() pointer, for inventory::submit!),
+    // these closures can capture runtime values (e.g. a subprocess command).
+    input_adapter_factories: HashMap<String, Arc<dyn Fn() -> Box<dyn InputAdapter> + Send + Sync>>,
     drivers: HashMap<String, Arc<DriverRegistration>>,
 }
 
@@ -71,9 +77,40 @@ impl ExtensionRegistry {
         self.auth_signers.get(kind).map(|r| (r.factory)())
     }
 
-    /// Get an input adapter by ID.
+    /// Register an adapter factory closure.
+    ///
+    /// Unlike `register_input_adapter()` (which takes a `fn()` pointer for
+    /// compile-time `inventory::submit!` compat), this accepts an `Arc<dyn Fn>`
+    /// closure that can capture runtime values. Use this for adapters that
+    /// need runtime configuration (e.g. subprocess adapter command string).
+    pub fn register_adapter_factory(
+        &mut self,
+        id: &str,
+        factory: Arc<dyn Fn() -> Box<dyn InputAdapter> + Send + Sync>,
+    ) {
+        self.input_adapter_factories.insert(id.to_string(), factory);
+    }
+
+    /// Get an input adapter by ID — checks factory closures first, then registrations.
     pub fn get_input_adapter(&self, id: &str) -> Option<Box<dyn InputAdapter>> {
+        if let Some(factory) = self.input_adapter_factories.get(id) {
+            return Some((factory)());
+        }
         self.input_adapters.get(id).map(|r| (r.create)())
+    }
+
+    /// Resolve an input adapter by explicit format ID.
+    pub fn resolve_input_by_id(&self, id: &str) -> Option<Box<dyn InputAdapter>> {
+        self.get_input_adapter(id)
+    }
+
+    /// List all registered inputs.
+    pub fn list_inputs(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.input_adapters.keys().cloned().collect();
+        ids.extend(self.input_adapter_factories.keys().cloned());
+        ids.sort();
+        ids.dedup();
+        ids
     }
 
     /// Get a driver by ID.
@@ -91,10 +128,7 @@ impl ExtensionRegistry {
         self.outputs.keys().cloned().collect()
     }
 
-    /// List all registered inputs.
-    pub fn list_inputs(&self) -> Vec<String> {
-        self.input_adapters.keys().cloned().collect()
-    }
+
 
     /// List all registered drivers.
     pub fn list_drivers(&self) -> Vec<String> {
@@ -144,11 +178,6 @@ impl ExtensionRegistry {
         None
     }
 
-    /// Resolve an input adapter by explicit format ID (e.g. `--format postman`).
-    pub fn resolve_input_by_id(&self, id: &str) -> Option<Box<dyn InputAdapter>> {
-        self.input_adapters.get(id).map(|r| (r.create)())
-    }
-
     /// Resolve a driver from raw bytes using content detection.
     /// Iterates all registered drivers and returns the first one whose
     /// `detect()` returns `true`.
@@ -159,6 +188,7 @@ impl ExtensionRegistry {
                 return Some(driver);
             }
         }
+        // Also check factory adapters? No — drivers use a separate path.
         None
     }
 
