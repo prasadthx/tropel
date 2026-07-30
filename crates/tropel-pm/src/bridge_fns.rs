@@ -26,6 +26,115 @@ fn string_to_json_encoded(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_default()
 }
 
+/// Resolve {{variable}} references in a URL using the current PM state.
+/// Searches environment, collection vars, and globals in order.
+/// Uses a cursor-based approach that builds the result string by pushing
+/// segments — no in-place mutation, no infinite-loop risk.
+fn resolve_vars(
+    url: &str,
+    environment: &HashMap<String, String>,
+    collection_vars: &HashMap<String, serde_json::Value>,
+    globals: &HashMap<String, serde_json::Value>,
+) -> String {
+    if !url.contains("{{") {
+        return url.to_string();
+    }
+
+    let mut result = String::with_capacity(url.len());
+    let mut pos = 0;
+
+
+    while pos < url.len() {
+        // Find the next {{ marker
+        if let Some(start) = url[pos..].find("{{") {
+            let abs_start = pos + start;
+
+            // Copy everything before the marker
+            result.push_str(&url[pos..abs_start]);
+
+            // Look for the closing }}
+            if let Some(end) = url[abs_start + 2..].find("}}") {
+                let key_start = abs_start + 2;
+                let key_end = abs_start + 2 + end;
+
+                // Extract and normalize the key — trim whitespace
+                let key = url[key_start..key_end].trim();
+
+                // Try to resolve from scopes in order: env → collection → globals
+                let resolved = environment
+                    .get(key)
+                    .cloned()
+                    .or_else(|| {
+                        collection_vars.get(key).map(|v| match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                    })
+                    .or_else(|| {
+                        globals.get(key).map(|v| match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                    });
+
+                match resolved {
+                    Some(val) => result.push_str(&val),
+                    None => {
+                        // Unresolved — emit the original {{key}} literal
+                        result.push_str(&url[abs_start..key_end + 2]);
+                    }
+                }
+
+                // Advance cursor past the {{key}}
+                pos = key_end + 2;
+            } else {
+                // No closing }} — emit the rest as-is and stop
+                result.push_str(&url[abs_start..]);
+                break;
+            }
+        } else {
+            // No more {{ markers — emit the tail
+            result.push_str(&url[pos..]);
+            break;
+        }
+    }
+
+    result
+}
+
+/// Parse headers from a JSON string that may be either:
+/// - Object form: {"Content-Type": "application/json"}
+/// - Postman array form: [{"key": "Content-Type", "value": "application/json"}]
+fn parse_headers(json: &str) -> HashMap<String, String> {
+    if json.is_empty() || json == "{}" || json == "[]" {
+        return HashMap::new();
+    }
+
+    // Try object form first
+    if json.trim_start().starts_with('{') {
+        if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(json) {
+            return map;
+        }
+    }
+
+    // Try Postman array form: [{"key": ..., "value": ...}]
+    if json.trim_start().starts_with('[') {
+        if let Ok(arr) = serde_json::from_str::<Vec<HashMap<String, serde_json::Value>>>(json) {
+            let mut headers = HashMap::new();
+            for entry in arr {
+                let key = entry.get("key").and_then(|v| v.as_str()).unwrap_or("");
+                let value = entry.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                if !key.is_empty() {
+                    headers.insert(key.to_string(), value.to_string());
+                }
+            }
+            return headers;
+        }
+    }
+
+    HashMap::new()
+}
+
 /// Register all `pm.*` bridge functions as global JS functions in a JsContext.
 /// Functions like `__tropel_pm_test`, `__tropel_pm_environment_get`, etc.
 /// are registered so the JS shims in pm-api/pm.js can call them.
@@ -332,13 +441,35 @@ impl PmBridge {
             // The bridge closure runs inside ctx.with() (synchronous), so we use
             // tokio::runtime::Handle::block_on() to await the async client.execute().
             // This is safe because the VU runs on its own thread (thread-per-core).
+            //
+            // Supports the auth-token-fetch pattern: scripts can call pm.sendRequest
+            // to obtain auth tokens or session data, then store them via pm.variables.set().
+            // Variable references ({{var}}) in the URL are resolved against the current
+            // environment/collection/global variables.
+            //
+            // Parameters:
+            //   method: HTTP method string (GET, POST, etc.)
+            //   url: Request URL with optional {{variable}} references
+            //   headers_json: JSON string of headers (supports both object and array formats)
+            //   body: Request body string (empty string = no body)
+            //   timeout_ms: Request timeout in milliseconds (0 = no timeout, default 30000)
+            // Returns: JSON-encoded response with code, statusText, body, headers, responseTime
             let http = self.http_client.clone();
+            let state_for_send = self.state.clone();
             let _ = globals.set(
                 "__tropel_pm_send_request",
                 Func::from(
-                    move |method: String, url: String, headers_json: String, body: String| -> String {
+                    move |method: String, url: String, headers_json: String, body: String, timeout_ms: f64| -> String {
+                        // Resolve {{variables}} in the URL using current PM state
+                        let resolved_url = {
+                            let st = state_for_send.lock().unwrap();
+                            resolve_vars(&url, &st.environment, &st.collection_vars, &st.globals)
+                        };
+
+                        // Parse headers — supports both object form {"key":"val"} and
+                        // Postman array form [{"key":"Content-Type","value":"application/json"}]
                         let headers: HashMap<String, String> =
-                            serde_json::from_str(&headers_json).unwrap_or_default();
+                            parse_headers(&headers_json);
 
                         let request_body = if body.is_empty() {
                             None
@@ -346,8 +477,14 @@ impl PmBridge {
                             Some(Body::Raw(body))
                         };
 
+                        let timeout = if timeout_ms > 0.0 {
+                            Some(std::time::Duration::from_millis(timeout_ms as u64))
+                        } else {
+                            Some(std::time::Duration::from_secs(30)) // default 30s
+                        };
+
                         let req = Request {
-                            url: url.clone(),
+                            url: resolved_url,
                             method: Method::from_str(&method).unwrap_or(Method::GET),
                             headers,
                             query_params: HashMap::new(),
@@ -355,7 +492,7 @@ impl PmBridge {
                             auth: None,
                             certificate: None,
                             follow_redirects: true,
-                            timeout: None,
+                            timeout,
                         };
 
                         // Execute the request synchronously by blocking on the async client

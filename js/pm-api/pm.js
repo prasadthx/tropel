@@ -247,24 +247,106 @@ pm.iterationData = {
 };
 
 // ── pm.sendRequest (for chaining requests within a test) ──
+// Supports the auth-token-fetch pattern: send a request to obtain
+// an auth token, then store it via pm.variables.set().
+// Handles both Postman-style options and simple string URLs.
 pm.sendRequest = function (options, callback) {
     // Delegate to native implementation
     if (typeof __tropel_pm_send_request === 'function') {
-        // Extract request fields as strings (bridge doesn't accept JS objects)
-        var url = (options && options.url) || (typeof options === 'string' ? options : '');
-        var method = (options && options.method) || 'GET';
-        var headers = (options && options.headers) || {};
-        var body = (options && options.body) || '';
+        // Normalize options
+        var url = '';
+        var method = 'GET';
+        var headers = {};
+        var body = '';
+        var timeout = 30000; // 30s default
+
+        if (typeof options === 'string') {
+            // Simple string URL
+            url = options;
+        } else if (options && typeof options === 'object') {
+            // Postman-style request object
+            url = options.url || '';
+            method = options.method || 'GET';
+            timeout = options.timeout || 30000;
+
+            // Handle Postman-style headers: array of {key, value} or plain object
+            if (options.header && Array.isArray(options.header)) {
+                // Postman array format: [{key: "Content-Type", value: "application/json"}]
+                headers = {};
+                for (var i = 0; i < options.header.length; i++) {
+                    var h = options.header[i];
+                    if (h && h.key) {
+                        headers[h.key] = h.value !== undefined ? h.value : '';
+                    }
+                }
+            } else if (options.headers) {
+                // Plain object or Postman header object
+                headers = options.headers;
+            }
+
+            // Handle Postman-style body
+            if (options.body) {
+                if (typeof options.body === 'string') {
+                    body = options.body;
+                } else if (options.body.mode) {
+                    // Postman body object: {mode: "raw", raw: "..."}
+                    switch (options.body.mode) {
+                        case 'raw':
+                            body = options.body.raw || '';
+                            break;
+                        case 'urlencoded':
+                            if (options.body.urlencoded && Array.isArray(options.body.urlencoded)) {
+                                var pairs = [];
+                                for (var j = 0; j < options.body.urlencoded.length; j++) {
+                                    var param = options.body.urlencoded[j];
+                                    if (param && param.key) {
+                                        pairs.push(encodeURIComponent(param.key) + '=' + encodeURIComponent(param.value || ''));
+                                    }
+                                }
+                                body = pairs.join('&');
+                            }
+                            break;
+                        case 'formdata':
+                            if (options.body.formdata && Array.isArray(options.body.formdata)) {
+                                var formPairs = [];
+                                for (var k = 0; k < options.body.formdata.length; k++) {
+                                    var fp = options.body.formdata[k];
+                                    if (fp && fp.key) {
+                                        formPairs.push(encodeURIComponent(fp.key) + '=' + encodeURIComponent(fp.value || ''));
+                                    }
+                                }
+                                body = formPairs.join('&');
+                            }
+                            break;
+                        case 'graphql':
+                            if (options.body.query) {
+                                body = JSON.stringify({query: options.body.query, variables: options.body.variables || {}});
+                            }
+                            break;
+                        default:
+                            body = options.body.raw || JSON.stringify(options.body);
+                    }
+                } else {
+                    // Plain object body — JSON encode
+                    try {
+                        body = JSON.stringify(options.body);
+                    } catch (e) {
+                        body = String(options.body);
+                    }
+                }
+            }
+        }
 
         var resultJson = __tropel_pm_send_request(
             method.toUpperCase(),
             url,
             JSON.stringify(headers),
-            typeof body === 'string' ? body : JSON.stringify(body)
+            typeof body === 'string' ? body : JSON.stringify(body),
+            timeout
         );
 
         // Fire callback with the response
-        if (callback) {
+        if (typeof callback === 'function') {
             try {
                 var result = JSON.parse(resultJson);
                 callback(null, {
