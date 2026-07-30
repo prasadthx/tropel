@@ -1,6 +1,6 @@
 use crate::error::*;
 use rquickjs::function::Func;
-use rquickjs::{Context, Function, Persistent, Runtime};
+use rquickjs::{Context, Function, Persistent, Promise, Runtime};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -58,6 +58,7 @@ pub struct JsContext {
     /// Declared FIRST so it is dropped BEFORE ctx.
     /// Avoids re-parsing scripts on every iteration.
     script_cache: Mutex<HashMap<u64, CachedScript>>,
+    rt: Runtime,
     ctx: Context,
     context_id: u64,
     /// Shared deadline (epoch nanos) for the interrupt handler.
@@ -85,12 +86,12 @@ fn now_nanos() -> u64 {
 impl JsContext {
     /// Create a new JS context with memory cap and interrupt handler.
     pub async fn new(memory_limit: Option<usize>, max_execution_time: Option<Duration>) -> Result<Self> {
-        let runtime = Runtime::new()
+        let rt = Runtime::new()
             .map_err(|e| JsError::ContextCreation(format!("Runtime creation failed: {}", e)))?;
 
         // Set memory limit (in bytes)
         if let Some(limit) = memory_limit {
-            runtime.set_memory_limit(limit);
+            rt.set_memory_limit(limit);
         }
 
         let max_execution_time = max_execution_time.unwrap_or(Duration::from_secs(10));
@@ -99,12 +100,12 @@ impl JsContext {
 
         // Set interrupt handler using atomic deadline (reset per-eval)
         let deadline = interrupt_deadline.clone();
-        runtime.set_interrupt_handler(Some(Box::new(move || {
+        rt.set_interrupt_handler(Some(Box::new(move || {
             now_nanos() > deadline.load(Ordering::Relaxed)
         })));
 
         // Create a full-featured context
-        let ctx = Context::full(&runtime)
+        let ctx = Context::full(&rt)
             .map_err(|e| JsError::ContextCreation(format!("Context creation failed: {}", e)))?;
 
         // Set up the global `console` object
@@ -129,6 +130,7 @@ impl JsContext {
 
         Ok(Self {
             ctx,
+            rt,
             context_id,
             interrupt_deadline,
             max_execution_time,
@@ -143,32 +145,86 @@ impl JsContext {
         self.interrupt_deadline.store(deadline, Ordering::Relaxed);
     }
 
+    /// Pump the QuickJS job queue to resolve pending promises.
+    ///
+    /// After evaluating code that creates Promises (via `async` functions or
+    /// `new Promise(...)`), the Promise callbacks are queued as pending jobs
+    /// in the JS runtime. This method drives those jobs to completion.
+    ///
+    /// Returns the number of times we pumped (0 means nothing was pending).
+    fn pump_promise_queue(&self) -> Result<u32> {
+        let mut pump_count = 0u32;
+        let max_iterations = 1000; // safety limit
+        for _ in 0..max_iterations {
+            match self.rt.execute_pending_job() {
+                Ok(true) => {
+                    pump_count += 1;
+                    // More pending — keep pumping
+                }
+                Ok(false) => {
+                    // No more pending jobs
+                    break;
+                }
+                Err(e) => {
+                    return Err(JsError::Eval(format!("Promise job error: {}", e)));
+                }
+            }
+        }
+        if pump_count >= max_iterations {
+            tracing::warn!("Promise queue reached max pump iterations ({}), possible infinite loop", max_iterations);
+        }
+        Ok(pump_count)
+    }
+
     /// Evaluate JavaScript code and return the result as a string.
+    /// After evaluation, pumps the promise job queue to resolve any
+    /// pending microtasks (Promise callbacks, async/await continuations).
     pub async fn eval(&self, code: &str) -> Result<String> {
         self.reset_interrupt();
         let code = code.to_string();
-        self.ctx
+        let result = self.ctx
             .with(move |ctx| {
                 let value: rquickjs::Value = ctx
                     .eval(code)
                     .map_err(|e| JsError::Eval(format!("JS eval error: {}", e)))?;
 
                 value_to_string(&value, &ctx)
-            })
+            })?;
+
+        // Pump the promise queue to resolve microtasks
+        self.pump_promise_queue()?;
+
+        Ok(result)
     }
 
-    /// Evaluate a script that returns a Promise and resolve it.
+    /// Evaluate an async script and resolve its Promise.
+    ///
+    /// The script should return a Promise (e.g., an async function invocation).
+    /// This method:
+    /// 1. Evaluates the code
+    /// 2. Pumps the job queue to resolve any pending microtasks
+    /// 3. Returns the result as a string
+    ///
+    /// If the script does NOT return a Promise, it behaves like `eval()`.
     pub async fn eval_async(&self, code: &str) -> Result<String> {
         self.reset_interrupt();
         let code = code.to_string();
-        self.ctx
-            .with(move |ctx| {
-                let value: rquickjs::Value = ctx
-                    .eval(code)
-                    .map_err(|e| JsError::Eval(format!("JS eval_async error: {}", e)))?;
 
-                value_to_string(&value, &ctx)
-            })
+        // Evaluate the code
+        let result = self.ctx.with(move |ctx| {
+            let value: rquickjs::Value = ctx
+                .eval(code)
+                .map_err(|e| JsError::Eval(format!("JS eval_async error: {}", e)))?;
+            value_to_string(&value, &ctx)
+        })?;
+
+        // Pump the job queue to resolve any pending promises
+        let pump_count = self.pump_promise_queue()?;
+        if pump_count > 0 {
+            tracing::trace!("Resolved async script (pumped {} times)", pump_count);
+        }
+
+        Ok(result)
     }
 
     /// Set a global variable from a string value.
@@ -231,6 +287,32 @@ impl JsContext {
         Ok(true)
     }
 
+    /// Execute a JS script that may contain `await` expressions using a cached
+    /// async function.
+    ///
+    /// Wraps the source in `(async function(){...})()` so `await` is valid,
+    /// evaluates it (getting a Promise), then pumps the job queue to resolve
+    /// the Promise to completion.
+    pub async fn run_script_async(&self, source: &str) -> Result<bool> {
+        self.reset_interrupt();
+        let source = source.to_string();
+
+        // Wrap in an async IIFE so `await` is valid syntax
+        let wrapped = format!("(async function __tropel_script(){{{source}}})()");
+
+        self.ctx.with(move |ctx| {
+            let _promise: Promise = ctx
+                .eval(wrapped)
+                .map_err(|e| JsError::Eval(format!("Async script compile error: {}", e)))?;
+            Ok::<_, JsError>(())
+        })?;
+
+        // Pump the promise queue to resolve the async function
+        self.pump_promise_queue()?;
+
+        Ok(true)
+    }
+
     /// Execute a JS script using a cached compiled function.
     ///
     /// On first call, the source is wrapped in `(function(){...})`, compiled
@@ -259,10 +341,13 @@ impl JsContext {
 
         if let Some(script) = cached {
             // Fast path: restore and invoke the persisted function
-            return self.ctx.with(|ctx| {
+            let result = self.ctx.with(|ctx| {
                 script.invoke(&ctx)?;
-                Ok(true)
+                Ok::<_, JsError>(true)
             });
+            // Pump promise queue after cached script execution
+            self.pump_promise_queue()?;
+            return result;
         }
 
         // Slow path: compile, persist, cache, invoke
@@ -279,6 +364,9 @@ impl JsContext {
 
             Ok::<_, JsError>(script)
         })?;
+
+        // Pump promise queue after script compilation and execution
+        self.pump_promise_queue()?;
 
         // Store in cache for future calls
         {

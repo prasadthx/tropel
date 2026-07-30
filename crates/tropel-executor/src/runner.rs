@@ -304,13 +304,22 @@ impl VURunner {
 
     /// Run a JavaScript script via the tropel-js context.
     ///
-    /// Uses the cached compilation path: the first call compiles the script
-    /// to a Function and stores it in the JS global object; subsequent calls
-    /// invoke the cached function directly, avoiding re-parsing.
+    /// Uses the cached compilation path with async support:
+    /// - If the script contains `await` or `Promise`, wraps in an async IIFE
+    ///   and pumps the job queue to resolve microtasks.
+    /// - Otherwise, uses the fast cached sync path.
     async fn run_script(&self, code: &str) -> Result<()> {
         if let Some(ctx) = &self.js_ctx {
-            ctx.run_script_cached(code).await
-                .map_err(|e| tropel_core::TropelError::Other(format!("Script error: {}", e)))?;
+            // Check if the script uses async features
+            let has_async = code.contains("await") || code.contains("Promise");
+
+            if has_async {
+                ctx.run_script_async(code).await
+                    .map_err(|e| tropel_core::TropelError::Other(format!("Async script error: {}", e)))?;
+            } else {
+                ctx.run_script_cached(code).await
+                    .map_err(|e| tropel_core::TropelError::Other(format!("Script error: {}", e)))?;
+            }
         } else {
             tracing::trace!("Script execution skipped (no JS context): {} chars", code.len());
         }
