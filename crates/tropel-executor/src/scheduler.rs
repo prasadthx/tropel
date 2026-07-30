@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time;
@@ -12,6 +12,9 @@ pub struct VUScheduler {
     active_vus: Arc<Mutex<u32>>,
     total_iterations: Arc<Mutex<u64>>,
     stop_signal: Arc<tokio::sync::Notify>,
+    /// Level-triggered stop flag — persists across notify_waiters() wake-ups
+    /// so VUs never miss the stop signal even if they're between iterations.
+    stop_requested: Arc<AtomicBool>,
     /// Token bucket count for arrival-rate mode (atomic, so ticker and VUs can share).
     arrival_tokens: Arc<AtomicU64>,
     /// Notify for waking VUs when a new token is available.
@@ -28,15 +31,27 @@ impl VUScheduler {
             active_vus: Arc::new(Mutex::new(0)),
             total_iterations: Arc::new(Mutex::new(0)),
             stop_signal: Arc::new(tokio::sync::Notify::new()),
+            stop_requested: Arc::new(AtomicBool::new(false)),
             arrival_tokens: Arc::new(AtomicU64::new(0)),
             arrival_notify: Arc::new(tokio::sync::Notify::new()),
             arrival_dropped: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Get the stop signal.
+    /// Get the stop signal (Notify for waking VUs mid-iteration).
     pub fn stop_signal(&self) -> Arc<tokio::sync::Notify> {
         self.stop_signal.clone()
+    }
+
+    /// Request a clean stop: sets the level-triggered flag and wakes all waiters.
+    pub fn request_stop(&self) {
+        self.stop_requested.store(true, Ordering::Release);
+        self.stop_signal.notify_waiters();
+    }
+
+    /// Check whether stop has been requested (level-triggered — stays true once set).
+    pub fn is_stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::Acquire)
     }
 
     /// Try to consume one arrival-rate token. Returns true if a token was available.
@@ -131,8 +146,8 @@ impl VUScheduler {
         // Wait for the duration
         time::sleep(duration).await;
 
-        // Signal stop
-        self.stop_signal.notify_waiters();
+        // Signal stop (level-triggered — sets the flag + wakes waiters)
+        self.request_stop();
 
         // Wait for all VUs to finish
         for handle in handles {
@@ -179,8 +194,8 @@ impl VUScheduler {
             } else {
                 // Ramp down: use per-VU cancellation via the decrement + notify pattern
                 let to_stop = current_vus - target;
-                // Signal all VUs; each VU checks remaining capacity
-                self.stop_signal.notify_waiters();
+                // Signal all VUs; each VU checks the level-triggered flag
+                self.request_stop();
                 time::sleep(Duration::from_millis(500)).await; // Brief wait for VUs to notice
                 // Decrement active count — VUs that exit will decrement themselves
                 self.remove_active_vu(to_stop).await;
@@ -188,8 +203,8 @@ impl VUScheduler {
             }
         }
 
-        // Signal stop
-        self.stop_signal.notify_waiters();
+        // Signal stop (level-triggered)
+        self.request_stop();
 
         // Wait for all VUs
         for handle in handles {
@@ -262,7 +277,7 @@ impl VUScheduler {
             }
         }
 
-        self.stop_signal.notify_waiters();
+        self.request_stop();
 
         for handle in handles {
             handle.await.ok();
@@ -279,6 +294,7 @@ impl VUScheduler {
             active_vus: self.active_vus.clone(),
             total_iterations: self.total_iterations.clone(),
             stop_signal: self.stop_signal.clone(),
+            stop_requested: self.stop_requested.clone(),
             arrival_tokens: self.arrival_tokens.clone(),
             arrival_notify: self.arrival_notify.clone(),
             arrival_dropped: self.arrival_dropped.clone(),

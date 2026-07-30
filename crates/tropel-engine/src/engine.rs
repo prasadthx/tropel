@@ -117,6 +117,13 @@ impl Engine {
                 tracing::debug!("VU {} starting iteration loop at index 0", vu_id);
 
                 loop {
+                    // Level-triggered stop check — catches signals that arrived
+                    // between iterations when no VU was awaiting on .notified().
+                    if sched.is_stop_requested() {
+                        tracing::debug!("VU {} stopping (level-triggered check)", vu_id);
+                        break;
+                    }
+
                     // Check if we should stop
                     tokio::select! {
                         _ = stop.notified() => {
@@ -165,7 +172,7 @@ impl Engine {
                                     if current_slot != prev_slot {
                                         let results = metrics.results().await;
                                         if check_abort_on_fail(&thresholds, &results, elapsed) {
-                                            stop.notify_waiters();
+                                            sched.request_stop();
                                         }
                                     }
                                 }
