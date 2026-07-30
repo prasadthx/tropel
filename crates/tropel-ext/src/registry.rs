@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// The extension registry: collects all registered extensions at startup.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ExtensionRegistry {
     protocols: HashMap<String, Arc<ProtocolRegistration>>,
     outputs: HashMap<String, Arc<OutputRegistration>>,
@@ -13,9 +13,13 @@ pub struct ExtensionRegistry {
 }
 
 impl ExtensionRegistry {
-    /// Create a new empty registry.
+    /// Create a new registry and collect all inventory-registered extensions.
+    /// Callers that want a truly empty registry (e.g., for testing) can use
+    /// `ExtensionRegistry::default()`.
     pub fn new() -> Self {
-        Self::default()
+        let mut registry = Self::default();
+        registry.collect_inventory();
+        registry
     }
 
     /// Register a protocol.
@@ -65,7 +69,7 @@ impl ExtensionRegistry {
 
     /// Get an input adapter by ID.
     pub fn get_input_adapter(&self, id: &str) -> Option<Box<dyn InputAdapter>> {
-        self.input_adapters.get(id).map(|r| (r.factory)())
+        self.input_adapters.get(id).map(|r| (r.create)())
     }
 
     /// List all registered protocols.
@@ -88,18 +92,42 @@ impl ExtensionRegistry {
         self.js_modules.keys().cloned().collect()
     }
 
-    /// Collect all inventory-registered extensions.
-    /// This is called once at startup to populate the registry from
+    /// Collect all inventory-registered input adapters.
+    /// Called once at startup to populate the registry from
     /// `inventory::submit!` calls throughout the codebase.
+    ///
+    /// Currently handles input adapters. Protocol, output, and other
+    /// extension types follow the same pattern when they implement
+    /// compile-time registration.
     pub fn collect_inventory(&mut self) {
-        // Collect protocols
-        // inventory::iter::<ProtocolRegistration>.for_each(|r| {
-        //     let scheme = (r.factory)();
-        //     self.register_protocol(scheme.scheme(), ...);
-        // });
-        //
-        // Note: inventory integration requires careful per-crate setup.
-        // For now, extensions register explicitly or via build configuration.
-        tracing::debug!("Collecting inventory-registered extensions");
+        tracing::debug!("Collecting inventory-registered input adapters");
+        for registration in inventory::iter::<InputAdapterRegistration> {
+            self.register_input_adapter(registration.id, InputAdapterRegistration {
+                id: registration.id,
+                create: registration.create,
+            });
+        }
+        let count = self.input_adapters.len();
+        tracing::debug!("Collected {} input adapter(s) from inventory", count);
+    }
+
+    /// Resolve an input adapter from raw bytes using content detection.
+    /// Iterates all registered adapters in registration order and returns
+    /// the first one whose `detect()` returns `true`. Returns `None` if
+    /// no adapter claims the bytes.
+    pub fn resolve_input(&self, bytes: &[u8]) -> Option<Box<dyn InputAdapter>> {
+        for registration in self.input_adapters.values() {
+            let adapter = (registration.create)();
+            if adapter.detect(bytes) {
+                return Some(adapter);
+            }
+        }
+        None
+    }
+
+    /// Resolve an input adapter by explicit format ID (e.g. `--format postman`).
+    /// Returns `None` if no adapter with that ID is registered.
+    pub fn resolve_input_by_id(&self, id: &str) -> Option<Box<dyn InputAdapter>> {
+        self.input_adapters.get(id).map(|r| (r.create)())
     }
 }

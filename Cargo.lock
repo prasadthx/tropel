@@ -2494,6 +2494,7 @@ dependencies = [
  "tropel-executor",
  "tropel-ext",
  "tropel-http",
+ "tropel-input-k6",
  "tropel-input-postman",
  "tropel-js",
  "tropel-metrics",
@@ -2578,9 +2579,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tropel-input-k6"
+version = "0.1.0"
+dependencies = [
+ "inventory",
+ "tracing",
+ "tropel-core",
+ "tropel-es",
+ "tropel-ext",
+]
+
+[[package]]
 name = "tropel-input-postman"
 version = "0.1.0"
 dependencies = [
+ "inventory",
  "tropel-collection",
  "tropel-core",
  "tropel-ext",

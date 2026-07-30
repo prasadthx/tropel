@@ -1,13 +1,15 @@
 [package]
-name = "tropel-input-postman"
+name = "tropel-input-k6"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+description = "Input adapter that reads k6-style JavaScript/TypeScript test scripts and produces a Scenario"
 
 [dependencies]
 tropel-core.workspace = true
-tropel-collection.workspace = true
 tropel-ext.workspace = true
+tropel-es.workspace = true
 inventory.workspace = true
+tracing.workspace = true

@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use rand::Rng;
 use tokio::sync::broadcast;
-use tropel_collection::{collection_to_scenario, parse_collection_file};
 use tropel_core::config::{ExecutionConfig, JobConfig, OutputConfig, ThinkTimeConfig};
 use tropel_core::scenario::Scenario;
 use tropel_core::{Result, TropelError};
@@ -38,6 +37,13 @@ impl Engine {
     ///   tags, and optional staggered `startTime`. All scenarios share the same metrics
     ///   collector and VU worker pool.
     pub async fn run(&self, config: &JobConfig) -> Result<EngineResult> {
+        // Collect inventory-registered extension and wrap registry in Arc for
+        // passing across spawned task boundaries.
+        let registry = Arc::new(self.extension_registry.clone());
+        // Clone the format hint string before the spawn loop to avoid
+        // lifetime issues (tokio::spawn requires 'static).
+        let format_hint = config.input_type.clone();
+
         let metrics = Arc::new(MetricsCollector::new());
 
         // Create thread-per-core worker pool for VU sharding
@@ -131,9 +137,17 @@ impl Engine {
             let test_start = test_start;
             let blocking_rt_sc = blocking_rt.clone();
 
+            let registry_sc = registry.clone();
+            let fmt_hint = format_hint.clone();
             let handle = tokio::spawn(async move {
-                // Parse the input file for this scenario
-                let scenario = parse_scenario_input(&input_path, &base_env).await;
+                // Parse the input file for this scenario using the
+                // registry-driven input adapter dispatch.
+                let scenario = parse_scenario_input(
+                    &input_path,
+                    fmt_hint.as_deref(),
+                    &registry_sc,
+                    &base_env,
+                );
                 let scenario = match scenario {
                     Ok(s) => Arc::new(s),
                     Err(e) => {
@@ -495,99 +509,73 @@ pub struct EngineResult {
     pub metrics: tropel_metrics::collector::MetricsResult,
 }
 
-/// Parse a scenario input file and return a Scenario.
+/// Parse a scenario input file and return a Scenario using the extension
+/// registry's input adapters.
 ///
-/// Supports:
-/// - `.json` files: Postman collections (existing path)
-/// - `.ts` / `.mts` files: TypeScript test scripts (transpiled via SWC, then bundled)
-/// - `.js` / `.mjs` files: JavaScript test scripts (ES module bundled if needed)
+/// Resolution order:
+/// 1. If `format_hint` is provided (`--format` flag), use that adapter directly.
+/// 2. Otherwise, iterate all registered adapters and call `detect(bytes)`.
+/// 3. If no adapter claims the file, return an error listing available adapters.
 ///
-/// The scenario's env is merged at runtime by the caller.
-async fn parse_scenario_input(
+/// The registry is populated at startup via `collect_inventory()`, which gathers
+/// all `inventory::submit!`-registered adapters from linked crates.
+fn parse_scenario_input(
     input_path: &str,
+    format_hint: Option<&str>,
+    registry: &tropel_ext::registry::ExtensionRegistry,
     base_env: &std::collections::HashMap<String, String>,
 ) -> Result<Scenario> {
     let input_p = std::path::Path::new(input_path);
 
-    // TypeScript/JavaScript standalone scripts — transpile + bundle, then
-    // wrap into a single-request scenario so the executor can run them.
-    if let Some(ext) = input_p.extension().and_then(|e| e.to_str()) {
-        let ext_lower = ext.to_lowercase();
-        if matches!(ext_lower.as_str(), "ts" | "mts" | "js" | "mjs") {
-            tracing::info!("Loading script file: {} (transpiling ES modules)", input_path);
-            return transpile_script_to_scenario(input_path, base_env);
-        }
-    }
+    // Read the file bytes — all adapters work from raw bytes.
+    // Using std::fs::read (synchronous) because this runs once at startup,
+    // not on the hot path. Tokio's fs feature would add unnecessary deps.
+    let bytes = std::fs::read(input_path)
+        .map_err(|e| TropelError::Parse(format!("Failed to read '{}': {}", input_path, e)))?;
 
-    // Postman collection JSON — existing path
-    let collection = parse_collection_file(input_path)
-        .map_err(|e| TropelError::Parse(format!("Failed to parse collection: {}", e)))?;
+    // Resolve the adapter: explicitly by format ID, or auto-detect from content.
+    let adapter: Box<dyn tropel_ext::traits::InputAdapter> = if let Some(fmt) = format_hint {
+        registry.resolve_input_by_id(fmt)
+            .ok_or_else(|| {
+                let available = registry.list_inputs();
+                TropelError::Config(format!(
+                    "Unknown input format '{}'. Available formats: {}",
+                    fmt, available.join(", ")
+                ))
+            })?
+    } else {
+        registry.resolve_input(&bytes)
+            .ok_or_else(|| {
+                let available = registry.list_inputs();
+                TropelError::Parse(format!(
+                    "No input adapter recognized '{}'. Available adapters: {}",
+                    input_path,
+                    if available.is_empty() {
+                        "(none registered — check build configuration)".to_string()
+                    } else {
+                        available.join(", ")
+                    }
+                ))
+            })?
+    };
 
-    let scenario = collection_to_scenario(collection, base_env.clone());
-    Ok(scenario)
-}
-
-/// Transpile a TypeScript/JavaScript script file into a single-request Scenario.
-///
-/// The transpiled script wraps all its code into a self-contained test function
-/// executed via the scenario item's test script slot. The executor checks for
-/// both prerequest and test scripts on items — even items without a request.
-///
-/// We create a minimal item with a dummy request placeholder so the executor
-/// processes it, then place the transpiled script as the test script (runs
-/// after the request). The request is a placeholder that gets skipped.
-fn transpile_script_to_scenario(
-    input_path: &str,
-    base_env: &std::collections::HashMap<String, String>,
-) -> Result<Scenario> {
-    let path = std::path::Path::new(input_path);
-
-    // Transpile (TS→JS + ES module bundle)
-    let js_code = tropel_es::transpile_file(path)
-        .map_err(|e| TropelError::Parse(format!("Script transpilation failed: {}", e)))?;
-
-    // Wrap the transpiled code in a self-executing function so it runs
-    // regardless of request execution status.
-    let wrapped_code = format!(
-        "(function() {{\n{}    }})();",
-        js_code.lines()
-            .map(|l| format!("    {}", l))
-            .collect::<Vec<_>>()
-            .join("\n")
+    let adapter_id = adapter.id().to_string();
+    tracing::info!(
+        "Input '{}' resolved by adapter '{}'",
+        input_path, adapter_id
     );
 
-    // Create a minimal item with a dummy request so the executor processes it.
-    // The transpiled script runs as the test script (after the request).
-    // Since the request is a placeholder (no real URL), it will be skipped
-    // in the HTTP execution phase, but the test script WILL be executed.
-    let scenario = Scenario {
-        info: tropel_core::scenario::ScenarioInfo {
-            name: path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("script")
-                .to_string(),
-            description: Some(format!("Transpiled from {}", input_path)),
-            schema: None,
-        },
-        items: vec![tropel_core::scenario::ScenarioItem {
-            id: "transpiled-script-1".to_string(),
-            name: path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("script")
-                .to_string(),
-            // No HTTP request — the script handles its own requests
-            // via pm.sendRequest. The runner now processes items even
-            // without a request (they still execute scripts).
-            request: None,
-            prerequest: None,
-            // The transpiled script runs as a test script
-            test: Some(wrapped_code),
-            assertions: vec![],
-            items: vec![],
-        }],
-        variables: std::collections::HashMap::new(),
-        auth: None,
-    };
+    // Parse with the source path hint so adapters that need file-system access
+    // (e.g. k6 for module resolution) can use it.
+    let mut scenario = adapter.parse_with_path(&bytes, Some(input_p))?;
+
+    // Merge base environment variables into the scenario's variables.
+    // The old code did this via collection_to_scenario(collection, base_env);
+    // now we do it generically for any adapter output.
+    for (key, val) in base_env {
+        scenario.variables.entry(key.clone())
+            .or_insert_with(|| serde_json::Value::String(val.clone()));
+    }
 
     Ok(scenario)
 }

@@ -7,10 +7,16 @@ use tropel_collection::{collection_to_scenario, parse_collection};
 use tropel_core::scenario::Scenario;
 use tropel_core::Result;
 use tropel_core::TropelError;
-use tropel_ext::traits::InputAdapter;
+use tropel_ext::traits::{InputAdapter, InputAdapterRegistration};
 
 /// Input adapter for Postman Collection files.
 pub struct PostmanInputAdapter;
+
+// Register PostmanInputAdapter for compile-time discovery by the engine.
+// When `tropel-ext` calls `ExtensionRegistry::collect_inventory()`, this
+// registration is picked up and the adapter is added to the registry.
+// Uses a fn pointer (captureless closure) for const-compatibility with inventory.
+inventory::submit!(InputAdapterRegistration::new("postman", || Box::new(PostmanInputAdapter)));
 
 impl InputAdapter for PostmanInputAdapter {
     fn id(&self) -> &str {
