@@ -102,12 +102,15 @@ impl Engine {
                     }
                 };
 
+                // Clone the HTTP client for the PM bridge (sendRequest needs it)
+                let bridge_client = Arc::new(client.clone());
+
                 // Create VU runner with its own dedicated HTTP client
                 let mut runner = VURunner::new(scenario, client);
                 let pm_state = runner.state_handle();
 
                 // Create JS context and attach to runner
-                let js_ctx = create_vu_js_context(vu_id, &pm_state).await;
+                let js_ctx = create_vu_js_context(vu_id, &pm_state, &bridge_client).await;
                 if let Some(ctx) = js_ctx {
                     runner = runner.with_js_context(Box::new(ctx));
                     tracing::debug!("VU {}: JS context attached for script execution", vu_id);
@@ -271,7 +274,11 @@ pub struct EngineResult {
 }
 
 /// Create a JS context for a VU and bootstrap the vendored JS libraries.
-async fn create_vu_js_context(vu_id: u32, pm_state: &tropel_pm::bridge::SharedPmState) -> Option<tropel_js::JsContext> {
+async fn create_vu_js_context(
+    vu_id: u32,
+    pm_state: &tropel_pm::bridge::SharedPmState,
+    http_client: &Arc<tropel_http::client::HttpClient>,
+) -> Option<tropel_js::JsContext> {
     // Create the JS context with a 10 MB memory limit and 10s execution timeout
     let ctx = match tropel_js::JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10))).await {
         Ok(ctx) => ctx,
@@ -313,8 +320,9 @@ async fn create_vu_js_context(vu_id: u32, pm_state: &tropel_pm::bridge::SharedPm
         tracing::warn!("VU {}: Failed to install native modules: {}", vu_id, e);
     }
 
-    // Install pm.* bridge functions so JS shims can call __tropel_pm_* functions
-    let bridge = tropel_pm::bridge_fns::PmBridge::new(pm_state.clone());
+    // Install pm.* bridge functions so JS shims can call __tropel_pm_* functions.
+    // Pass the per-VU HTTP client for pm.sendRequest to work synchronously.
+    let bridge = tropel_pm::bridge_fns::PmBridge::new(pm_state.clone(), http_client.clone());
     if let Err(e) = bridge.install(&ctx) {
         tracing::warn!("VU {}: Failed to install PM bridge functions: {}", vu_id, e);
     }

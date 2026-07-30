@@ -4,15 +4,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tropel_core::types::{Request, Response, Sample, TagMap};
 
-/// A request queued by pm.sendRequest for later async execution.
-#[derive(Debug, Clone)]
-pub struct PendingRequest {
-    pub method: String,
-    pub url: String,
-    pub headers: HashMap<String, String>,
-    pub body: Option<String>,
-}
-
 /// The mutable state for a single VU's pm.* API.
 /// Shared between the JS context and the native executor.
 #[derive(Debug, Clone)]
@@ -41,8 +32,6 @@ pub struct PmState {
     pub iteration_data: Option<HashMap<String, Value>>,
     /// Whether to skip the remaining tests.
     pub skip_tests: bool,
-    /// Requests queued by pm.sendRequest for async execution.
-    pub pending_requests: Vec<PendingRequest>,
 }
 
 /// Assertion pass/fail counters (like pm.test results).
@@ -68,7 +57,6 @@ impl PmState {
             request_names: Vec::new(),
             iteration_data: None,
             skip_tests: false,
-            pending_requests: Vec::new(),
         }
     }
 

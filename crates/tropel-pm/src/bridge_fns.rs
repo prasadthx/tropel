@@ -1,8 +1,11 @@
 use std::collections::HashMap;
-use crate::bridge::{PendingRequest, SharedPmState};
+use std::sync::Arc;
+use crate::bridge::SharedPmState;
 use rquickjs::function::Func;
 use serde_json::Value;
 use tropel_core::Result;
+use tropel_core::types::{Body, Method, Request};
+use tropel_http::client::HttpClient;
 use tropel_js::JsContext;
 
 /// Convert a serde_json::Value to a string suitable for JS consumption.
@@ -24,11 +27,13 @@ fn variable_value_to_string(val: &Value) -> String {
 /// Vec<(String, String)>, Option<T>, Vec<T>, and all primitive types.
 pub struct PmBridge {
     state: SharedPmState,
+    /// Per-VU HTTP client for executing pm.sendRequest synchronously.
+    http_client: Arc<HttpClient>,
 }
 
 impl PmBridge {
-    pub fn new(state: SharedPmState) -> Self {
-        Self { state }
+    pub fn new(state: SharedPmState, http_client: Arc<HttpClient>) -> Self {
+        Self { state, http_client }
     }
 
     /// Register all bridge functions into the given JS context.
@@ -280,33 +285,58 @@ impl PmBridge {
             );
 
             // ── sendRequest ──
-            // Queues a request for later async execution. Returns a JSON error
-            // response since true async sendRequest isn't implemented yet.
-            let state_clone = state.clone();
+            // Executes an HTTP request synchronously using the per-VU HTTP client.
+            // The bridge closure runs inside ctx.with() (synchronous), so we use
+            // tokio::runtime::Handle::block_on() to await the async client.execute().
+            // This is safe because the VU runs on its own thread (thread-per-core).
+            let http = self.http_client.clone();
             let _ = globals.set(
                 "__tropel_pm_send_request",
                 Func::from(
                     move |method: String, url: String, headers_json: String, body: String| -> String {
                         let headers: HashMap<String, String> =
                             serde_json::from_str(&headers_json).unwrap_or_default();
-                        {
-                            let mut st = state_clone.lock().unwrap();
-                            st.pending_requests.push(PendingRequest {
-                                method: method.clone(),
-                                url: url.clone(),
-                                headers,
-                                body: if body.is_empty() { None } else { Some(body) },
-                            });
+
+                        let request_body = if body.is_empty() {
+                            None
+                        } else {
+                            Some(Body::Raw(body))
+                        };
+
+                        let req = Request {
+                            url: url.clone(),
+                            method: Method::from_str(&method).unwrap_or(Method::GET),
+                            headers,
+                            query_params: HashMap::new(),
+                            body: request_body,
+                            auth: None,
+                            certificate: None,
+                            follow_redirects: true,
+                            timeout: None,
+                        };
+
+                        // Execute the request synchronously by blocking on the async client
+                        match tokio::runtime::Handle::current().block_on(http.execute(&req, None)) {
+                            Ok(http_resp) => {
+                                let body_text = String::from_utf8(http_resp.body.clone()).unwrap_or_default();
+                                serde_json::json!({
+                                    "code": http_resp.status_code,
+                                    "statusText": http_resp.status_text,
+                                    "body": body_text,
+                                    "headers": http_resp.headers,
+                                    "responseTime": http_resp.response_time.as_secs_f64() * 1000.0,
+                                }).to_string()
+                            }
+                            Err(e) => {
+                                serde_json::json!({
+                                    "code": 0,
+                                    "statusText": format!("Request failed: {}", e),
+                                    "body": "",
+                                    "headers": {},
+                                    "responseTime": 0,
+                                }).to_string()
+                            }
                         }
-                        // Return a JSON response indicating queued status
-                        serde_json::json!({
-                            "status": "queued",
-                            "code": 0,
-                            "statusText": "Request queued — async sendRequest will be processed in a future iteration",
-                            "body": "",
-                            "headers": {},
-                            "responseTime": 0
-                        }).to_string()
                     },
                 ),
             );
