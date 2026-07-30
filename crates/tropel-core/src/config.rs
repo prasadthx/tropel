@@ -166,6 +166,25 @@ pub enum ExecutionConfig {
         #[serde(default, alias = "thinkTime")]
         think_time: ThinkTimeConfig,
     },
+    /// Each VU runs exactly N iterations independently.
+    /// Similar to k6's `per-vu-iterations` executor.
+    #[serde(rename = "per-vu-iterations")]
+    PerVUIterations {
+        /// Number of VUs to spawn.
+        vus: u32,
+        /// Number of iterations per VU (each VU runs exactly this many).
+        iterations: u64,
+        /// Optional overall time limit for the test.
+        #[serde(default, alias = "maxDuration")]
+        max_duration: Option<String>,
+        /// How long to wait for in-flight iterations to finish after the
+        /// iteration budget is exhausted or max_duration is reached.
+        #[serde(default, alias = "gracefulStop")]
+        graceful_stop: Option<String>,
+        /// Think time / pacing configuration between iterations.
+        #[serde(default, alias = "thinkTime")]
+        think_time: ThinkTimeConfig,
+    },
 }
 
 /// A ramping stage.

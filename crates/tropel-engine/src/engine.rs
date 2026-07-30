@@ -120,6 +120,7 @@ impl Engine {
 
                 let total_iterations = match &exec_cfg {
                     ExecutionConfig::SharedIterations { iterations, .. } => *iterations,
+                    ExecutionConfig::PerVUIterations { iterations, .. } => *iterations,
                     _ => u64::MAX,
                 };
 
@@ -128,10 +129,17 @@ impl Engine {
                     ExecutionConfig::RampingVus { start_vus, .. } => *start_vus,
                     ExecutionConfig::SharedIterations { vus, .. } => *vus,
                     ExecutionConfig::ConstantArrivalRate { pre_alloc_vus, .. } => *pre_alloc_vus,
+                    ExecutionConfig::PerVUIterations { vus, .. } => *vus,
                 };
                 let _vus = vus.max(1);
 
                 let has_abort_thresholds = thresholds.values().any(|t| t.abort_on_fail);
+
+                // Distinguish PerVUIterations from other executor types.
+                // For PerVUIterations, each VU tracks its own iteration count
+                // locally; the exit check uses the local `iteration_index`
+                // instead of the scheduler's global counter.
+                let is_per_vu_iterations = matches!(exec_cfg, ExecutionConfig::PerVUIterations { .. });
 
                 let metrics_clone = metrics.clone();
                 let scenario_clone = scenario.clone();
@@ -148,6 +156,7 @@ impl Engine {
                     ExecutionConfig::RampingVus { think_time, .. } => think_time.clone(),
                     ExecutionConfig::ConstantArrivalRate { think_time, .. } => think_time.clone(),
                     ExecutionConfig::SharedIterations { think_time, .. } => think_time.clone(),
+                    ExecutionConfig::PerVUIterations { think_time, .. } => think_time.clone(),
                 };
 
                 executor.run(move |sched, vu_id| {
@@ -308,10 +317,23 @@ impl Engine {
                                 apply_think_time(&think_time, Some(iter_duration)).await;
                             }
 
+                            // Check iteration limit.
+                            // For PerVUIterations, each VU tracks its own count via
+                            // the local `iteration_index`. For SharedIterations, VUs
+                            // share a global counter checked through the scheduler.
                             if total_iters != u64::MAX {
-                                let current_iters = sched.total_iterations().await;
-                                if current_iters >= total_iters {
-                                    break;
+                                if is_per_vu_iterations {
+                                    // Per-VU count: each VU exits after running its
+                                    // assigned iterations independently.
+                                    if iteration_index >= total_iters {
+                                        break;
+                                    }
+                                } else {
+                                    // Global count: all VUs share the iteration budget.
+                                    let current_iters = sched.total_iterations().await;
+                                    if current_iters >= total_iters {
+                                        break;
+                                    }
                                 }
                             }
                         }

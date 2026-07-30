@@ -199,6 +199,13 @@ impl VUScheduler {
                 self.run_arrival_rate(*rate, *pre_alloc_vus, *max_vus, duration, grace, &run_vu).await;
                 Ok(())
             }
+            ExecutionConfig::PerVUIterations { vus, iterations, max_duration, graceful_stop, .. } => {
+                let max_dur = max_duration.as_ref().and_then(|d| parse_duration(d).ok());
+                let grace = graceful_stop_duration(graceful_stop);
+                // Duration::ZERO here — think_time/pacing is handled in the VU loop in engine.rs
+                self.run_per_vu_iterations(*vus, *iterations, max_dur, grace, &run_vu).await;
+                Ok(())
+            }
         }
     }
 
@@ -439,6 +446,42 @@ impl VUScheduler {
 
         let dropped_total = self.arrival_dropped.load(Ordering::Relaxed);
         tracing::info!("Constant arrival rate finished (dropped: {})", dropped_total);
+    }
+
+    /// Run with per-VU iterations — each VU runs exactly N iterations independently.
+    /// Similar to k6's `per-vu-iterations` executor.
+    async fn run_per_vu_iterations<F>(&self, vus: u32, per_vu_iters: u64,
+                                      max_duration: Option<Duration>, grace: Duration, run_vu: &F)
+    where
+        F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
+    {
+        tracing::info!(
+            "Starting per-VU iterations: {} VUs × {} iterations each (max_duration: {:?}, grace: {:?})",
+            vus, per_vu_iters, max_duration, grace
+        );
+
+        let mut handles = Vec::new();
+        for vu_id in 0..vus {
+            let handle = run_vu(self.shared_clone(), vu_id);
+            handles.push(handle);
+        }
+
+        // If max_duration is set, wait for it then signal stop (grace period applies).
+        // VUs may already be done if all their iterations completed before max_duration.
+        // If max_duration is not set, VUs run until all iterations are exhausted —
+        // the stopsignal remains unset, and drain waits for active VUs to reach 0.
+        if let Some(max_dur) = max_duration {
+            time::sleep(max_dur).await;
+            self.request_stop();
+            self.wait_for_drain(grace).await;
+        }
+
+        // Wait for all JoinHandles (VUs should have completed or been stopped)
+        for handle in handles {
+            handle.await.ok();
+        }
+
+        tracing::info!("Per-VU iterations finished");
     }
 
     /// Create a shared clone of this scheduler for passing to VU tasks.
