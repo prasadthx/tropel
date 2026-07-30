@@ -524,6 +524,78 @@ impl PmBridge {
                 }),
             );
 
+            // ═══════════════════════════════════════════════════
+            // Execution context (k6 exec.* / test.abort())
+            // ═══════════════════════════════════════════════════
+            // exec.vu.idInTest — VU ID
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_exec_vu_id",
+                Func::from(move || -> u32 {
+                    state_clone.lock().unwrap().vu_id
+                }),
+            );
+
+            // exec.scenario.name — scenario name
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_exec_scenario_name",
+                Func::from(move || -> String {
+                    state_clone.lock().unwrap().scenario_name.clone()
+                }),
+            );
+
+            // Known limitation: exec.scenario.executor — executor type string
+            // (e.g., "constant-vus", "ramping-vus") is not yet piped through to
+            // PmState. The ExecutionConfig enum variant is available when the
+            // VURunner is created but not stored. Always returns "".
+            let _ = globals.set(
+                "__tropel_exec_scenario_executor",
+                Func::from(|| -> String { String::new() }),
+            );
+
+            // exec.vu.iterationInScenario — current iteration index
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_exec_iteration",
+                Func::from(move || -> u64 {
+                    state_clone.lock().unwrap().iteration_index
+                }),
+            );
+
+            // Known limitation: exec.instance.iterationsCompleted — returns the
+            // per-VU iteration count, NOT a global total across all VUs (which is
+            // what k6 provides). Requires a shared atomic counter across VUs in
+            // the scheduler to be piped into PmState.
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_exec_iterations_completed",
+                Func::from(move || -> u64 {
+                    let st = state_clone.lock().unwrap();
+                    st.iteration_index
+                }),
+            );
+
+            // Known limitation: exec.instance.vusActive — currently active VUs.
+            // Requires the scheduler's active_vus count to be passed to PmState
+            // each iteration. k6 provides this via the instance object, but the
+            // connection from VU runner to scheduler is indirect. Always returns 0.
+            let _ = globals.set(
+                "__tropel_exec_vus_active",
+                Func::from(|| -> u32 { 0 }),
+            );
+
+            // test.abort(message) — requests engine to abort the test
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_test_abort",
+                Func::from(move |message: String| {
+                    let mut st = state_clone.lock().unwrap();
+                    st.abort_requested = true;
+                    st.abort_message = Some(message);
+                }),
+            );
+
             // ── sendRequest ──
             // Executes an HTTP request synchronously using the per-VU HTTP client.
             // The bridge closure runs inside ctx.with() (synchronous), so we use

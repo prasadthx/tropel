@@ -40,6 +40,21 @@ pub struct PmState {
     pub group_stack: Vec<String>,
     /// Current active group path (e.g. "outer::inner") for tagging metrics.
     pub current_group: Option<String>,
+    // ── Execution context (k6 exec.* API) ──
+    /// Unique VU identifier.
+    pub vu_id: u32,
+    /// Name of the currently running scenario.
+    pub scenario_name: String,
+    /// Current iteration index (0-based) within this scenario.
+    pub iteration_index: u64,
+    /// Name of the currently executing request/item.
+    pub current_request_name: String,
+    // ── Test abort ──
+    /// When true, the engine should abort the entire test run.
+    /// Set by test.abort() from scripts.
+    pub abort_requested: bool,
+    /// Optional abort message set by test.abort(message).
+    pub abort_message: Option<String>,
 }
 
 /// Assertion pass/fail counters (like pm.test results).
@@ -68,6 +83,12 @@ impl PmState {
             skip_tests: false,
             group_stack: Vec::new(),
             current_group: None,
+            vu_id: 0,
+            scenario_name: String::new(),
+            iteration_index: 0,
+            current_request_name: String::new(),
+            abort_requested: false,
+            abort_message: None,
         }
     }
 

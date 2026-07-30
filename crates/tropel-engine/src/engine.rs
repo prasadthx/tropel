@@ -190,6 +190,8 @@ impl Engine {
                     ExecutionConfig::RampingArrivalRate { think_time, .. } => think_time.clone(),
                 };
 
+                // Clone sc_name for the closure to avoid move-ownership conflicts
+                let sc_name_for_vu = sc_name.clone();
                 executor.run(move |sched, vu_id| {
                     let metrics = metrics_clone.clone();
                     let scenario = scenario_clone.clone();
@@ -204,6 +206,7 @@ impl Engine {
                     let pool = pool_clone.clone();
                     let think_time = think_time_cfg.clone();
 
+                    let sc_name_vu = sc_name_for_vu.clone();
                     let (_, handle) = pool.spawn(async move {
                         sched.add_active_vu(1).await;
 
@@ -217,7 +220,7 @@ impl Engine {
                         };
 
                         let bridge_client = Arc::new(client.clone());
-                        let mut runner = VURunner::new(scenario, client)
+                        let mut runner = VURunner::new(scenario, client, vu_id, sc_name_vu.clone())
                             .with_expected_statuses(http_cfg.expected_statuses.clone());
                         let pm_state = runner.state_handle();
 
@@ -334,6 +337,19 @@ impl Engine {
                                                     sched.request_stop();
                                                 }
                                             }
+                                        }
+                                    }
+
+                                    // Check if test.abort() was called from the script.
+                                    // If so, request a clean stop so all VUs drain.
+                                    {
+                                        let state = pm_state.lock().unwrap();
+                                        if state.abort_requested {
+                                            let msg = state.abort_message.clone()
+                                                .unwrap_or_else(|| "Test aborted by script".to_string());
+                                            tracing::warn!("test.abort(): {} — stopping", msg);
+                                            drop(state);
+                                            sched.request_stop();
                                         }
                                     }
 
@@ -678,10 +694,12 @@ async fn create_vu_js_context(
         }
     }
 
-    // Bootstrap lodash and cryptojs
+    // Bootstrap lodash, cryptojs, and exec shims
+    let exec_code: &str = include_str!("../../../js/exec/exec.js");
     for (name, code) in &[
         ("lodash-shim", lodash_code),
         ("cryptojs-shim", cryptojs_code),
+        ("exec-shim", exec_code),
     ] {
         if let Err(e) = ctx.bootstrap_library(code).await {
             tracing::warn!("VU {}: Failed to bootstrap JS library '{}': {}", vu_id, name, e);

@@ -48,17 +48,24 @@ pub struct VURunner {
     /// Expected status codes/ranges that determine request success.
     /// Controls http_req_failed metric: 1.0 when status is NOT expected.
     expected_statuses: Vec<ExpectedStatus>,
+    // ── Execution context (k6 exec.* API) ──
+    /// Unique VU identifier.
+    pub vu_id: u32,
+    /// Name of the currently running scenario.
+    pub scenario_name: String,
 }
 
 impl VURunner {
     /// Create a new VU runner with a dedicated HTTP client.
-    pub fn new(scenario: Arc<Scenario>, client: HttpClient) -> Self {
+    pub fn new(scenario: Arc<Scenario>, client: HttpClient, vu_id: u32, scenario_name: String) -> Self {
         // Extract all item names in order for setNextRequest resolution
         let names: Vec<String> = scenario.items.iter().map(|item| item.name.clone()).collect();
         let pm_state = Arc::new(Mutex::new(PmState::new()));
         {
             let mut state = pm_state.lock().unwrap();
             state.set_request_names(names);
+            state.vu_id = vu_id;
+            state.scenario_name = scenario_name.clone();
         }
         Self {
             scenario,
@@ -68,6 +75,8 @@ impl VURunner {
             js_ctx: None,
             // Default: 2xx-3xx = success (matches k6 behavior)
             expected_statuses: vec![ExpectedStatus::Range("200-399".to_string())],
+            vu_id,
+            scenario_name,
         }
     }
 
@@ -106,11 +115,16 @@ impl VURunner {
             ..Default::default()
         };
 
-        // Set iteration data in PM state for pm.iterationData access
+        // Set iteration data and execution context in PM state.
+        // vu_id and scenario_name are already set once in new() and never
+        // change — only iteration_index is updated each iteration.
         {
             let mut state = self.pm_state.lock().unwrap();
             state.set_iteration_data(data_row.clone());
+            state.iteration_index = iteration_index;
         }
+
+        // Walk through the scenario items in order
 
         // Build variable scope for this iteration
         let _scope = self.build_scope(data_row.clone(), env_vars).await;
@@ -144,6 +158,7 @@ impl VURunner {
                     let mut state = self.pm_state.lock().unwrap();
                     state.request = item.request.clone();
                     state.skip_tests = false;
+                    state.current_request_name = item.name.clone();
                 }
 
                 // Run prerequest script
