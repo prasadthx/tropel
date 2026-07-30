@@ -3,17 +3,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use rand::Rng;
+use tokio::sync::broadcast;
 use tropel_collection::{collection_to_scenario, parse_collection_file};
 use tropel_core::config::{ExecutionConfig, JobConfig, OutputConfig, ThinkTimeConfig};
 use tropel_core::scenario::Scenario;
 use tropel_core::{Result, TropelError};
+use tropel_core::types::Sample;
 use tropel_executor::runner::VURunner;
 use tropel_executor::scheduler::VUScheduler;
 use tropel_ext::registry::ExtensionRegistry;
 use tropel_http::client::HttpClient;
 use tropel_metrics::collector::MetricsCollector;
 use tropel_metrics::thresholds::check_abort_on_fail;
-use tropel_report::{create_reporter, Reporter};
+use tropel_report::{create_reporter, Reporter, StreamingStdoutOutput};
 
 /// The engine orchestrates a complete load test job.
 pub struct Engine {
@@ -50,7 +52,34 @@ impl Engine {
         let data_rows = config.iteration_data.clone();
         let test_start = Instant::now();
 
+        // ═══════════════════════════════════════════════════════════
+        // Streaming outputs — live progress during the run
+        // ═══════════════════════════════════════════════════════════
+        // Create a broadcast sample stream. The metrics collector forwards
+        // each sample to all subscribed outputs (best-effort, non-blocking).
+        // Each output consumer subscribes independently via `subscribe()`.
+        // When a consumer lags, it skips missed samples via RecvError::Lagged.
+        //
+        // Broadcast buffer capacity: 10_000 samples. At ~10 samples/req × 10k req/s
+        // this provides ~100ms of burst buffer before oldest samples are evicted.
+        // This is more than adequate for a 2s-interval progress display.
+        // Higher capacity (100_000+) would allocate ~50 MB of pre-allocated buffer.
+        let mut output_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let (sample_tx, _) = broadcast::channel::<Sample>(10_000);
+        metrics.set_sample_sink(Some(sample_tx.clone()));
 
+        // Start streaming output consumers based on config
+        let has_stdout = config.output.reporters.iter().any(|r| r == "stdout");
+        if has_stdout {
+            let rx = sample_tx.subscribe();
+            let handle = StreamingStdoutOutput::spawn(rx);
+            output_handles.push(handle);
+        }
+        // If no streaming outputs are configured, clear the sink
+        // so the broadcast channel can be garbage collected.
+        if output_handles.is_empty() {
+            metrics.set_sample_sink(None);
+        }
 
         // Build the list of scenarios to execute.
         // If config specifies named scenarios, use those; otherwise synthesise a
@@ -378,6 +407,15 @@ impl Engine {
         // Wait for all scenarios to complete
         for handle in scenario_handles {
             handle.await.ok();
+        }
+
+        // Drain remaining streaming output samples and wait for consumer tasks.
+        // The metrics collector is still alive at this point, so the broadcast
+        // channel is still open. Drop the sample sink first to signal outputs
+        // that no more samples will arrive.
+        metrics.set_sample_sink(None);
+        for handle in output_handles {
+            let _ = handle.await;
         }
 
         // Collect and aggregate metrics across all scenarios

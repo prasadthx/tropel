@@ -1,14 +1,17 @@
 //! # tropel-report
 //!
 //! Reporters consuming aggregated metrics: stdout summary, JSON, CSV.
+//! Streaming outputs consuming individual samples during the run.
 
 pub mod stdout;
 pub mod json_reporter;
 pub mod csv_reporter;
+pub mod output;
 
 pub use stdout::*;
 pub use json_reporter::*;
 pub use csv_reporter::*;
+pub use output::*;
 
 use async_trait::async_trait;
 use tropel_core::Result;
@@ -27,6 +30,14 @@ pub fn create_reporter(name: &str) -> Option<Box<dyn Reporter>> {
         "stdout" => Some(Box::new(StdoutReporter)),
         "json" => Some(Box::new(JsonReporter::new(None))),
         "csv" => Some(Box::new(CsvReporter::new(None))),
+        _ => None,
+    }
+}
+
+/// Create a streaming output by name.
+pub fn create_output(name: &str) -> Option<Box<dyn Output>> {
+    match name {
+        "stdout" => Some(Box::new(StreamingStdoutOutput::new())),
         _ => None,
     }
 }

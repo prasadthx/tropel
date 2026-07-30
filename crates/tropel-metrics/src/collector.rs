@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tropel_core::types::{Sample, SampleType};
 
 /// Information about the type of a metric — stored alongside MetricSet so the
@@ -220,8 +220,20 @@ enum MetricsEvent {
 /// `results()` sends a request to the aggregator and waits for the response
 /// via a one-shot channel. This is off the hot path (called ~once per 2s per VU
 /// for threshold checks, and once at test end).
+///
+/// # Streaming outputs
+///
+/// An optional `sample_sink` can be set via `set_sample_sink()`. When configured,
+/// every sample forwarded to the aggregator is also cloned and broadcast to all
+/// subscribed output consumers. The broadcast sender is non-blocking — if the
+/// internal buffer is full, the OLDEST message is evicted (lagging consumers
+/// skip missed samples). This ensures VUs are never blocked by slow outputs.
 pub struct MetricsCollector {
     tx: mpsc::Sender<MetricsEvent>,
+    /// Optional broadcast sender for streaming outputs.
+    /// Cloned samples are sent via `broadcast::Sender::send()` (non-blocking,
+    /// evicts oldest if buffer is full).
+    sample_sink: std::sync::Mutex<Option<broadcast::Sender<Sample>>>,
 }
 
 impl MetricsCollector {
@@ -235,10 +247,45 @@ impl MetricsCollector {
             Aggregator::run(rx).await;
         });
 
-        Self { tx }
+        Self {
+            tx,
+            sample_sink: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Set a broadcast sender for forwarding samples to streaming outputs.
+    ///
+    /// Once set, every sample passed to `record_batch()` or `record()` is also
+    /// cloned and broadcast via `sender.send()` (non-blocking). If the
+    /// broadcast buffer is full, the oldest sample is evicted — lagging
+    /// output consumers will skip ahead via `RecvError::Lagged`.
+    ///
+    /// To stop forwarding, pass `None`.
+    pub fn set_sample_sink(&self, sink: Option<broadcast::Sender<Sample>>) {
+        let mut guard = self.sample_sink.lock().unwrap();
+        *guard = sink;
+    }
+
+    /// Forward a batch of samples to the optional output sink (best-effort).
+    /// Called internally by `record_batch()` before sending to the aggregator.
+    /// Uses `broadcast::Sender::send()` which is non-blocking and never
+    /// stalls the VU hot path.
+    fn forward_to_sink(&self, samples: &[Sample]) {
+        let sink = {
+            let guard = self.sample_sink.lock().unwrap();
+            guard.clone()
+        };
+        if let Some(sink) = sink {
+            for sample in samples {
+                let _ = sink.send(sample.clone());
+            }
+        }
     }
 
     /// Record a batch of samples — bounded backpressure path.
+    ///
+    /// Before sending to the aggregator, samples are also forwarded to the
+    /// optional streaming output sink (best-effort, non-blocking).
     ///
     /// Sends samples into the bounded MPSC channel. If the channel is full,
     /// `send().await` blocks, applying backpressure to the producing VU.
@@ -248,6 +295,9 @@ impl MetricsCollector {
     /// If the aggregator has shut down (channel closed), the send silently
     /// drops the samples — acceptable during test teardown.
     pub async fn record_batch(&self, samples: &[Sample]) {
+        // Forward to streaming output sinks (best-effort, non-blocking)
+        self.forward_to_sink(samples);
+
         let batch: Vec<Sample> = samples.to_vec();
         if self.tx.send(MetricsEvent::Samples(batch)).await.is_err() {
             tracing::trace!("Metrics channel closed, dropping {} samples", samples.len());
@@ -255,7 +305,11 @@ impl MetricsCollector {
     }
 
     /// Record a single sample — bounded backpressure path.
+    /// Also forwards to the streaming output sink if configured.
     pub async fn record(&self, sample: &Sample) {
+        // Forward to streaming output sinks (best-effort, non-blocking)
+        self.forward_to_sink(std::slice::from_ref(sample));
+
         if self
             .tx
             .send(MetricsEvent::Samples(vec![sample.clone()]))
