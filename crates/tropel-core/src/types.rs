@@ -108,19 +108,39 @@ pub enum Body {
     GraphQL { query: String, variables: Option<HashMap<String, serde_json::Value>> },
 }
 
-/// HTTP response.
+/// HTTP response with lazy body decoding.
+///
+/// The body is stored as raw `Vec<u8>`. `body_text()` and `body_json()`
+/// parse on first access — avoiding the cost of `String::from_utf8` and
+/// `serde_json::from_str` on every response when scripts rarely inspect
+/// the body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
     pub status_code: u16,
     pub status_text: String,
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
-    pub body_text: Option<String>,
-    pub body_json: Option<serde_json::Value>,
     pub response_time: Duration,
     pub timings: Option<Timings>,
     pub cookies: Vec<Cookie>,
     pub size: u64,
+}
+
+impl Response {
+    /// Decode the body as UTF-8 text (lazy — parses on each call).
+    pub fn body_text(&self) -> Option<String> {
+        if self.body.is_empty() {
+            None
+        } else {
+            String::from_utf8(self.body.clone()).ok()
+        }
+    }
+
+    /// Parse the body as JSON (lazy — parses on each call).
+    pub fn body_json(&self) -> Option<serde_json::Value> {
+        self.body_text()
+            .and_then(|text| serde_json::from_str(&text).ok())
+    }
 }
 
 /// Request timings.

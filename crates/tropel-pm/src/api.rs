@@ -86,16 +86,16 @@ impl PmApi {
         state.response.as_ref().map(|r| r.status_code)
     }
 
-    /// Get the response body as text.
+    /// Get the response body as text (lazy — decodes on access).
     pub fn response_body(&self) -> Option<String> {
         let state = self.state.lock().unwrap();
-        state.response.as_ref().and_then(|r| r.body_text.clone())
+        state.response.as_ref().and_then(|r| r.body_text())
     }
 
-    /// Get the response body as JSON.
+    /// Get the response body as JSON (lazy — parses on access).
     pub fn response_json(&self) -> Option<Value> {
         let state = self.state.lock().unwrap();
-        state.response.as_ref().and_then(|r| r.body_json.clone())
+        state.response.as_ref().and_then(|r| r.body_json())
     }
 
     /// Get response headers.

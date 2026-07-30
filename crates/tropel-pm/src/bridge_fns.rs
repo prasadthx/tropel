@@ -141,16 +141,9 @@ impl PmBridge {
                 "__tropel_pm_response_body",
                 Func::from(move || -> Option<String> {
                     let st = state_clone.lock().unwrap();
-                    st.response.as_ref().and_then(|r| r.body_text.clone())
+                    st.response.as_ref().and_then(|r| r.body_text())
                 }),
             );
-
-            // __tropel_pm_response_json intentionally omitted: Func::from doesn't
-            // support returning serde_json::Value (which is what pm.response.json()
-            // expects as a parsed object). Returning a JSON string would break
-            // pm.response.json().key access. Users should call:
-            //   JSON.parse(pm.response.text())
-            // until a typed bridge binding is available.
 
             let state_clone = state.clone();
             let _ = globals.set(
@@ -209,10 +202,10 @@ impl PmBridge {
                 Func::from(move || -> Option<String> {
                     let st = state_clone.lock().unwrap();
                     st.response.as_ref().and_then(|r| {
-                        r.body_text.as_ref().and_then(|text| {
+                        r.body_text().and_then(|text| {
                             // Validate that the body is valid JSON before returning
-                            serde_json::from_str::<serde_json::Value>(text).ok()?;
-                            Some(text.clone())
+                            serde_json::from_str::<serde_json::Value>(&text).ok()?;
+                            Some(text)
                         })
                     })
                 }),

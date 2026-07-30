@@ -134,6 +134,11 @@ pub struct HttpConfig {
     pub user_agent: String,
     /// Whether to decompress response bodies.
     pub decompress: bool,
+    /// Whether to discard response bodies entirely (don't store bytes).
+    /// Saves memory and bandwidth at the cost of not being able to inspect
+    /// response content in scripts.
+    #[serde(default)]
+    pub discard_response_bodies: bool,
     /// Max redirects to follow.
     pub max_redirects: u32,
 }
@@ -148,6 +153,7 @@ impl Default for HttpConfig {
             user_agent: "Tropel/0.1.0".to_string(),
             decompress: true,
             max_redirects: 10,
+            discard_response_bodies: false,
         }
     }
 }

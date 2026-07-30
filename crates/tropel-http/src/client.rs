@@ -12,6 +12,9 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone)]
 pub struct HttpClient {
     inner: reqwest::Client,
+    /// When true, response bodies are discarded entirely.
+    /// The body field will be empty, saving memory and bandwidth.
+    discard_bodies: bool,
 }
 
 impl HttpClient {
@@ -46,6 +49,7 @@ impl HttpClient {
 
         Ok(Self {
             inner,
+            discard_bodies: config.discard_response_bodies,
         })
     }
 
@@ -137,25 +141,23 @@ impl HttpClient {
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
 
-        // Read response body
-        let body_bytes = response
-            .bytes()
-            .await
-            .map_err(|e| TropelError::Http(format!("Failed to read response body: {}", e)))?;
-
-        let size = body_bytes.len() as u64;
-        let body_text = String::from_utf8(body_bytes.to_vec()).ok();
-        let body_json = body_text
-            .as_ref()
-            .and_then(|text| serde_json::from_str(text).ok());
+        // Read response body (if not discarded)
+        let body_vec = if self.discard_bodies {
+            Vec::new()
+        } else {
+            response
+                .bytes()
+                .await
+                .map_err(|e| TropelError::Http(format!("Failed to read response body: {}", e)))?
+                .to_vec()
+        };
+        let size = body_vec.len() as u64;
 
         let response = HttpResponse {
             status_code,
             status_text,
             headers,
-            body: body_bytes.to_vec(),
-            body_text,
-            body_json,
+            body: body_vec,
             response_time: duration,
             timings: None,
             cookies: vec![],
@@ -179,15 +181,14 @@ impl HttpClient {
     }
 }
 
-/// HTTP response data (mirrors tropel_core::Response but from reqwest).
+/// HTTP response data (mirrors `tropel_core::Response` but from reqwest).
+/// Body text and JSON are NOT eagerly parsed — see `body_text()` / `body_json()`.
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
     pub status_code: u16,
     pub status_text: String,
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
-    pub body_text: Option<String>,
-    pub body_json: Option<serde_json::Value>,
     pub response_time: Duration,
     pub timings: Option<Timings>,
     pub cookies: Vec<Cookie>,
@@ -201,13 +202,28 @@ impl From<&HttpResponse> for tropel_core::types::Response {
             status_text: resp.status_text.clone(),
             headers: resp.headers.clone(),
             body: resp.body.clone(),
-            body_text: resp.body_text.clone(),
-            body_json: resp.body_json.clone(),
             response_time: resp.response_time,
             timings: resp.timings.clone(),
             cookies: resp.cookies.clone(),
             size: resp.size,
         }
+    }
+}
+
+impl HttpResponse {
+    /// Decode the body as UTF-8 text (lazy — parses on each call).
+    pub fn body_text(&self) -> Option<String> {
+        if self.body.is_empty() {
+            None
+        } else {
+            String::from_utf8(self.body.clone()).ok()
+        }
+    }
+
+    /// Parse the body as JSON (lazy — parses on each call).
+    pub fn body_json(&self) -> Option<serde_json::Value> {
+        self.body_text()
+            .and_then(|text| serde_json::from_str(&text).ok())
     }
 }
 
