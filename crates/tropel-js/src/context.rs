@@ -1,11 +1,56 @@
 use crate::error::*;
 use rquickjs::function::Func;
-use rquickjs::{Context, Runtime};
-use std::sync::Arc;
+use rquickjs::{Context, Function, Persistent, Runtime};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 static NEXT_CTX_ID: AtomicU64 = AtomicU64::new(1);
+
+/// A compiled script function persisted across `ctx.with()` calls.
+///
+/// Wraps `rquickjs::Persistent<Function>` which roots the compiled JS
+/// function in the Runtime so it survives across `Context::with()` calls
+/// without polluting the global namespace.
+///
+/// # Safety
+/// Each `JsContext` owns its own `Runtime`, and a `CachedScript` is only
+/// ever created and restored within that Runtime. Sending the cache as
+/// part of its owning `JsContext` is safe.
+#[derive(Clone)]
+pub struct CachedScript {
+    func: Persistent<Function<'static>>,
+}
+
+// Safety: each JsContext owns its own Runtime. A CachedScript is only
+// used from within that same Runtime, never concurrently from multiple
+// Runtimes.
+unsafe impl Send for CachedScript {}
+unsafe impl Sync for CachedScript {}
+
+impl CachedScript {
+    /// Compile a JS function and persist it.
+    pub fn compile<'js>(ctx: &rquickjs::Ctx<'js>, func: Function<'js>) -> Self {
+        Self {
+            func: Persistent::save(ctx, func),
+        }
+    }
+
+    /// Restore the function and invoke it with no arguments.
+    pub fn invoke<'js>(&self, ctx: &rquickjs::Ctx<'js>) -> Result<()> {
+        let func = self
+            .func
+            .clone()
+            .restore(ctx)
+            .map_err(|e| JsError::Eval(format!("Script restore error: {}", e)))?;
+        func.call::<_, rquickjs::Value>(())
+            .map_err(|e| JsError::Eval(format!("Script error: {}", e)))?;
+        Ok(())
+    }
+}
 
 /// A per-VU JavaScript execution context backed by rquickjs.
 pub struct JsContext {
@@ -16,6 +61,9 @@ pub struct JsContext {
     interrupt_deadline: Arc<AtomicU64>,
     /// Maximum execution time per script eval.
     max_execution_time: Duration,
+    /// Compiled script cache: source-hash → persistent function.
+    /// Avoids re-parsing scripts on every iteration.
+    script_cache: Mutex<HashMap<u64, CachedScript>>,
 }
 
 /// Get the current time as nanoseconds since UNIX epoch.
@@ -76,6 +124,7 @@ impl JsContext {
             context_id,
             interrupt_deadline,
             max_execution_time,
+            script_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -171,6 +220,64 @@ impl JsContext {
     /// Execute a JS script and return whether it completed successfully.
     pub async fn run_script(&self, code: &str) -> Result<bool> {
         self.eval(code).await?;
+        Ok(true)
+    }
+
+    /// Execute a JS script using a cached compiled function.
+    ///
+    /// On first call, the source is wrapped in `(function(){...})`, compiled
+    /// via `ctx.eval()`, and persisted via `Persistent<Function>`. Subsequent
+    /// calls restore the persisted function from the cache and invoke it
+    /// directly — avoiding re-parsing the source on every iteration.
+    ///
+    /// Uses `rquickjs::Persistent<Function>` which roots the compiled
+    /// function in the Runtime (not the global object), so it survives
+    /// across `ctx.with()` calls without namespace pollution.
+    pub async fn run_script_cached(&self, source: &str) -> Result<bool> {
+        self.reset_interrupt();
+        let source = source.to_string();
+
+        let hash = {
+            let mut hasher = DefaultHasher::new();
+            source.hash(&mut hasher);
+            hasher.finish()
+        };
+
+        // Check cache (lock dropped before ctx.with)
+        let cached = {
+            let cache = self.script_cache.lock().unwrap();
+            cache.get(&hash).cloned()
+        };
+
+        if let Some(script) = cached {
+            // Fast path: restore and invoke the persisted function
+            return self.ctx.with(|ctx| {
+                script.invoke(&ctx)?;
+                Ok(true)
+            });
+        }
+
+        // Slow path: compile, persist, cache, invoke
+        let script = self.ctx.with(move |ctx| {
+            let wrapped = format!("(function __tropel_script(){{{source}}})");
+            let func: Function = ctx
+                .eval(wrapped.as_str())
+                .map_err(|e| JsError::Eval(format!("Script compile error: {}", e)))?;
+
+            let script = CachedScript::compile(&ctx, func);
+
+            // Execute now before caching
+            script.invoke(&ctx)?;
+
+            Ok::<_, JsError>(script)
+        })?;
+
+        // Store in cache for future calls
+        {
+            let mut cache = self.script_cache.lock().unwrap();
+            cache.entry(hash).or_insert_with(|| script.clone());
+        }
+
         Ok(true)
     }
 

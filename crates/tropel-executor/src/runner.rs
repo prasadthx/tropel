@@ -256,9 +256,13 @@ impl VURunner {
     }
 
     /// Run a JavaScript script via the tropel-js context.
+    ///
+    /// Uses the cached compilation path: the first call compiles the script
+    /// to a Function and stores it in the JS global object; subsequent calls
+    /// invoke the cached function directly, avoiding re-parsing.
     async fn run_script(&self, code: &str) -> Result<()> {
         if let Some(ctx) = &self.js_ctx {
-            ctx.eval_async(code).await
+            ctx.run_script_cached(code).await
                 .map_err(|e| tropel_core::TropelError::Other(format!("Script error: {}", e)))?;
         } else {
             tracing::trace!("Script execution skipped (no JS context): {} chars", code.len());
