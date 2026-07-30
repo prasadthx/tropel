@@ -24,12 +24,16 @@
 //!    and drains metrics/abort state from the `VuContext`.
 
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use futures::executor::block_on;
 use regex::Regex;
+use rquickjs::function::Func;
 use tropel_core::{Result, TropelError};
-use tropel_core::types::TagMap;
-use tropel_ext::traits::{Driver, DriverInstance, DriverRegistration, VuContext};
+use tropel_core::types::{Body, Method, Request, TagMap};
+use tropel_ext::traits::{Driver, DriverHttpClient, DriverInstance, DriverRegistration, VuContext};
 use tropel_js::JsContext;
 
 // ══════════════════════════════════════════════════════════════════
@@ -115,6 +119,7 @@ impl Driver for K6Driver {
         Ok(Box::new(K6DriverInstance {
             js_ctx,
             _source_path: source_path.map(|p| p.to_path_buf()),
+            http_bridge_registered: false,
         }))
     }
 }
@@ -129,6 +134,10 @@ inventory::submit!(DriverRegistration::new("k6", || Box::new(K6Driver)));
 pub struct K6DriverInstance {
     js_ctx: JsContext,
     _source_path: Option<std::path::PathBuf>,
+    /// Whether the native HTTP bridge (__tropel_k6_http_request) has been
+    /// registered. Registration happens on the first run_iteration() call
+    /// because the HttpClient isn't available until init() completes.
+    http_bridge_registered: bool,
 }
 
 // Safety: each DriverInstance runs on its own VU thread (thread-per-core).
@@ -139,10 +148,20 @@ unsafe impl Sync for K6DriverInstance {}
 #[async_trait]
 impl DriverInstance for K6DriverInstance {
     async fn run_iteration(&mut self, ctx: &mut VuContext) -> Result<()> {
-        // Sync VuContext state into JS globals
+        // Lazy-init: register the native HTTP bridge on the first iteration.
+        // The HttpClient is only available at runtime (from engine), not during
+        // init(). We register a synchronous native function that uses
+        // futures::executor::block_on to call the async HTTP client. Since each
+        // VU runs on its own thread (thread-per-core), blocking the OS thread
+        // only pauses this VU — other VUs on other cores are unaffected.
+        if !self.http_bridge_registered {
+            self.maybe_register_http_bridge(ctx).await;
+        }
+
+        // Sync VuContext state into JS globals (__tropel_vu_id, etc.)
         self.sync_globals(ctx).await?;
 
-        // Call __tropel_iteration()
+        // Call __tropel_iteration() — the user's k6 script entry point
         let iter_start = Instant::now();
 
         match self.js_ctx.eval("__tropel_iteration()").await {
@@ -167,12 +186,86 @@ impl DriverInstance for K6DriverInstance {
 }
 
 impl K6DriverInstance {
+    /// Lazily register the `__tropel_k6_http_request` native function.
+    /// This function wraps the per-VU HttpClient so the k6 shim can
+    /// execute HTTP requests synchronously from JS.
+    async fn maybe_register_http_bridge(&mut self, ctx: &VuContext) {
+        let http_client = match ctx.http_client.clone() {
+            Some(c) => c,
+            None => {
+                tracing::warn!("K6Driver: http_client not available on first iteration — k6 http.* will fail");
+                self.http_bridge_registered = true; // Don't retry
+                return;
+            }
+        };
+
+        self.js_ctx.with_ctx(|rq_ctx| {
+            let globals = rq_ctx.globals();
+            let _ = globals.set(
+                "__tropel_k6_http_request",
+                Func::from(
+                    move |method: String, url: String, headers_json: String, body: String, _timeout_ms: f64| -> String {
+                        let headers: HashMap<String, String> =
+                            serde_json::from_str(&headers_json).unwrap_or_default();
+                        let req_body = if body.is_empty() {
+                            None
+                        } else {
+                            Some(Body::Raw(body))
+                        };
+                        let req = Request {
+                            url,
+                            method: Method::from_str(&method).unwrap_or(Method::GET),
+                            headers,
+                            query_params: HashMap::new(),
+                            body: req_body,
+                            auth: None,
+                            certificate: None,
+                            follow_redirects: true,
+                            timeout: None,
+                        };
+                        match block_on(http_client.execute(&req)) {
+                            Ok(resp) => {
+                                let body_text = String::from_utf8(resp.body).unwrap_or_default();
+                                serde_json::json!({
+                                    "code": resp.status_code,
+                                    "status": resp.status_code,
+                                    "status_text": resp.status_text,
+                                    "body": body_text,
+                                    "headers": resp.headers,
+                                    "response_time": resp.response_time.as_secs_f64() * 1000.0,
+                                }).to_string()
+                            }
+                            Err(e) => {
+                                serde_json::json!({
+                                    "code": 0,
+                                    "status": 0,
+                                    "status_text": format!("HTTP error: {}", e),
+                                    "body": "",
+                                    "headers": {},
+                                    "response_time": 0,
+                                }).to_string()
+                            }
+                        }
+                    },
+                ),
+            );
+        });
+
+        self.http_bridge_registered = true;
+        tracing::debug!("K6Driver: registered __tropel_k6_http_request native bridge");
+    }
+}
+
+impl K6DriverInstance {
     /// Sync VuContext state into JS globals so the script can read
     /// environment variables, data rows, etc.
     async fn sync_globals(&self, ctx: &VuContext) -> Result<()> {
         let _ = self.js_ctx.set_global_str("__tropel_vu_id", &ctx.vu_id.to_string()).await;
         let _ = self.js_ctx.set_global_str("__tropel_iteration_num", &ctx.iteration.to_string()).await;
         let _ = self.js_ctx.set_global_str("__tropel_scenario", &ctx.scenario_name).await;
+        // k6-compatible globals: __VU and __ITER
+        let _ = self.js_ctx.set_global_str("__VU", &ctx.vu_id.to_string()).await;
+        let _ = self.js_ctx.set_global_str("__ITER", &ctx.iteration.to_string()).await;
 
         // Set env vars as JS global
         if !ctx.env.is_empty() {
@@ -259,24 +352,36 @@ fn is_typescript_ext(path: &Path) -> bool {
 /// Bootstrap vendored JS libraries into a fresh context.
 /// Mirrors the engine's `create_vu_js_context()` setup.
 async fn bootstrap_js_libs(ctx: &JsContext) -> Result<()> {
-    let libraries: [(&str, &str); 6] = [
-        ("pm-api", include_str!("../../../../js/pm-api/pm.js")),
+    // Phase 1: Base shim libraries (no native dependencies)
+    let base_libraries: [(&str, &str); 4] = [
         ("chai-shim", include_str!("../../../../js/chai/chai-shim.js")),
         ("lodash-shim", include_str!("../../../../js/lodash/lodash-shim.js")),
         ("cryptojs-shim", include_str!("../../../../js/cryptojs-shim/cryptojs.js")),
         ("exec-shim", include_str!("../../../../js/exec/exec.js")),
-        ("sleep-shim", SLEEP_SHIM),
     ];
 
-    for (name, code) in &libraries {
+    for (name, code) in &base_libraries {
         if let Err(e) = ctx.bootstrap_library(code).await {
             tracing::warn!("Failed to bootstrap JS library '{}': {}", name, e);
         }
     }
 
-    // Install native module functions
+    // Phase 2: Install native module functions (needed by pm-api and k6-shim)
     if let Err(e) = tropel_native::install_all(ctx).await {
         tracing::warn!("Failed to install native modules: {}", e);
+    }
+
+    // Phase 3: Bootstrapping libraries that depend on native functions
+    let native_dependent_libraries: [(&str, &str); 3] = [
+        ("pm-api", include_str!("../../../../js/pm-api/pm.js")),
+        ("sleep-shim", SLEEP_SHIM),
+        ("k6-shim", include_str!("../../../../js/k6-shim/k6-shim.js")),
+    ];
+
+    for (name, code) in &native_dependent_libraries {
+        if let Err(e) = ctx.bootstrap_library(code).await {
+            tracing::warn!("Failed to bootstrap JS library '{}': {}", name, e);
+        }
     }
 
     // Install __tropel_native_sleep (blocks the OS thread, safe under thread-per-core)
@@ -292,7 +397,7 @@ async fn bootstrap_js_libs(ctx: &JsContext) -> Result<()> {
         );
     });
 
-    // Eval the sleep(seconds) wrapper
+    // Eval the sleep(seconds) wrapper (sits behind native_sleep)
     let _ = ctx.eval(SLEEP_SHIM).await;
 
     Ok(())
