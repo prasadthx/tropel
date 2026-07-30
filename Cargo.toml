@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/tropel",
+    "crates/tropel-es",
     "crates/tropel-engine",
     "crates/tropel-core",
     "crates/tropel-collection",
@@ -107,9 +108,14 @@ indexmap = { version = "2", features = ["serde"] }
 # URL parsing
 url = { version = "2", features = ["serde"] }
 
+# Lazy initialization
+once_cell = "1"
+
 # MIME types
 mime = "0.3"
 mime_guess = "2"
+
+
 
 # ── Internal workspace crate paths ────────────────────
 tropel-core = { path = "crates/tropel-core" }
@@ -129,3 +135,4 @@ tropel-input-postman = { path = "crates/inputs/tropel-input-postman" }
 tropel-x-grpc = { path = "crates/extensions/tropel-x-grpc" }
 tropel-x-websocket = { path = "crates/extensions/tropel-x-websocket" }
 tropel-x-prometheus = { path = "crates/extensions/tropel-x-prometheus" }
+tropel-es = { path = "crates/tropel-es" }

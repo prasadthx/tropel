@@ -1383,6 +1383,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
+name = "pathdiff"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2463,6 +2469,7 @@ dependencies = [
  "tracing",
  "tropel-collection",
  "tropel-core",
+ "tropel-es",
  "tropel-executor",
  "tropel-ext",
  "tropel-http",
@@ -2473,6 +2480,19 @@ dependencies = [
  "tropel-pm",
  "tropel-report",
  "tropel-variables",
+]
+
+[[package]]
+name = "tropel-es"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "once_cell",
+ "pathdiff",
+ "regex",
+ "serde_json",
+ "tracing",
+ "tropel-core",
 ]
 
 [[package]]

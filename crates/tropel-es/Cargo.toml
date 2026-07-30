@@ -1,0 +1,17 @@
+[package]
+name = "tropel-es"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "TypeScript transpilation and ES module bundling for Tropel load-test scripts"
+
+[dependencies]
+tropel-core.workspace = true
+regex.workspace = true
+pathdiff = "0.2"
+once_cell.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde_json.workspace = true

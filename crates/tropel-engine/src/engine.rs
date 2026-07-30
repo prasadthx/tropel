@@ -407,15 +407,99 @@ pub struct EngineResult {
 }
 
 /// Parse a scenario input file and return a Scenario.
+///
+/// Supports:
+/// - `.json` files: Postman collections (existing path)
+/// - `.ts` / `.mts` files: TypeScript test scripts (transpiled via SWC, then bundled)
+/// - `.js` / `.mjs` files: JavaScript test scripts (ES module bundled if needed)
+///
 /// The scenario's env is merged at runtime by the caller.
 async fn parse_scenario_input(
     input_path: &str,
     base_env: &std::collections::HashMap<String, String>,
 ) -> Result<Scenario> {
+    let input_p = std::path::Path::new(input_path);
+
+    // TypeScript/JavaScript standalone scripts — transpile + bundle, then
+    // wrap into a single-request scenario so the executor can run them.
+    if let Some(ext) = input_p.extension().and_then(|e| e.to_str()) {
+        let ext_lower = ext.to_lowercase();
+        if matches!(ext_lower.as_str(), "ts" | "mts" | "js" | "mjs") {
+            tracing::info!("Loading script file: {} (transpiling ES modules)", input_path);
+            return transpile_script_to_scenario(input_path, base_env);
+        }
+    }
+
+    // Postman collection JSON — existing path
     let collection = parse_collection_file(input_path)
         .map_err(|e| TropelError::Parse(format!("Failed to parse collection: {}", e)))?;
 
     let scenario = collection_to_scenario(collection, base_env.clone());
+    Ok(scenario)
+}
+
+/// Transpile a TypeScript/JavaScript script file into a single-request Scenario.
+///
+/// The transpiled script wraps all its code into a self-contained test function
+/// executed via the scenario item's test script slot. The executor checks for
+/// both prerequest and test scripts on items — even items without a request.
+///
+/// We create a minimal item with a dummy request placeholder so the executor
+/// processes it, then place the transpiled script as the test script (runs
+/// after the request). The request is a placeholder that gets skipped.
+fn transpile_script_to_scenario(
+    input_path: &str,
+    base_env: &std::collections::HashMap<String, String>,
+) -> Result<Scenario> {
+    let path = std::path::Path::new(input_path);
+
+    // Transpile (TS→JS + ES module bundle)
+    let js_code = tropel_es::transpile_file(path)
+        .map_err(|e| TropelError::Parse(format!("Script transpilation failed: {}", e)))?;
+
+    // Wrap the transpiled code in a self-executing function so it runs
+    // regardless of request execution status.
+    let wrapped_code = format!(
+        "(function() {{\n{}    }})();",
+        js_code.lines()
+            .map(|l| format!("    {}", l))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // Create a minimal item with a dummy request so the executor processes it.
+    // The transpiled script runs as the test script (after the request).
+    // Since the request is a placeholder (no real URL), it will be skipped
+    // in the HTTP execution phase, but the test script WILL be executed.
+    let scenario = Scenario {
+        info: tropel_core::scenario::ScenarioInfo {
+            name: path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("script")
+                .to_string(),
+            description: Some(format!("Transpiled from {}", input_path)),
+            schema: None,
+        },
+        items: vec![tropel_core::scenario::ScenarioItem {
+            id: "transpiled-script-1".to_string(),
+            name: path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("script")
+                .to_string(),
+            // No HTTP request — the script handles its own requests
+            // via pm.sendRequest. The runner now processes items even
+            // without a request (they still execute scripts).
+            request: None,
+            prerequest: None,
+            // The transpiled script runs as a test script
+            test: Some(wrapped_code),
+            assertions: vec![],
+            items: vec![],
+        }],
+        variables: std::collections::HashMap::new(),
+        auth: None,
+    };
+
     Ok(scenario)
 }
 

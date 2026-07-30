@@ -123,8 +123,10 @@ impl VURunner {
 
             let item = &self.scenario.items[current_index];
 
-            // Process leaf items and folders with children
-            if item.items.is_empty() && item.request.is_some() {
+            // Process leaf items: execute the request (if present), then run scripts.
+            // Items without a request (e.g. transpiled TS/ES module scripts) still
+            // execute their prerequest and test scripts.
+            if item.items.is_empty() && (item.request.is_some() || item.prerequest.is_some() || item.test.is_some()) {
                 // Set request info in PM state
                 {
                     let mut state = self.pm_state.lock().unwrap();
@@ -143,126 +145,130 @@ impl VURunner {
                 let data_row_ref = data_row.as_ref();
                 let scope = self.build_scope(data_row_ref.cloned(), env_vars).await;
 
-                // Resolve variables across the entire request
-                let request = item.request.as_ref().unwrap();
-                let resolved_url = resolver.resolve_deep(&request.url, &scope, 5);
+                // Execute HTTP request only if this item has one.
+                // Script-only items (transpiled TS/ES module scripts) don't have
+                // a request — they handle HTTP via pm.sendRequest internally.
+                if let Some(request) = &item.request {
+                    // Resolve variables across the entire request
+                    let resolved_url = resolver.resolve_deep(&request.url, &scope, 5);
 
-                // Resolve headers, query params, body
-                let resolved_headers: HashMap<String, String> = request.headers.iter()
-                    .map(|(k, v)| (k.clone(), resolver.resolve_deep(v, &scope, 5)))
-                    .collect();
-                let resolved_query: HashMap<String, String> = request.query_params.iter()
-                    .map(|(k, v)| (k.clone(), resolver.resolve_deep(v, &scope, 5)))
-                    .collect();
-                let resolved_body = request.body.as_ref().map(|b| resolve_body(b, &resolver, &scope));
+                    // Resolve headers, query params, body
+                    let resolved_headers: HashMap<String, String> = request.headers.iter()
+                        .map(|(k, v)| (k.clone(), resolver.resolve_deep(v, &scope, 5)))
+                        .collect();
+                    let resolved_query: HashMap<String, String> = request.query_params.iter()
+                        .map(|(k, v)| (k.clone(), resolver.resolve_deep(v, &scope, 5)))
+                        .collect();
+                    let resolved_body = request.body.as_ref().map(|b| resolve_body(b, &resolver, &scope));
 
-                // Build the fully resolved request
-                let resolved_req = tropel_core::types::Request {
-                    url: resolved_url.clone(),
-                    method: request.method.clone(),
-                    headers: resolved_headers,
-                    query_params: resolved_query,
-                    body: resolved_body,
-                    auth: request.auth.clone(),
-                    certificate: request.certificate.clone(),
-                    follow_redirects: request.follow_redirects,
-                    timeout: request.timeout,
-                };
+                    // Build the fully resolved request
+                    let resolved_req = tropel_core::types::Request {
+                        url: resolved_url.clone(),
+                        method: request.method.clone(),
+                        headers: resolved_headers,
+                        query_params: resolved_query,
+                        body: resolved_body,
+                        auth: request.auth.clone(),
+                        certificate: request.certificate.clone(),
+                        follow_redirects: request.follow_redirects,
+                        timeout: request.timeout,
+                    };
 
-                // Build auth signer from request auth config, or use the scenario-level auth
-                let auth_signer = resolved_req.auth.as_ref()
-                    .or(self.scenario.auth.as_ref())
-                    .and_then(|auth| build_auth_signer(auth));
+                    // Build auth signer from request auth config, or use the scenario-level auth
+                    let auth_signer = resolved_req.auth.as_ref()
+                        .or(self.scenario.auth.as_ref())
+                        .and_then(|auth| build_auth_signer(auth));
 
-                // Execute the request directly via the per-VU HTTP client
-                tracing::trace!("VU runner: executing request to {}", resolved_req.url);
+                    // Execute the request directly via the per-VU HTTP client
+                    tracing::trace!("VU runner: executing request to {}", resolved_req.url);
 
-                let exec_start = Instant::now();
-                let exec_result = self.client.execute(&resolved_req, auth_signer.as_deref()).await;
-                let duration = exec_start.elapsed();
+                    let exec_start = Instant::now();
+                    let exec_result = self.client.execute(&resolved_req, auth_signer.as_deref()).await;
+                    let duration = exec_start.elapsed();
 
-                tracing::trace!("VU runner: request to {} completed in {:?}", resolved_req.url, duration);
+                    tracing::trace!("VU runner: request to {} completed in {:?}", resolved_req.url, duration);
 
-                match exec_result {
-                    Ok(http_response) => {
-                        // Convert to core Response and store in PM state (by move — no shared slot)
-                        let pm_response = tropel_core::types::Response::from(&http_response);
-                        {
-                            let mut state = self.pm_state.lock().unwrap();
-                            state.response = Some(pm_response);
+                    match exec_result {
+                        Ok(http_response) => {
+                            // Convert to core Response and store in PM state (by move — no shared slot)
+                            let pm_response = tropel_core::types::Response::from(&http_response);
+                            {
+                                let mut state = self.pm_state.lock().unwrap();
+                                state.response = Some(pm_response);
+                            }
+
+                            // Build tags for all request-level metrics
+                            let mut tags = TagMap::with_capacity(5);
+                            tags.insert("url", resolved_req.url.clone());
+                            tags.insert("method", resolved_req.method.to_string());
+                            tags.insert("status_code", http_response.status_code.to_string());
+                            tags.insert("name", resolved_req.url.clone());
+                            tags.insert("group", "http");
+
+                            let now = std::time::SystemTime::now();
+
+                            // http_req_duration (Trend)
+                            result.samples.push(Sample {
+                                metric: "http_req_duration".to_string(),
+                                value: duration.as_micros() as f64,
+                                tags: tags.clone(),
+                                timestamp: now,
+                                sample_type: SampleType::Trend,
+                            });
+
+                            // http_reqs (Counter)
+                            result.samples.push(Sample {
+                                metric: "http_reqs".to_string(),
+                                value: 1.0,
+                                tags: tags.clone(),
+                                timestamp: now,
+                                sample_type: SampleType::Counter,
+                            });
+
+                            // http_req_failed (Rate) — true for status >= 400
+                            result.samples.push(Sample {
+                                metric: "http_req_failed".to_string(),
+                                value: if http_response.status_code >= 400 { 1.0 } else { 0.0 },
+                                tags: tags.clone(),
+                                timestamp: now,
+                                sample_type: SampleType::Rate,
+                            });
+
+                            // data_received (Counter) — response body bytes
+                            result.samples.push(Sample {
+                                metric: "data_received".to_string(),
+                                value: http_response.size as f64,
+                                tags: tags.clone(),
+                                timestamp: now,
+                                sample_type: SampleType::Counter,
+                            });
+
+                            // data_sent (Counter) — request body bytes
+                            result.samples.push(Sample {
+                                metric: "data_sent".to_string(),
+                                value: http_response.request_body_size as f64,
+                                tags,
+                                timestamp: now,
+                                sample_type: SampleType::Counter,
+                            });
                         }
-
-                        // Build tags for all request-level metrics
-                        let mut tags = TagMap::with_capacity(5);
-                        tags.insert("url", resolved_req.url.clone());
-                        tags.insert("method", resolved_req.method.to_string());
-                        tags.insert("status_code", http_response.status_code.to_string());
-                        tags.insert("name", resolved_req.url.clone());
-                        tags.insert("group", "http");
-
-                        let now = std::time::SystemTime::now();
-
-                        // http_req_duration (Trend)
-                        result.samples.push(Sample {
-                            metric: "http_req_duration".to_string(),
-                            value: duration.as_micros() as f64,
-                            tags: tags.clone(),
-                            timestamp: now,
-                            sample_type: SampleType::Trend,
-                        });
-
-                        // http_reqs (Counter)
-                        result.samples.push(Sample {
-                            metric: "http_reqs".to_string(),
-                            value: 1.0,
-                            tags: tags.clone(),
-                            timestamp: now,
-                            sample_type: SampleType::Counter,
-                        });
-
-                        // http_req_failed (Rate) — true for status >= 400
-                        result.samples.push(Sample {
-                            metric: "http_req_failed".to_string(),
-                            value: if http_response.status_code >= 400 { 1.0 } else { 0.0 },
-                            tags: tags.clone(),
-                            timestamp: now,
-                            sample_type: SampleType::Rate,
-                        });
-
-                        // data_received (Counter) — response body bytes
-                        result.samples.push(Sample {
-                            metric: "data_received".to_string(),
-                            value: http_response.size as f64,
-                            tags: tags.clone(),
-                            timestamp: now,
-                            sample_type: SampleType::Counter,
-                        });
-
-                        // data_sent (Counter) — request body bytes
-                        result.samples.push(Sample {
-                            metric: "data_sent".to_string(),
-                            value: http_response.request_body_size as f64,
-                            tags,
-                            timestamp: now,
-                            sample_type: SampleType::Counter,
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!("VU {} request '{}' failed: {}", iteration_index, item.name, e);
-                        let err_tags = TagMap::from_pairs([
-                            ("url", resolved_url),
-                            ("method", request.method.to_string()),
-                            ("name", item.name.clone()),
-                            ("error", e.to_string()),
-                        ]);
-                        let error_sample = tropel_core::types::Sample {
-                            metric: "errors".to_string(),
-                            value: 1.0,
-                            tags: err_tags,
-                            timestamp: std::time::SystemTime::now(),
-                            sample_type: SampleType::Counter,
-                        };
-                        result.samples.push(error_sample);
+                        Err(e) => {
+                            tracing::warn!("VU {} request '{}' failed: {}", iteration_index, item.name, e);
+                            let err_tags = TagMap::from_pairs([
+                                ("url", resolved_url),
+                                ("method", request.method.to_string()),
+                                ("name", item.name.clone()),
+                                ("error", e.to_string()),
+                            ]);
+                            let error_sample = tropel_core::types::Sample {
+                                metric: "errors".to_string(),
+                                value: 1.0,
+                                tags: err_tags,
+                                timestamp: std::time::SystemTime::now(),
+                                sample_type: SampleType::Counter,
+                            };
+                            result.samples.push(error_sample);
+                        }
                     }
                 }
 
