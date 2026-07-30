@@ -20,6 +20,7 @@ members = [
     "crates/inputs/tropel-input-postman",
     "crates/inputs/tropel-input-k6",
     "crates/inputs/tropel-input-har",
+    "crates/inputs/tropel-input-openapi",
     "crates/extensions/tropel-x-grpc",
     "crates/extensions/tropel-x-websocket",
     "crates/extensions/tropel-x-prometheus",
@@ -109,6 +110,9 @@ rustc-hash = "2"
 # IndexMap for preserving insertion order
 indexmap = { version = "2", features = ["serde"] }
 
+# Temp directory for tropel-build
+tempfile = "3"
+
 # URL parsing
 url = { version = "2", features = ["serde"] }
 
@@ -118,6 +122,9 @@ once_cell = "1"
 # MIME types
 mime = "0.3"
 mime_guess = "2"
+
+# CSV parsing for data files
+csv = "1.3"
 
 
 
@@ -139,6 +146,7 @@ tropel-build = { path = "crates/tropel-build" }
 tropel-input-postman = { path = "crates/inputs/tropel-input-postman" }
 tropel-input-k6 = { path = "crates/inputs/tropel-input-k6" }
 tropel-input-har = { path = "crates/inputs/tropel-input-har" }
+tropel-input-openapi = { path = "crates/inputs/tropel-input-openapi" }
 tropel-x-grpc = { path = "crates/extensions/tropel-x-grpc" }
 tropel-x-websocket = { path = "crates/extensions/tropel-x-websocket" }
 tropel-x-prometheus = { path = "crates/extensions/tropel-x-prometheus" }

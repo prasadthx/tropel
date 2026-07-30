@@ -2444,6 +2444,7 @@ dependencies = [
  "anyhow",
  "clap",
  "serde",
+ "tempfile",
  "thiserror",
  "tracing",
  "tropel-core",
@@ -2481,6 +2482,8 @@ name = "tropel-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
+ "csv",
  "rand 0.8.7",
  "rquickjs",
  "serde",
@@ -2488,6 +2491,8 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "tropel-build",
  "tropel-collection",
  "tropel-core",
  "tropel-es",
@@ -2496,6 +2501,7 @@ dependencies = [
  "tropel-http",
  "tropel-input-har",
  "tropel-input-k6",
+ "tropel-input-openapi",
  "tropel-input-postman",
  "tropel-js",
  "tropel-metrics",
@@ -2599,6 +2605,18 @@ dependencies = [
  "tracing",
  "tropel-core",
  "tropel-es",
+ "tropel-ext",
+]
+
+[[package]]
+name = "tropel-input-openapi"
+version = "0.1.0"
+dependencies = [
+ "inventory",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tropel-core",
  "tropel-ext",
 ]
 
