@@ -82,6 +82,9 @@ pub use tropel_core::types::{AuthConfig, Body, Cookie, Method, Request, Response
 // InputAdapter is the stable, primary extension trait — always available.
 pub use tropel_ext::traits::{InputAdapter, InputAdapterRegistration};
 
+// Driver/DriverInstance + VuContext are stable — the imperative input contract.
+pub use tropel_ext::traits::{Driver, DriverInstance, DriverRegistration, VuContext, DriverHttpClient};
+
 // Protocol, Output, and AuthSigner traits are gated behind feature flags.
 // They exist in the backing crate but aren't yet wired into engine dispatch.
 // Enable with `tropel-sdk = { features = ["unstable-protocol"] }` etc.

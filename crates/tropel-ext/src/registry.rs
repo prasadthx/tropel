@@ -10,12 +10,11 @@ pub struct ExtensionRegistry {
     js_modules: HashMap<String, Arc<JsModuleRegistration>>,
     auth_signers: HashMap<String, Arc<AuthSignerRegistration>>,
     input_adapters: HashMap<String, Arc<InputAdapterRegistration>>,
+    drivers: HashMap<String, Arc<DriverRegistration>>,
 }
 
 impl ExtensionRegistry {
     /// Create a new registry and collect all inventory-registered extensions.
-    /// Callers that want a truly empty registry (e.g., for testing) can use
-    /// `ExtensionRegistry::default()`.
     pub fn new() -> Self {
         let mut registry = Self::default();
         registry.collect_inventory();
@@ -47,6 +46,11 @@ impl ExtensionRegistry {
         self.input_adapters.insert(id.to_string(), Arc::new(registration));
     }
 
+    /// Register a driver.
+    pub fn register_driver(&mut self, id: &str, registration: DriverRegistration) {
+        self.drivers.insert(id.to_string(), Arc::new(registration));
+    }
+
     /// Get a protocol by scheme.
     pub fn get_protocol(&self, scheme: &str) -> Option<Box<dyn Protocol>> {
         self.protocols.get(scheme).map(|r| (r.factory)())
@@ -72,6 +76,11 @@ impl ExtensionRegistry {
         self.input_adapters.get(id).map(|r| (r.create)())
     }
 
+    /// Get a driver by ID.
+    pub fn get_driver(&self, id: &str) -> Option<Box<dyn Driver>> {
+        self.drivers.get(id).map(|r| (r.create)())
+    }
+
     /// List all registered protocols.
     pub fn list_protocols(&self) -> Vec<String> {
         self.protocols.keys().cloned().collect()
@@ -87,18 +96,18 @@ impl ExtensionRegistry {
         self.input_adapters.keys().cloned().collect()
     }
 
+    /// List all registered drivers.
+    pub fn list_drivers(&self) -> Vec<String> {
+        self.drivers.keys().cloned().collect()
+    }
+
     /// List all registered JS modules.
     pub fn list_js_modules(&self) -> Vec<String> {
         self.js_modules.keys().cloned().collect()
     }
 
-    /// Collect all inventory-registered input adapters.
-    /// Called once at startup to populate the registry from
-    /// `inventory::submit!` calls throughout the codebase.
-    ///
-    /// Currently handles input adapters. Protocol, output, and other
-    /// extension types follow the same pattern when they implement
-    /// compile-time registration.
+    /// Collect all inventory-registered extensions at startup.
+    /// Populates input adapters and drivers from `inventory::submit!` calls.
     pub fn collect_inventory(&mut self) {
         tracing::debug!("Collecting inventory-registered input adapters");
         for registration in inventory::iter::<InputAdapterRegistration> {
@@ -107,8 +116,18 @@ impl ExtensionRegistry {
                 create: registration.create,
             });
         }
-        let count = self.input_adapters.len();
-        tracing::debug!("Collected {} input adapter(s) from inventory", count);
+        let adapter_count = self.input_adapters.len();
+        tracing::debug!("Collected {} input adapter(s) from inventory", adapter_count);
+
+        tracing::debug!("Collecting inventory-registered drivers");
+        for registration in inventory::iter::<DriverRegistration> {
+            self.register_driver(registration.id, DriverRegistration {
+                id: registration.id,
+                create: registration.create,
+            });
+        }
+        let driver_count = self.drivers.len();
+        tracing::debug!("Collected {} driver(s) from inventory", driver_count);
     }
 
     /// Resolve an input adapter from raw bytes using content detection.
@@ -126,8 +145,25 @@ impl ExtensionRegistry {
     }
 
     /// Resolve an input adapter by explicit format ID (e.g. `--format postman`).
-    /// Returns `None` if no adapter with that ID is registered.
     pub fn resolve_input_by_id(&self, id: &str) -> Option<Box<dyn InputAdapter>> {
         self.input_adapters.get(id).map(|r| (r.create)())
+    }
+
+    /// Resolve a driver from raw bytes using content detection.
+    /// Iterates all registered drivers and returns the first one whose
+    /// `detect()` returns `true`.
+    pub fn resolve_driver(&self, bytes: &[u8]) -> Option<Box<dyn Driver>> {
+        for registration in self.drivers.values() {
+            let driver = (registration.create)();
+            if driver.detect(bytes) {
+                return Some(driver);
+            }
+        }
+        None
+    }
+
+    /// Resolve a driver by explicit ID.
+    pub fn resolve_driver_by_id(&self, id: &str) -> Option<Box<dyn Driver>> {
+        self.drivers.get(id).map(|r| (r.create)())
     }
 }
