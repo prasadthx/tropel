@@ -54,14 +54,25 @@ impl HttpClient {
         })
     }
 
-    /// Execute an HTTP request.
+    /// Execute an HTTP request with sub-timing instrumentation.
+    ///
+    /// Measures three phases of the request lifecycle:
+    /// - **waiting** (TTFB): from `execute()` start to response headers received.
+    ///   Includes DNS, TCP, TLS, sending, and server processing time.
+    /// - **receiving**: from response headers to full body bytes received.
+    /// - **total**: entire `execute()` duration.
+    ///
+    /// Blocked, connecting, tls_handshaking, and sending phases are set to
+    /// `Duration::ZERO` — they require connector-level instrumentation that
+    /// reqwest's stable API does not expose.
+    ///
     /// Returns the response along with the number of bytes sent in the request body.
     pub async fn execute(
         &self,
         request: &Request,
         signer: Option<&dyn AuthSigner>,
     ) -> Result<HttpResponse> {
-        let start = std::time::Instant::now();
+        let total_start = std::time::Instant::now();
 
         // Calculate request body size for data_sent tracking
         let request_body_size: u64 = request.body.as_ref()
@@ -131,13 +142,24 @@ impl HttpClient {
             req_builder
         };
 
-        // Send the request
+        // ═══════════════════════════════════════════════════════
+        // Phase 1: Send request → receive response head (TTFB)
+        // ═══════════════════════════════════════════════════════
+        // `send().await` returns the Response once the status line and
+        // response headers are received. The request body has been sent
+        // by this point (or is being streamed).
+        //
+        // The measured "waiting" time includes everything up to this point:
+        // blocked + DNS + TCP connect + TLS handshake + sending + server
+        // processing. Without connector-level instrumentation we cannot
+        // separate these phases.
+        let waiting_start = std::time::Instant::now();
         let response = req_builder
             .send()
             .await
             .map_err(|e| TropelError::Http(format!("Request failed: {}", e)))?;
+        let waiting_duration = waiting_start.elapsed();
 
-        let duration = start.elapsed();
         let status_code = response.status().as_u16();
         let status_text = response.status().canonical_reason().unwrap_or("Unknown").to_string();
 
@@ -148,7 +170,10 @@ impl HttpClient {
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
 
-        // Read response body (if not discarded)
+        // ═══════════════════════════════════════════════════════
+        // Phase 2: Receive response body
+        // ═══════════════════════════════════════════════════════
+        let receiving_start = std::time::Instant::now();
         let body_vec = if self.discard_bodies {
             Vec::new()
         } else {
@@ -158,15 +183,23 @@ impl HttpClient {
                 .map_err(|e| TropelError::Http(format!("Failed to read response body: {}", e)))?
                 .to_vec()
         };
+        let receiving_duration = receiving_start.elapsed();
         let size = body_vec.len() as u64;
+
+        let total_duration = total_start.elapsed();
+
+        // Build sub-timings.
+        // blocked/dns/connecting/tls_handshaking/sending are ZERO because
+        // reqwest's stable API does not expose connection-level phases.
+        let timings = Timings::from_measured(waiting_duration, receiving_duration, total_duration);
 
         let response = HttpResponse {
             status_code,
             status_text,
             headers,
             body: body_vec,
-            response_time: duration,
-            timings: None,
+            response_time: total_duration,
+            timings: Some(timings),
             cookies: vec![],
             size,
             request_body_size,

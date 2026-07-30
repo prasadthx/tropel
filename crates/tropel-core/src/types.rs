@@ -152,14 +152,76 @@ impl Response {
     }
 }
 
-/// Request timings.
+/// Request sub-timings, matching k6's http_req_* breakdown.
+///
+/// All durations are wall-clock microseconds measured from the start of the
+/// HTTP request (`execute()`). Fields that cannot be measured from reqwest's
+/// public API (blocked, connecting, tls_handshaking, sending) are set to
+/// `Duration::ZERO` and documented as "requires connector instrumentation".
+///
+/// The measurable phases:
+/// - **waiting** (TTFB): request sent until response headers received
+/// - **receiving**: response headers received until full body received
+/// - **total**: full request lifecycle (start until body fully received)
+///
+/// Phases not yet measurable from reqwest alone:
+/// - **blocked**: time spent before connection starts (queue, proxy, etc.)
+/// - **connecting**: TCP handshake
+/// - **tls_handshaking**: TLS handshake
+/// - **sending**: time to transmit the request body
+///
+/// Note: `total >= waiting + receiving`. The difference is the time spent
+/// in blocked/connecting/tls_handshaking/sending phases (plus any overhead).
+/// When connector instrumentation is added, those phases can be filled from
+/// DNS/TCP/TLS timestamps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Timings {
-    pub dns: Option<Duration>,
-    pub tcp: Option<Duration>,
-    pub tls: Option<Duration>,
-    pub first_byte: Option<Duration>,
+    /// Time blocked before connection starts (queue, DNS, proxy negotiation).
+    /// Requires connector-level instrumentation to measure accurately.
+    #[serde(default)]
+    pub blocked: Duration,
+    /// DNS resolution time.
+    /// Requires connector-level instrumentation to measure accurately.
+    #[serde(default)]
+    pub dns: Duration,
+    /// TCP connect time.
+    /// Requires connector-level instrumentation to measure accurately.
+    #[serde(default)]
+    pub connecting: Duration,
+    /// TLS handshake time.
+    /// Requires connector-level instrumentation to measure accurately.
+    #[serde(default)]
+    pub tls_handshaking: Duration,
+    /// Time to send the request body.
+    /// Requires connector-level instrumentation to measure accurately.
+    #[serde(default)]
+    pub sending: Duration,
+    /// Time to first byte (TTFB) — from request start to response head received.
+    #[serde(default)]
+    pub waiting: Duration,
+    /// Time to receive the full response body.
+    #[serde(default)]
+    pub receiving: Duration,
+    /// Total request duration (start to full body received).
     pub total: Duration,
+}
+
+impl Timings {
+    /// Create a new Timings from measured phases.
+    /// blocked/dns/connecting/tls_handshaking/sending default to ZERO
+    /// (requires connector-level instrumentation).
+    pub fn from_measured(waiting: Duration, receiving: Duration, total: Duration) -> Self {
+        Self {
+            blocked: Duration::ZERO,
+            dns: Duration::ZERO,
+            connecting: Duration::ZERO,
+            tls_handshaking: Duration::ZERO,
+            sending: Duration::ZERO,
+            waiting,
+            receiving,
+            total,
+        }
+    }
 }
 
 /// A cookie.

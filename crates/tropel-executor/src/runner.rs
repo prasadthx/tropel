@@ -264,10 +264,39 @@ impl VURunner {
                             result.samples.push(Sample {
                                 metric: "data_sent".to_string(),
                                 value: http_response.request_body_size as f64,
-                                tags,
+                                tags: tags.clone(),
                                 timestamp: now,
                                 sample_type: SampleType::Counter,
                             });
+
+                            // ═══════════════════════════════════════════════
+                            // HTTP sub-timing metrics (Trend, all in μs)
+                            // ═══════════════════════════════════════════════
+                            // These match k6's http_req_* sub-timing metrics.
+                            // blocked/connecting/tls_handshaking/sending are
+                            // ZERO until connector-level instrumentation is
+                            // added to reqwest. waiting (TTFB) and receiving
+                            // are always measured.
+                            if let Some(timings) = &http_response.timings {
+                                let sub_timing_metrics = [
+                                    ("http_req_blocked", timings.blocked),
+                                    ("http_req_connecting", timings.connecting),
+                                    ("http_req_tls_handshaking", timings.tls_handshaking),
+                                    ("http_req_sending", timings.sending),
+                                    ("http_req_waiting", timings.waiting),
+                                    ("http_req_receiving", timings.receiving),
+                                ];
+                                let sub_tags = tags.clone();
+                                for (metric_name, dur) in &sub_timing_metrics {
+                                    result.samples.push(Sample {
+                                        metric: metric_name.to_string(),
+                                        value: dur.as_micros() as f64,
+                                        tags: sub_tags.clone(),
+                                        timestamp: now,
+                                        sample_type: SampleType::Trend,
+                                    });
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::warn!("VU {} request '{}' failed: {}", iteration_index, item.name, e);
