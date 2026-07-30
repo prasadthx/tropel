@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time;
@@ -21,6 +21,9 @@ pub struct VUScheduler {
     arrival_notify: Arc<tokio::sync::Notify>,
     /// Dropped iterations counter for arrival-rate mode.
     arrival_dropped: Arc<AtomicU64>,
+    /// Count of VUs currently idle (waiting for an arrival token), not executing.
+    /// Used by the ticker to decide when to grow the VU pool.
+    idle_vus: Arc<AtomicU32>,
 }
 
 impl VUScheduler {
@@ -35,6 +38,7 @@ impl VUScheduler {
             arrival_tokens: Arc::new(AtomicU64::new(0)),
             arrival_notify: Arc::new(tokio::sync::Notify::new()),
             arrival_dropped: Arc::new(AtomicU64::new(0)),
+            idle_vus: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -66,6 +70,26 @@ impl VUScheduler {
     /// Get the Notify for waking VUs when tokens are added.
     pub fn arrival_notify(&self) -> Arc<tokio::sync::Notify> {
         self.arrival_notify.clone()
+    }
+
+    /// Whether this scheduler is in arrival-rate mode.
+    pub fn is_arrival_rate(&self) -> bool {
+        matches!(self.config, ExecutionConfig::ConstantArrivalRate { .. })
+    }
+
+    /// Mark a VU as idle (waiting for an arrival token).
+    pub fn mark_idle(&self) {
+        self.idle_vus.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Mark a VU as busy (acquired a token, about to execute).
+    pub fn mark_busy(&self) {
+        self.idle_vus.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Current count of idle VUs (waiting for tokens).
+    pub fn idle_vu_count(&self) -> u32 {
+        self.idle_vus.load(Ordering::Relaxed)
     }
 
     /// Get and reset the dropped iterations counter.
@@ -242,39 +266,86 @@ impl VUScheduler {
     }
 
     /// Run with constant arrival rate.
-    /// Uses a VU pool + token-bucket semaphore for rate-independent pacing.
+    ///
+    /// Uses a time-based token bucket (no 1ms timer floor — resilient at high rates)
+    /// and a dynamically growing VU pool (`pre_alloc_vus → max_vus`). VUs are
+    /// spawned on demand when the current pool is saturated.
     async fn run_arrival_rate<F>(&self, rate: f64, pre_alloc: u32, max_vus: u32, duration: Duration, run_vu: &F)
     where
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
-        let interval = Duration::from_secs_f64(1.0 / rate);
-        let max_tokens = max_vus as u64;
-        let dropped = self.arrival_dropped.clone();
-
         tracing::info!(
             "Starting constant arrival rate: {}/s for {:?} (pre_alloc={}, max_vus={})",
             rate, duration, pre_alloc, max_vus
         );
 
-        // Pre-spawn VUs — each runs iterations, consuming a token before each iteration
+        // Pre-spawn initial VU pool
         let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         for vu_id in 0..pre_alloc.max(1) {
             let handle = run_vu(self.shared_clone(), vu_id);
             handles.push(handle);
         }
+        let mut current_vus = pre_alloc.max(1);
+        let max_tokens = max_vus as u64;
+        let dropped = self.arrival_dropped.clone();
 
-        // Ticker loop: add tokens at the configured rate (token bucket)
+        // Time-based token bucket: compute tokens from wall-clock elapsed time.
+        // This avoids the `sleep(1/rate)` timer-floor bug: even at 10k/s the
+        // bucket still refills accurately because we measure elapsed, not ticks.
         let start = time::Instant::now();
-        while start.elapsed() < duration {
-            time::sleep(interval).await;
+        let mut last_target: u64 = 0;
 
-            if self.arrival_tokens.load(Ordering::Relaxed) < max_tokens {
-                self.arrival_tokens.fetch_add(1, Ordering::Relaxed);
-                self.arrival_notify.notify_one();
-            } else {
-                // Pool is saturated — all VUs busy, drop this iteration
-                dropped.fetch_add(1, Ordering::Relaxed);
+        while start.elapsed() < duration {
+            let elapsed_secs = start.elapsed().as_secs_f64();
+            let target_tokens = (elapsed_secs * rate) as u64;
+
+            if target_tokens > last_target {
+                let to_add = target_tokens - last_target;
+                let current = self.arrival_tokens.load(Ordering::Relaxed);
+                let capacity = max_tokens.saturating_sub(current);
+                let actual_add = to_add.min(capacity);
+
+                if actual_add > 0 {
+                    self.arrival_tokens.fetch_add(actual_add, Ordering::Relaxed);
+                    // Wake ALL waiters — multiple VUs may be waiting
+                    self.arrival_notify.notify_waiters();
+
+                    // Grow the VU pool if the current pool is saturated
+                    // (no idle VUs) and we haven't reached max_vus yet.
+                    let idle = self.idle_vus.load(Ordering::Relaxed);
+                    if idle == 0 && current_vus < max_vus {
+                        let grow_cap = (max_vus - current_vus) as u64;
+                        let grow_by = to_add.min(grow_cap) as u32;
+                        if grow_by > 0 {
+                            for vu_id in current_vus..current_vus + grow_by {
+                                let handle = run_vu(self.shared_clone(), vu_id);
+                                handles.push(handle);
+                            }
+                            tracing::debug!(
+                                "Arrival-rate: VU pool {} → {} (rate={}/s)",
+                                current_vus, current_vus + grow_by, rate
+                            );
+                            current_vus += grow_by;
+                        }
+                    }
+                }
+
+                // Dropped iterations: tokens we couldn't add because the bucket
+                // was full (all max_tokens preoccupied — no idle VU to consume).
+                // This means VUs can't keep up with the target rate.
+                let overflow = to_add.saturating_sub(capacity);
+                if overflow > 0 {
+                    dropped.fetch_add(overflow, Ordering::Relaxed);
+                }
             }
+
+            last_target = target_tokens;
+
+            // 1ms tick — NOT 1/rate. This avoids the tokio ~1ms timer floor
+            // that silently under-delivered at high rates. The token bucket
+            // accumulates multiple tokens per tick; accuracy is governed by
+            // wall-clock elapsed, not tick resolution.
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
         self.request_stop();
@@ -298,6 +369,7 @@ impl VUScheduler {
             arrival_tokens: self.arrival_tokens.clone(),
             arrival_notify: self.arrival_notify.clone(),
             arrival_dropped: self.arrival_dropped.clone(),
+            idle_vus: self.idle_vus.clone(),
         })
     }
 }

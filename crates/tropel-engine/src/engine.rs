@@ -143,15 +143,18 @@ impl Engine {
                             };
 
                             // Arrival-rate gate: consume a token before each iteration.
-                            // The ticker adds tokens at the configured rate; if none
-                            // available, the VU waits until one arrives.
-                            // (No-op for non-arriral modes where tokens stay at 0.)
-                            loop {
-                                if sched.try_acquire_arrival_token() {
-                                    break;
+                            // Only applies in arrival-rate mode — VUs in constant/ramping/
+                            // shared-iterations modes skip this gate entirely.
+                            if sched.is_arrival_rate() {
+                                sched.mark_idle();
+                                loop {
+                                    if sched.try_acquire_arrival_token() {
+                                        sched.mark_busy();
+                                        break;
+                                    }
+                                    // No token available — wait for ticker to add one
+                                    sched.arrival_notify().notified().await;
                                 }
-                                // No token available — wait for ticker to add one
-                                sched.arrival_notify().notified().await;
                             }
 
                             tracing::debug!("VU {} running iteration {}", vu_id, iteration_index);
