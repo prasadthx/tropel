@@ -2692,6 +2692,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tropel-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "inventory",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tropel-core",
+ "tropel-ext",
+]
+
+[[package]]
 name = "tropel-variables"
 version = "0.1.0"
 dependencies = [

@@ -14,6 +14,7 @@ members = [
     "crates/tropel-executor",
     "crates/tropel-metrics",
     "crates/tropel-report",
+    "crates/tropel-sdk",
     "crates/tropel-ext",
     "crates/tropel-build",
     "crates/inputs/tropel-input-postman",
@@ -131,6 +132,7 @@ tropel-executor = { path = "crates/tropel-executor" }
 tropel-metrics = { path = "crates/tropel-metrics" }
 tropel-report = { path = "crates/tropel-report" }
 tropel-ext = { path = "crates/tropel-ext" }
+tropel-sdk = { path = "crates/tropel-sdk" }
 tropel-engine = { path = "crates/tropel-engine" }
 tropel-build = { path = "crates/tropel-build" }
 tropel-input-postman = { path = "crates/inputs/tropel-input-postman" }
