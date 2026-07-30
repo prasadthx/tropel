@@ -12,10 +12,18 @@ use tropel_js::JsContext;
 /// Always JSON-encodes the value so the JS shim can JSON.parse() to
 /// restore the correct type. This ensures "123" (string) survives as
 /// the string "123" rather than being parsed as the number 123.
-/// Environment variables (plain HashMap<String, String>) bypass this
-/// and return the raw string; the JS try/catch handles those correctly.
+/// All variable scopes (env, collection, globals) use this same path
+/// for type-safe round-tripping.
 fn variable_value_to_string(val: &Value) -> String {
     serde_json::to_string(val).unwrap_or_default()
+}
+
+/// Convert a plain string to its JSON-encoded form for type-safe JS round-tripping.
+/// `&str` implements `Serialize`, so `serde_json::to_string` produces
+/// `'"123"'` which `JSON.parse()` restores as the string `"123"` — not
+/// the number `123` or boolean `true`.
+fn string_to_json_encoded(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_default()
 }
 
 /// Register all `pm.*` bridge functions as global JS functions in a JsContext.
@@ -81,17 +89,18 @@ impl PmBridge {
             );
 
             // ── Variables ──
-            // Returns Option<String>: strings return the inner value directly,
-            // non-strings (objects, arrays, numbers, booleans) return JSON-encoded.
-            // The JS shim calls JSON.parse() to restore non-string types.
+            // Returns Option<String>: ALL variable scopes return JSON-encoded
+            // strings so the JS shim can `JSON.parse()` to restore the correct
+            // JS type. Without encoding, an env var like "123" would be parsed
+            // as the number 123 instead of the string "123".
             let state_clone = state.clone();
             let _ = globals.set(
                 "__tropel_pm_variables_get",
                 Func::from(move |key: String| -> Option<String> {
                     let st = state_clone.lock().unwrap();
-                    // Environment variables are always plain strings
+                    // Environment variables are HashMap<String, String>
                     if let Some(val) = st.environment.get(&key) {
-                        return Some(val.clone());
+                        return Some(string_to_json_encoded(val));
                     }
                     // Collection and global variables are serde_json::Value
                     if let Some(val) = st.collection_vars.get(&key) {
