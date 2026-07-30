@@ -148,7 +148,8 @@ impl VURunner {
 
                 // Run prerequest script
                 if let Some(script) = &item.prerequest {
-                    if let Err(e) = self.run_script(script).await {
+                    let source_url = Some(format!("{}.prerequest.js", item.name));
+                    if let Err(e) = self.run_script(script, source_url).await {
                         tracing::warn!("VU {} prerequest script error: {}", iteration_index, e);
                     }
                 }
@@ -298,7 +299,8 @@ impl VURunner {
 
                 // Run test script
                 if let Some(script) = &item.test {
-                    if let Err(e) = self.run_script(script).await {
+                    let source_url = Some(format!("{}.test.js", item.name));
+                    if let Err(e) = self.run_script(script, source_url).await {
                         tracing::warn!("VU {} test script error: {}", iteration_index, e);
                     }
                 }
@@ -337,8 +339,12 @@ impl VURunner {
     /// Uses the cached compilation path with async support:
     /// - If the script contains `await` or `Promise`, wraps in an async IIFE
     ///   and pumps the job queue to resolve microtasks.
-    /// - Otherwise, uses the fast cached sync path.
-    async fn run_script(&self, code: &str) -> Result<()> {
+    /// - Otherwise, uses the fast cached sync path with `run_script_cached`.
+    ///
+    /// `source_url` is an identifier shown in error messages and stack traces
+    /// (e.g. `"prerequest.js"` or `"test.js"`). When omitted, errors show
+    /// the raw source without a meaningful label.
+    async fn run_script(&self, code: &str, source_url: Option<String>) -> Result<()> {
         if let Some(ctx) = &self.js_ctx {
             // Check if the script uses async features
             let has_async = code.contains("await") || code.contains("Promise");
@@ -347,7 +353,7 @@ impl VURunner {
                 ctx.run_script_async(code).await
                     .map_err(|e| tropel_core::TropelError::Other(format!("Async script error: {}", e)))?;
             } else {
-                ctx.run_script_cached(code).await
+                ctx.run_script_cached(code, source_url).await
                     .map_err(|e| tropel_core::TropelError::Other(format!("Script error: {}", e)))?;
             }
         } else {

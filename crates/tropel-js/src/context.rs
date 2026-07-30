@@ -16,6 +16,10 @@ static NEXT_CTX_ID: AtomicU64 = AtomicU64::new(1);
 /// function in the Runtime so it survives across `Context::with()` calls
 /// without polluting the global namespace.
 ///
+/// Also stores the original source and wrapper offset so that runtime
+/// errors from the cached function can report adjusted line numbers
+/// pointing back to the user's original source, not the wrapped source.
+///
 /// # Safety
 /// Each `JsContext` owns its own `Runtime`, and a `CachedScript` is only
 /// ever created and restored within that Runtime. Sending the cache as
@@ -23,17 +27,35 @@ static NEXT_CTX_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone)]
 pub struct CachedScript {
     func: Persistent<Function<'static>>,
+    /// Original (unwrapped) source text, kept for error message context.
+    source: Arc<str>,
+    /// Optional identifier used as `//# sourceURL` in stack traces.
+    source_url: Option<String>,
+    /// Number of wrapper lines prepended to user source (e.g. 2 for the
+    /// `function __tropel_script(){` + `//# sourceURL=` lines).
+    wrapper_offset: u32,
 }
 
 impl CachedScript {
-    /// Compile a JS function and persist it.
-    pub fn compile<'js>(ctx: &rquickjs::Ctx<'js>, func: Function<'js>) -> Self {
+    /// Compile a JS function and persist it with source metadata.
+    pub fn compile<'js>(
+        ctx: &rquickjs::Ctx<'js>,
+        func: Function<'js>,
+        source: &str,
+        source_url: Option<String>,
+        wrapper_offset: u32,
+    ) -> Self {
         Self {
             func: Persistent::save(ctx, func),
+            source: Arc::from(source),
+            source_url,
+            wrapper_offset,
         }
     }
 
     /// Restore the function and invoke it with no arguments.
+    /// On error, adjusts line numbers by subtracting the wrapper offset
+    /// and includes the original source in the diagnostic.
     pub fn invoke<'js>(&self, ctx: &rquickjs::Ctx<'js>) -> Result<()> {
         let func = self
             .func
@@ -41,9 +63,152 @@ impl CachedScript {
             .restore(ctx)
             .map_err(|e| JsError::Eval(format!("Script restore error: {}", e)))?;
         func.call::<_, rquickjs::Value>(())
-            .map_err(|e| JsError::Eval(format!("Script error: {}", e)))?;
+            .map_err(|e| {
+                let err_msg = format!("{}", e);
+                let adjusted = adjust_error_lines(
+                    &err_msg,
+                    self.wrapper_offset,
+                    self.source_url.as_deref(),
+                );
+                // Show adjusted error + source excerpt
+                let label = self.source_url.as_deref().unwrap_or("<script>");
+                // Show first N lines of source for context
+                let max_preview_lines = 20usize;
+                let source_lines: Vec<&str> = self.source.lines().collect();
+                let source_preview = if source_lines.len() > max_preview_lines {
+                    format!(
+                        "{}... ({} lines total)",
+                        source_lines[..max_preview_lines].join("\n"),
+                        source_lines.len()
+                    )
+                } else {
+                    self.source.to_string()
+                };
+                JsError::Eval(format!(
+                    "Script error ({}): {}\n--- source ---\n{}\n--------------",
+                    label, adjusted, source_preview
+                ))
+            })?;
         Ok(())
     }
+}
+
+/// Adjust line numbers in a QuickJS error message by subtracting the
+/// wrapper offset. QuickJS reports line numbers relative to the eval'd
+/// source (which includes wrapper lines), but we want to report them
+/// relative to the user's original source.
+///
+/// Handles three patterns:
+/// 1. `<eval>:LINE:COL` — runtime errors in eval'd code
+/// 2. `sourceURL:LINE:COL` — when `//# sourceURL` is used
+/// 3. SyntaxError format: `"(line N, column M)"` — compile-time errors
+fn adjust_error_lines(msg: &str, offset: u32, source_url: Option<&str>) -> String {
+    if offset == 0 {
+        return msg.to_string();
+    }
+
+    // Build all known prefixes that introduce a line number.
+    let mut prefixes: Vec<&str> = vec!["<eval>:"];
+    if let Some(url) = source_url {
+        prefixes.push(url); // e.g. "item_name.js" — followed by ":LINE:COL"
+    }
+
+    let mut out = String::with_capacity(msg.len());
+    let bytes = msg.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let mut handled = false;
+
+        // Pattern 3: SyntaxError format "(line N, column M)"
+        // Only match when preceded by '(' to avoid false positives.
+        if bytes[i] == b'('
+            && i + 7 <= bytes.len()
+            && &bytes[i + 1..i + 6] == b"line "
+        {
+            out.push('(');
+            out.push_str("line ");
+            i += 6;
+
+            let line_start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i > line_start {
+                let line_str =
+                    std::str::from_utf8(&bytes[line_start..i]).unwrap_or("0");
+                if let Ok(line) = line_str.parse::<u32>() {
+                    let adjusted = if line > offset {
+                        line - offset
+                    } else {
+                        1
+                    };
+                    out.push_str(&adjusted.to_string());
+                } else {
+                    out.push_str(line_str);
+                }
+            }
+            handled = true;
+        }
+
+        // Patterns 1 & 2: `<eval>:LINE:COL` and `sourceURL:LINE:COL`
+        if !handled {
+            for prefix in &prefixes {
+                let pb = prefix.as_bytes();
+                if i + pb.len() <= bytes.len() && &bytes[i..i + pb.len()] == pb {
+                    // Found a known prefix — copy it
+                    out.push_str(prefix);
+                    i += pb.len();
+
+                    // Skip optional " (" after sourceURL (stack frame format:
+                    // "item.js (eval at ..., item.js:LINE:COL)")
+                    if i < bytes.len() && bytes[i] == b'(' {
+                        out.push('(');
+                        i += 1;
+                    }
+
+                    // At this point we expect ":LINE" or ":" already consumed
+                    // For "<eval>:" we're at ":" and need to advance past it
+                    // For sourceURL we may be at ":"
+                    if i < bytes.len() && bytes[i] == b':' {
+                        out.push(':');
+                        i += 1;
+                    }
+
+                    // Read line number digits
+                    let line_start = i;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+
+                    if i > line_start {
+                        let line_str = std::str::from_utf8(&bytes[line_start..i])
+                            .unwrap_or("0");
+                        if let Ok(line) = line_str.parse::<u32>() {
+                            let adjusted = if line > offset {
+                                line - offset
+                            } else {
+                                1
+                            };
+                            out.push_str(&adjusted.to_string());
+                        } else {
+                            out.push_str(line_str);
+                        }
+                    }
+
+                    handled = true;
+                    break;
+                }
+            }
+        }
+
+        if !handled {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+
+    out
 }
 
 /// A per-VU JavaScript execution context backed by rquickjs.
@@ -315,15 +480,35 @@ impl JsContext {
 
     /// Execute a JS script using a cached compiled function.
     ///
-    /// On first call, the source is wrapped in `(function(){...})`, compiled
-    /// via `ctx.eval()`, and persisted via `Persistent<Function>`. Subsequent
-    /// calls restore the persisted function from the cache and invoke it
-    /// directly — avoiding re-parsing the source on every iteration.
+    /// On first call, the source is wrapped in:
+    /// ```
+    /// (function __tropel_script(){
+    /// //# sourceURL=<source_url>
+    /// <source>
+    /// })
+    /// ```
+    /// compiled via `ctx.eval()`, and persisted via `Persistent<Function>`.
+    /// Subsequent calls restore the persisted function from the cache and
+    /// invoke it directly — avoiding re-parsing the source on every iteration.
+    ///
+    /// The wrapped source puts user code on its own lines so QuickJS error
+    /// line numbers are shifted by a known offset (2 lines). When reporting
+    /// errors, the offset is subtracted to show the correct location in the
+    /// user's original source. The `//# sourceURL` directive gives stack
+    /// traces a meaningful identifier instead of bare `<eval>`.
     ///
     /// Uses `rquickjs::Persistent<Function>` which roots the compiled
     /// function in the Runtime (not the global object), so it survives
     /// across `ctx.with()` calls without namespace pollution.
-    pub async fn run_script_cached(&self, source: &str) -> Result<bool> {
+    ///
+    /// `source_url` is an optional identifier shown in stack traces (e.g.
+    /// `"prerequest.js"` or `"test.js"`). When set, it's injected as
+    /// `//# sourceURL=<source_url>` in the wrapper and used in error messages.
+    pub async fn run_script_cached(
+        &self,
+        source: &str,
+        source_url: Option<String>,
+    ) -> Result<bool> {
         self.reset_interrupt();
         let source = source.to_string();
 
@@ -332,6 +517,14 @@ impl JsContext {
             source.hash(&mut hasher);
             hasher.finish()
         };
+
+        // Wrapper format — 2 lines before user source:
+        //   Line 1: (function __tropel_script(){
+        //   Line 2: //# sourceURL=...
+        //   Line 3+: user source...
+        //   Last:   })
+        const WRAPPER_OFFSET: u32 = 2;
+        let source_url_str = source_url.as_deref().unwrap_or("script.js");
 
         // Check cache (lock dropped before ctx.with)
         let cached = {
@@ -352,12 +545,28 @@ impl JsContext {
 
         // Slow path: compile, persist, cache, invoke
         let script = self.ctx.with(move |ctx| {
-            let wrapped = format!("(function __tropel_script(){{{source}}})");
+            let wrapped = format!(
+                "(function __tropel_script(){{\n//# sourceURL={}\n{source}\n}})",
+                source_url_str
+            );
             let func: Function = ctx
                 .eval(wrapped.as_str())
-                .map_err(|e| JsError::Eval(format!("Script compile error: {}", e)))?;
+                .map_err(|e| {
+                    let err_msg = format!("{}", e);
+                    let adjusted = adjust_error_lines(&err_msg, WRAPPER_OFFSET, Some(source_url_str));
+                    JsError::Eval(format!(
+                        "Script compile error ({}): {}",
+                        source_url_str, adjusted
+                    ))
+                })?;
 
-            let script = CachedScript::compile(&ctx, func);
+            let script = CachedScript::compile(
+                &ctx,
+                func,
+                &source,
+                Some(source_url_str.to_string()),
+                WRAPPER_OFFSET,
+            );
 
             // Execute now before caching
             script.invoke(&ctx)?;
