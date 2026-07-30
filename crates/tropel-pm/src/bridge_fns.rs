@@ -402,6 +402,55 @@ impl PmBridge {
                 }),
             );
 
+            // ── Group (for nesting groups with group_duration metric) ──
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_group_start",
+                Func::from(move |name: String| {
+                    let mut st = state_clone.lock().unwrap();
+                    st.group_stack.push(name);
+                    // Rebuild the current group path from the stack
+                    st.current_group = if st.group_stack.is_empty() {
+                        None
+                    } else {
+                        Some(st.group_stack.join("::"))
+                    };
+                }),
+            );
+
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_group_end",
+                Func::from(move |name: String, duration_ms: f64| {
+                    let mut st = state_clone.lock().unwrap();
+                    // Pop the matching group from the stack
+                    if st.group_stack.last().map(|n| n == &name).unwrap_or(false) {
+                        st.group_stack.pop();
+                    }
+                    // Rebuild current group path
+                    st.current_group = if st.group_stack.is_empty() {
+                        None
+                    } else {
+                        Some(st.group_stack.join("::"))
+                    };
+
+                    // Emit group_duration sample (Trend) in microseconds
+                    let duration_micros = (duration_ms * 1000.0) as u64;
+                    let mut tags = tropel_core::types::TagMap::new();
+                    tags.insert("group", name.clone());
+                    if let Some(ref path) = st.current_group {
+                        tags.insert("group_path", path.clone());
+                    }
+                    st.samples.push(tropel_core::types::Sample {
+                        metric: "group_duration".to_string(),
+                        value: duration_micros as f64,
+                        tags,
+                        timestamp: std::time::SystemTime::now(),
+                        sample_type: tropel_core::types::SampleType::Trend,
+                    });
+                }),
+            );
+
             // ── Custom Metrics ──
             let state_clone = state.clone();
             let _ = globals.set(

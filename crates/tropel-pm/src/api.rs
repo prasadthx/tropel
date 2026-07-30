@@ -199,6 +199,54 @@ impl PmApi {
         passed
     }
 
+    // ── Group ──
+
+    /// Start a named group (pushes onto the group stack).
+    pub fn group_start(&self, name: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.group_stack.push(name.to_string());
+        state.current_group = Some(state.group_stack.join("::"));
+    }
+
+    /// End a named group (pops from stack, records group_duration).
+    pub fn group_end(&self, name: &str, duration_ms: f64) {
+        let mut state = self.state.lock().unwrap();
+        // Pop the matching group
+        if state.group_stack.last().map(|n| n == name).unwrap_or(false) {
+            state.group_stack.pop();
+        }
+        // Rebuild the current group path
+        state.current_group = if state.group_stack.is_empty() {
+            None
+        } else {
+            Some(state.group_stack.join("::"))
+        };
+
+        // Emit group_duration sample (Trend) in microseconds
+        let duration_micros = (duration_ms * 1000.0) as u64;
+        let mut tags = HashMap::new();
+        tags.insert("group".to_string(), name.to_string());
+        if let Some(ref path) = state.current_group {
+            tags.insert("group_path".to_string(), path.clone());
+        }
+        state.samples.push(tropel_core::types::Sample {
+            metric: "group_duration".to_string(),
+            value: duration_micros as f64,
+            tags: TagMap::from_pairs(tags),
+            timestamp: std::time::SystemTime::now(),
+            sample_type: tropel_core::types::SampleType::Trend,
+        });
+    }
+
+    // ── Check ──
+
+    /// Run a named check (records pass/fail to checks Rate metric).
+    /// Returns true if the check passed.
+    pub fn check(&self, name: &str, passed: bool) -> bool {
+        self.test(&format!("check {}", name), passed);
+        passed
+    }
+
     // ── Sample Emission ──
 
     pub fn emit_metric(&self, metric: &str, value: f64, tags: HashMap<String, String>) {

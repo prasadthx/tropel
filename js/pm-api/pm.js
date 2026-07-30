@@ -432,6 +432,70 @@ pm.metrics = {
     }
 };
 
+// ── group(name, fn) — k6-style grouping ──
+// Wraps a block of code in a named group. Emits group_duration
+// metric (Trend) showing how long the group took to execute.
+// Supports nesting (groups within groups).
+function group(name, fn) {
+    if (typeof __tropel_pm_group_start === 'function') {
+        __tropel_pm_group_start(name);
+        var startTime = Date.now();
+        try {
+            if (typeof fn === 'function') {
+                return fn();
+            }
+        } finally {
+            var duration = Date.now() - startTime;
+            __tropel_pm_group_end(name, duration);
+        }
+    } else {
+        // No native group support — run the function directly
+        if (typeof fn === 'function') {
+            return fn();
+        }
+    }
+}
+
+// ── check(val, conds) — k6-style checks ──
+// Evaluates conditions against a value. Each condition is a named
+// predicate (function) or expected value. Records each as a checks
+// Rate metric (pass/fail). Returns true if ALL checks pass.
+function check(val, conds) {
+    if (!conds || typeof conds !== 'object') {
+        return true;
+    }
+    var allPassed = true;
+    var names = Object.keys(conds);
+    for (var i = 0; i < names.length; i++) {
+        var name = names[i];
+        var condition = conds[name];
+        var passed = false;
+
+        try {
+            if (typeof condition === 'function') {
+                // Predicate function — call with the value
+                passed = !!condition(val);
+            } else {
+                // Direct comparison
+                passed = val === condition;
+            }
+        } catch (e) {
+            // Error during evaluation — count as failed
+            console.error('check error for "' + name + '":', e);
+        }
+
+        // Record the check pass/fail via the existing test bridge
+        if (typeof __tropel_pm_test === 'function') {
+            __tropel_pm_test('check ' + name, passed);
+        }
+
+        if (!passed) {
+            allPassed = false;
+        }
+    }
+    return allPassed;
+}
+
 // ── pm.visualizer ──
 pm.visualizer = {
     set: function (template, data) {

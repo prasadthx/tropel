@@ -35,6 +35,11 @@ pub struct PmState {
     pub iteration_data: Option<HashMap<String, Value>>,
     /// Whether to skip the remaining tests.
     pub skip_tests: bool,
+    /// Group nesting stack — tracks active groups for group_duration metrics.
+    /// Innermost group is at the top (last element).
+    pub group_stack: Vec<String>,
+    /// Current active group path (e.g. "outer::inner") for tagging metrics.
+    pub current_group: Option<String>,
 }
 
 /// Assertion pass/fail counters (like pm.test results).
@@ -61,6 +66,8 @@ impl PmState {
             request_names: Vec::new(),
             iteration_data: None,
             skip_tests: false,
+            group_stack: Vec::new(),
+            current_group: None,
         }
     }
 
