@@ -54,12 +54,18 @@ impl HttpClient {
     }
 
     /// Execute an HTTP request.
+    /// Returns the response along with the number of bytes sent in the request body.
     pub async fn execute(
         &self,
         request: &Request,
         signer: Option<&dyn AuthSigner>,
     ) -> Result<HttpResponse> {
         let start = std::time::Instant::now();
+
+        // Calculate request body size for data_sent tracking
+        let request_body_size: u64 = request.body.as_ref()
+            .map(|b| body_size(b) as u64)
+            .unwrap_or(0);
 
         // Build the reqwest request
         let mut req_builder = match request.method {
@@ -162,6 +168,7 @@ impl HttpClient {
             timings: None,
             cookies: vec![],
             size,
+            request_body_size,
         };
 
         Ok(response)
@@ -193,6 +200,8 @@ pub struct HttpResponse {
     pub timings: Option<Timings>,
     pub cookies: Vec<Cookie>,
     pub size: u64,
+    /// Number of bytes sent in the request body (for data_sent tracking).
+    pub request_body_size: u64,
 }
 
 impl From<&HttpResponse> for tropel_core::types::Response {
@@ -230,6 +239,26 @@ impl HttpResponse {
         }
         let mut body_bytes = self.body.clone();
         simd_json::serde::from_slice(&mut body_bytes).ok()
+    }
+}
+
+/// Calculate the byte size of a request body.
+pub fn body_size(body: &Body) -> usize {
+    match body {
+        Body::Raw(s) => s.len(),
+        Body::Json(val) => serde_json::to_string(val).unwrap_or_default().len(),
+        Body::FormData(map) => {
+            map.iter()
+                .map(|(k, v)| k.len() + v.len() + 1) // key=value
+                .sum::<usize>()
+        }
+        Body::UrlEncoded(map) => {
+            map.iter()
+                .map(|(k, v)| k.len() + v.len() + 1)
+                .sum::<usize>()
+        }
+        Body::Binary(data) => data.len(),
+        Body::GraphQL { query, .. } => query.len() + 50, // approximate JSON wrapper
     }
 }
 

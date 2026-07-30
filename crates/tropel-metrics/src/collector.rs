@@ -286,12 +286,18 @@ impl Aggregator {
         let mut metrics = Vec::new();
         let mut http_reqs: u64 = 0;
         let mut http_req_duration: Option<MetricSummary> = None;
+        let mut http_req_failed_count: f64 = 0.0;
+        let mut http_req_failed_total: f64 = 0.0;
         let mut errors: u64 = 0;
         let mut checks_total: u64 = 0;
         let mut checks_passed: u64 = 0;
         let mut checks_failed: u64 = 0;
         let mut data_received: f64 = 0.0;
         let mut data_sent: f64 = 0.0;
+        let mut iterations: u64 = 0;
+        let mut merged_iter_dur: Option<MetricSet> = None;
+        let mut vus_max: u64 = 0;
+        let mut iteration_duration: Option<MetricSummary> = None;
 
         // Merge all http_req_duration* histograms into one for the headline value
         let mut merged_http_dur: Option<MetricSet> = None;
@@ -340,9 +346,48 @@ impl Aggregator {
                 data_received += set.sum;
             } else if key.metric.starts_with("data_sent") {
                 data_sent += set.sum;
+            } else if key.metric.starts_with("http_req_failed") {
+                http_req_failed_total += set.count;
+                http_req_failed_count += set.sum;
+            } else if key.metric.starts_with("iterations") {
+                iterations += set.count as u64;
+            } else if key.metric.starts_with("iteration_duration") {
+                match &mut merged_iter_dur {
+                    Some(ref mut merged) => {
+                        merged.histogram.merge(&set.histogram);
+                        merged.count += set.count;
+                        merged.sum += set.sum;
+                    }
+                    None => {
+                        merged_iter_dur = Some(set.clone());
+                    }
+                }
+            } else if key.metric.starts_with("vus") {
+                // vus_max tracks the maximum observed value
+                let obs = set.count.max(set.sum) as u64;
+                if obs > vus_max {
+                    vus_max = obs;
+                }
             }
 
             metrics.push(summary);
+        }
+
+        // Build headline iteration_duration from merged histogram
+        if let Some(ref merged) = merged_iter_dur {
+            let stats = merged.histogram.stats();
+            iteration_duration = Some(MetricSummary {
+                key: "iteration_duration".to_string(),
+                count: merged.count as u64,
+                sum: merged.sum,
+                mean: merged.mean(),
+                min: stats.min,
+                max: stats.max,
+                p50: stats.p50,
+                p90: stats.p90,
+                p95: stats.p95,
+                p99: stats.p99,
+            });
         }
 
         // Build headline http_req_duration from merged histogram
@@ -383,10 +428,14 @@ impl Aggregator {
             checks_failed,
             http_reqs,
             http_req_duration,
+            iteration_duration,
             data_received,
             data_sent,
             errors,
-            ..Default::default()
+            dropped_iterations: self.totals.get("dropped_iterations").copied().unwrap_or(0.0) as u64,
+            http_req_failed: if http_req_failed_total > 0.0 { http_req_failed_count / http_req_failed_total } else { 0.0 },
+            iterations,
+            vus_max,
         }
     }
 }
@@ -421,6 +470,12 @@ pub struct MetricsResult {
     pub errors: u64,
     /// Iterations dropped because the VU pool was saturated (arrival-rate mode).
     pub dropped_iterations: u64,
+    /// HTTP request failure rate (0.0 - 1.0).
+    pub http_req_failed: f64,
+    /// Total iterations completed.
+    pub iterations: u64,
+    /// Maximum concurrent VUs observed.
+    pub vus_max: u64,
 }
 
 impl Default for MetricsResult {
@@ -437,6 +492,9 @@ impl Default for MetricsResult {
             data_sent: 0.0,
             errors: 0,
             dropped_iterations: 0,
+            http_req_failed: 0.0,
+            iterations: 0,
+            vus_max: 0,
         }
     }
 }

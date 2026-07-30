@@ -48,7 +48,11 @@ impl Engine {
         let http_config = config.http.clone();
         let thresholds = config.thresholds.clone();
         let data_rows = config.iteration_data.clone();
-        let test_start = Instant::now();        // Build the list of scenarios to execute.
+        let test_start = Instant::now();
+
+
+
+        // Build the list of scenarios to execute.
         // If config specifies named scenarios, use those; otherwise synthesise a
         // single anonymous scenario from the top-level execution config.
         let scenario_configs: Vec<(String, ExecutionConfig, HashMap<String, String>, Duration, String)> =
@@ -75,8 +79,12 @@ impl Engine {
 
         let mut scenario_handles = Vec::new();
 
-        for (scenario_name, exec_cfg, sc_env, start_delay, input_path) in scenario_configs {
+        for (scenario_name, exec_cfg, sc_env, start_delay, input_path) in &scenario_configs {
             let sc_name = scenario_name.clone();
+            let exec_cfg = exec_cfg.clone();
+            let sc_env = sc_env.clone();
+            let input_path = input_path.clone();
+            let start_delay = *start_delay;
             let metrics = metrics.clone();
             let pool = pool.clone();
             let http_cfg = http_config.clone();
@@ -178,6 +186,8 @@ impl Engine {
                         }
 
                         let mut iteration_index = 0u64;
+                        // Periodic VU gauge sampling: every N iterations, emit vus/vus_max
+                        let mut vu_sample_counter: u64 = 0;
 
                         loop {
                             if sched.is_force_stop_requested() || sched.is_stop_requested() {
@@ -192,6 +202,30 @@ impl Engine {
                                 if sched.should_ramp_down(active).await {
                                     break;
                                 }
+                            }
+
+                            // Emit vus gauge sample periodically (every ~100 iterations)
+                            vu_sample_counter += 1;
+                            if vu_sample_counter % 100 == 0 {
+                                let active = sched.active_vus().await;
+                                let now = std::time::SystemTime::now();
+                                let vus_tags = tropel_core::types::TagMap::new();
+                                metrics.record_batch(&[
+                                    tropel_core::types::Sample {
+                                        metric: "vus".to_string(),
+                                        value: active as f64,
+                                        tags: vus_tags.clone(),
+                                        timestamp: now,
+                                        sample_type: tropel_core::types::SampleType::Point,
+                                    },
+                                    tropel_core::types::Sample {
+                                        metric: "vus_max".to_string(),
+                                        value: active as f64,
+                                        tags: vus_tags,
+                                        timestamp: now,
+                                        sample_type: tropel_core::types::SampleType::Point,
+                                    },
+                                ]).await;
                             }
 
                             let iter_start = Instant::now();
@@ -217,10 +251,35 @@ impl Engine {
                                         }
                                     }
 
+                                    let iter_start_time = Instant::now();
                                     let iter_result = runner.run_iteration(iteration_index, data_row, &vu_env).await;
+                                    let iter_dur = iter_start_time.elapsed();
 
-                                    if !iter_result.samples.is_empty() {
-                                        metrics.record_batch(&iter_result.samples).await;
+                                    // Emit iteration metrics
+                                    {
+                                        let mut iter_samples = iter_result.samples;
+                                        let now = std::time::SystemTime::now();
+                                        let empty_tags = tropel_core::types::TagMap::new();
+
+                                        // iterations (Counter)
+                                        iter_samples.push(tropel_core::types::Sample {
+                                            metric: "iterations".to_string(),
+                                            value: 1.0,
+                                            tags: empty_tags.clone(),
+                                            timestamp: now,
+                                            sample_type: tropel_core::types::SampleType::Counter,
+                                        });
+
+                                        // iteration_duration (Trend) in microseconds
+                                        iter_samples.push(tropel_core::types::Sample {
+                                            metric: "iteration_duration".to_string(),
+                                            value: iter_dur.as_micros() as f64,
+                                            tags: empty_tags,
+                                            timestamp: now,
+                                            sample_type: tropel_core::types::SampleType::Trend,
+                                        });
+
+                                        metrics.record_batch(&iter_samples).await;
                                     }
 
                                     if has_abort_thresholds {
@@ -262,6 +321,20 @@ impl Engine {
                     handle
                 }).await.ok();
 
+                // Record dropped iterations from this scenario's scheduler as a counter metric
+                {
+                    let dropped = executor.take_dropped_iterations();
+                    if dropped > 0 {
+                        metrics.record(&tropel_core::types::Sample {
+                            metric: "dropped_iterations".to_string(),
+                            value: dropped as f64,
+                            tags: tropel_core::types::TagMap::new(),
+                            timestamp: std::time::SystemTime::now(),
+                            sample_type: tropel_core::types::SampleType::Counter,
+                        }).await;
+                    }
+                }
+
                 // Wait for active VUs in this scenario to reach zero
                 loop {
                     let active = executor.active_vus().await;
@@ -283,6 +356,8 @@ impl Engine {
         }
 
         // Collect and aggregate metrics across all scenarios
+        // dropped_iterations is populated via counter metric samples
+        // recorded by each scenario's spawn after executor.run().
         let results = metrics.results().await;
 
         // Report results

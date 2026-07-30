@@ -17,10 +17,18 @@ impl Reporter for StdoutReporter {
         println!("║          Tropel Load Test Summary               ║");
         println!("╚══════════════════════════════════════════════════╝\n");
 
+        // Execution overview
+        println!("  Execution:");
+        println!("    Iterations:     {}", result.iterations);
+        println!("    Max VUs:        {}", result.vus_max);
+        println!("    Dropped:        {}", result.dropped_iterations);
+
         // HTTP requests
-        println!("  HTTP requests:");
+        println!("\n  HTTP requests:");
         println!("    Total:     {}", result.http_reqs);
-        println!("    Failed:    {}", result.errors);
+        println!("    Failed:    {} ({:.1}%)",
+            (result.http_req_failed * result.http_reqs as f64) as u64,
+            result.http_req_failed * 100.0);
         println!("    Data received: {:.2} MB", result.data_received / 1_000_000.0);
         println!("    Data sent:     {:.2} MB", result.data_sent / 1_000_000.0);
 
@@ -33,6 +41,14 @@ impl Reporter for StdoutReporter {
             println!("    p90:    {}ms", duration.p90 / 1000);
             println!("    p95:    {}ms", duration.p95 / 1000);
             println!("    p99:    {}ms", duration.p99 / 1000);
+        }
+
+        // Iteration duration
+        if let Some(dur) = &result.iteration_duration {
+            println!("\n  Iteration duration:");
+            println!("    avg:    {:.2}ms", dur.mean / 1000.0);
+            println!("    min:    {}μs", dur.min);
+            println!("    max:    {}ms", dur.max / 1000);
         }
 
         // Checks/assertions
@@ -49,7 +65,7 @@ impl Reporter for StdoutReporter {
         if !result.metrics.is_empty() {
             println!("\n  All metrics:");
             for metric in &result.metrics {
-                if metric.key.starts_with("http_req_duration") || metric.key.starts_with("http_reqs") || metric.key.starts_with("checks") {
+                if metric.key.starts_with("http_req_duration") || metric.key.starts_with("http_reqs") || metric.key.starts_with("checks") || metric.key.starts_with("iteration_duration") || metric.key.starts_with("iterations") || metric.key.starts_with("http_req_failed") || metric.key.starts_with("data_") {
                     continue; // Already shown above
                 }
                 println!("    {}:", metric.key);

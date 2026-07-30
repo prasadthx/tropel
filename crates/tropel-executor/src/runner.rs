@@ -192,7 +192,7 @@ impl VURunner {
                             state.response = Some(pm_response);
                         }
 
-                        // Build duration sample with interned tags
+                        // Build tags for all request-level metrics
                         let mut tags = TagMap::with_capacity(5);
                         tags.insert("url", resolved_req.url.clone());
                         tags.insert("method", resolved_req.method.to_string());
@@ -200,24 +200,52 @@ impl VURunner {
                         tags.insert("name", resolved_req.url.clone());
                         tags.insert("group", "http");
 
-                        let duration_sample = Sample {
+                        let now = std::time::SystemTime::now();
+
+                        // http_req_duration (Trend)
+                        result.samples.push(Sample {
                             metric: "http_req_duration".to_string(),
                             value: duration.as_micros() as f64,
                             tags: tags.clone(),
-                            timestamp: std::time::SystemTime::now(),
+                            timestamp: now,
                             sample_type: SampleType::Trend,
-                        };
-                        result.samples.push(duration_sample);
+                        });
 
-                        // Also emit a counter (reuses interned tag map — cheap clone)
-                        let count_sample = Sample {
+                        // http_reqs (Counter)
+                        result.samples.push(Sample {
                             metric: "http_reqs".to_string(),
                             value: 1.0,
-                            tags,
-                            timestamp: std::time::SystemTime::now(),
+                            tags: tags.clone(),
+                            timestamp: now,
                             sample_type: SampleType::Counter,
-                        };
-                        result.samples.push(count_sample);
+                        });
+
+                        // http_req_failed (Rate) — true for status >= 400
+                        result.samples.push(Sample {
+                            metric: "http_req_failed".to_string(),
+                            value: if http_response.status_code >= 400 { 1.0 } else { 0.0 },
+                            tags: tags.clone(),
+                            timestamp: now,
+                            sample_type: SampleType::Rate,
+                        });
+
+                        // data_received (Counter) — response body bytes
+                        result.samples.push(Sample {
+                            metric: "data_received".to_string(),
+                            value: http_response.size as f64,
+                            tags: tags.clone(),
+                            timestamp: now,
+                            sample_type: SampleType::Counter,
+                        });
+
+                        // data_sent (Counter) — request body bytes
+                        result.samples.push(Sample {
+                            metric: "data_sent".to_string(),
+                            value: http_response.request_body_size as f64,
+                            tags,
+                            timestamp: now,
+                            sample_type: SampleType::Counter,
+                        });
                     }
                     Err(e) => {
                         tracing::warn!("VU {} request '{}' failed: {}", iteration_index, item.name, e);
