@@ -208,6 +208,8 @@ async fn run(cli: Cli) -> Result<()> {
                 stages: stages_list,
                 start_vus,
                 graceful_ramp_down: Some("30s".to_string()),
+                graceful_stop: Some("30s".to_string()),
+                think_time: ThinkTimeConfig::default(),
             }
         }
         "shared-iterations" => {
@@ -215,6 +217,8 @@ async fn run(cli: Cli) -> Result<()> {
                 iterations: iterations.unwrap_or(100),
                 max_duration: duration.clone(),
                 vus: vus.unwrap_or(1),
+                graceful_stop: Some("30s".to_string()),
+                think_time: ThinkTimeConfig::default(),
             }
         }
         "arrival-rate" | "constant-arrival-rate" => {
@@ -224,6 +228,8 @@ async fn run(cli: Cli) -> Result<()> {
                 duration: duration.clone().unwrap_or_else(|| "30s".to_string()),
                 pre_alloc_vus: 1,
                 max_vus: vus.unwrap_or(10).max(10),
+                graceful_stop: Some("30s".to_string()),
+                think_time: ThinkTimeConfig::default(),
             }
         }
         _ => {
@@ -231,6 +237,8 @@ async fn run(cli: Cli) -> Result<()> {
             ExecutionConfig::ConstantVus {
                 vus: vus.unwrap_or(1),
                 duration: duration.clone().unwrap_or_else(|| "30s".to_string()),
+                graceful_stop: Some("30s".to_string()),
+                think_time: ThinkTimeConfig::default(),
             }
         }
     };

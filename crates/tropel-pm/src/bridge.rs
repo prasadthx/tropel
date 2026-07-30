@@ -22,6 +22,9 @@ pub struct PmState {
     pub assertions: AssertionCounters,
     /// Custom metrics/values set by scripts.
     pub custom: HashMap<String, Value>,
+    /// Custom metrics counter values (tracked by name for pm.metrics API).
+    /// Scripts can create and query custom Counter/Gauge/Trend/Rate metrics.
+    pub custom_metrics: HashMap<String, f64>,
     /// Samples emitted by this VU.
     pub samples: Vec<Sample>,
     /// Flow control: next request index to jump to.
@@ -52,6 +55,7 @@ impl PmState {
             request: None,
             assertions: AssertionCounters::default(),
             custom: HashMap::new(),
+            custom_metrics: HashMap::new(),
             samples: Vec::new(),
             next_request: None,
             request_names: Vec::new(),

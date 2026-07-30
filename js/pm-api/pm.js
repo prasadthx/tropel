@@ -315,6 +315,41 @@ pm.info = {
     requestId: ''
 };
 
+// ── pm.metrics (custom metrics) ──
+pm.metrics = {
+    // Add a value to a custom metric (creates it if it doesn't exist).
+    // Metric types: 'counter', 'gauge', 'rate', 'trend' (default: 'trend')
+    add: function (name, value, metricType) {
+        if (typeof __tropel_pm_metrics_add === 'function') {
+            var type = metricType || 'trend';
+            __tropel_pm_metrics_add(name, Number(value), type);
+        }
+    },
+    // Get the current value of a custom metric.
+    get: function (name) {
+        if (typeof __tropel_pm_metrics_get === 'function') {
+            return __tropel_pm_metrics_get(name);
+        }
+        return null;
+    },
+    // Convenience: add a counter value (always increments by the value).
+    counter: function (name, value) {
+        pm.metrics.add(name, value, 'counter');
+    },
+    // Convenience: set a gauge value (records the current value).
+    gauge: function (name, value) {
+        pm.metrics.add(name, value, 'gauge');
+    },
+    // Convenience: add a rate event (value = 1.0 for success, 0.0 for failure).
+    rate: function (name, value) {
+        pm.metrics.add(name, value, 'rate');
+    },
+    // Convenience: add a trend sample (records the value for percentile analysis).
+    trend: function (name, value) {
+        pm.metrics.add(name, value, 'trend');
+    }
+};
+
 // ── pm.visualizer ──
 pm.visualizer = {
     set: function (template, data) {

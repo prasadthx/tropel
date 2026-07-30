@@ -7,6 +7,24 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tropel_core::types::{Sample, SampleType};
 
+/// Information about the type of a metric — stored alongside MetricSet so the
+/// aggregator can report type-appropriate summary statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricType {
+    /// Counter — monotonically increasing total (e.g. http_reqs, data_received).
+    /// Aggregation: sum only.
+    Counter,
+    /// Gauge — point-in-time value (e.g. vus, http_req_duration for a single req).
+    /// Aggregation: track last, min, max, avg.
+    Gauge,
+    /// Rate — ratio over time (e.g. http_req_failed, checks).
+    /// Aggregation: count = events, sum = sum of values; rate = sum/count.
+    Rate,
+    /// Trend — distribution of values (e.g. http_req_duration, iteration_duration).
+    /// Aggregation: full HdrHistogram with percentiles.
+    Trend,
+}
+
 /// Maximum pending samples in the bounded MPSC channel before backpressure applies.
 /// At ~10 samples/request × 10k req/s, this provides a ~1s burst buffer.
 /// If the aggregator falls behind, VUs will block on send() instead of
@@ -74,43 +92,96 @@ impl PartialEq for MetricKey {
     }
 }
 
-/// Aggregated metrics for a tag set.
+/// Aggregated metrics for a tag set, with type-aware aggregation.
+///
+/// Each `MetricSet` stores its type from the first sample recorded.
+/// Subsequent samples for the same key use the same aggregation strategy.
+///
+/// Aggregation strategies by type:
+/// - **Counter**: `count` = events, `sum` = total value
+/// - **Rate**: `count` = denominator (events), `sum` = numerator (sum of values)
+/// - **Gauge**: `min`/`max`/`last`/`count`(samples)/`sum`(for avg)
+/// - **Trend**: full HdrHistogram + `count`(samples) + `sum`(for avg)
 #[derive(Debug, Clone)]
 pub struct MetricSet {
-    /// Latency histogram (for trend metrics).
+    /// The type of this metric, set from the first sample recorded.
+    pub metric_type: MetricType,
+    /// Latency histogram (for Trend metrics only).
     pub histogram: LatencyHistogram,
-    /// Counter for rate/counter metrics.
+    /// For Counter/Rate: event count; for Gauge/Trend: sample count.
     pub count: f64,
-    /// Sum of values (for mean calculation).
+    /// Sum of values (for mean calculation or rate numerator).
     pub sum: f64,
+    /// Minimum value observed (Gauge only).
+    pub min: f64,
+    /// Maximum value observed (Gauge only).
+    pub max: f64,
+    /// Most recent value (Gauge only).
+    pub last: f64,
 }
 
 impl MetricSet {
-    fn new() -> Self {
+    fn new(metric_type: MetricType) -> Self {
         Self {
+            metric_type,
             histogram: LatencyHistogram::new(),
             count: 0.0,
             sum: 0.0,
+            min: f64::MAX,
+            max: f64::MIN,
+            last: 0.0,
         }
     }
 
     fn record(&mut self, value: f64, sample_type: &SampleType) {
-        match sample_type {
-            SampleType::Trend | SampleType::Point => {
+        // Derive MetricType from SampleType for the record action
+        let action_type = match sample_type {
+            SampleType::Counter => MetricType::Counter,
+            SampleType::Point => MetricType::Gauge,
+            SampleType::Rate => MetricType::Rate,
+            SampleType::Trend => MetricType::Trend,
+        };
+
+        match action_type {
+            MetricType::Counter => {
+                // Counter: count events, track total sum
+                self.count += 1.0;
+                self.sum += value;
+            }
+            MetricType::Rate => {
+                // Rate: count = denominator (events), sum = numerator (values)
+                self.count += 1.0;
+                self.sum += value;
+            }
+            MetricType::Gauge => {
+                // Gauge: track min, max, last, count, sum (for avg)
+                self.count += 1.0;
+                self.sum += value;
+                if value < self.min { self.min = value; }
+                if value > self.max { self.max = value; }
+                self.last = value;
+            }
+            MetricType::Trend => {
+                // Trend: histogram distribution
                 if value > 0.0 {
                     self.histogram.record_micros(value as u64);
                 }
                 self.count += 1.0;
                 self.sum += value;
             }
-            SampleType::Counter | SampleType::Rate => {
-                self.count += value;
-                self.sum += value;
-            }
         }
     }
 
     fn mean(&self) -> f64 {
+        if self.count > 0.0 {
+            self.sum / self.count
+        } else {
+            0.0
+        }
+    }
+
+    /// Get the rate (sum/count) — only meaningful for Rate type.
+    fn rate(&self) -> f64 {
         if self.count > 0.0 {
             self.sum / self.count
         } else {
@@ -271,10 +342,19 @@ impl Aggregator {
     fn record(&mut self, sample: Sample) {
         let key = MetricKey::new(&sample.metric, &sample.tags);
 
+        // Derive MetricType from the sample's SampleType
+        let metric_type = match sample.sample_type {
+            SampleType::Counter => MetricType::Counter,
+            SampleType::Point => MetricType::Gauge,
+            SampleType::Rate => MetricType::Rate,
+            SampleType::Trend => MetricType::Trend,
+        };
+
+        // Use the type from the first sample for this key
         let metric_set = self
             .data
             .entry(key)
-            .or_insert_with(MetricSet::new);
+            .or_insert_with(|| MetricSet::new(metric_type));
         metric_set.record(sample.value, &sample.sample_type);
 
         // Update totals
@@ -304,18 +384,72 @@ impl Aggregator {
 
         for (key, set) in self.data.iter() {
             let key_str = key.to_key_string();
-            let stats = set.histogram.stats();
-            let summary = MetricSummary {
-                key: key_str,
-                count: set.count as u64,
-                sum: set.sum,
-                mean: set.mean(),
-                min: stats.min,
-                max: stats.max,
-                p50: stats.p50,
-                p90: stats.p90,
-                p95: stats.p95,
-                p99: stats.p99,
+
+            // Build type-appropriate summary
+            let summary = match set.metric_type {
+                MetricType::Counter => MetricSummary {
+                    key: key_str,
+                    metric_type: MetricType::Counter,
+                    count: set.count as u64,
+                    sum: set.sum,
+                    mean: set.mean(),
+                    min: 0,
+                    max: 0,
+                    p50: 0,
+                    p90: 0,
+                    p95: 0,
+                    p99: 0,
+                    last: 0.0,
+                    rate: 0.0,
+                },
+                MetricType::Rate => MetricSummary {
+                    key: key_str,
+                    metric_type: MetricType::Rate,
+                    count: set.count as u64,
+                    sum: set.sum,
+                    mean: set.mean(),
+                    min: 0,
+                    max: 0,
+                    p50: 0,
+                    p90: 0,
+                    p95: 0,
+                    p99: 0,
+                    last: 0.0,
+                    rate: set.rate(),
+                },
+                MetricType::Gauge => MetricSummary {
+                    key: key_str,
+                    metric_type: MetricType::Gauge,
+                    count: set.count as u64,
+                    sum: set.sum,
+                    mean: set.mean(),
+                    min: if set.min == f64::MAX { 0 } else { set.min as u64 },
+                    max: if set.max == f64::MIN { 0 } else { set.max as u64 },
+                    p50: 0,
+                    p90: 0,
+                    p95: 0,
+                    p99: 0,
+                    last: set.last,
+                    rate: 0.0,
+                },
+                MetricType::Trend => {
+                    let stats = set.histogram.stats();
+                    MetricSummary {
+                        key: key_str,
+                        metric_type: MetricType::Trend,
+                        count: set.count as u64,
+                        sum: set.sum,
+                        mean: set.mean(),
+                        min: stats.min,
+                        max: stats.max,
+                        p50: stats.p50,
+                        p90: stats.p90,
+                        p95: stats.p95,
+                        p99: stats.p99,
+                        last: 0.0,
+                        rate: 0.0,
+                    }
+                }
             };
 
             // Derive headline values from the metric key prefix
@@ -363,10 +497,18 @@ impl Aggregator {
                     }
                 }
             } else if key.metric.starts_with("vus") {
-                // vus_max tracks the maximum observed value
-                let obs = set.count.max(set.sum) as u64;
-                if obs > vus_max {
-                    vus_max = obs;
+                // vus_max: use the max value observed from Gauge tracking
+                if set.metric_type == MetricType::Gauge && set.max != f64::MIN {
+                    let obs = set.max as u64;
+                    if obs > vus_max {
+                        vus_max = obs;
+                    }
+                } else {
+                    // Fallback for non-gauge vus tracking
+                    let obs = set.count.max(set.sum) as u64;
+                    if obs > vus_max {
+                        vus_max = obs;
+                    }
                 }
             }
 
@@ -378,6 +520,7 @@ impl Aggregator {
             let stats = merged.histogram.stats();
             iteration_duration = Some(MetricSummary {
                 key: "iteration_duration".to_string(),
+                metric_type: MetricType::Trend,
                 count: merged.count as u64,
                 sum: merged.sum,
                 mean: merged.mean(),
@@ -387,6 +530,8 @@ impl Aggregator {
                 p90: stats.p90,
                 p95: stats.p95,
                 p99: stats.p99,
+                last: 0.0,
+                rate: 0.0,
             });
         }
 
@@ -395,6 +540,7 @@ impl Aggregator {
             let stats = merged.histogram.stats();
             http_req_duration = Some(MetricSummary {
                 key: "http_req_duration".to_string(),
+                metric_type: MetricType::Trend,
                 count: merged.count as u64,
                 sum: merged.sum,
                 mean: merged.mean(),
@@ -404,6 +550,8 @@ impl Aggregator {
                 p90: stats.p90,
                 p95: stats.p95,
                 p99: stats.p99,
+                last: 0.0,
+                rate: 0.0,
             });
         }
 
@@ -440,19 +588,35 @@ impl Aggregator {
     }
 }
 
-/// Summary of a single metric.
+/// Summary of a single metric, with type-aware statistics.
+/// Fields not applicable to the metric type are set to 0.
 #[derive(Debug, Clone)]
 pub struct MetricSummary {
     pub key: String,
+    /// The type of this metric — determines which fields are meaningful.
+    pub metric_type: MetricType,
+    /// Sample count (Counter: events added; Rate: events; Trend: samples; Gauge: samples).
     pub count: u64,
+    /// Sum of values (Counter/ Rate: total; Trend/Gauge: sum for avg).
     pub sum: f64,
+    /// Mean value (sum / count).
     pub mean: f64,
+    /// Minimum value (Trend/Gauge only).
     pub min: u64,
+    /// Maximum value (Trend/Gauge only).
     pub max: u64,
+    /// p50 / median (Trend only).
     pub p50: u64,
+    /// p90 (Trend only).
     pub p90: u64,
+    /// p95 (Trend only).
     pub p95: u64,
+    /// p99 (Trend only).
     pub p99: u64,
+    /// Last/gauge value (Gauge only).
+    pub last: f64,
+    /// Rate (Rate only: sum/count).
+    pub rate: f64,
 }
 
 /// Aggregated metrics result.

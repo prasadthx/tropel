@@ -293,6 +293,40 @@ impl PmBridge {
                 }),
             );
 
+            // ── Custom Metrics ──
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_metrics_add",
+                Func::from(move |name: String, value: f64, metric_type_str: String| {
+                    let mut st = state_clone.lock().unwrap();
+                    // Track current value
+                    st.custom_metrics.insert(name.clone(), value);
+                    // Emit a metric sample with the appropriate type
+                    let sample_type = match metric_type_str.as_str() {
+                        "counter" => tropel_core::types::SampleType::Counter,
+                        "gauge" => tropel_core::types::SampleType::Point,
+                        "rate" => tropel_core::types::SampleType::Rate,
+                        _ => tropel_core::types::SampleType::Trend,
+                    };
+                    st.samples.push(tropel_core::types::Sample {
+                        metric: format!("custom_{}", name),
+                        value,
+                        tags: tropel_core::types::TagMap::new(),
+                        timestamp: std::time::SystemTime::now(),
+                        sample_type,
+                    });
+                }),
+            );
+
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_metrics_get",
+                Func::from(move |name: String| -> Option<f64> {
+                    let st = state_clone.lock().unwrap();
+                    st.custom_metrics.get(&name).copied()
+                }),
+            );
+
             // ── sendRequest ──
             // Executes an HTTP request synchronously using the per-VU HTTP client.
             // The bridge closure runs inside ctx.with() (synchronous), so we use

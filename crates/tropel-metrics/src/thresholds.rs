@@ -205,7 +205,7 @@ fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collector::{MetricSummary, MetricsResult};
+    use crate::collector::{MetricSummary, MetricsResult, MetricType};
 
     fn make_metrics() -> MetricsResult {
         MetricsResult {
@@ -216,6 +216,7 @@ mod tests {
             checks_failed: 5,
             http_req_duration: Some(MetricSummary {
                 key: "http_req_duration".into(),
+                metric_type: MetricType::Trend,
                 count: 100,
                 sum: 50000.0,
                 mean: 500.0,
@@ -225,6 +226,8 @@ mod tests {
                 p90: 900,
                 p95: 1200,
                 p99: 1800,
+                last: 0.0,
+                rate: 0.0,
             }),
             ..Default::default()
         }

@@ -61,18 +61,31 @@ impl Reporter for StdoutReporter {
                      (result.checks_failed as f64 / result.checks_total as f64 * 100.0) as u64);
         }
 
-        // Other metrics
+        // Custom / other metrics (type-aware display)
         if !result.metrics.is_empty() {
             println!("\n  All metrics:");
             for metric in &result.metrics {
                 if metric.key.starts_with("http_req_duration") || metric.key.starts_with("http_reqs") || metric.key.starts_with("checks") || metric.key.starts_with("iteration_duration") || metric.key.starts_with("iterations") || metric.key.starts_with("http_req_failed") || metric.key.starts_with("data_") {
                     continue; // Already shown above
                 }
-                println!("    {}:", metric.key);
-                println!("      count: {}", metric.count);
-                println!("      avg:   {:.2}", metric.mean);
-                println!("      min:   {}", metric.min);
-                println!("      max:   {}", metric.max);
+                print!("    {}  ", metric.key);
+                match metric.metric_type {
+                    tropel_metrics::collector::MetricType::Counter => {
+                        println!("[Counter]  total: {:.0}", metric.sum);
+                    }
+                    tropel_metrics::collector::MetricType::Rate => {
+                        println!("[Rate]  events: {}  rate: {:.4}", metric.count, metric.rate);
+                    }
+                    tropel_metrics::collector::MetricType::Gauge => {
+                        println!("[Gauge]  last: {:.0}  min: {}  max: {}  avg: {:.2}",
+                            metric.last, metric.min, metric.max, metric.mean);
+                    }
+                    tropel_metrics::collector::MetricType::Trend => {
+                        println!("[Trend]  count: {}  avg: {:.2}  min: {}  max: {}  p50: {}  p90: {}  p95: {}  p99: {}",
+                            metric.count, metric.mean, metric.min, metric.max,
+                            metric.p50, metric.p90, metric.p95, metric.p99);
+                    }
+                }
             }
         }
 
