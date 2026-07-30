@@ -35,3 +35,4 @@ anyhow.workspace = true
 rand.workspace = true
 clap.workspace = true
 csv.workspace = true
+async-trait.workspace = true

@@ -2482,6 +2482,7 @@ name = "tropel-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "csv",
  "rand 0.8.7",
