@@ -2596,6 +2596,7 @@ dependencies = [
  "sha3",
  "simd-json",
  "thiserror",
+ "tokio",
  "tracing",
  "tropel-core",
  "tropel-js",

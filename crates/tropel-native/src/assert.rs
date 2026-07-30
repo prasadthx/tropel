@@ -28,6 +28,59 @@ impl NativeModule for AssertModule {
                     }
                 }),
             );
+
+            // ── Type check helpers ──
+            // JS calls: __tropel_native_is_string(JSON.stringify(value))
+            // Returns: boolean
+            let _ = globals.set("__tropel_native_is_string", Func::from(|json: String| -> bool {
+                serde_json::from_str::<serde_json::Value>(&json)
+                    .map(|v| is_string(&v))
+                    .unwrap_or(false)
+            }));
+
+            let _ = globals.set("__tropel_native_is_number", Func::from(|json: String| -> bool {
+                serde_json::from_str::<serde_json::Value>(&json)
+                    .map(|v| is_number(&v))
+                    .unwrap_or(false)
+            }));
+
+            let _ = globals.set("__tropel_native_is_array", Func::from(|json: String| -> bool {
+                serde_json::from_str::<serde_json::Value>(&json)
+                    .map(|v| is_array(&v))
+                    .unwrap_or(false)
+            }));
+
+            let _ = globals.set("__tropel_native_is_object", Func::from(|json: String| -> bool {
+                serde_json::from_str::<serde_json::Value>(&json)
+                    .map(|v| is_object(&v))
+                    .unwrap_or(false)
+            }));
+
+            let _ = globals.set("__tropel_native_is_null", Func::from(|json: String| -> bool {
+                serde_json::from_str::<serde_json::Value>(&json)
+                    .map(|v| is_null(&v))
+                    .unwrap_or(false)
+            }));
+
+            let _ = globals.set("__tropel_native_is_boolean", Func::from(|json: String| -> bool {
+                serde_json::from_str::<serde_json::Value>(&json)
+                    .map(|v| is_boolean(&v))
+                    .unwrap_or(false)
+            }));
+
+            // ── length(value) ──
+            // Returns: number (string length or array length) or null if neither.
+            let _ = globals.set("__tropel_native_length", Func::from(|json: String| -> Option<usize> {
+                serde_json::from_str::<serde_json::Value>(&json).ok()
+                    .and_then(|v| length(&v))
+            }));
+
+            // ── matches(value, pattern) ──
+            // Returns: boolean (whether the value matches the regex pattern).
+            // If the pattern is invalid, returns false (throws no error across FFI).
+            let _ = globals.set("__tropel_native_matches", Func::from(|value: String, pattern: String| -> bool {
+                matches(&value, &pattern).unwrap_or(false)
+            }));
         });
 
         tracing::debug!("Installed assert native module");
