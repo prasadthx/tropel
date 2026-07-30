@@ -146,11 +146,21 @@ pub struct PmBridge {
     state: SharedPmState,
     /// Per-VU HTTP client for executing pm.sendRequest synchronously.
     http_client: Arc<HttpClient>,
+    /// A separate multi-thread tokio runtime for blocking bridge calls.
+    /// Required because each VU runs on a current-thread runtime where
+    /// Handle::current().block_on() would panic. This independent runtime
+    /// is used instead for synchronous FFI bridge calls that need to await
+    /// async operations (like pm.sendRequest → reqwest HTTP calls).
+    blocking_rt: Arc<tokio::runtime::Runtime>,
 }
 
 impl PmBridge {
-    pub fn new(state: SharedPmState, http_client: Arc<HttpClient>) -> Self {
-        Self { state, http_client }
+    pub fn new(
+        state: SharedPmState,
+        http_client: Arc<HttpClient>,
+        blocking_rt: Arc<tokio::runtime::Runtime>,
+    ) -> Self {
+        Self { state, http_client, blocking_rt }
     }
 
     /// Register all bridge functions into the given JS context.
@@ -599,8 +609,10 @@ impl PmBridge {
             // ── sendRequest ──
             // Executes an HTTP request synchronously using the per-VU HTTP client.
             // The bridge closure runs inside ctx.with() (synchronous), so we use
-            // tokio::runtime::Handle::block_on() to await the async client.execute().
-            // This is safe because the VU runs on its own thread (thread-per-core).
+            // a separate multi-thread tokio runtime (blocking_rt) to await the async
+            // client.execute(). This avoids the "cannot block from within a runtime"
+            // panic that would occur with Handle::current().block_on() on a
+            // current-thread runtime (thread-per-core architecture).
             //
             // Supports the auth-token-fetch pattern: scripts can call pm.sendRequest
             // to obtain auth tokens or session data, then store them via pm.variables.set().
@@ -616,6 +628,7 @@ impl PmBridge {
             // Returns: JSON-encoded response with code, statusText, body, headers, responseTime
             let http = self.http_client.clone();
             let state_for_send = self.state.clone();
+            let blocking_rt = self.blocking_rt.clone();
             let _ = globals.set(
                 "__tropel_pm_send_request",
                 Func::from(
@@ -655,8 +668,10 @@ impl PmBridge {
                             timeout,
                         };
 
-                        // Execute the request synchronously by blocking on the async client
-                        match tokio::runtime::Handle::current().block_on(http.execute(&req, None)) {
+                        // Execute the request on the independent blocking runtime.
+                        // This runtime is multi-thread, so block_on() works fine
+                        // even though we're inside a current-thread VU runtime.
+                        match blocking_rt.block_on(http.execute(&req, None)) {
                             Ok(http_resp) => {
                                 let body_text = String::from_utf8(http_resp.body.clone()).unwrap_or_default();
                                 serde_json::json!({

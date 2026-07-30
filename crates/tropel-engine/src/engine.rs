@@ -47,6 +47,14 @@ impl Engine {
         let pool = Arc::new(VUWorkerPool::new(num_workers));
         tracing::info!("VU worker pool: {} threads (available cores: {})", num_workers, num_workers);
 
+        // Create a shared multi-thread tokio runtime for blocking bridge calls.
+        // The VU thread-per-core workers use current-thread runtimes where
+        // Handle::current().block_on() panics. Bridge functions like
+        // pm.sendRequest that need to await async HTTP calls use this
+        // independent multi-thread runtime via block_on() instead.
+        let blocking_rt = Arc::new(tokio::runtime::Runtime::new()
+            .expect("Failed to create blocking tokio runtime"));
+
         let http_config = config.http.clone();
         let thresholds = config.thresholds.clone();
         let data_rows = config.iteration_data.clone();
@@ -121,6 +129,7 @@ impl Engine {
             let data_rows = data_rows.clone();
             let base_env = config.env.clone();
             let test_start = test_start;
+            let blocking_rt_sc = blocking_rt.clone();
 
             let handle = tokio::spawn(async move {
                 // Parse the input file for this scenario
@@ -206,6 +215,7 @@ impl Engine {
                     let pool = pool_clone.clone();
                     let think_time = think_time_cfg.clone();
 
+                    let blocking_rt_vu = blocking_rt_sc.clone();
                     let sc_name_vu = sc_name_for_vu.clone();
                     let (_, handle) = pool.spawn(async move {
                         sched.add_active_vu(1).await;
@@ -224,7 +234,7 @@ impl Engine {
                             .with_expected_statuses(http_cfg.expected_statuses.clone());
                         let pm_state = runner.state_handle();
 
-                        let js_ctx = create_vu_js_context(vu_id, &pm_state, &bridge_client).await;
+                        let js_ctx = create_vu_js_context(vu_id, &pm_state, &bridge_client, blocking_rt_vu.clone()).await;
                         if let Some(ctx) = js_ctx {
                             runner = runner.with_js_context(Box::new(ctx));
                         }
@@ -663,10 +673,16 @@ async fn apply_think_time(config: &ThinkTimeConfig, iter_duration: Option<Durati
 }
 
 /// Create a JS context for a VU and bootstrap the vendored JS libraries.
+///
+/// `blocking_rt` is a shared multi-thread tokio runtime used by bridge functions
+/// like pm.sendRequest that need to await async operations from within a
+/// synchronous FFI bridge closure (which runs on a current-thread VU worker
+/// where Handle::current().block_on() would panic).
 async fn create_vu_js_context(
     vu_id: u32,
     pm_state: &tropel_pm::bridge::SharedPmState,
     http_client: &Arc<tropel_http::client::HttpClient>,
+    blocking_rt: Arc<tokio::runtime::Runtime>,
 ) -> Option<tropel_js::JsContext> {
     // Create the JS context with a 10 MB memory limit and 10s execution timeout
     let ctx = match tropel_js::JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10))).await {
@@ -712,8 +728,14 @@ async fn create_vu_js_context(
     }
 
     // Install pm.* bridge functions so JS shims can call __tropel_pm_* functions.
-    // Pass the per-VU HTTP client for pm.sendRequest to work synchronously.
-    let bridge = tropel_pm::bridge_fns::PmBridge::new(pm_state.clone(), http_client.clone());
+    // Pass the per-VU HTTP client + blocking runtime for pm.sendRequest.
+    // The blocking runtime allows synchronous bridge closures to await
+    // async HTTP calls without panicking on a current-thread VU worker.
+    let bridge = tropel_pm::bridge_fns::PmBridge::new(
+        pm_state.clone(),
+        http_client.clone(),
+        blocking_rt,
+    );
     if let Err(e) = bridge.install(&ctx) {
         tracing::warn!("VU {}: Failed to install PM bridge functions: {}", vu_id, e);
     }
