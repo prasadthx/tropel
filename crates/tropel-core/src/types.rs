@@ -1,5 +1,7 @@
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 /// HTTP method.
@@ -136,10 +138,17 @@ impl Response {
         }
     }
 
-    /// Parse the body as JSON (lazy — parses on each call).
+    /// Parse the body as JSON using simd-json (lazy — parses on each call).
+    ///
+    /// Parses directly from the raw `Vec<u8>` body, skipping the intermediate
+    /// `String::from_utf8` step that `body_text()` requires. Uses `simd-json`
+    /// for ~2-4x faster parsing on typical payloads.
     pub fn body_json(&self) -> Option<serde_json::Value> {
-        self.body_text()
-            .and_then(|text| serde_json::from_str(&text).ok())
+        if self.body.is_empty() {
+            return None;
+        }
+        let mut body_bytes = self.body.clone();
+        simd_json::serde::from_slice(&mut body_bytes).ok()
     }
 }
 
@@ -219,6 +228,113 @@ pub struct CertificateConfig {
     pub passphrase: Option<String>,
 }
 
+/// A set of metric tags backed by a fast hash map with `Arc<str>` key/value
+/// interning to reduce per-iteration allocation churn.
+///
+/// Tag keys are almost always string literals ("url", "method", "status_code",
+/// etc.) and tag values are often reused across iterations (status codes,
+/// group names, etc.). Using `Arc<str>` avoids cloning the underlying string
+/// data when the tag map is cloned (e.g., when building both a duration sample
+/// and a counter sample from the same tags).
+///
+/// Internally backed by `FxHashMap` (faster than std's SipHash for small
+/// string keys) with `Arc<str>` values.
+#[derive(Debug, Clone)]
+pub struct TagMap {
+    pub(crate) inner: FxHashMap<Arc<str>, Arc<str>>,
+}
+
+impl TagMap {
+    /// Create an empty tag map.
+    pub fn new() -> Self {
+        Self {
+            inner: FxHashMap::default(),
+        }
+    }
+
+    /// Create a tag map with the given pre-allocated capacity.
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            inner: FxHashMap::with_capacity_and_hasher(cap, Default::default()),
+        }
+    }
+
+    /// Create a tag map from an iterator of (key, value) pairs.
+    /// Both keys and values are interned as `Arc<str>`.
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (impl Into<Arc<str>>, impl Into<Arc<str>>)>) -> Self {
+        let mut map = FxHashMap::default();
+        for (k, v) in pairs {
+            map.insert(k.into(), v.into());
+        }
+        Self { inner: map }
+    }
+
+    /// Insert a tag pair. Both key and value are interned as `Arc<str>`.
+    pub fn insert(&mut self, key: impl Into<Arc<str>>, value: impl Into<Arc<str>>) {
+        self.inner.insert(key.into(), value.into());
+    }
+
+    /// Get a tag value by key.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.inner.get(key).map(|s| s.as_ref())
+    }
+
+    /// Returns true if the map contains no elements.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Number of tag pairs.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Iterate over (key, value) pairs as &str references.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.inner.iter().map(|(k, v)| (k.as_ref(), v.as_ref()))
+    }
+
+    /// Collect into a sorted Vec of (Arc<str>, Arc<str>) for MetricKey construction.
+    /// The Arc references are cloned (ref-count bump only, no string copy).
+    pub fn to_sorted_arc_vec(&self) -> Vec<(Arc<str>, Arc<str>)> {
+        let mut pairs: Vec<(Arc<str>, Arc<str>)> = self
+            .inner
+            .iter()
+            .map(|(k, v)| (Arc::clone(k), Arc::clone(v)))
+            .collect();
+        pairs.sort();
+        pairs
+    }
+}
+
+impl Default for TagMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Serialize for TagMap {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.inner.len()))?;
+        for (k, v) in self.inner.iter() {
+            map.serialize_entry(k.as_ref(), v.as_ref())?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TagMap {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw: HashMap<String, String> = HashMap::deserialize(deserializer)?;
+        let mut map = FxHashMap::with_capacity_and_hasher(raw.len(), Default::default());
+        for (k, v) in raw {
+            map.insert(Arc::from(k), Arc::from(v));
+        }
+        Ok(Self { inner: map })
+    }
+}
+
 /// A single metric sample emitted during execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sample {
@@ -227,7 +343,7 @@ pub struct Sample {
     /// Metric value.
     pub value: f64,
     /// Tags (e.g. url, method, status_code, name).
-    pub tags: HashMap<String, String>,
+    pub tags: TagMap,
     /// Timestamp.
     pub timestamp: SystemTime,
     /// Sample type.

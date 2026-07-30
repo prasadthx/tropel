@@ -2358,6 +2358,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "indexmap",
+ "rustc-hash",
  "serde",
  "serde_json",
  "thiserror",

@@ -220,10 +220,16 @@ impl HttpResponse {
         }
     }
 
-    /// Parse the body as JSON (lazy — parses on each call).
+    /// Parse the body as JSON using simd-json (lazy — parses on each call).
+    ///
+    /// Parses directly from raw bytes, skipping the `String::from_utf8`
+    /// intermediate step. Uses `simd-json` for ~2-4x faster parsing.
     pub fn body_json(&self) -> Option<serde_json::Value> {
-        self.body_text()
-            .and_then(|text| serde_json::from_str(&text).ok())
+        if self.body.is_empty() {
+            return None;
+        }
+        let mut body_bytes = self.body.clone();
+        simd_json::serde::from_slice(&mut body_bytes).ok()
     }
 }
 

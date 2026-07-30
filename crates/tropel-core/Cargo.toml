@@ -9,8 +9,10 @@ rust-version.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+simd-json.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 indexmap.workspace = true
+rustc-hash.workspace = true
 url.workspace = true
 tracing.workspace = true

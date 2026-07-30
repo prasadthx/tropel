@@ -59,13 +59,13 @@ impl HttpProtocol {
         let duration = start.elapsed();
         let http_response = tropel_core::types::Response::from(&response);
 
-        // Build a sample from the response
-        let mut tags = std::collections::HashMap::new();
-        tags.insert("url".to_string(), resolved_req.url.clone());
-        tags.insert("method".to_string(), resolved_req.method.to_string());
-        tags.insert("status_code".to_string(), response.status_code.to_string());
-        tags.insert("name".to_string(), resolved_req.url.clone());
-        tags.insert("group".to_string(), "http".to_string());
+        // Build a sample with interned tags
+        let mut tags = TagMap::with_capacity(5);
+        tags.insert("url", resolved_req.url.clone());
+        tags.insert("method", resolved_req.method.to_string());
+        tags.insert("status_code", response.status_code.to_string());
+        tags.insert("name", resolved_req.url.clone());
+        tags.insert("group", "http");
 
         let sample = Sample {
             metric: "http_req_duration".to_string(),

@@ -2,6 +2,7 @@ use crate::histogram::LatencyHistogram;
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tropel_core::types::{Sample, SampleType};
 
@@ -11,24 +12,24 @@ use tropel_core::types::{Sample, SampleType};
 /// via `format!` on every sample — a heap allocation per-record on the hot path.
 /// This struct uses the metric name + sorted tag pairs directly as the hash key,
 /// eliminating the `format!` call.
+///
+/// Uses `Arc<str>` internally so keys shared between samples (same metric name,
+/// same tag keys/values) share the backing allocation.
 #[derive(Debug, Clone, Eq)]
 pub struct MetricKey {
-    pub metric: String,
+    pub metric: Arc<str>,
     /// Sorted (key, value) pairs for deterministic ordering.
-    pub tags: Vec<(String, String)>,
+    pub tags: Vec<(Arc<str>, Arc<str>)>,
 }
 
 impl MetricKey {
     /// Build a key from a metric name and tag map.
     /// Tags are sorted for deterministic hash/eq.
-    pub fn new(metric: &str, tags: &HashMap<String, String>) -> Self {
-        let mut tags: Vec<(String, String)> = tags
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        tags.sort();
+    /// Uses `to_sorted_arc_vec()` which clones Arc references (ref-count bump, no string copy).
+    pub fn new(metric: &str, tags: &tropel_core::types::TagMap) -> Self {
+        let tags = tags.to_sorted_arc_vec();
         Self {
-            metric: metric.to_string(),
+            metric: Arc::from(metric),
             tags,
         }
     }
@@ -37,12 +38,12 @@ impl MetricKey {
     /// Used when building MetricSummary for the public API.
     pub fn to_key_string(&self) -> String {
         if self.tags.is_empty() {
-            self.metric.clone()
+            self.metric.to_string()
         } else {
             let tag_str: String = self
                 .tags
                 .iter()
-                .map(|(k, v)| format!("{{{}}}", [k.as_str(), v.as_str()].join("=")))
+                .map(|(k, v)| format!("{{{}}}", [k.as_ref(), v.as_ref()].join("=")))
                 .collect::<Vec<_>>()
                 .join(",");
             format!("{}{}", self.metric, tag_str)
@@ -414,17 +415,16 @@ impl Default for MetricsResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
     fn test_metric_key_equality() {
-        let mut tags1 = HashMap::new();
-        tags1.insert("status".to_string(), "200".to_string());
-        tags1.insert("method".to_string(), "GET".to_string());
+        let mut tags1 = tropel_core::types::TagMap::new();
+        tags1.insert("status", "200");
+        tags1.insert("method", "GET");
 
-        let mut tags2 = HashMap::new();
-        tags2.insert("method".to_string(), "GET".to_string());
-        tags2.insert("status".to_string(), "200".to_string());
+        let mut tags2 = tropel_core::types::TagMap::new();
+        tags2.insert("method", "GET");
+        tags2.insert("status", "200");
 
         let key1 = MetricKey::new("http_req_duration", &tags1);
         let key2 = MetricKey::new("http_req_duration", &tags2);
@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn test_metric_key_different_metric() {
-        let tags = HashMap::new();
+        let tags = tropel_core::types::TagMap::new();
         let key1 = MetricKey::new("http_reqs", &tags);
         let key2 = MetricKey::new("errors", &tags);
         assert_ne!(key1, key2);
@@ -443,11 +443,11 @@ mod tests {
 
     #[test]
     fn test_metric_key_different_tags() {
-        let mut tags1 = HashMap::new();
-        tags1.insert("status".to_string(), "200".to_string());
+        let mut tags1 = tropel_core::types::TagMap::new();
+        tags1.insert("status", "200");
 
-        let mut tags2 = HashMap::new();
-        tags2.insert("status".to_string(), "404".to_string());
+        let mut tags2 = tropel_core::types::TagMap::new();
+        tags2.insert("status", "404");
 
         let key1 = MetricKey::new("http_req_duration", &tags1);
         let key2 = MetricKey::new("http_req_duration", &tags2);
@@ -456,8 +456,8 @@ mod tests {
 
     #[test]
     fn test_metric_key_to_string() {
-        let mut tags = HashMap::new();
-        tags.insert("status".to_string(), "200".to_string());
+        let mut tags = tropel_core::types::TagMap::new();
+        tags.insert("status", "200");
         let key = MetricKey::new("http_req_duration", &tags);
         let s = key.to_key_string();
         assert!(s.contains("http_req_duration"));

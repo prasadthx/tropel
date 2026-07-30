@@ -41,6 +41,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Fast JSON parsing (≈2-4× faster than serde_json for response bodies)
+simd-json = { version = "0.14", features = ["serde-impl"] }
+
 # Metrics
 hdrhistogram = "7"
 
@@ -94,6 +97,9 @@ mimalloc = { version = "0.1", default-features = false }
 # Testing
 wiremock = "0.6"
 insta = "1"
+
+# Fast hash maps for tag sets
+rustc-hash = "2"
 
 # IndexMap for preserving insertion order
 indexmap = { version = "2", features = ["serde"] }

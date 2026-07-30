@@ -1,7 +1,7 @@
 use crate::bridge::SharedPmState;
 use serde_json::Value;
 use std::collections::HashMap;
-use tropel_core::types::Response;
+use tropel_core::types::{Response, TagMap};
 
 /// The pm.* API surface exposed to JS scripts.
 pub struct PmApi {
@@ -206,7 +206,7 @@ impl PmApi {
         state.samples.push(tropel_core::types::Sample {
             metric: metric.to_string(),
             value,
-            tags,
+            tags: TagMap::from_pairs(tags),
             timestamp: std::time::SystemTime::now(),
             sample_type: tropel_core::types::SampleType::Point,
         });

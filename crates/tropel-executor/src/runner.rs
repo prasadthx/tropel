@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tropel_core::scenario::Scenario;
-use tropel_core::types::{Sample, SampleType, AuthConfig};
+use tropel_core::types::{Sample, SampleType, AuthConfig, TagMap};
 use tropel_core::Result;
 use tropel_http::client::HttpClient;
 use tropel_js::JsContext;
@@ -192,13 +192,13 @@ impl VURunner {
                             state.response = Some(pm_response);
                         }
 
-                        // Build duration sample (tags match what k6 emits for http_req_duration)
-                        let mut tags = HashMap::new();
-                        tags.insert("url".to_string(), resolved_req.url.clone());
-                        tags.insert("method".to_string(), resolved_req.method.to_string());
-                        tags.insert("status_code".to_string(), http_response.status_code.to_string());
-                        tags.insert("name".to_string(), resolved_req.url.clone());
-                        tags.insert("group".to_string(), "http".to_string());
+                        // Build duration sample with interned tags
+                        let mut tags = TagMap::with_capacity(5);
+                        tags.insert("url", resolved_req.url.clone());
+                        tags.insert("method", resolved_req.method.to_string());
+                        tags.insert("status_code", http_response.status_code.to_string());
+                        tags.insert("name", resolved_req.url.clone());
+                        tags.insert("group", "http");
 
                         let duration_sample = Sample {
                             metric: "http_req_duration".to_string(),
@@ -209,7 +209,7 @@ impl VURunner {
                         };
                         result.samples.push(duration_sample);
 
-                        // Also emit a counter
+                        // Also emit a counter (reuses interned tag map — cheap clone)
                         let count_sample = Sample {
                             metric: "http_reqs".to_string(),
                             value: 1.0,
@@ -221,11 +221,11 @@ impl VURunner {
                     }
                     Err(e) => {
                         tracing::warn!("VU {} request '{}' failed: {}", iteration_index, item.name, e);
-                        let err_tags = HashMap::from([
-                            ("url".to_string(), resolved_url),
-                            ("method".to_string(), request.method.to_string()),
-                            ("name".to_string(), item.name.clone()),
-                            ("error".to_string(), e.to_string()),
+                        let err_tags = TagMap::from_pairs([
+                            ("url", resolved_url),
+                            ("method", request.method.to_string()),
+                            ("name", item.name.clone()),
+                            ("error", e.to_string()),
                         ]);
                         let error_sample = tropel_core::types::Sample {
                             metric: "errors".to_string(),
