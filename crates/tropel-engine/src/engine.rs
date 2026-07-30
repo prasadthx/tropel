@@ -559,7 +559,7 @@ async fn run_driver_vus(
                 }
             };
 
-            let mut driver_instance = match driver.init(&input_bytes, Some(&input_p)) {
+            let mut driver_instance = match driver.init(&input_bytes, Some(&input_p)).await {
                 Ok(inst) => inst,
                 Err(e) => {
                     tracing::error!("VU {}: Driver '{}' init failed: {}", vu_id, driver_id, e);

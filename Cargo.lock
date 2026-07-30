@@ -2602,11 +2602,17 @@ dependencies = [
 name = "tropel-input-k6"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "inventory",
+ "regex",
+ "rquickjs",
+ "serde_json",
  "tracing",
  "tropel-core",
  "tropel-es",
  "tropel-ext",
+ "tropel-js",
+ "tropel-native",
 ]
 
 [[package]]

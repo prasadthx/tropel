@@ -144,8 +144,8 @@ pub trait Driver: Send + Sync {
 
     /// Initialize the driver from raw input bytes.
     /// This is called once at setup time, not per-iteration.
-    /// Returns a boxed Driver that is then called per-iteration.
-    fn init(&self, bytes: &[u8], source_path: Option<&std::path::Path>) -> Result<Box<dyn DriverInstance>>;
+    /// Returns a boxed DriverInstance that is then called per-iteration.
+    async fn init(&self, bytes: &[u8], source_path: Option<&std::path::Path>) -> Result<Box<dyn DriverInstance>>;
 }
 
 /// A driver instance ready to run iterations.

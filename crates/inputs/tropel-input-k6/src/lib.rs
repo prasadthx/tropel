@@ -1,16 +1,17 @@
 //! # tropel-input-k6
 //!
-//! Input adapter that reads k6-style JavaScript/TypeScript test scripts and
-//! produces a protocol-agnostic `Scenario`.
+//! Input adapter + Driver for k6-style JavaScript/TypeScript test scripts.
 //!
-//! The k6 script becomes a single-item Scenario where the transpiled JS code
-//! runs as the item's test script. Since k6 scripts make their own HTTP
-//! requests via `pm.sendRequest`, the item has no request of its own.
+//! Provides two entry points:
+//! - **InputAdapter** (declarative): wraps transpiled JS as a single-item
+//!   Scenario, for backward compatibility.
+//! - **Driver** (imperative): creates per-VU JS contexts, bootstraps shims,
+//!   and runs the user's exported default function per iteration.
 //!
-//! This adapter delegates to `tropel_es` for TypeScript transpilation and
-//! ES module bundling. Because module resolution requires file-system access,
-//! the adapter overrides `parse_with_path()` — the engine passes the source
-//! file path when available.
+//! The Driver is tried first by the engine's input resolution. The InputAdapter
+//! serves as a fallback for older execution paths.
+
+pub mod driver;
 
 use std::path::Path;
 use tropel_core::scenario::{Scenario, ScenarioInfo, ScenarioItem};
