@@ -51,10 +51,10 @@ world tropel-adapter-world {
     /// Import optional host-side functions available to WASM adapters.
     /// Components declare only what they actually use; unused imports
     /// don't need to be provided.
-    import tropel-host: self.tropel-host;
+    import tropel-host: tropel:adapter/tropel-host;
 
     /// Export the adapter interface — the engine calls `detect` and `parse`.
-    export tropel-adapter: self.tropel-adapter;
+    export tropel-adapter: tropel:adapter/tropel-adapter;
 }
 
 /// Optional host functions that a WASM adapter can import.

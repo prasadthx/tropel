@@ -3,11 +3,9 @@ package tropel:adapter;
 /// Shared types for the Tropel WASM plugin interface.
 /// Mirrors the Rust types in `tropel_core::scenario` and `tropel_core::types`.
 ///
-/// These records, enums, and variants are used by both the `tropel-adapter`
-/// (declarative parser) and the eventual `tropel-driver` (imperative per-iteration
-/// runtime) interfaces. They are the WASM Component Model representation of the
-/// `Scenario` IR — the stable contract between any input format and the Tropel
-/// engine.
+/// NOTE: Recursive types (e.g. scenario-item containing list<scenario-item>)
+/// are NOT supported by the Component Model WIT parser. Instead, scenario
+/// items use a flat list with a `parent-index` field for tree structure.
 interface tropel-types {
     // ── HTTP Method ────────────────────────────────────────────
     enum http-method {
@@ -22,26 +20,16 @@ interface tropel-types {
         PATCH,
     }
 
-    // ── Request Body ───────────────────────────────────────────
+    // ── Request Body (flat — no recursive types) ───────────────
     variant body {
-        /// Raw byte payload with optional MIME content type hint.
+        /// Raw string payload.
         raw(string),
         /// JSON-encoded payload (stored as text, parsed on demand).
         json(string),
         /// URL-encoded form: key=value&key=value.
         form-urlencoded(list<tuple<string, string>>),
-        /// Multipart form-data with per-field content-type.
-        form-data(list<form-param>),
         /// Binary payload (base64-encoded). Decoded by the engine.
         binary(string),
-    }
-
-    record form-param {
-        key: string,
-        value: string,
-        content-type: option<string>,
-        /// File path for file upload fields. If set, `value` is ignored.
-        file: option<string>,
     }
 
     // ── Cookie ─────────────────────────────────────────────────
@@ -55,24 +43,17 @@ interface tropel-types {
         max-age: option<u64>,
     }
 
-    // ── Auth ───────────────────────────────────────────────────
-    variant auth-type {
-        inherit,
-        no-auth,
-        bearer(string),
-        basic(string, string),
-        api-key(string, string),
-        digest(string),
-        oauth1(string),
-        oauth2(string),
-        hawk(string),
-        aws-sigv4(string),
-    }
-
+    // ── Auth (flat tuple instead of nested variant) ────────────
     record auth-config {
-        auth-type: auth-type,
-        /// Additional auth parameters as key-value pairs.
-        params: list<tuple<string, string>>,
+        /// Auth type: "inherit", "no-auth", "bearer", "basic",
+        /// "api-key", "digest", "oauth1", "oauth2", "hawk", "aws-sigv4"
+        kind: string,
+        /// Credential value(s) — semantics depend on `kind`:
+        ///   bearer: token
+        ///   basic: "username:password"
+        ///   api-key: "key:value"
+        ///   others: params string
+        credentials: string,
     }
 
     // ── Request ────────────────────────────────────────────────
@@ -100,26 +81,27 @@ interface tropel-types {
         cookies: list<cookie>,
     }
 
-    // ── Scenario IR (the shared contract) ──────────────────────
-    record scenario-info {
-        name: string,
-        description: option<string>,
-        /// Postman collection schema version, if applicable.
-        schema: option<string>,
-    }
-
+    // ── Scenario Item (flat — parent-index instead of recursive nesting) ──
     record scenario-item {
         id: string,
         name: string,
         request: option<request>,
-        /// Pre-request script (JS code, for k6-style imperative mode).
+        /// Pre-request script (JS code).
         prerequest: option<string>,
         /// Test script (JS code, pm.test assertions).
         test: option<string>,
         /// Assertions (Postman-style string expressions).
         assertions: list<string>,
-        /// Child items (for folder/group nesting).
-        items: list<scenario-item>,
+        /// Index into the parent scenario's items list, or -1 for root-level.
+        parent-index: s32,
+    }
+
+    // ── Scenario ───────────────────────────────────────────────
+    record scenario-info {
+        name: string,
+        description: option<string>,
+        /// Postman collection schema version, if applicable.
+        schema: option<string>,
     }
 
     record scenario {

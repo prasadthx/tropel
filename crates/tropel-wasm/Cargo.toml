@@ -1,0 +1,19 @@
+[package]
+name = "tropel-wasm"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "WASM plugin runtime for Tropel — loads and runs WebAssembly plugins via wasmtime"
+
+[dependencies]
+tropel-core.workspace = true
+tropel-ext.workspace = true
+wasmtime = "21"
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

@@ -24,6 +24,7 @@ members = [
     "crates/extensions/tropel-x-grpc",
     "crates/extensions/tropel-x-websocket",
     "crates/extensions/tropel-x-prometheus",
+    "crates/tropel-wasm",
 ]
 
 [workspace.package]

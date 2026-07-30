@@ -1,0 +1,111 @@
+// ── Tropel WASM Adapter World (single file) ──
+
+package tropel:adapter;
+
+// ── Types interface ─────────────────────────────────────────
+interface tropel-types {
+    enum http-method {
+        GET,
+        HEAD,
+        POST,
+        PUT,
+        DELETE,
+        CONNECT,
+        OPTIONS,
+        TRACE,
+        PATCH,
+    }
+
+    variant body {
+        raw(string),
+        json(string),
+        form-urlencoded(list<tuple<string, string>>),
+        binary(string),
+    }
+
+    record cookie {
+        name: string,
+        value: string,
+        path: option<string>,
+        domain: option<string>,
+        secure: bool,
+        http-only: bool,
+        max-age: option<u64>,
+    }
+
+    record auth-config {
+        kind: string,
+        credentials: string,
+    }
+
+    record request {
+        url: string,
+        method: http-method,
+        headers: list<tuple<string, string>>,
+        query-params: list<tuple<string, string>>,
+        body: option<body>,
+        auth: option<auth-config>,
+        follow-redirects: bool,
+        timeout-ms: option<u64>,
+    }
+
+    record response {
+        status-code: u16,
+        status-text: string,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+        response-time-ms: float64,
+        cookies: list<cookie>,
+    }
+
+    record scenario-item {
+        id: string,
+        name: string,
+        request: option<request>,
+        prerequest: option<string>,
+        test: option<string>,
+        assertions: list<string>,
+        parent-index: s32,
+    }
+
+    record scenario-info {
+        name: string,
+        description: option<string>,
+        schema: option<string>,
+    }
+
+    record scenario {
+        info: scenario-info,
+        items: list<scenario-item>,
+        variables: list<tuple<string, string>>,
+        auth: option<auth-config>,
+    }
+
+    record parse-error {
+        message: string,
+        line: option<u32>,
+        column: option<u32>,
+    }
+}
+
+// ── Adapter Interface ────────────────────────────────────────
+interface tropel-adapter {
+    use tropel-types.{
+        scenario,
+        parse-error
+    };
+    id: func() -> string;
+    detect: func(bytes: list<u8>) -> bool;
+    parse: func(bytes: list<u8>) -> result<scenario, parse-error>;
+}
+
+// ── Host Interface (optional logging) ────────────────────────
+interface tropel-host {
+    log: func(level: string, message: string);
+}
+
+// ── World ────────────────────────────────────────────────────
+world tropel-adapter-world {
+    import tropel-host;
+    export tropel-adapter;
+}
