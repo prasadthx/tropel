@@ -3,8 +3,15 @@ use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+
 use tokio::sync::mpsc;
 use tropel_core::types::{Sample, SampleType};
+
+/// Maximum pending samples in the bounded MPSC channel before backpressure applies.
+/// At ~10 samples/request × 10k req/s, this provides a ~1s burst buffer.
+/// If the aggregator falls behind, VUs will block on send() instead of
+/// growing the queue unboundedly — preventing OOM.
+const MAX_PENDING_SAMPLES: usize = 100_000;
 
 /// A hashable metric key that avoids heap-allocated string formatting.
 ///
@@ -128,24 +135,28 @@ enum MetricsEvent {
 
 /// The top-level metrics collector.
 ///
-/// # Lock-free hot path
+/// # Lock-free hot path with bounded backpressure
 ///
-/// `record_batch()` sends samples into an unbounded MPSC channel — no locks,
-/// no `format!`, no heap-allocated key strings. A single background aggregator
-/// task processes the samples sequentially, updating an internal
-/// `HashMap<MetricKey, MetricSet>`.
+/// `record_batch()` sends samples into a bounded MPSC channel (`MAX_PENDING_SAMPLES`).
+/// When the channel is full, `send().await` blocks, applying backpressure to the
+/// producing VU — preventing unbounded queue growth that could OOM the process.
+/// The `tokio::select!` in the VU run loop ensures the stop signal is still
+/// checked while waiting, so shutdown is not blocked.
+///
+/// A single background aggregator task processes the samples sequentially,
+/// updating an internal `IndexMap<MetricKey, MetricSet>`.
 ///
 /// `results()` sends a request to the aggregator and waits for the response
 /// via a one-shot channel. This is off the hot path (called ~once per 2s per VU
 /// for threshold checks, and once at test end).
 pub struct MetricsCollector {
-    tx: mpsc::UnboundedSender<MetricsEvent>,
+    tx: mpsc::Sender<MetricsEvent>,
 }
 
 impl MetricsCollector {
     /// Create a new collector and spawn the background aggregator task.
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(MAX_PENDING_SAMPLES);
 
         // Spawn the aggregator task on the current tokio runtime.
         // It processes samples sequentially, lock-free on the consumer side.
@@ -156,39 +167,57 @@ impl MetricsCollector {
         Self { tx }
     }
 
-    /// Record a batch of samples — lock-free fast path.
+    /// Record a batch of samples — bounded backpressure path.
     ///
-    /// Sends samples into the MPSC channel. The aggregator task processes them.
-    /// This is O(n) in sample count but with zero contention (no locks, no
-    /// `format!` key building).
+    /// Sends samples into the bounded MPSC channel. If the channel is full,
+    /// `send().await` blocks, applying backpressure to the producing VU.
+    /// The caller's `tokio::select!` ensures stop signals are still checked
+    /// while waiting, so shutdown is not blocked.
+    ///
+    /// If the aggregator has shut down (channel closed), the send silently
+    /// drops the samples — acceptable during test teardown.
     pub async fn record_batch(&self, samples: &[Sample]) {
-        // Clone the slice into a Vec for sending through the channel.
-        // This is cheaper than holding a Mutex lock across the batch.
         let batch: Vec<Sample> = samples.to_vec();
-        let _ = self.tx.send(MetricsEvent::Samples(batch));
+        if self.tx.send(MetricsEvent::Samples(batch)).await.is_err() {
+            tracing::trace!("Metrics channel closed, dropping {} samples", samples.len());
+        }
     }
 
-    /// Record a single sample — lock-free fast path.
+    /// Record a single sample — bounded backpressure path.
     pub async fn record(&self, sample: &Sample) {
-        let _ = self
+        if self
             .tx
-            .send(MetricsEvent::Samples(vec![sample.clone()]));
+            .send(MetricsEvent::Samples(vec![sample.clone()]))
+            .await
+            .is_err()
+        {
+            tracing::trace!("Metrics channel closed, dropping sample");
+        }
     }
 
     /// Get aggregated results — sends a request and waits for the response.
     pub async fn results(&self) -> MetricsResult {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        let _ = self.tx.send(MetricsEvent::GetResults(resp_tx));
+        if self.tx.send(MetricsEvent::GetResults(resp_tx)).await.is_err() {
+            return MetricsResult::default();
+        }
         resp_rx.await.unwrap_or_default()
     }
 
     /// Get total count for a metric — sends a request and waits.
     pub async fn total_count(&self, metric: &str) -> f64 {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        let _ = self.tx.send(MetricsEvent::GetTotal {
-            metric: metric.to_string(),
-            tx: resp_tx,
-        });
+        if self
+            .tx
+            .send(MetricsEvent::GetTotal {
+                metric: metric.to_string(),
+                tx: resp_tx,
+            })
+            .await
+            .is_err()
+        {
+            return 0.0;
+        }
         resp_rx.await.unwrap_or(0.0)
     }
 }
@@ -217,7 +246,7 @@ impl Aggregator {
     }
 
     /// Run the aggregator loop, processing events until the channel closes.
-    async fn run(mut rx: mpsc::UnboundedReceiver<MetricsEvent>) {
+    async fn run(mut rx: mpsc::Receiver<MetricsEvent>) {
         let mut agg = Self::new();
 
         while let Some(event) = rx.recv().await {
