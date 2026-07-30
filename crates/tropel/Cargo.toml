@@ -10,6 +10,13 @@ rust-version.workspace = true
 name = "tropel"
 path = "src/main.rs"
 
+[features]
+default = ["alloc-mimalloc"]
+# Use mimalloc as the global allocator (default, well-tested)
+alloc-mimalloc = ["dep:mimalloc"]
+# Use tikv-jemallocator as the global allocator (better for large RSS)
+alloc-jemalloc = ["dep:tikv-jemallocator"]
+
 [dependencies]
 tropel-core.workspace = true
 tropel-engine.workspace = true
@@ -23,5 +30,6 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
-mimalloc.workspace = true
+mimalloc = { workspace = true, optional = true }
+tikv-jemallocator = { workspace = true, optional = true }
 csv = "1.3"

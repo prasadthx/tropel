@@ -308,9 +308,15 @@ pub struct HttpConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
-            max_idle_connections: 100,
+            // With per-VU HTTP clients, each VU has its own connection pool.
+            // A VU only makes one request at a time (sequential), so 4 idle
+            // connections per host per VU is plenty. The old default of 100
+            // was designed for shared clients — with per-VU clients and 100 VUs
+            // it would mean 10,000 idle connections total.
+            max_idle_connections: 4,
             keep_alive: Some("30s".to_string()),
-            idle_connection_timeout: Some("10s".to_string()),
+            // How long an idle connection is kept before being closed.
+            idle_connection_timeout: Some("30s".to_string()),
             http2: true,
             user_agent: "Tropel/0.1.0".to_string(),
             decompress: true,

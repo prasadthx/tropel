@@ -3,6 +3,18 @@
 //! The main entry point for the Tropel load testing tool.
 //! Run `tropel run <collection>` to execute a load test.
 
+// Select the global allocator at compile time via feature flags.
+// - Default: mimalloc (fast, low fragmentation, well-tested across workloads)
+// - Feature `alloc-jemalloc`: tikv-jemallocator (better peak-RSS behavior for
+//   very large heap sizes, matching k6's Go runtime GC profile)
+#[cfg(feature = "alloc-mimalloc")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "alloc-jemalloc")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -11,9 +23,6 @@ use tropel_core::Result;
 use tropel_engine::engine::Engine;
 use tropel_ext::registry::ExtensionRegistry;
 use tropel_metrics::thresholds::evaluate_thresholds;
-
-#[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Tropel — A high-performance load-testing framework.
 #[derive(Parser, Debug)]
@@ -90,7 +99,10 @@ enum Commands {
     Version,
 }
 
-#[tokio::main]
+// Outer tokio runtime: 2 workers. VUs run on the thread-per-core VUWorkerPool
+// (current-thread runtimes, one per CPU core), so the orchestrator only needs
+// minimal worker threads for scenario coordination and final metric collection.
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 

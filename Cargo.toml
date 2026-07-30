@@ -92,8 +92,9 @@ async-trait = "0.1"
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }
 
-# Allocator
+# Allocator (default: mimalloc; feature-gate tikv-jemallocator)
 mimalloc = { version = "0.1", default-features = false }
+tikv-jemallocator = { version = "0.6", default-features = false }
 
 # Testing
 wiremock = "0.6"
