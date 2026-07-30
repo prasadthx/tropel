@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use tropel_core::config::ExpectedStatus;
 use tropel_core::scenario::Scenario;
 use tropel_core::types::{Sample, SampleType, AuthConfig, TagMap};
 use tropel_core::Result;
@@ -44,6 +45,9 @@ pub struct VURunner {
     client: HttpClient,
     config: RunnerConfig,
     js_ctx: Option<Box<JsContext>>,
+    /// Expected status codes/ranges that determine request success.
+    /// Controls http_req_failed metric: 1.0 when status is NOT expected.
+    expected_statuses: Vec<ExpectedStatus>,
 }
 
 impl VURunner {
@@ -62,6 +66,8 @@ impl VURunner {
             client,
             config: RunnerConfig::default(),
             js_ctx: None,
+            // Default: 2xx-3xx = success (matches k6 behavior)
+            expected_statuses: vec![ExpectedStatus::Range("200-399".to_string())],
         }
     }
 
@@ -74,6 +80,12 @@ impl VURunner {
     /// Set the runner configuration.
     pub fn with_config(mut self, config: RunnerConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Set expected status codes/ranges for http_req_failed evaluation.
+    pub fn with_expected_statuses(mut self, expected: Vec<ExpectedStatus>) -> Self {
+        self.expected_statuses = expected;
         self
     }
 
@@ -225,10 +237,14 @@ impl VURunner {
                                 sample_type: SampleType::Counter,
                             });
 
-                            // http_req_failed (Rate) — true for status >= 400
+                            // http_req_failed (Rate) — true when status not in expected list
+                            let is_failed = !tropel_core::config::status_is_expected(
+                                http_response.status_code,
+                                &self.expected_statuses,
+                            );
                             result.samples.push(Sample {
                                 metric: "http_req_failed".to_string(),
-                                value: if http_response.status_code >= 400 { 1.0 } else { 0.0 },
+                                value: if is_failed { 1.0 } else { 0.0 },
                                 tags: tags.clone(),
                                 timestamp: now,
                                 sample_type: SampleType::Rate,
@@ -255,19 +271,27 @@ impl VURunner {
                         Err(e) => {
                             tracing::warn!("VU {} request '{}' failed: {}", iteration_index, item.name, e);
                             let err_tags = TagMap::from_pairs([
-                                ("url", resolved_url),
+                                ("url", resolved_url.clone()),
                                 ("method", request.method.to_string()),
                                 ("name", item.name.clone()),
                                 ("error", e.to_string()),
                             ]);
-                            let error_sample = tropel_core::types::Sample {
+                            let now = std::time::SystemTime::now();
+                            result.samples.push(tropel_core::types::Sample {
                                 metric: "errors".to_string(),
                                 value: 1.0,
-                                tags: err_tags,
-                                timestamp: std::time::SystemTime::now(),
+                                tags: err_tags.clone(),
+                                timestamp: now,
                                 sample_type: SampleType::Counter,
-                            };
-                            result.samples.push(error_sample);
+                            });
+                            // Connection errors always count as failed requests
+                            result.samples.push(tropel_core::types::Sample {
+                                metric: "http_req_failed".to_string(),
+                                value: 1.0,
+                                tags: err_tags,
+                                timestamp: now,
+                                sample_type: SampleType::Rate,
+                            });
                         }
                     }
                 }

@@ -280,10 +280,74 @@ impl Default for OutputConfig {
     }
 }
 
+/// Expected status code or range for determining http_req_failed.
+/// A request fails (http_req_failed=1) when the response status code
+/// does NOT fall within any of the expected entries.
+///
+/// Each entry can be:
+/// - A single code: `200`
+/// - A range: `"200-399"`
+/// - A pattern with wildcard: `"2xx"`, `"3xx"`
+///
+/// Default: `["200-399"]` — all 2xx and 3xx are considered success.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ExpectedStatus {
+    Single(u16),
+    Range(String),
+}
+
+impl ExpectedStatus {
+    /// Check if a given status code matches this expected status entry.
+    pub fn matches(&self, code: u16) -> bool {
+        match self {
+            ExpectedStatus::Single(c) => *c == code,
+            ExpectedStatus::Range(s) => {
+                // Support patterns: "200-399" (range), "2xx" (wildcard), "200" (single)
+                if let Some((lo, hi)) = s.split_once('-') {
+                    // Range: "200-299"
+                    let lo: u16 = lo.trim().parse().unwrap_or(0);
+                    let hi: u16 = hi.trim().parse().unwrap_or(u16::MAX);
+                    code >= lo && code <= hi
+                } else if s.ends_with("xx") {
+                    // Wildcard: "2xx" → 200-299, "3xx" → 300-399
+                    let prefix = &s[..s.len() - 2];
+                    if let Ok(base) = prefix.parse::<u16>() {
+                        let lo = base * 100;
+                        let hi = lo + 99;
+                        code >= lo && code <= hi
+                    } else {
+                        false
+                    }
+                } else if let Ok(c) = s.parse::<u16>() {
+                    c == code
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// Check if a response status code is expected (successful) according to the
+/// list of expected statuses. Returns true if the code matches ANY expected entry.
+/// Returns false if the list is empty (never succeeds — all requests fail).
+pub fn status_is_expected(code: u16, expected: &[ExpectedStatus]) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
+    expected.iter().any(|e| e.matches(code))
+}
+
 /// HTTP client configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HttpConfig {
+    /// Expected response status codes/ranges that determine request success.
+    /// Used to drive the http_req_failed Rate metric.
+    /// Default: `["200-399"]` — 2xx and 3xx are success, everything else fails.
+    #[serde(default = "default_expected_statuses", alias = "expectedStatuses")]
+    pub expected_statuses: Vec<ExpectedStatus>,
     /// Connection pool max idle connections.
     pub max_idle_connections: usize,
     /// Keep-alive duration.
@@ -305,9 +369,15 @@ pub struct HttpConfig {
     pub max_redirects: u32,
 }
 
+fn default_expected_statuses() -> Vec<ExpectedStatus> {
+    vec![ExpectedStatus::Range("200-399".to_string())]
+}
+
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
+            // 2xx-3xx = success (default, matches k6 behavior)
+            expected_statuses: default_expected_statuses(),
             // With per-VU HTTP clients, each VU has its own connection pool.
             // A VU only makes one request at a time (sequential), so 4 idle
             // connections per host per VU is plenty. The old default of 100

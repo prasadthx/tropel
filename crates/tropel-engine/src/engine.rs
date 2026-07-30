@@ -188,7 +188,8 @@ impl Engine {
                         };
 
                         let bridge_client = Arc::new(client.clone());
-                        let mut runner = VURunner::new(scenario, client);
+                        let mut runner = VURunner::new(scenario, client)
+                            .with_expected_statuses(http_cfg.expected_statuses.clone());
                         let pm_state = runner.state_handle();
 
                         let js_ctx = create_vu_js_context(vu_id, &pm_state, &bridge_client).await;
