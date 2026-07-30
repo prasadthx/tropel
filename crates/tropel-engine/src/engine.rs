@@ -8,7 +8,7 @@ use tropel_core::{Result, TropelError};
 use tropel_executor::runner::VURunner;
 use tropel_executor::scheduler::VUScheduler;
 use tropel_ext::registry::ExtensionRegistry;
-use tropel_http::protocol::HttpProtocol;
+use tropel_http::client::HttpClient;
 use tropel_metrics::collector::MetricsCollector;
 use tropel_metrics::thresholds::check_abort_on_fail;
 use tropel_report::{create_reporter, Reporter};
@@ -33,9 +33,6 @@ impl Engine {
         // Parse the input file
         let scenario = self.parse_input(&config.input, config).await?;
         let scenario = Arc::new(scenario);
-
-        // Create shared HTTP protocol (used by all VUs)
-        let http_protocol = Arc::new(HttpProtocol::new(&config.http)?);
 
         // Create metrics collector
         let metrics = Arc::new(MetricsCollector::new());
@@ -71,20 +68,20 @@ impl Engine {
 
         let metrics_clone = metrics.clone();
         let scenario_clone = scenario.clone();
-        let http_protocol_clone = http_protocol.clone();
         let stop_signal_clone = stop_signal.clone();
         let env_clone = config.env.clone();
         let data_rows = config.iteration_data.clone();
         let pool_clone = pool.clone();
+        let http_config = config.http.clone();
 
         executor.run(move |sched, vu_id| {
             let metrics = metrics_clone.clone();
             let scenario = scenario_clone.clone();
-            let http = http_protocol_clone.clone();
             let stop = stop_signal_clone.clone();
             let total_iters = total_iterations;
             let vu_env = env_clone.clone();
             let data_rows = data_rows.clone();
+            let http_cfg = http_config.clone();
             let _vus_count = vus;
             let thresholds = thresholds.clone();
             let test_start = test_start;
@@ -95,8 +92,18 @@ impl Engine {
                 // Increment active VU count on start
                 sched.add_active_vu(1).await;
 
-                // Create VU runner (HTTP client shared via HttpProtocol)
-                let mut runner = VURunner::new(scenario, http);
+                // Create per-VU HTTP client — own connection pool + cookie jar
+                let client = match HttpClient::new(&http_cfg) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("VU {}: Failed to create HTTP client: {}", vu_id, e);
+                        sched.remove_active_vu(1).await;
+                        return;
+                    }
+                };
+
+                // Create VU runner with its own dedicated HTTP client
+                let mut runner = VURunner::new(scenario, client);
                 let pm_state = runner.state_handle();
 
                 // Create JS context and attach to runner

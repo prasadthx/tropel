@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tropel_core::scenario::Scenario;
 use tropel_core::types::{Sample, SampleType, AuthConfig};
 use tropel_core::Result;
-use tropel_http::protocol::HttpProtocol;
+use tropel_http::client::HttpClient;
 use tropel_js::JsContext;
 use tropel_pm::bridge::{PmState, SharedPmState};
 
@@ -34,17 +34,21 @@ impl Default for RunnerConfig {
 }
 
 /// Per-VU iteration runner with full HTTP/JS/PM integration.
+///
+/// Each VU owns its own `HttpClient` (own connection pool, cookie jar,
+/// and discard_bodies setting) — eliminating connection contention and
+/// the N1 race condition where VUs shared a response slot.
 pub struct VURunner {
     scenario: Arc<Scenario>,
     pm_state: SharedPmState,
-    http: Arc<HttpProtocol>,
+    client: HttpClient,
     config: RunnerConfig,
     js_ctx: Option<Box<JsContext>>,
 }
 
 impl VURunner {
-    /// Create a new VU runner.
-    pub fn new(scenario: Arc<Scenario>, http: Arc<HttpProtocol>) -> Self {
+    /// Create a new VU runner with a dedicated HTTP client.
+    pub fn new(scenario: Arc<Scenario>, client: HttpClient) -> Self {
         // Extract all item names in order for setNextRequest resolution
         let names: Vec<String> = scenario.items.iter().map(|item| item.name.clone()).collect();
         let pm_state = Arc::new(Mutex::new(PmState::new()));
@@ -55,7 +59,7 @@ impl VURunner {
         Self {
             scenario,
             pm_state,
-            http,
+            client,
             config: RunnerConfig::default(),
             js_ctx: None,
         }
@@ -170,28 +174,43 @@ impl VURunner {
                     .or(self.scenario.auth.as_ref())
                     .and_then(|auth| build_auth_signer(auth));
 
+                // Execute the request directly via the per-VU HTTP client
                 tracing::trace!("VU runner: executing request to {}", resolved_req.url);
 
-                // Execute the request via HTTP protocol
-                let http_result = self.http.execute_item_with_request(&resolved_req, auth_signer.as_deref()).await;
+                let exec_start = Instant::now();
+                let exec_result = self.client.execute(&resolved_req, auth_signer.as_deref()).await;
+                let duration = exec_start.elapsed();
 
-                tracing::trace!("VU runner: request to {} completed", resolved_req.url);
+                tracing::trace!("VU runner: request to {} completed in {:?}", resolved_req.url, duration);
 
-                match http_result {
-                    Ok((sample, http_response)) => {
-                        // Set response in PM state (directly from the returned value,
-                        // not from a shared slot — avoids race conditions with other VUs)
+                match exec_result {
+                    Ok(http_response) => {
+                        // Convert to core Response and store in PM state (by move — no shared slot)
+                        let pm_response = tropel_core::types::Response::from(&http_response);
                         {
                             let mut state = self.pm_state.lock().unwrap();
-                            state.response = Some(http_response);
+                            state.response = Some(pm_response);
                         }
 
-                        // Record duration sample
-                        let tags = sample.tags.clone();
-                        result.samples.push(sample);
+                        // Build duration sample (tags match what k6 emits for http_req_duration)
+                        let mut tags = HashMap::new();
+                        tags.insert("url".to_string(), resolved_req.url.clone());
+                        tags.insert("method".to_string(), resolved_req.method.to_string());
+                        tags.insert("status_code".to_string(), http_response.status_code.to_string());
+                        tags.insert("name".to_string(), resolved_req.url.clone());
+                        tags.insert("group".to_string(), "http".to_string());
+
+                        let duration_sample = Sample {
+                            metric: "http_req_duration".to_string(),
+                            value: duration.as_micros() as f64,
+                            tags: tags.clone(),
+                            timestamp: std::time::SystemTime::now(),
+                            sample_type: SampleType::Trend,
+                        };
+                        result.samples.push(duration_sample);
 
                         // Also emit a counter
-                        let count_sample = tropel_core::types::Sample {
+                        let count_sample = Sample {
                             metric: "http_reqs".to_string(),
                             value: 1.0,
                             tags,
