@@ -375,79 +375,135 @@ var CryptoJS = CryptoJS || {};
     };
 
     // ── AES (real encryption via native Rust) ──
+    /// Derive a key+IV from a passphrase using OpenSSL-compatible EVP_BytesToKey.
+    /// For AES-256-GCM: key=32 bytes, iv=12 bytes.
+    /// For AES-256-CBC: key=32 bytes, iv=16 bytes.
+    function deriveKeyAndIv(passphrase, salt, keyLen, ivLen) {
+        if (typeof __tropel_native_evp_bytes_to_key === 'function') {
+            var passBytes = bytesFromWordArray(CryptoJS.enc.Utf8.parse(passphrase));
+            var resultJson = __tropel_native_evp_bytes_to_key(passBytes, salt, keyLen, ivLen);
+            var result = JSON.parse(resultJson);
+            return {
+                key: wordArrayFromBytes(result.key),
+                iv: wordArrayFromBytes(result.iv)
+            };
+        }
+        // Fallback JS implementation (rare — native is preferred)
+        // EVP_BytesToKey: D_i = MD5(D_{i-1} + password + salt), concatenate until enough
+        throw new Error('EVP_BytesToKey native function not available');
+    }
+
     CryptoJS.AES = {
         /// Encrypt with AES-256-GCM (authenticated encryption)
         ///   message: string or WordArray (plaintext)
-        ///   key: 32-byte key (WordArray or hex/base64 string)
-        ///   options: { iv: WordArray|string (12 bytes for GCM, 16 for CBC),
+        ///   key: 32-byte key (WordArray) or passphrase (string, uses EVP_BytesToKey)
+        ///   options: { iv: WordArray|bytes (12 for GCM, 16 for CBC),
         ///              mode: 'GCM' (default) | 'CBC' }
         /// Returns: { ciphertext: WordArray, key: WordArray, iv: WordArray,
-        ///            salt: '', toString: fn → base64(ciphertext) }
+        ///            salt: WordArray (empty for direct keys), toString: fn }
         encrypt: function (message, key, options) {
-            // Convert inputs to bytes
             var msgBytes = typeof message === 'string'
                 ? CryptoJS.enc.Utf8.parse(message)
                 : message;
-            var keyBytes = typeof key === 'string'
-                ? CryptoJS.enc.Hex.parse(key)
-                : key;
             var plainBytes = bytesFromWordArray(msgBytes);
-            var keyArr = bytesFromWordArray(keyBytes);
 
-            // Determine mode (default GCM)
             options = options || {};
             var mode = options.mode || 'GCM';
-
-            // Generate random IV/nonce if not provided
-            var ivBytes;
             var ivLen = mode === 'CBC' ? 16 : 12;
-            if (options.iv) {
-                var ivWord = typeof options.iv === 'string'
-                    ? CryptoJS.enc.Hex.parse(options.iv)
-                    : options.iv;
-                ivBytes = bytesFromWordArray(ivWord);
-            } else if (typeof __tropel_native_uuid === 'function') {
-                // Use hash of uuid as pseudo-random IV (in real usage, cryptographically random)
-                // For now, use a fixed-time-based nonce
-                var ts = Date.now().toString(16);
-                while (ts.length < ivLen * 2) ts = '0' + ts;
-                ts = ts.slice(-ivLen * 2);
-                ivBytes = [];
-                for (var i = 0; i < ts.length; i += 2) {
-                    ivBytes.push(parseInt(ts.substr(i, 2), 16));
+            var keyLen = 32; // AES-256
+
+            var keyBytes;
+            var keyWordArr;
+            var ivBytes;
+            var ivWordArr;
+            var saltBytes = [];
+            var saltWordArr = CryptoJS.enc.Hex.parse('');
+
+            if (typeof key === 'string') {
+                // String key = passphrase → use EVP_BytesToKey (OpenSSL-compatible)
+                // Generate random 8-byte salt via CSPRNG
+                if (typeof __tropel_native_random_bytes === 'function') {
+                    saltBytes = __tropel_native_random_bytes(8);
+                } else {
+                    // Fallback: use Date.now (not cryptographically secure)
+                    saltBytes = [];
+                    var ts = Date.now();
+                    for (var i = 0; i < 8; i++) {
+                        saltBytes.push(ts & 0xFF);
+                        ts = ts >>> 8;
+                    }
                 }
-                while (ivBytes.length < ivLen) ivBytes.push(0);
+                saltWordArr = wordArrayFromBytes(saltBytes);
+
+                var derived = deriveKeyAndIv(key, saltBytes, keyLen, ivLen);
+                keyWordArr = derived.key;
+                keyBytes = bytesFromWordArray(keyWordArr);
+                ivWordArr = derived.iv;
+                ivBytes = bytesFromWordArray(ivWordArr);
             } else {
-                ivBytes = [];
-                for (var i = 0; i < ivLen; i++) ivBytes.push(0);
+                // WordArray key = use directly
+                keyWordArr = key;
+                keyBytes = bytesFromWordArray(key);
+
+                // Generate random IV/nonce via CSPRNG if not provided
+                if (options.iv) {
+                    var ivWord = typeof options.iv === 'string'
+                        ? CryptoJS.enc.Hex.parse(options.iv)
+                        : options.iv;
+                    ivWordArr = ivWord;
+                    ivBytes = bytesFromWordArray(ivWord);
+                } else if (typeof __tropel_native_random_bytes === 'function') {
+                    ivBytes = __tropel_native_random_bytes(ivLen);
+                    ivWordArr = wordArrayFromBytes(ivBytes);
+                } else {
+                    // Last-resort fallback (NOT cryptographically secure)
+                    ivBytes = [];
+                    for (var i = 0; i < ivLen; i++) ivBytes.push(0);
+                    ivWordArr = wordArrayFromBytes(ivBytes);
+                }
             }
 
+            // Execute encryption via native function
             var result;
             if (mode === 'CBC') {
-                // AES-256-CBC
                 if (typeof __tropel_native_aes_cbc_encrypt !== 'function') {
                     throw new Error('AES-CBC encrypt native function not available');
                 }
-                result = __tropel_native_aes_cbc_encrypt(keyArr, ivBytes, plainBytes);
+                result = __tropel_native_aes_cbc_encrypt(keyBytes, ivBytes, plainBytes);
             } else {
-                // AES-256-GCM (default, authenticated)
                 if (typeof __tropel_native_aes_gcm_encrypt !== 'function') {
                     throw new Error('AES-GCM encrypt native function not available');
                 }
-                result = __tropel_native_aes_gcm_encrypt(keyArr, ivBytes, plainBytes);
+                result = __tropel_native_aes_gcm_encrypt(keyBytes, ivBytes, plainBytes);
+            }
+
+            // Handle null result (e.g., wrong key length)
+            if (result === null || result === undefined) {
+                throw new Error('AES encrypt failed: bad key length, bad nonce length, or internal error');
             }
 
             var cipherWordArr = wordArrayFromBytes(result);
-            var ivWordArr = wordArrayFromBytes(ivBytes);
 
             // Return a CipherParams-like object
             var cipherParams = {
                 ciphertext: cipherWordArr,
-                key: keyBytes,
+                key: keyWordArr,
                 iv: ivWordArr,
-                salt: '',
+                salt: saltWordArr,
                 toString: function (encoder) {
-                    return (encoder || CryptoJS.enc.Base64).stringify(this.ciphertext);
+                    var enc = encoder || CryptoJS.enc.Base64;
+                    // If we used a passphrase (has salt), include salt in output
+                    if (this.salt && this.salt.sigBytes > 0) {
+                        // OpenSSL format: 'Salted__' + 8-byte salt + ciphertext
+                        var saltedPrefix = wordArrayFromBytes([83, 97, 108, 116, 101, 100, 95, 95]); // 'Salted__'
+                        saltedPrefix.sigBytes = 8;
+                        var combined = CryptoJS.lib.WordArray.create();
+                        combined = combined.concat(saltedPrefix);
+                        combined = combined.concat(this.salt);
+                        combined = combined.concat(this.ciphertext);
+                        return enc.stringify(combined);
+                    }
+                    return enc.stringify(this.ciphertext);
                 }
             };
             return cipherParams;
@@ -455,35 +511,84 @@ var CryptoJS = CryptoJS || {};
 
         /// Decrypt with AES-256-GCM or AES-256-CBC
         ///   ciphertext: result from encrypt() or { ciphertext: WordArray }
-        ///   key: 32-byte key (WordArray or hex/base64 string)
-        ///   options: { iv: WordArray|string, mode: 'GCM' (default) | 'CBC' }
+        ///   key: 32-byte key (WordArray) or passphrase (string, uses EVP_BytesToKey)
+        ///   options: { iv: WordArray|bytes, mode: 'GCM' (default) | 'CBC' }
         /// Returns: WordArray (decrypted plaintext)
         decrypt: function (ciphertext, key, options) {
-            // Accept either the ciphertext directly or an object with ciphertext property
             var ct = ciphertext.ciphertext || ciphertext;
-            var ctKey = ciphertext.key || key;
-            var ctIv = ciphertext.iv || (options && options.iv) || null;
             options = options || {};
-
-            var cipherBytes = typeof ct === 'string'
-                ? bytesFromWordArray(CryptoJS.enc.Base64.parse(ct))
-                : bytesFromWordArray(ct);
-            var keyBytes = typeof ctKey === 'string'
-                ? bytesFromWordArray(CryptoJS.enc.Hex.parse(ctKey))
-                : bytesFromWordArray(ctKey);
-
             var mode = options.mode || 'GCM';
             var ivLen = mode === 'CBC' ? 16 : 12;
+            var keyLen = 32;
 
-            // Use IV from cipherParams or options, or derive from ciphertext
-            var ivBytes;
-            if (ctIv) {
-                var ivWord = typeof ctIv === 'string'
-                    ? CryptoJS.enc.Hex.parse(ctIv)
-                    : ctIv;
-                ivBytes = bytesFromWordArray(ivWord);
+            // Extract IV, key, and salt from cipherParams object if available
+            var ctIv = ciphertext.iv || null;
+            var ctKey = ciphertext.key || key;
+            var ctSalt = ciphertext.salt || null;
+
+            // Parse ciphertext: base64 string or WordArray to bytes
+            var rawBytes;
+            if (typeof ct === 'string') {
+                rawBytes = bytesFromWordArray(CryptoJS.enc.Base64.parse(ct));
             } else {
-                throw new Error('IV required for AES decryption. Provide iv in options or use object from encrypt().');
+                rawBytes = bytesFromWordArray(ct);
+            }
+
+            // Detect OpenSSL passphrase format: 'Salted__' prefix + 8-byte salt
+            // If present, extract salt and use it for key derivation, then strip
+            // the prefix for the actual ciphertext.
+            var cipherBytes = rawBytes;
+            if (typeof ctKey === 'string' && rawBytes.length >= 16) {
+                // Check for 'Salted__' magic bytes at offset 0
+                var saltedMagic = [83, 97, 108, 116, 101, 100, 95, 95]; // 'Salted__'
+                var isSalted = true;
+                for (var i = 0; i < 8; i++) {
+                    if (rawBytes[i] !== saltedMagic[i]) {
+                        isSalted = false;
+                        break;
+                    }
+                }
+                if (isSalted) {
+                    ctSalt = wordArrayFromBytes(rawBytes.slice(8, 16));
+                    cipherBytes = rawBytes.slice(16);
+                }
+            }
+
+            // Handle key: string → passphrase, WordArray → direct
+            var keyBytes;
+            var keyWordArr;
+            var ivBytes;
+
+            if (typeof ctKey === 'string') {
+                // Passphrase mode: derive key+IV from password + salt
+                var saltBytes;
+                if (ctSalt) {
+                    saltBytes = bytesFromWordArray(ctSalt);
+                } else {
+                    throw new Error('Salt required for passphrase-based decryption. Use object from encrypt() or provide salt.');
+                }
+                var derived = deriveKeyAndIv(ctKey, saltBytes, keyLen, ivLen);
+                keyWordArr = derived.key;
+                keyBytes = bytesFromWordArray(derived.key);
+                ivBytes = bytesFromWordArray(derived.iv);
+            } else {
+                keyWordArr = ctKey;
+                keyBytes = bytesFromWordArray(ctKey);
+
+                // Get IV from cipherParams or options
+                if (ctIv) {
+                    var ivWord = typeof ctIv === 'string'
+                        ? CryptoJS.enc.Hex.parse(ctIv)
+                        : ctIv;
+                    ivBytes = bytesFromWordArray(ivWord);
+                } else if (options.iv) {
+                    var optIv = typeof options.iv === 'string'
+                        ? CryptoJS.enc.Hex.parse(options.iv)
+                        : options.iv;
+                    ivBytes = bytesFromWordArray(optIv);
+                } else {
+                    throw new Error('IV required for AES decryption. Provide iv in options or use object from encrypt().');
+                }
             }
 
             var result;
@@ -497,6 +602,11 @@ var CryptoJS = CryptoJS || {};
                     throw new Error('AES-GCM decrypt native function not available');
                 }
                 result = __tropel_native_aes_gcm_decrypt(keyBytes, ivBytes, cipherBytes);
+            }
+
+            // Handle null result (wrong key, auth failure, etc.)
+            if (result === null || result === undefined) {
+                throw new Error('AES decrypt failed: wrong key, corrupted data, or authentication failure');
             }
 
             return wordArrayFromBytes(result);

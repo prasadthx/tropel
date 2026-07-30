@@ -2,7 +2,9 @@ use crate::NativeModule;
 use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use aes_gcm::aead::{Aead, KeyInit as _};
 use cbc::cipher::block_padding::Pkcs7;
+use md5::Md5;
 use rquickjs::function::Func;
+use sha2::Digest;
 use tropel_core::Result;
 use tropel_js::JsContext;
 
@@ -67,36 +69,53 @@ impl NativeModule for CryptoModule {
             }));
 
             // ── AES-256-GCM (authenticated encryption) ──
+            // Returns None on error (wrong key/nonce length, auth failure)
+            // instead of panicking across the FFI boundary.
             let _ = globals.set(
                 "__tropel_native_aes_gcm_encrypt",
-                Func::from(|key: Vec<u8>, nonce: Vec<u8>, plaintext: Vec<u8>| -> Vec<u8> {
-                    aes_gcm_encrypt(&key, &nonce, &plaintext)
-                        .expect("AES-GCM encrypt failed")
+                Func::from(|key: Vec<u8>, nonce: Vec<u8>, plaintext: Vec<u8>| -> Option<Vec<u8>> {
+                    aes_gcm_encrypt(&key, &nonce, &plaintext).ok()
                 }),
             );
 
             let _ = globals.set(
                 "__tropel_native_aes_gcm_decrypt",
-                Func::from(|key: Vec<u8>, nonce: Vec<u8>, ciphertext: Vec<u8>| -> Vec<u8> {
-                    aes_gcm_decrypt(&key, &nonce, &ciphertext)
-                        .expect("AES-GCM decrypt failed")
+                Func::from(|key: Vec<u8>, nonce: Vec<u8>, ciphertext: Vec<u8>| -> Option<Vec<u8>> {
+                    aes_gcm_decrypt(&key, &nonce, &ciphertext).ok()
                 }),
             );
 
             // ── AES-256-CBC (PKCS7 padding) ──
             let _ = globals.set(
                 "__tropel_native_aes_cbc_encrypt",
-                Func::from(|key: Vec<u8>, iv: Vec<u8>, plaintext: Vec<u8>| -> Vec<u8> {
-                    aes_cbc_encrypt(&key, &iv, &plaintext)
-                        .expect("AES-CBC encrypt failed")
+                Func::from(|key: Vec<u8>, iv: Vec<u8>, plaintext: Vec<u8>| -> Option<Vec<u8>> {
+                    aes_cbc_encrypt(&key, &iv, &plaintext).ok()
                 }),
             );
 
             let _ = globals.set(
                 "__tropel_native_aes_cbc_decrypt",
-                Func::from(|key: Vec<u8>, iv: Vec<u8>, ciphertext: Vec<u8>| -> Vec<u8> {
-                    aes_cbc_decrypt(&key, &iv, &ciphertext)
-                        .expect("AES-CBC decrypt failed")
+                Func::from(|key: Vec<u8>, iv: Vec<u8>, ciphertext: Vec<u8>| -> Option<Vec<u8>> {
+                    aes_cbc_decrypt(&key, &iv, &ciphertext).ok()
+                }),
+            );
+
+            // ── CSPRNG: generate cryptographically secure random bytes ──
+            let _ = globals.set(
+                "__tropel_native_random_bytes",
+                Func::from(|n: u32| -> Vec<u8> {
+                    random_bytes(n as usize)
+                }),
+            );
+
+            // ── EVP_BytesToKey (OpenSSL-compatible key derivation for CryptoJS interop) ──
+            // Derives a key+iv pair from a passphrase + salt using iterative MD5.
+            // Returns JSON: {"key": [...], "iv": [...]}
+            let _ = globals.set(
+                "__tropel_native_evp_bytes_to_key",
+                Func::from(|password: Vec<u8>, salt: Vec<u8>, key_len: u32, iv_len: u32| -> String {
+                    let (key, iv) = evp_bytes_to_key(&password, &salt, key_len as usize, iv_len as usize);
+                    serde_json::json!({"key": key, "iv": iv}).to_string()
                 }),
             );
         });
@@ -140,8 +159,6 @@ pub fn sha1(data: &[u8]) -> Vec<u8> {
 
 /// Compute MD5 hash.
 pub fn md5(data: &[u8]) -> Vec<u8> {
-    use md5::Md5;
-    use sha2::Digest;
     let mut hasher = Md5::new();
     hasher.update(data);
     hasher.finalize().to_vec()
@@ -197,6 +214,47 @@ pub fn hmac_md5(key: &[u8], data: &[u8]) -> Vec<u8> {
         .expect("HMAC key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
+}
+
+/// Generate `n` cryptographically secure random bytes using the OS CSPRNG.
+pub fn random_bytes(n: usize) -> Vec<u8> {
+    use rand::RngCore;
+    let mut buf = vec![0u8; n];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    buf
+}
+
+/// OpenSSL-compatible EVP_BytesToKey key derivation.
+///
+/// Derives a key+iv pair from a passphrase and salt using iterative MD5,
+/// matching the algorithm used by CryptoJS when a string passphrase is
+/// provided (and by OpenSSL's `enc` command).
+///
+/// Algorithm:
+///   D_0 = ''
+///   D_i = MD5(D_{i-1} || password || salt)
+///   Concatenate D_1, D_2, ... until key_len + iv_len bytes are produced
+///   key = first key_len bytes, iv = next iv_len bytes
+pub fn evp_bytes_to_key(password: &[u8], salt: &[u8], key_len: usize, iv_len: usize) -> (Vec<u8>, Vec<u8>) {
+    let total = key_len + iv_len;
+    let mut derived = Vec::with_capacity(total);
+    let mut prev_hash: Vec<u8> = Vec::new();
+
+    while derived.len() < total {
+        let mut hasher = Md5::new();
+        // Prepend previous hash block
+        hasher.update(&prev_hash);
+        // Append password and salt
+        hasher.update(password);
+        hasher.update(salt);
+        let hash = hasher.finalize().to_vec();
+        derived.extend_from_slice(&hash);
+        prev_hash = hash;
+    }
+
+    let key = derived[..key_len].to_vec();
+    let iv = derived[key_len..key_len + iv_len].to_vec();
+    (key, iv)
 }
 
 /// AES-256-GCM encrypt.
@@ -322,6 +380,43 @@ pub fn aes_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_random_bytes() {
+        let bytes = random_bytes(32);
+        assert_eq!(bytes.len(), 32);
+        // Two calls should produce different results (CSPRNG)
+        let bytes2 = random_bytes(32);
+        assert_ne!(bytes, bytes2);
+    }
+
+    #[test]
+    fn test_random_bytes_zero() {
+        let bytes = random_bytes(0);
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn test_evp_bytes_to_key() {
+        // Test vector: known password + salt should produce deterministic output
+        let password = b"password";
+        let salt = b"12345678";
+        let (key, iv) = evp_bytes_to_key(password, salt, 32, 16);
+        assert_eq!(key.len(), 32);
+        assert_eq!(iv.len(), 16);
+        // Deterministic for same inputs
+        let (key2, iv2) = evp_bytes_to_key(password, salt, 32, 16);
+        assert_eq!(key, key2);
+        assert_eq!(iv, iv2);
+    }
+
+    #[test]
+    fn test_evp_bytes_to_key_different_salt() {
+        let password = b"password";
+        let (key1, _) = evp_bytes_to_key(password, b"aaaaaaaa", 32, 16);
+        let (key2, _) = evp_bytes_to_key(password, b"bbbbbbbb", 32, 16);
+        assert_ne!(key1, key2, "Different salts should produce different keys");
+    }
 
     #[test]
     fn test_sha256() {
