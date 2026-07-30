@@ -39,7 +39,7 @@ pub struct VURunner {
     pm_state: SharedPmState,
     http: Arc<HttpProtocol>,
     config: RunnerConfig,
-    js_ctx: Option<Arc<JsContext>>,
+    js_ctx: Option<Box<JsContext>>,
 }
 
 impl VURunner {
@@ -62,7 +62,7 @@ impl VURunner {
     }
 
     /// Attach a JS context for script execution.
-    pub fn with_js_context(mut self, js_ctx: Arc<JsContext>) -> Self {
+    pub fn with_js_context(mut self, js_ctx: Box<JsContext>) -> Self {
         self.js_ctx = Some(js_ctx);
         self
     }

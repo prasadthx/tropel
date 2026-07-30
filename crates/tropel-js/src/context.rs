@@ -25,12 +25,6 @@ pub struct CachedScript {
     func: Persistent<Function<'static>>,
 }
 
-// Safety: each JsContext owns its own Runtime. A CachedScript is only
-// used from within that same Runtime, never concurrently from multiple
-// Runtimes.
-unsafe impl Send for CachedScript {}
-unsafe impl Sync for CachedScript {}
-
 impl CachedScript {
     /// Compile a JS function and persist it.
     pub fn compile<'js>(ctx: &rquickjs::Ctx<'js>, func: Function<'js>) -> Self {
@@ -65,6 +59,13 @@ pub struct JsContext {
     /// Avoids re-parsing scripts on every iteration.
     script_cache: Mutex<HashMap<u64, CachedScript>>,
 }
+
+// Safety: each JsContext owns its own rquickjs Runtime, and thread-per-core
+// architecture ensures it is only ever used from a single thread at a time.
+// Sync is required because `&self` async methods (eval, run_script_cached,
+// etc.) need `&JsContext: Send`, which requires `JsContext: Sync`.
+unsafe impl Send for JsContext {}
+unsafe impl Sync for JsContext {}
 
 /// Get the current time as nanoseconds since UNIX epoch.
 fn now_nanos() -> u64 {

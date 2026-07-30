@@ -102,7 +102,7 @@ impl Engine {
                 // Create JS context and attach to runner
                 let js_ctx = create_vu_js_context(vu_id, &pm_state).await;
                 if let Some(ctx) = js_ctx {
-                    runner = runner.with_js_context(Arc::new(ctx));
+                    runner = runner.with_js_context(Box::new(ctx));
                     tracing::debug!("VU {}: JS context attached for script execution", vu_id);
                 }
 
