@@ -42,7 +42,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Fast JSON parsing (≈2-4× faster than serde_json for response bodies)
-simd-json = { version = "0.14", features = ["serde-impl"] }
+simd-json = { version = "0.14", features = ["serde_impl"] }
 
 # Metrics
 hdrhistogram = "7"

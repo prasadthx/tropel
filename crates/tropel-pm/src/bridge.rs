@@ -2,7 +2,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use tropel_core::types::{Request, Response, Sample};
+use tropel_core::types::{Request, Response, Sample, TagMap};
 
 /// A request queued by pm.sendRequest for later async execution.
 #[derive(Debug, Clone)]
@@ -84,7 +84,7 @@ impl PmState {
         self.samples.push(Sample {
             metric: "checks".to_string(),
             value: if passed { 1.0 } else { 0.0 },
-            tags: HashMap::from([("check".to_string(), name.to_string())]),
+            tags: TagMap::from_pairs([("check", name.to_string())]),
             timestamp: std::time::SystemTime::now(),
             sample_type: tropel_core::types::SampleType::Rate,
         });
