@@ -34,10 +34,15 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Run a load test from a Postman Collection
+    /// Run a load test
     Run {
-        /// Path to the Postman Collection JSON file
+        /// Path to the input file (collection, HAR, script, etc.)
         input: PathBuf,
+
+        /// Input format (auto-detect if not specified).
+        /// Use `tropel extensions` to list available formats.
+        #[arg(long = "format")]
+        format: Option<String>,
 
         /// Number of virtual users (overrides collection config)
         #[arg(short = 'u', long = "vus")]
@@ -92,7 +97,7 @@ enum Commands {
         iterations: Option<u64>,
     },
 
-    /// List available extensions and their capabilities
+    /// List available input formats and their capabilities
     Extensions,
 
     /// Print the version and build information
@@ -137,7 +142,7 @@ impl Cli {
 async fn run(cli: Cli) -> Result<()> {
     // Extract fields from the Run command
     let Commands::Run {
-        input, vus, duration, env, env_file, data_file,
+        input, format, vus, duration, env, env_file, data_file,
         reporter, output, threshold, insecure, verbose: _,
         mode, stages, iterations,
     } = &cli.command else {
@@ -145,6 +150,7 @@ async fn run(cli: Cli) -> Result<()> {
     };
 
     let input = input.clone();
+    let format = format.clone();
     let vus = *vus;
     let duration = duration.clone();
     let env = env.clone();
@@ -282,6 +288,7 @@ async fn run(cli: Cli) -> Result<()> {
     // Build the full job config
     let config = JobConfig {
         input: input.to_string_lossy().to_string(),
+        input_type: format,
         execution,
         env: env_map,
         iteration_data,
@@ -331,9 +338,43 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 async fn list_extensions() -> Result<()> {
-    println!("Tropel Extensions");
-    println!("  No extensions currently registered.");
-    println!("  Use `tropel build --with <ext>` to build a custom binary with extensions.");
+    let registry = ExtensionRegistry::new();
+    let inputs = registry.list_inputs();
+
+    println!("Tropel Extensions — v{}", env!("CARGO_PKG_VERSION"));
+    println!();
+
+    if inputs.is_empty() {
+        println!("  No input adapters registered.");
+        println!("  Use `tropel build --with <crate>` to build a custom binary with extensions.");
+    } else {
+        println!("  Input formats:");
+        for fmt in &inputs {
+            println!("    - {}  (use: `tropel run input.{} --format {}", fmt, fmt, fmt);
+        }
+        println!();
+        println!("  Use `tropel run <file> --format <name>` to select a specific format.");
+        println!("  Without `--format`, the engine auto-detects from file content.");
+    }
+
+    let protocols = registry.list_protocols();
+    if !protocols.is_empty() {
+        println!();
+        println!("  Protocols:");
+        for p in &protocols {
+            println!("    - {}", p);
+        }
+    }
+
+    let outputs = registry.list_outputs();
+    if !outputs.is_empty() {
+        println!();
+        println!("  Outputs:");
+        for o in &outputs {
+            println!("    - {}", o);
+        }
+    }
+
     Ok(())
 }
 

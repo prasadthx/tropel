@@ -21,6 +21,7 @@ tropel-native.workspace = true
 tropel-es.workspace = true
 tropel-input-postman.workspace = true
 tropel-input-k6.workspace = true
+tropel-input-har.workspace = true
 rquickjs.workspace = true
 tokio.workspace = true
 thiserror.workspace = true

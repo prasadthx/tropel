@@ -19,6 +19,7 @@ members = [
     "crates/tropel-build",
     "crates/inputs/tropel-input-postman",
     "crates/inputs/tropel-input-k6",
+    "crates/inputs/tropel-input-har",
     "crates/extensions/tropel-x-grpc",
     "crates/extensions/tropel-x-websocket",
     "crates/extensions/tropel-x-prometheus",
@@ -137,6 +138,7 @@ tropel-engine = { path = "crates/tropel-engine" }
 tropel-build = { path = "crates/tropel-build" }
 tropel-input-postman = { path = "crates/inputs/tropel-input-postman" }
 tropel-input-k6 = { path = "crates/inputs/tropel-input-k6" }
+tropel-input-har = { path = "crates/inputs/tropel-input-har" }
 tropel-x-grpc = { path = "crates/extensions/tropel-x-grpc" }
 tropel-x-websocket = { path = "crates/extensions/tropel-x-websocket" }
 tropel-x-prometheus = { path = "crates/extensions/tropel-x-prometheus" }

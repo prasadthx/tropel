@@ -2494,6 +2494,7 @@ dependencies = [
  "tropel-executor",
  "tropel-ext",
  "tropel-http",
+ "tropel-input-har",
  "tropel-input-k6",
  "tropel-input-postman",
  "tropel-js",
@@ -2576,6 +2577,18 @@ dependencies = [
  "tropel-ext",
  "tropel-metrics",
  "url",
+]
+
+[[package]]
+name = "tropel-input-har"
+version = "0.1.0"
+dependencies = [
+ "inventory",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tropel-core",
+ "tropel-ext",
 ]
 
 [[package]]
