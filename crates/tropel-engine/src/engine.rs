@@ -170,8 +170,18 @@ impl Engine {
                         let mut iteration_index = 0u64;
 
                         loop {
-                            if sched.is_stop_requested() {
+                            if sched.is_force_stop_requested() || sched.is_stop_requested() {
                                 break;
+                            }
+
+                            // Check ramp-down target before starting a new iteration.
+                            // If active VUs exceed the target, this VU self-selects
+                            // to exit (level-triggered, so surplus VUs drain naturally).
+                            {
+                                let active = sched.active_vus().await;
+                                if sched.should_ramp_down(active).await {
+                                    break;
+                                }
                             }
 
                             tokio::select! {

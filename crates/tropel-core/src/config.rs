@@ -77,12 +77,23 @@ pub enum ExecutionConfig {
     ConstantVus {
         vus: u32,
         duration: String,
+        /// How long to wait for in-flight iterations to finish after the
+        /// test duration expires. Defaults to 30s if not set.
+        #[serde(default, alias = "gracefulStop")]
+        graceful_stop: Option<String>,
     },
     #[serde(rename = "ramping-vus")]
     RampingVus {
         stages: Vec<Stage>,
         start_vus: u32,
+        /// How long to wait for a VU to finish its current iteration during
+        /// a ramp-down stage before moving on. Defaults to 30s.
+        #[serde(default, alias = "gracefulRampDown")]
         graceful_ramp_down: Option<String>,
+        /// How long to wait for in-flight iterations to finish after the
+        /// final stage completes. Defaults to 30s.
+        #[serde(default, alias = "gracefulStop")]
+        graceful_stop: Option<String>,
     },
     #[serde(rename = "constant-arrival-rate")]
     ConstantArrivalRate {
@@ -91,12 +102,20 @@ pub enum ExecutionConfig {
         duration: String,
         pre_alloc_vus: u32,
         max_vus: u32,
+        /// How long to wait for in-flight iterations to finish after the
+        /// test duration expires. Defaults to 30s if not set.
+        #[serde(default, alias = "gracefulStop")]
+        graceful_stop: Option<String>,
     },
     #[serde(rename = "shared-iterations")]
     SharedIterations {
         iterations: u64,
         max_duration: Option<String>,
         vus: u32,
+        /// How long to wait for in-flight iterations to finish after the
+        /// iteration budget is exhausted or max_duration is reached.
+        #[serde(default, alias = "gracefulStop")]
+        graceful_stop: Option<String>,
     },
 }
 
@@ -221,6 +240,7 @@ impl Default for JobConfig {
             execution: ExecutionConfig::ConstantVus {
                 vus: 1,
                 duration: "30s".to_string(),
+                graceful_stop: Some("30s".to_string()),
             },
             scenarios: HashMap::new(),
             env: HashMap::new(),

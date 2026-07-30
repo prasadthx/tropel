@@ -12,9 +12,12 @@ pub struct VUScheduler {
     active_vus: Arc<Mutex<u32>>,
     total_iterations: Arc<Mutex<u64>>,
     stop_signal: Arc<tokio::sync::Notify>,
-    /// Level-triggered stop flag — persists across notify_waiters() wake-ups
-    /// so VUs never miss the stop signal even if they're between iterations.
+    /// Level-triggered stop flag — VUs check this between iterations and exit
+    /// gracefully (finish current iteration first).
     stop_requested: Arc<AtomicBool>,
+    /// Level-triggered force-stop flag — VUs check this during iterations
+    /// (e.g., in select! branches) for hard abort after grace period expires.
+    force_stop_requested: Arc<AtomicBool>,
     /// Token bucket count for arrival-rate mode (atomic, so ticker and VUs can share).
     arrival_tokens: Arc<AtomicU64>,
     /// Notify for waking VUs when a new token is available.
@@ -24,6 +27,9 @@ pub struct VUScheduler {
     /// Count of VUs currently idle (waiting for an arrival token), not executing.
     /// Used by the ticker to decide when to grow the VU pool.
     idle_vus: Arc<AtomicU32>,
+    /// Target VU count for ramp-down — VUs compare `active_vus > ramp_down_target`
+    /// and self-select to exit when the pool is above the target.
+    ramp_down_target: Arc<AtomicU32>,
 }
 
 impl VUScheduler {
@@ -35,10 +41,12 @@ impl VUScheduler {
             total_iterations: Arc::new(Mutex::new(0)),
             stop_signal: Arc::new(tokio::sync::Notify::new()),
             stop_requested: Arc::new(AtomicBool::new(false)),
+            force_stop_requested: Arc::new(AtomicBool::new(false)),
             arrival_tokens: Arc::new(AtomicU64::new(0)),
             arrival_notify: Arc::new(tokio::sync::Notify::new()),
             arrival_dropped: Arc::new(AtomicU64::new(0)),
             idle_vus: Arc::new(AtomicU32::new(0)),
+            ramp_down_target: Arc::new(AtomicU32::new(u32::MAX)),
         }
     }
 
@@ -54,8 +62,41 @@ impl VUScheduler {
     }
 
     /// Check whether stop has been requested (level-triggered — stays true once set).
+    /// VUs check this between iterations and stop gracefully after finishing the
+    /// current iteration.
     pub fn is_stop_requested(&self) -> bool {
         self.stop_requested.load(Ordering::Acquire)
+    }
+
+    /// Check whether a force stop has been requested.
+    /// VUs check this as a hard-abort signal (e.g., in select! branches)
+    /// when the graceful stop deadline has expired.
+    pub fn is_force_stop_requested(&self) -> bool {
+        self.force_stop_requested.load(Ordering::Acquire)
+    }
+
+    /// Request a hard stop — sets the force-stop flag and wakes all waiters.
+    /// This is the final deadline expiration: VUs should exit as soon as
+    /// possible, potentially mid-iteration.
+    pub fn request_force_stop(&self) {
+        self.force_stop_requested.store(true, Ordering::Release);
+        self.stop_requested.store(true, Ordering::Release);
+        self.stop_signal.notify_waiters();
+    }
+
+    /// Set the ramp-down target VU count.
+    /// VUs compare `active_vus > target` to decide if they should exit.
+    /// No wake is sent — VUs check the flag naturally at their next iteration
+    /// start via the `should_ramp_down` check in the VU loop.
+    pub fn set_ramp_down_target(&self, target: u32) {
+        self.ramp_down_target.store(target, Ordering::Release);
+    }
+
+    /// Check whether this VU should exit due to ramp-down.
+    /// A VU exits voluntarily when active_vus > ramp_down_target.
+    pub async fn should_ramp_down(&self, my_active_vus: u32) -> bool {
+        let target = self.ramp_down_target.load(Ordering::Acquire);
+        my_active_vus > target
     }
 
     /// Try to consume one arrival-rate token. Returns true if a token was available.
@@ -132,33 +173,39 @@ impl VUScheduler {
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
         match &self.config {
-            ExecutionConfig::ConstantVus { vus, duration } => {
+            ExecutionConfig::ConstantVus { vus, duration, graceful_stop } => {
                 let duration = parse_duration(duration)?;
-                self.run_constant(*vus, duration, &run_vu).await;
+                let grace = graceful_stop_duration(graceful_stop);
+                self.run_constant(*vus, duration, grace, &run_vu).await;
                 Ok(())
             }
-            ExecutionConfig::RampingVus { stages, start_vus, .. } => {
-                self.run_ramping(*start_vus, stages, &run_vu).await;
+            ExecutionConfig::RampingVus { stages, start_vus, graceful_ramp_down, graceful_stop } => {
+                let grace_rd = graceful_stop_duration(graceful_ramp_down);
+                let grace = graceful_stop_duration(graceful_stop);
+                self.run_ramping(*start_vus, stages, grace_rd, grace, &run_vu).await;
                 Ok(())
             }
-            ExecutionConfig::SharedIterations { iterations, .. } => {
-                self.run_shared_iterations(*iterations, &run_vu).await;
+            ExecutionConfig::SharedIterations { iterations, max_duration, graceful_stop, .. } => {
+                let max_dur = max_duration.as_ref().and_then(|d| parse_duration(d).ok());
+                let grace = graceful_stop_duration(graceful_stop);
+                self.run_shared_iterations(*iterations, max_dur, grace, &run_vu).await;
                 Ok(())
             }
-            ExecutionConfig::ConstantArrivalRate { rate, duration, pre_alloc_vus, max_vus, .. } => {
+            ExecutionConfig::ConstantArrivalRate { rate, duration, pre_alloc_vus, max_vus, graceful_stop, .. } => {
                 let duration = parse_duration(duration)?;
-                self.run_arrival_rate(*rate, *pre_alloc_vus, *max_vus, duration, &run_vu).await;
+                let grace = graceful_stop_duration(graceful_stop);
+                self.run_arrival_rate(*rate, *pre_alloc_vus, *max_vus, duration, grace, &run_vu).await;
                 Ok(())
             }
         }
     }
 
     /// Run with a constant number of VUs.
-    async fn run_constant<F>(&self, vus: u32, duration: Duration, run_vu: &F)
+    async fn run_constant<F>(&self, vus: u32, duration: Duration, grace: Duration, run_vu: &F)
     where
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
-        tracing::info!("Starting constant VUs: {} for {:?}", vus, duration);
+        tracing::info!("Starting constant VUs: {} for {:?} (graceful_stop: {:?})", vus, duration, grace);
 
         // Spawn VUs (active count incremented by each VU task itself)
         let mut handles = Vec::new();
@@ -167,13 +214,16 @@ impl VUScheduler {
             handles.push(handle);
         }
 
-        // Wait for the duration
+        // Wait for the test duration
         time::sleep(duration).await;
 
-        // Signal stop (level-triggered — sets the flag + wakes waiters)
+        // Signal soft stop — VUs finish their current iteration
         self.request_stop();
 
-        // Wait for all VUs to finish
+        // Wait for active VUs to drain within the graceful stop window
+        self.wait_for_drain(grace).await;
+
+        // Wait for all JoinHandles (VUs that exited should be done)
         for handle in handles {
             handle.await.ok();
         }
@@ -182,7 +232,8 @@ impl VUScheduler {
     }
 
     /// Run with ramping VUs.
-    async fn run_ramping<F>(&self, start_vus: u32, stages: &[tropel_core::config::Stage], run_vu: &F)
+    async fn run_ramping<F>(&self, start_vus: u32, stages: &[tropel_core::config::Stage],
+                            grace_rd: Duration, grace: Duration, run_vu: &F)
     where
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
@@ -216,21 +267,34 @@ impl VUScheduler {
                     time::sleep(step_delay).await;
                 }
             } else {
-                // Ramp down: use per-VU cancellation via the decrement + notify pattern
+                // Ramp down: set the target so VUs self-select to exit.
+                // This is LEVEL-triggered, not EDGE-triggered — VUs check
+                // `active_vus > ramp_down_target` each iteration and exit
+                // if they're surplus. No global notify_waiters() required.
                 let to_stop = current_vus - target;
-                // Signal all VUs; each VU checks the level-triggered flag
-                self.request_stop();
-                time::sleep(Duration::from_millis(500)).await; // Brief wait for VUs to notice
-                // Decrement active count — VUs that exit will decrement themselves
-                self.remove_active_vu(to_stop).await;
+                self.set_ramp_down_target(target);
+
+                // Wait for the surplus VUs to drain within the graceful_ramp_down window
+                tracing::debug!(
+                    "Ramp-down: waiting for {} VUs to exit (grace: {:?}, target: {})",
+                    to_stop, grace_rd, target
+                );
+                self.wait_for_drain_while(grace_rd, || async {
+                    let active = *self.active_vus.lock().await;
+                    active <= target
+                }).await;
+
                 current_vus = target;
             }
         }
 
-        // Signal stop (level-triggered)
+        // Final stage complete — signal soft stop for all remaining VUs
         self.request_stop();
 
-        // Wait for all VUs
+        // Wait for remaining VUs to drain within the final graceful stop window
+        self.wait_for_drain(grace).await;
+
+        // Wait for all JoinHandles
         for handle in handles {
             handle.await.ok();
         }
@@ -239,7 +303,8 @@ impl VUScheduler {
     }
 
     /// Run with shared iterations across all VUs.
-    async fn run_shared_iterations<F>(&self, total_iterations: u64, run_vu: &F)
+    async fn run_shared_iterations<F>(&self, total_iterations: u64,
+                                      max_duration: Option<Duration>, grace: Duration, run_vu: &F)
     where
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
@@ -249,7 +314,10 @@ impl VUScheduler {
             _ => 1,
         };
 
-        tracing::info!("Starting shared iterations: {} across {} VUs", total_iterations, vus);
+        tracing::info!(
+            "Starting shared iterations: {} across {} VUs (max_duration: {:?}, grace: {:?})",
+            total_iterations, vus, max_duration, grace
+        );
 
         let mut handles = Vec::new();
         for vu_id in 0..vus {
@@ -257,7 +325,15 @@ impl VUScheduler {
             handles.push(handle);
         }
 
-        // Wait for all VUs to complete (they check shared iterations)
+        // If max_duration is set, wait for it then signal stop (grace period applies).
+        // Otherwise, wait for VUs to naturally exhaust the iteration budget.
+        if let Some(max_dur) = max_duration {
+            time::sleep(max_dur).await;
+            self.request_stop();
+            self.wait_for_drain(grace).await;
+        }
+
+        // Wait for all JoinHandles
         for handle in handles {
             handle.await.ok();
         }
@@ -270,13 +346,14 @@ impl VUScheduler {
     /// Uses a time-based token bucket (no 1ms timer floor — resilient at high rates)
     /// and a dynamically growing VU pool (`pre_alloc_vus → max_vus`). VUs are
     /// spawned on demand when the current pool is saturated.
-    async fn run_arrival_rate<F>(&self, rate: f64, pre_alloc: u32, max_vus: u32, duration: Duration, run_vu: &F)
+    async fn run_arrival_rate<F>(&self, rate: f64, pre_alloc: u32, max_vus: u32,
+                                 duration: Duration, grace: Duration, run_vu: &F)
     where
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
         tracing::info!(
-            "Starting constant arrival rate: {}/s for {:?} (pre_alloc={}, max_vus={})",
-            rate, duration, pre_alloc, max_vus
+            "Starting constant arrival rate: {}/s for {:?} (pre_alloc={}, max_vus={}, grace: {:?})",
+            rate, duration, pre_alloc, max_vus, grace
         );
 
         // Pre-spawn initial VU pool
@@ -348,7 +425,11 @@ impl VUScheduler {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
+        // Signal soft stop — VUs finish their current iteration
         self.request_stop();
+
+        // Wait for active VUs to drain within the graceful stop window
+        self.wait_for_drain(grace).await;
 
         for handle in handles {
             handle.await.ok();
@@ -366,15 +447,84 @@ impl VUScheduler {
             total_iterations: self.total_iterations.clone(),
             stop_signal: self.stop_signal.clone(),
             stop_requested: self.stop_requested.clone(),
+            force_stop_requested: self.force_stop_requested.clone(),
             arrival_tokens: self.arrival_tokens.clone(),
             arrival_notify: self.arrival_notify.clone(),
             arrival_dropped: self.arrival_dropped.clone(),
             idle_vus: self.idle_vus.clone(),
+            ramp_down_target: self.ramp_down_target.clone(),
         })
+    }
+
+    /// Wait up to `grace` for active VUs to drain to 0.
+    /// After the deadline, calls `force_stop()` to hard-abort any remaining.
+    pub async fn wait_for_drain(&self, grace: Duration) {
+        if grace == Duration::ZERO {
+            // No grace period — force stop immediately
+            self.request_force_stop();
+            return;
+        }
+
+        let deadline = time::Instant::now() + grace;
+        loop {
+            let active = *self.active_vus.lock().await;
+            if active == 0 {
+                tracing::debug!("All VUs drained within grace period");
+                return;
+            }
+            if time::Instant::now() >= deadline {
+                tracing::warn!(
+                    "Grace period ({:?}) expired with {} active VUs — force stopping",
+                    grace, active
+                );
+                self.request_force_stop();
+                return;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Wait up to `grace` for a condition (e.g., active_vus <= target) to become true.
+    /// After the deadline, logs a warning but does NOT force-stop — the caller
+    /// handles the final state.
+    pub async fn wait_for_drain_while<F, Fut>(&self, grace: Duration, condition: F)
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        if grace == Duration::ZERO {
+            return;
+        }
+
+        let deadline = time::Instant::now() + grace;
+        loop {
+            if condition().await {
+                return;
+            }
+            if time::Instant::now() >= deadline {
+                tracing::warn!(
+                    "Grace period ({:?}) expired while waiting for drain condition",
+                    grace
+                );
+                return;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }
 
-fn parse_duration(s: &str    ) -> Result<Duration> {
+/// Parse an optional graceful_stop/graceful_ramp_down string into a Duration.
+/// Defaults to 30 seconds when the field is None or empty, matching k6's default.
+fn graceful_stop_duration(s: &Option<String>) -> Duration {
+    match s {
+        Some(dur_str) if !dur_str.trim().is_empty() => {
+            parse_duration(dur_str).unwrap_or(Duration::from_secs(30))
+        }
+        _ => Duration::from_secs(30),
+    }
+}
+
+fn parse_duration(s: &str) -> Result<Duration> {
     let s = s.trim();
     if let Some(num) = s.strip_suffix("ms") {
         let v: u64 = num.parse().map_err(|_| tropel_core::TropelError::Config(format!("Invalid duration: {}", s)))?;
