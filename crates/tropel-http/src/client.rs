@@ -21,6 +21,7 @@ impl HttpClient {
     /// Create a new HTTP client from config.
     pub fn new(config: &HttpConfig) -> Result<Self> {
         let mut builder = reqwest::Client::builder()
+            .cookie_store(true)
             .user_agent(&config.user_agent)
             .pool_max_idle_per_host(config.max_idle_connections)
             .timeout(DEFAULT_REQUEST_TIMEOUT);
