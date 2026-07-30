@@ -166,6 +166,32 @@ pub enum ExecutionConfig {
         #[serde(default, alias = "thinkTime")]
         think_time: ThinkTimeConfig,
     },
+    /// Ramping arrival rate — stages of target rate (iterations/sec).
+    /// Similar to k6's `ramping-arrival-rate` executor.
+    #[serde(rename = "ramping-arrival-rate")]
+    RampingArrivalRate {
+        /// Starting rate (iterations/sec).
+        #[serde(default)]
+        start_rate: f64,
+        /// Stages defining how the rate changes over time.
+        stages: Vec<ArrivalRateStage>,
+        /// Time unit for the rate (e.g. "1s").
+        #[serde(default = "default_time_unit")]
+        time_unit: String,
+        /// Pre-allocated VUs.
+        #[serde(default = "default_pre_alloc")]
+        pre_alloc_vus: u32,
+        /// Maximum VUs.
+        #[serde(default = "default_max_vus")]
+        max_vus: u32,
+        /// How long to wait for in-flight iterations to finish after the
+        /// test duration expires. Defaults to 30s if not set.
+        #[serde(default, alias = "gracefulStop")]
+        graceful_stop: Option<String>,
+        /// Think time / pacing configuration between iterations.
+        #[serde(default, alias = "thinkTime")]
+        think_time: ThinkTimeConfig,
+    },
     /// Each VU runs exactly N iterations independently.
     /// Similar to k6's `per-vu-iterations` executor.
     #[serde(rename = "per-vu-iterations")]
@@ -187,11 +213,32 @@ pub enum ExecutionConfig {
     },
 }
 
-/// A ramping stage.
+/// A ramping stage (for VU count — used by RampingVus).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stage {
     pub duration: String,
     pub target: u32,
+}
+
+/// A ramping arrival rate stage.
+/// The rate linearly interpolates from the previous stage's target (or start_rate)
+/// to this stage's target over the stage duration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArrivalRateStage {
+    pub duration: String,
+    pub target: f64,
+}
+
+fn default_time_unit() -> String {
+    "1s".to_string()
+}
+
+fn default_pre_alloc() -> u32 {
+    1
+}
+
+fn default_max_vus() -> u32 {
+    10
 }
 
 /// Threshold configuration.

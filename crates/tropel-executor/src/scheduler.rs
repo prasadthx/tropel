@@ -116,6 +116,7 @@ impl VUScheduler {
     /// Whether this scheduler is in arrival-rate mode.
     pub fn is_arrival_rate(&self) -> bool {
         matches!(self.config, ExecutionConfig::ConstantArrivalRate { .. })
+            || matches!(self.config, ExecutionConfig::RampingArrivalRate { .. })
     }
 
     /// Mark a VU as idle (waiting for an arrival token).
@@ -204,6 +205,11 @@ impl VUScheduler {
                 let grace = graceful_stop_duration(graceful_stop);
                 // Duration::ZERO here — think_time/pacing is handled in the VU loop in engine.rs
                 self.run_per_vu_iterations(*vus, *iterations, max_dur, grace, &run_vu).await;
+                Ok(())
+            }
+            ExecutionConfig::RampingArrivalRate { start_rate, stages, pre_alloc_vus, max_vus, graceful_stop, .. } => {
+                let grace = graceful_stop_duration(graceful_stop);
+                self.run_ramping_arrival_rate(*start_rate, stages, *pre_alloc_vus, *max_vus, grace, &run_vu).await;
                 Ok(())
             }
         }
@@ -446,6 +452,154 @@ impl VUScheduler {
 
         let dropped_total = self.arrival_dropped.load(Ordering::Relaxed);
         tracing::info!("Constant arrival rate finished (dropped: {})", dropped_total);
+    }
+
+    /// Run with ramping arrival rate — stages of target rate (iterations/sec).
+    /// Similar to k6's `ramping-arrival-rate` executor.
+    ///
+    /// Uses a time-based token bucket (same as `run_arrival_rate`) but the rate
+    /// linearly interpolates across stages over the total stage duration.
+    /// VUs are spawned on demand when the current pool is saturated, up to max_vus.
+    async fn run_ramping_arrival_rate<F>(&self, start_rate: f64, stages: &[tropel_core::config::ArrivalRateStage],
+                                         pre_alloc: u32, max_vus: u32, grace: Duration, run_vu: &F)
+    where
+        F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
+    {
+        // Compute total duration from all stages
+        let mut total_duration = Duration::ZERO;
+        for stage in stages {
+            if let Ok(d) = parse_duration(&stage.duration) {
+                total_duration += d;
+            }
+        }
+
+        if total_duration == Duration::ZERO {
+            tracing::warn!("Ramping arrival rate: total duration is zero, nothing to run");
+            return;
+        }
+
+        tracing::info!(
+            "Starting ramping arrival rate: start_rate={}/s, {} stages, total={:?} (pre_alloc={}, max_vus={}, grace: {:?})",
+            start_rate, stages.len(), total_duration, pre_alloc, max_vus, grace
+        );
+
+        // Pre-spawn initial VU pool
+        let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        for vu_id in 0..pre_alloc.max(1) {
+            let handle = run_vu(self.shared_clone(), vu_id);
+            handles.push(handle);
+        }
+        let mut current_vus = pre_alloc.max(1);
+        let max_tokens = max_vus as u64;
+        let dropped = self.arrival_dropped.clone();
+
+        // Time-based token bucket (same as run_arrival_rate) with stage-aware rate
+        // Helpers for computing the instantaneous rate at a given elapsed time
+        let stage_data: Vec<(f64, f64, f64)> = {
+            let mut data = Vec::with_capacity(stages.len());
+            let mut prev_target = start_rate;
+            for stage in stages {
+                let dur = parse_duration(&stage.duration).unwrap_or(Duration::from_secs(10));
+                let dur = dur.max(Duration::from_millis(1));
+                let dur_secs = dur.as_secs_f64();
+                data.push((dur_secs, prev_target, stage.target));
+                prev_target = stage.target;
+            }
+            data
+        };
+
+        // Helper to compute the exact token count at a given elapsed time.
+        // Uses the integral of the piecewise-linear rate function:
+        // - For a completed stage: (start + end) * duration / 2 (trapezoid area)
+        // - For a partial stage: d * (s*p + (e-s)*p²/2) where p = remaining/d
+        // This avoids the burst bug from point-sampling `elapsed * current_rate`
+        // at stage boundaries.
+        let tokens_at = |elapsed_secs: f64| -> f64 {
+            if stage_data.is_empty() {
+                return elapsed_secs * start_rate;
+            }
+            let mut remaining = elapsed_secs;
+            let mut total = 0.0_f64;
+            for &(dur_secs, s, e) in &stage_data {
+                if remaining <= 0.0 {
+                    break;
+                }
+                if remaining >= dur_secs {
+                    // Completed stage: trapezoid area
+                    total += (s + e) * dur_secs / 2.0;
+                    remaining -= dur_secs;
+                } else {
+                    // Partial stage: linear ramp integral
+                    let p = remaining / dur_secs;
+                    total += dur_secs * (s * p + (e - s) * p * p / 2.0);
+                    remaining = 0.0;
+                }
+            }
+            // Any remaining time after the last stage uses the final rate
+            if remaining > 0.0 {
+                let final_rate = stages.last().map(|s| s.target).unwrap_or(start_rate);
+                total += remaining * final_rate;
+            }
+            total
+        };
+
+        let start = time::Instant::now();
+        let mut last_target: u64 = 0;
+
+        while start.elapsed() < total_duration {
+            let elapsed_secs = start.elapsed().as_secs_f64();
+            let exact_tokens = tokens_at(elapsed_secs);
+            let target = exact_tokens as u64;
+
+            if target > last_target {
+                let to_add = target - last_target;
+                let current = self.arrival_tokens.load(Ordering::Relaxed);
+                let capacity = max_tokens.saturating_sub(current);
+                let actual_add = to_add.min(capacity);
+
+                if actual_add > 0 {
+                    self.arrival_tokens.fetch_add(actual_add, Ordering::Relaxed);
+                    self.arrival_notify.notify_waiters();
+
+                    // Grow VU pool if saturated
+                    let idle = self.idle_vus.load(Ordering::Relaxed);
+                    if idle == 0 && current_vus < max_vus {
+                        let grow_cap = (max_vus - current_vus) as u64;
+                        let grow_by = to_add.min(grow_cap) as u32;
+                        if grow_by > 0 {
+                            for vu_id in current_vus..current_vus + grow_by {
+                                let handle = run_vu(self.shared_clone(), vu_id);
+                                handles.push(handle);
+                            }
+                            tracing::debug!(
+                                "Ramping arrival-rate: VU pool {} → {} at t={:.1}s",
+                                current_vus, current_vus + grow_by, elapsed_secs
+                            );
+                            current_vus += grow_by;
+                        }
+                    }
+                }
+
+                let overflow = to_add.saturating_sub(capacity);
+                if overflow > 0 {
+                    dropped.fetch_add(overflow, Ordering::Relaxed);
+                }
+            }
+
+            last_target = target;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // Signal soft stop
+        self.request_stop();
+        self.wait_for_drain(grace).await;
+
+        for handle in handles {
+            handle.await.ok();
+        }
+
+        let dropped_total = self.arrival_dropped.load(Ordering::Relaxed);
+        tracing::info!("Ramping arrival rate finished (dropped: {})", dropped_total);
     }
 
     /// Run with per-VU iterations — each VU runs exactly N iterations independently.

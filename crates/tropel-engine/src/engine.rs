@@ -130,6 +130,7 @@ impl Engine {
                     ExecutionConfig::SharedIterations { vus, .. } => *vus,
                     ExecutionConfig::ConstantArrivalRate { pre_alloc_vus, .. } => *pre_alloc_vus,
                     ExecutionConfig::PerVUIterations { vus, .. } => *vus,
+                    ExecutionConfig::RampingArrivalRate { pre_alloc_vus, .. } => *pre_alloc_vus,
                 };
                 let _vus = vus.max(1);
 
@@ -157,6 +158,7 @@ impl Engine {
                     ExecutionConfig::ConstantArrivalRate { think_time, .. } => think_time.clone(),
                     ExecutionConfig::SharedIterations { think_time, .. } => think_time.clone(),
                     ExecutionConfig::PerVUIterations { think_time, .. } => think_time.clone(),
+                    ExecutionConfig::RampingArrivalRate { think_time, .. } => think_time.clone(),
                 };
 
                 executor.run(move |sched, vu_id| {
