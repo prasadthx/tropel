@@ -1,0 +1,141 @@
+package tropel:adapter;
+
+/// Shared types for the Tropel WASM plugin interface.
+/// Mirrors the Rust types in `tropel_core::scenario` and `tropel_core::types`.
+///
+/// These records, enums, and variants are used by both the `tropel-adapter`
+/// (declarative parser) and the eventual `tropel-driver` (imperative per-iteration
+/// runtime) interfaces. They are the WASM Component Model representation of the
+/// `Scenario` IR — the stable contract between any input format and the Tropel
+/// engine.
+interface tropel-types {
+    // ── HTTP Method ────────────────────────────────────────────
+    enum http-method {
+        GET,
+        HEAD,
+        POST,
+        PUT,
+        DELETE,
+        CONNECT,
+        OPTIONS,
+        TRACE,
+        PATCH,
+    }
+
+    // ── Request Body ───────────────────────────────────────────
+    variant body {
+        /// Raw byte payload with optional MIME content type hint.
+        raw(string),
+        /// JSON-encoded payload (stored as text, parsed on demand).
+        json(string),
+        /// URL-encoded form: key=value&key=value.
+        form-urlencoded(list<tuple<string, string>>),
+        /// Multipart form-data with per-field content-type.
+        form-data(list<form-param>),
+        /// Binary payload (base64-encoded). Decoded by the engine.
+        binary(string),
+    }
+
+    record form-param {
+        key: string,
+        value: string,
+        content-type: option<string>,
+        /// File path for file upload fields. If set, `value` is ignored.
+        file: option<string>,
+    }
+
+    // ── Cookie ─────────────────────────────────────────────────
+    record cookie {
+        name: string,
+        value: string,
+        path: option<string>,
+        domain: option<string>,
+        secure: bool,
+        http-only: bool,
+        max-age: option<u64>,
+    }
+
+    // ── Auth ───────────────────────────────────────────────────
+    variant auth-type {
+        inherit,
+        no-auth,
+        bearer(string),
+        basic(string, string),
+        api-key(string, string),
+        digest(string),
+        oauth1(string),
+        oauth2(string),
+        hawk(string),
+        aws-sigv4(string),
+    }
+
+    record auth-config {
+        auth-type: auth-type,
+        /// Additional auth parameters as key-value pairs.
+        params: list<tuple<string, string>>,
+    }
+
+    // ── Request ────────────────────────────────────────────────
+    record request {
+        url: string,
+        method: http-method,
+        headers: list<tuple<string, string>>,
+        query-params: list<tuple<string, string>>,
+        body: option<body>,
+        auth: option<auth-config>,
+        follow-redirects: bool,
+        /// Request timeout in milliseconds. None = use engine default.
+        timeout-ms: option<u64>,
+    }
+
+    // ── Response (for the imperative driver tier) ──────────────
+    record response {
+        status-code: u16,
+        status-text: string,
+        headers: list<tuple<string, string>>,
+        /// Raw response body bytes.
+        body: list<u8>,
+        /// Response time in milliseconds.
+        response-time-ms: float64,
+        cookies: list<cookie>,
+    }
+
+    // ── Scenario IR (the shared contract) ──────────────────────
+    record scenario-info {
+        name: string,
+        description: option<string>,
+        /// Postman collection schema version, if applicable.
+        schema: option<string>,
+    }
+
+    record scenario-item {
+        id: string,
+        name: string,
+        request: option<request>,
+        /// Pre-request script (JS code, for k6-style imperative mode).
+        prerequest: option<string>,
+        /// Test script (JS code, pm.test assertions).
+        test: option<string>,
+        /// Assertions (Postman-style string expressions).
+        assertions: list<string>,
+        /// Child items (for folder/group nesting).
+        items: list<scenario-item>,
+    }
+
+    record scenario {
+        info: scenario-info,
+        items: list<scenario-item>,
+        /// Global variables as key-value string pairs.
+        variables: list<tuple<string, string>>,
+        auth: option<auth-config>,
+    }
+
+    // ── Error type ─────────────────────────────────────────────
+    record parse-error {
+        message: string,
+        /// Optional line number for error reporting.
+        line: option<u32>,
+        /// Optional column number for error reporting.
+        column: option<u32>,
+    }
+}

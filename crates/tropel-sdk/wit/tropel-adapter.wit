@@ -1,0 +1,62 @@
+package tropel:adapter;
+
+/// Tropel Adapter — the WASM equivalent of the Rust `InputAdapter` trait.
+///
+/// Any WASM component that exports this interface can serve as an input format
+/// adapter for Tropel. The engine calls `detect` to check if the component can
+/// handle the given bytes, then `parse` to produce the Scenario IR.
+///
+/// ## Lifecycle
+///
+/// 1. Engine loads the WASM component and resolves its exports.
+/// 2. Engine calls `detect(bytes)` — the component returns true if it
+///    recognizes the format.
+/// 3. Engine calls `parse(bytes)` — the component returns a `scenario` or
+///    a `parse-error`.
+/// 4. The engine never calls these functions again for this file (declarative
+///    parse is one-time, off the hot path).
+///
+/// ## Host imports
+///
+/// Components MAY import `tropel-host` functions for logging or diagnostics
+/// during parse. The engine provides these.
+///
+/// ## Language support
+///
+/// Any language that compiles to WASM with Component Model support can
+/// implement this interface:
+/// - Rust via `wit-bindgen` + `wasm32-wasip2` target
+/// - Go via `go-sdk` + TinyGo
+/// - C/C++ via `wit-bindgen` + wasi-sdk
+/// - Python via Pyodide (componentized)
+/// - AssemblyScript, Kotlin, and others with Component Model tooling
+interface tropel-adapter {
+    use tropel-types.{
+        scenario, parse-error
+    };
+
+    /// Return a human-readable identifier for this adapter (e.g. "postman",
+    /// "har", "openapi"). Used for `--format` selection and diagnostics.
+    id: func() -> string;
+
+    /// Probe whether this adapter can parse the given bytes.
+    /// The engine calls this once per file during resolution. The function
+    /// should be cheap (no I/O, no heavy computation) since the engine may
+    /// call it on several adapters before finding a match.
+    ///
+    /// - `bytes`: Raw file bytes (UTF-8 text or binary).
+    /// - Returns: `true` if the adapter claims the format, `false` otherwise.
+    detect: func(bytes: list<u8>) -> bool;
+
+    /// Parse the given bytes into a `scenario`.
+    ///
+    /// The engine guarantees:
+    /// - `detect` returned `true` for these same bytes before calling `parse`.
+    /// - The bytes are valid UTF-8 for text-based formats (Postman JSON,
+    ///   HAR JSON, OpenAPI YAML/JSON, JS/TS source). Binary formats receive
+    ///   the raw bytes unchanged.
+    ///
+    /// On success, returns the `scenario`. On failure, returns a `parse-error`
+    /// with a human-readable message and optional source position.
+    parse: func(bytes: list<u8>) -> result<scenario, parse-error>;
+}

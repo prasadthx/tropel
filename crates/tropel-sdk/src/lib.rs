@@ -65,7 +65,7 @@
 //! | `Result<T>` / `TropelError` | ✅ Stable — error handling |
 //! | `Protocol` trait | 🚧 Available but not yet wired into engine dispatch |
 //! | `Output` trait | 🚧 Available but not yet wired into engine dispatch |
-//! | `WASM` / `WIT` interface | 🔜 Planned for Phase 4 |
+//! | `WASM` / `WIT` interface | ✅ Designed — see `wit/` in the crate root. `InputAdapter` mirrored as `tropel-adapter` world. Host functions (logging), Scenario IR types. Runtime integration pending Phase 4. |
 //! | `VuProgram` / `Driver` trait | 🔜 Planned for future release |
 
 // ═══════════════════════════════════════════════════════════════════
