@@ -187,7 +187,10 @@ impl VUScheduler {
                 Ok(())
             }
             ExecutionConfig::SharedIterations { iterations, max_duration, graceful_stop, .. } => {
-                let max_dur = max_duration.as_ref().and_then(|d| parse_duration(d).ok());
+                // Default maxDuration to 10 minutes (matching k6 behavior)
+                let max_dur = max_duration.as_ref()
+                    .and_then(|d| parse_duration(d).ok())
+                    .or(Some(Duration::from_secs(600)));
                 let grace = graceful_stop_duration(graceful_stop);
                 // Duration::ZERO here — think_time/pacing is handled in the VU loop in engine.rs
                 self.run_shared_iterations(*iterations, max_dur, grace, &run_vu).await;
@@ -201,7 +204,10 @@ impl VUScheduler {
                 Ok(())
             }
             ExecutionConfig::PerVUIterations { vus, iterations, max_duration, graceful_stop, .. } => {
-                let max_dur = max_duration.as_ref().and_then(|d| parse_duration(d).ok());
+                // Default maxDuration to 10 minutes (matching k6 behavior)
+                let max_dur = max_duration.as_ref()
+                    .and_then(|d| parse_duration(d).ok())
+                    .or(Some(Duration::from_secs(600)));
                 let grace = graceful_stop_duration(graceful_stop);
                 // Duration::ZERO here — think_time/pacing is handled in the VU loop in engine.rs
                 self.run_per_vu_iterations(*vus, *iterations, max_dur, grace, &run_vu).await;
