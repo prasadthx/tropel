@@ -1,3 +1,4 @@
+use crate::worker::VUWorkerPool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tropel_collection::{collection_to_scenario, parse_collection_file};
@@ -43,6 +44,13 @@ impl Engine {
         let executor = VUScheduler::new(&config.execution);
         let stop_signal = executor.stop_signal();
 
+        // Create thread-per-core worker pool for VU sharding
+        let num_workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let pool = Arc::new(VUWorkerPool::new(num_workers));
+        tracing::info!("VU worker pool: {} threads (available cores: {})", num_workers, num_workers);
+
         let total_iterations = match &config.execution {
             ExecutionConfig::SharedIterations { iterations, .. } => *iterations,
             _ => u64::MAX,
@@ -67,6 +75,7 @@ impl Engine {
         let stop_signal_clone = stop_signal.clone();
         let env_clone = config.env.clone();
         let data_rows = config.iteration_data.clone();
+        let pool_clone = pool.clone();
 
         executor.run(move |sched, vu_id| {
             let metrics = metrics_clone.clone();
@@ -80,8 +89,9 @@ impl Engine {
             let thresholds = thresholds.clone();
             let test_start = test_start;
             let has_abort_thresholds = has_abort_thresholds;
+            let pool = pool_clone.clone();
 
-            tokio::spawn(async move {
+            let (_, handle) = pool.spawn(async move {
                 // Increment active VU count on start
                 sched.add_active_vu(1).await;
 
@@ -172,7 +182,8 @@ impl Engine {
                 // Decrement active VU count on exit
                 sched.remove_active_vu(1).await;
                 tracing::debug!("VU {} finished ({} iterations)", vu_id, iteration_index);
-            })
+            });
+            handle
         }).await?;
 
         // Wait for active VUs to reach zero (all finished)

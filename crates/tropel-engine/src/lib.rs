@@ -3,4 +3,5 @@
 //! Orchestration facade: wires adapters → executor → protocols/pm → metrics → reporters.
 
 pub mod engine;
+pub mod worker;
 pub use engine::*;
