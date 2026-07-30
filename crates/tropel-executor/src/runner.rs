@@ -229,7 +229,7 @@ impl VURunner {
                             let mut tags = TagMap::with_capacity(5);
                             tags.insert("url", resolved_req.url.clone());
                             tags.insert("method", resolved_req.method.to_string());
-                            tags.insert("status_code", http_response.status_code.to_string());
+                            tags.insert("status", http_response.status_code.to_string());
                             tags.insert("name", resolved_req.url.clone());
                             tags.insert("group", "http");
 

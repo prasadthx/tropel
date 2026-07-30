@@ -213,12 +213,27 @@ fn evaluate_single_threshold(expression: &str, metrics: &MetricsResult) -> (bool
 /// Get a metric value for a tag-scoped threshold by searching the metrics list.
 /// Looks for entries whose key starts with the metric name and contains all
 /// the specified tag key=value pairs.
+///
+/// When MULTIPLE entries match (e.g. `http_req_duration{status=200}{method=GET}`
+/// and `http_req_duration{status=200}{method=POST}` both match `{status=200}`),
+/// the function aggregates:
+/// - **Percentiles** (p50/p90/p95/p99): returns the WORST (highest) value
+/// - **Avg/mean**: returns the WORST (highest) value across matches
+/// - **Min**: returns the MINIMUM value across matches
+/// - **Max**: returns the MAXIMUM value across matches
+/// - **Count**: returns the SUM of counts
+/// - **Sum**: returns the SUM of sums
+/// - **Rate**: recomputes sum/count from totals
+///
+/// If no entry matches, returns 0.0.
 fn get_tag_scoped_metric_value(
     metrics: &MetricsResult,
     metric_name: &str,
     tag_filters: &[(&str, &str)],
     stat: Option<&str>,
 ) -> f64 {
+    let mut matched = Vec::new();
+
     for m in &metrics.metrics {
         // Check if this entry's key starts with the metric name
         if !m.key.starts_with(metric_name) {
@@ -233,23 +248,58 @@ fn get_tag_scoped_metric_value(
         if !all_tags_match {
             continue;
         }
-        return match stat {
-            Some("avg") => m.mean,
-            Some("min") => m.min as f64,
-            Some("max") => m.max as f64,
-            Some("p50") | Some("median") => m.p50 as f64,
-            Some("p90") => m.p90 as f64,
-            Some("p95") => m.p95 as f64,
-            Some("p99") => m.p99 as f64,
-            Some("count") => m.count as f64,
-            Some("rate") => m.rate,
-            Some("sum") => m.sum,
-            Some("last") => m.last,
-            _ => m.mean,
-        };
+        matched.push(m);
     }
-    // No matching metric found
-    0.0
+
+    if matched.is_empty() {
+        return 0.0;
+    }
+
+    // Aggregate all matching entries
+    match stat {
+        Some("avg") => {
+            // Return the WORST (highest) mean across all matches
+            matched.iter().map(|m| m.mean).fold(0.0_f64, f64::max)
+        }
+        Some("min") => {
+            // Return the MINIMUM min across all matches
+            matched.iter().map(|m| m.min as f64).fold(f64::MAX, f64::min)
+        }
+        Some("max") => {
+            // Return the MAXIMUM max across all matches
+            matched.iter().map(|m| m.max as f64).fold(0.0_f64, f64::max)
+        }
+        Some("p50") | Some("median") => {
+            matched.iter().map(|m| m.p50 as f64).fold(0.0_f64, f64::max)
+        }
+        Some("p90") => {
+            matched.iter().map(|m| m.p90 as f64).fold(0.0_f64, f64::max)
+        }
+        Some("p95") => {
+            matched.iter().map(|m| m.p95 as f64).fold(0.0_f64, f64::max)
+        }
+        Some("p99") => {
+            matched.iter().map(|m| m.p99 as f64).fold(0.0_f64, f64::max)
+        }
+        Some("count") => {
+            matched.iter().map(|m| m.count as f64).sum()
+        }
+        Some("rate") => {
+            let total_sum: f64 = matched.iter().map(|m| m.sum).sum();
+            let total_count: f64 = matched.iter().map(|m| m.count as f64).sum();
+            if total_count > 0.0 { total_sum / total_count } else { 0.0 }
+        }
+        Some("sum") => {
+            matched.iter().map(|m| m.sum).sum()
+        }
+        Some("last") => {
+            matched.last().map(|m| m.last).unwrap_or(0.0)
+        }
+        // Default (no stat or unknown stat) — return WORST mean
+        _ => {
+            matched.iter().map(|m| m.mean).fold(0.0_f64, f64::max)
+        }
+    }
 }
 
 /// Extract a metric value from the MetricsResult by name and optional statistic.
