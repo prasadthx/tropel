@@ -10,7 +10,26 @@ description = "WASM plugin runtime for Tropel — loads and runs WebAssembly plu
 [dependencies]
 tropel-core.workspace = true
 tropel-ext.workspace = true
-wasmtime = "21"
+# wasmtime 47 (latest). We build only what the plugin runtime needs:
+# cranelift (JIT + precompile_module), wat (WAT text in tests),
+# pooling-allocator (PoolingAllocationConfig), runtime + std (core
+# engine/module/instance APIs). The heavy optional machinery
+# (component-model, gc, profiling, coredump, async, cache) stays off —
+# smaller binaries and faster builds.
+#
+# Note: wasmtime <47 aborted the whole process on Windows when a trap
+# fired (fuel/epoch) — the old longjmp-based trap unwinding tripped MSVC's
+# /GS stack-cookie check (STATUS_STACK_BUFFER_OVERRUN). wasmtime 47
+# rewrote trap unwinding with a dedicated unwinder crate, which traps
+# cleanly on Windows (verified by the infinite-loop test).
+wasmtime = { version = "47", default-features = false, features = [
+    "anyhow",
+    "cranelift",
+    "wat",
+    "pooling-allocator",
+    "runtime",
+    "std",
+] }
 tracing.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true

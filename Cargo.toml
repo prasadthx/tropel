@@ -154,3 +154,4 @@ tropel-x-grpc = { path = "crates/extensions/tropel-x-grpc" }
 tropel-x-websocket = { path = "crates/extensions/tropel-x-websocket" }
 tropel-x-prometheus = { path = "crates/extensions/tropel-x-prometheus" }
 tropel-es = { path = "crates/tropel-es" }
+tropel-wasm = { path = "crates/tropel-wasm" }

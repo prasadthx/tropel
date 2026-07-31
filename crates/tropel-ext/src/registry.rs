@@ -168,9 +168,19 @@ impl ExtensionRegistry {
     /// Iterates all registered adapters in registration order and returns
     /// the first one whose `detect()` returns `true`. Returns `None` if
     /// no adapter claims the bytes.
+    ///
+    /// Also probes factory-registered adapters (e.g. WASM plugins loaded from
+    /// `--plugins-dir`), so content auto-detection works for runtime plugins
+    /// too, not just compile-time `inventory` registrations.
     pub fn resolve_input(&self, bytes: &[u8]) -> Option<Box<dyn InputAdapter>> {
         for registration in self.input_adapters.values() {
             let adapter = (registration.create)();
+            if adapter.detect(bytes) {
+                return Some(adapter);
+            }
+        }
+        for factory in self.input_adapter_factories.values() {
+            let adapter = (factory)();
             if adapter.detect(bytes) {
                 return Some(adapter);
             }

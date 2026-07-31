@@ -100,13 +100,24 @@ pub enum Commands {
         #[arg(long = "subprocess-adapter")]
         subprocess_adapter: Vec<String>,
 
+        /// Directory of WASM plugins (`.wasm`) to load as input adapters.
+        /// Modules are AOT-precompiled to `.cwasm` next to the source and
+        /// registered under `wasm:<plugin_id>`; content auto-detection probes
+        /// them too. Example: `--plugins-dir ./plugins`.
+        #[arg(long = "plugins-dir")]
+        plugins_dir: Option<PathBuf>,
+
         /// Build extensions (for `tropel build` — used here for uniform parsing)
         #[arg(long = "with")]
         with_extensions: Vec<String>,
     },
 
     /// List available input formats and their capabilities
-    Extensions,
+    Extensions {
+        /// Optional directory of WASM plugins to include in the listing.
+        #[arg(long = "plugins-dir")]
+        plugins_dir: Option<PathBuf>,
+    },
 
     /// Build a custom Tropel binary with extensions
     Build {
@@ -157,7 +168,7 @@ pub async fn run_cli() -> Result<()> {
 
     match cli.command {
         Commands::Run { .. } => run_command(cli).await,
-        Commands::Extensions => list_extensions().await,
+        Commands::Extensions { plugins_dir } => list_extensions(plugins_dir.as_deref()).await,
         Commands::Build { ref with, ref output, debug } => {
             build_custom(with, output.as_deref().unwrap_or(&PathBuf::from("./tropel-custom")), !debug).await
         }
@@ -169,7 +180,7 @@ async fn run_command(cli: Cli) -> Result<()> {
     let Commands::Run {
         input, format, vus, duration, env, env_file, data_file,
         reporter, output, threshold, insecure, verbose: _,
-        mode, stages, iterations, subprocess_adapter, ..
+        mode, stages, iterations, subprocess_adapter, plugins_dir, ..
     } = &cli.command else {
         return Err(TropelError::Other("Not a Run command".into()));
     };
@@ -341,6 +352,20 @@ async fn run_command(cli: Cli) -> Result<()> {
         );
     }
 
+    // Register WASM plugins from --plugins-dir (Tier 2 no-recompile adapters).
+    if let Some(dir) = plugins_dir {
+        let adapters = tropel_wasm::discover_plugins(dir);
+        tracing::info!("Loaded {} WASM plugin(s) from {}", adapters.len(), dir.display());
+        for adapter in adapters {
+            let id = format!("wasm:{}", adapter.plugin_id());
+            let adapter = adapter.clone();
+            registry.register_adapter_factory(
+                &id,
+                Arc::new(move || Box::new(adapter.clone())),
+            );
+        }
+    }
+
     let engine = Engine::new(registry);
     let result = engine.run(&config).await?;
 
@@ -370,8 +395,23 @@ async fn run_command(cli: Cli) -> Result<()> {
     }
 }
 
-async fn list_extensions() -> Result<()> {
-    let registry = ExtensionRegistry::new();
+async fn list_extensions(plugins_dir: Option<&std::path::Path>) -> Result<()> {
+    let mut registry = ExtensionRegistry::new();
+
+    // Include WASM plugins from --plugins-dir in the listing.
+    if let Some(dir) = plugins_dir {
+        let adapters = tropel_wasm::discover_plugins(dir);
+        tracing::info!("Loaded {} WASM plugin(s) from {}", adapters.len(), dir.display());
+        for adapter in adapters {
+            let id = format!("wasm:{}", adapter.plugin_id());
+            let adapter = adapter.clone();
+            registry.register_adapter_factory(
+                &id,
+                Arc::new(move || Box::new(adapter.clone())),
+            );
+        }
+    }
+
     let inputs = registry.list_inputs();
 
     println!("Tropel Extensions — v{}", env!("CARGO_PKG_VERSION"));
