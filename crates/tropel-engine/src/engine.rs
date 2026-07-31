@@ -139,7 +139,15 @@ impl Engine {
             handle.await.ok();
         }
 
+        // The broadcast channel only closes when ALL senders drop. The
+        // collector drops its clone in `set_sample_sink(None)`, but our
+        // local `sample_tx` was alive until the end of this function — so
+        // the streaming output task never saw `RecvError::Closed` and the
+        // `handle.await` below hung, in EVERY run (the 0-req runs merely
+        // exposed it most visibly). Dropping it here terminates the
+        // output tasks and lets the run finish.
         metrics.set_sample_sink(None);
+        drop(sample_tx);
         for handle in output_handles {
             let _ = handle.await;
         }

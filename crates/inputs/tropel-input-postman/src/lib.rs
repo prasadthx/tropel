@@ -24,12 +24,21 @@ impl InputAdapter for PostmanInputAdapter {
     }
 
     fn detect(&self, bytes: &[u8]) -> bool {
-        // Check for Postman Collection schema indicator
-        if let Ok(text) = std::str::from_utf8(bytes) {
-            text.contains("postman") && text.contains("collection")
-        } else {
-            false
-        }
+        // Structural detection: a Postman Collection is a JSON document
+        // whose top-level `info.schema` points at the getpostman.com
+        // collection schema. Substring matching is forbidden — a HAR or
+        // any document may legitimately contain the words "postman" /
+        // "collection" in embedded content (e.g. a Google-search capture
+        // of getpostman.com pages) and must NOT be mis-detected.
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+            return false;
+        };
+        let schema = value
+            .get("info")
+            .and_then(|info| info.get("schema"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+        schema.contains("getpostman.com") && schema.contains("collection")
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Scenario> {
@@ -55,6 +64,32 @@ mod tests {
     fn test_detect_no_postman() {
         let adapter = PostmanInputAdapter;
         let data = br#"{"info":{"name":"Test"}}"#;
+        assert!(!adapter.detect(data));
+    }
+
+    #[test]
+    fn test_detect_har_not_postman() {
+        // Regression: a HAR whose embedded JS bundles contain the words
+        // "postman" and "collection" must NOT be detected as a Postman
+        // collection — substring matching mis-classified it before.
+        let adapter = PostmanInputAdapter;
+        let data = br#"{
+            "log": {
+                "version": "1.2",
+                "entries": [{
+                    "request": {"method": "GET", "url": "https://www.google.com/search?q=postman+collection", "headers": [], "queryString": []},
+                    "response": {"status": 200, "statusText": "OK"}
+                }]
+            }
+        }"#;
+        assert!(!adapter.detect(data), "HAR content mentioning postman must not be detected as a Postman collection");
+    }
+
+    #[test]
+    fn test_detect_requires_schema_url() {
+        // The schema field must be the actual getpostman.com URL.
+        let adapter = PostmanInputAdapter;
+        let data = br#"{"info":{"name":"Test","schema":"https://example.com/collection.json"},"item":[]}"#;
         assert!(!adapter.detect(data));
     }
 

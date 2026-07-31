@@ -2939,6 +2939,7 @@ dependencies = [
 name = "tropel-input-har"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "inventory",
  "serde",
  "serde_json",
@@ -2983,6 +2984,7 @@ name = "tropel-input-postman"
 version = "0.1.0"
 dependencies = [
  "inventory",
+ "serde_json",
  "tropel-collection",
  "tropel-core",
  "tropel-ext",

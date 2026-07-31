@@ -157,6 +157,10 @@ impl Cli {
 /// This is the single entry point that both the standard `tropel` binary
 /// and custom `tropel build` binaries call from their `fn main()`.
 pub async fn run_cli() -> Result<()> {
+    // Force-link built-in adapters/drivers so their `inventory::submit!`
+    // registrations survive linker dead-stripping (see `builtins` module).
+    crate::builtins::register_builtins();
+
     let cli = Cli::parse();
 
     // Initialize tracing

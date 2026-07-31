@@ -481,7 +481,7 @@ impl JsContext {
     /// Execute a JS script using a cached compiled function.
     ///
     /// On first call, the source is wrapped in:
-    /// ```
+    /// ```text
     /// (function __tropel_script(){
     /// //# sourceURL=<source_url>
     /// <source>

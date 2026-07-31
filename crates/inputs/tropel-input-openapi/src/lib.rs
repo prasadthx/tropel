@@ -1,16 +1,11 @@
 //! # tropel-input-openapi
 //!
-//! Input adapter that reads [OpenAPI 3.x][openapi] specifications and produces
-//
-// Allow dead code on deserialization-only structs.
-// OauthFlow, OasSecurityScheme, and related types are only used
-// for JSON deserialization and never read directly after that.
-#![allow(dead_code)]
-//
-//! a protocol-agnostic `Scenario`. Each operation (path + method combination)
-//! becomes one `ScenarioItem`.
+//! Input adapter that reads [OpenAPI 3.x][openapi] and [Swagger 2.0][swagger]
+//! specifications and produces a protocol-agnostic `Scenario`. Each
+//! operation (path + method combination) becomes one `ScenarioItem`.
 //!
 //! [openapi]: https://spec.openapis.org/oas/v3.0.3
+//! [swagger]: https://swagger.io/specification/v2/
 //!
 //! ## Mapping
 //!
@@ -23,7 +18,15 @@
 //! | `parameters` (query, header) | `request.headers` / `request.query_params` |
 //! | `requestBody` | `request.body` |
 //! | `security` | `request.auth` |
-//! | `servers[0].url` | Base URL prepended to `request.url` |
+//! | `servers[0].url` | Base URL prepended to `request.url` (server variables substituted) |
+//!
+//! ## Robustness
+//!
+//! - Intra-document `$ref` pointers (`#/components/...`) are resolved before
+//!   parsing, so parameter/body/security refs in real specs (Stripe, GitHub)
+//!   work instead of hard-failing serde.
+//! - Swagger 2.0 documents are normalized to an OpenAPI 3.x shape.
+//! - Server variables (`https://{env}.example.com`) use their default value.
 
 use std::collections::HashMap;
 use tropel_core::scenario::{Scenario, ScenarioInfo, ScenarioItem};
@@ -31,6 +34,7 @@ use tropel_core::types::{ApiKeyLocation, AuthConfig, Body, Method, Request};
 use tropel_core::{Result, TropelError};
 use tropel_ext::traits::{InputAdapter, InputAdapterRegistration};
 use serde::Deserialize;
+use serde_json::Value;
 
 // ── OpenAPI 3.x data model (minimal — only what we need) ────────
 
@@ -62,6 +66,17 @@ struct OasServer {
     url: String,
     #[serde(default)]
     description: Option<String>,
+    /// Server variables (e.g. `https://{env}.example.com`).
+    #[serde(default)]
+    variables: HashMap<String, OasServerVariable>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OasServerVariable {
+    #[serde(default)]
+    default: Option<String>,
+    #[serde(default)]
+    r#enum: Option<Vec<String>>,
 }
 
 /// A path item — can have one or more operations.
@@ -128,6 +143,7 @@ struct OasOperation {
 
 #[derive(Debug, Deserialize)]
 struct OasParameter {
+    #[serde(default)]
     name: String,
     #[serde(default)]
     r#in: String,
@@ -258,7 +274,7 @@ struct OauthFlow {
 
 // ── InputAdapter implementation ─────────────────────────────────
 
-/// Input adapter for OpenAPI 3.x specification files.
+/// Input adapter for OpenAPI 3.x / Swagger 2.0 specification files.
 pub struct OpenApiInputAdapter;
 
 inventory::submit!(InputAdapterRegistration::new("openapi", || Box::new(OpenApiInputAdapter)));
@@ -269,143 +285,569 @@ impl InputAdapter for OpenApiInputAdapter {
     }
 
     fn detect(&self, bytes: &[u8]) -> bool {
-        if let Ok(text) = std::str::from_utf8(bytes) {
-            let text = text.trim_start();
-            if text.starts_with('{') {
-                // Detect by looking for OpenAPI required fields
-                text.contains("\"openapi\"") && text.contains("\"paths\"")
-                    && text.contains("\"info\"")
-                    && !text.contains("postman")  // exclude Postman
-                    && !text.contains("\"log\"")    // exclude HAR
-            } else {
-                false
-            }
-        } else {
-            false
+        // Structural detection: a spec is JSON with a top-level `openapi`
+        // (3.x) or `swagger` (2.0) version string plus `info` and `paths`.
+        // No substring matching — a HAR capture or Postman export may
+        // mention these words in content and must not be detected.
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+            return false;
+        };
+        if !value.is_object() {
+            return false;
         }
+        let version = value
+            .get("openapi")
+            .or_else(|| value.get("swagger"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let has_version = version.starts_with("3.") || version.starts_with("2.");
+        has_version
+            && value.get("info").map(|v| v.is_object()).unwrap_or(false)
+            && value.get("paths").map(|v| v.is_object()).unwrap_or(false)
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Scenario> {
-        let doc: OasDoc = serde_json::from_slice(bytes)
+        // 1. Parse into a Value tree so we can normalize + resolve refs
+        //    before the typed (serde) model, which hard-fails on $ref.
+        let mut doc: Value = serde_json::from_slice(bytes)
             .map_err(|e| TropelError::Parse(format!("Failed to parse OpenAPI spec: {}", e)))?;
 
-        if doc.paths.is_empty() {
-            return Err(TropelError::Parse(
-                "OpenAPI spec contains no paths".into(),
-            ));
+        // 2. Swagger 2.0 → normalize to an OpenAPI 3.x-shaped document.
+        if is_swagger2(&doc) {
+            doc = normalize_swagger2(doc)
+                .map_err(|e| TropelError::Parse(format!("Failed to normalize Swagger 2.0 spec: {}", e)))?;
         }
 
-        // Build base URL from servers
-        let base_url = doc.servers.first()
-            .map(|s| s.url.trim_end_matches('/').to_string())
-            .unwrap_or_default();
+        // 3. Resolve intra-document $refs (#/components/...) so parameter /
+        //    body / security references work instead of failing serde.
+        doc = resolve_refs(&doc);
 
-        // Flatten global security requirements
-        let global_security = doc.security.clone();
+        // 4. Typed parse.
+        let parsed: OasDoc = serde_json::from_value(doc)
+            .map_err(|e| TropelError::Parse(format!("Failed to parse OpenAPI spec: {}", e)))?;
 
-        let mut items: Vec<ScenarioItem> = Vec::new();
-        let mut index = 0usize;
-
-        // Sort paths for deterministic output
-        let mut path_keys: Vec<&String> = doc.paths.keys().collect();
-        path_keys.sort();
-
-        for path_str in path_keys {
-            let path_item = &doc.paths[path_str];
-            let _path_summary = path_item.summary.as_deref();
-
-            for (method, operation) in path_item.operations() {
-                if operation.deprecated {
-                    continue;
-                }
-
-                let item_name = operation.operation_id.clone()
-                    .or_else(|| operation.summary.clone())
-                    .unwrap_or_else(|| format!("{} {}", method.to_uppercase(), path_str));
-
-                let url = format!("{}{}", base_url, path_str);
-
-                // Collect parameters — path-item-level + operation-level
-                let params: Vec<&OasParameter> = path_item.parameters.iter()
-                    .chain(operation.parameters.iter())
-                    .collect();
-
-                let mut headers: HashMap<String, String> = HashMap::new();
-                let mut query_params: HashMap<String, String> = HashMap::new();
-                let mut path_params: HashMap<String, String> = HashMap::new();
-
-                for param in &params {
-                    let val = extract_param_value(param);
-                    match param.r#in.as_str() {
-                        "header" => { headers.insert(param.name.clone(), val); }
-                        "query" => { query_params.insert(param.name.clone(), val); }
-                        "path" => { path_params.insert(param.name.clone(), val); }
-                        _ => {}
-                    }
-                }
-
-                // Resolve path template parameters (e.g. /users/{userId})
-                let resolved_url = if !path_params.is_empty() {
-                    let mut resolved = url.clone();
-                    for (key, val) in &path_params {
-                        resolved = resolved.replace(&format!("{{{}}}", key), val);
-                        resolved = resolved.replace(&format!("{{{{{}}}}}", key), val); // double-brace
-                    }
-                    resolved
-                } else {
-                    url.clone()
-                };
-
-                // Build request body
-                let body = operation.request_body.as_ref()
-                    .and_then(|rb| build_request_body(rb));
-
-                // Resolve auth
-                let auth = resolve_auth(&operation, &global_security, &doc.components);
-
-                items.push(ScenarioItem {
-                    id: format!("openapi-item-{}", index),
-                    name: item_name,
-                    request: Some(Request {
-                        url: resolved_url,
-                        method: Method::from_str(method).unwrap_or(Method::GET),
-                        headers,
-                        query_params,
-                        body,
-                        auth,
-                        certificate: None,
-                        follow_redirects: true,
-                        timeout: None,
-                    }),
-                    prerequest: None,
-                    test: None,
-                    assertions: vec![],
-                    items: vec![],
-                });
-
-                index += 1;
-            }
-        }
-
-        if items.is_empty() {
-            return Err(TropelError::Parse(
-                "OpenAPI spec has paths but no non-deprecated operations".into(),
-            ));
-        }
-
-        Ok(Scenario {
-            info: ScenarioInfo {
-                name: doc.info.title,
-                description: doc.info.description
-                    .or_else(|| Some(format!("OpenAPI {} — {}", doc.openapi, doc.info.version))),
-                schema: None,
-            },
-            items,
-            variables: HashMap::new(),
-            auth: None,
-        })
+        parse_typed(parsed)
     }
 }
+
+/// Parse a typed OAS 3.x document into a Scenario.
+fn parse_typed(doc: OasDoc) -> Result<Scenario> {
+    if doc.paths.is_empty() {
+        return Err(TropelError::Parse("OpenAPI spec contains no paths".into()));
+    }
+
+    // Build base URL from servers (substituting server variables).
+    let base_url = doc
+        .servers
+        .first()
+        .map(resolve_server_url)
+        .unwrap_or_default();
+
+    // Flatten global security requirements
+    let global_security = doc.security.clone();
+
+    let mut items: Vec<ScenarioItem> = Vec::new();
+    let mut index = 0usize;
+
+    // Sort paths for deterministic output
+    let mut path_keys: Vec<&String> = doc.paths.keys().collect();
+    path_keys.sort();
+
+    for path_str in path_keys {
+        let path_item = &doc.paths[path_str];
+
+        for (method, operation) in path_item.operations() {
+            if operation.deprecated {
+                continue;
+            }
+
+            let item_name = operation.operation_id.clone()
+                .or_else(|| operation.summary.clone())
+                .unwrap_or_else(|| format!("{} {}", method.to_uppercase(), path_str));
+
+            let url = format!("{}{}", base_url, path_str);
+
+            // Collect parameters — path-item-level + operation-level
+            let params: Vec<&OasParameter> = path_item.parameters.iter()
+                .chain(operation.parameters.iter())
+                .collect();
+
+            let mut headers: HashMap<String, String> = HashMap::new();
+            let mut query_params: HashMap<String, String> = HashMap::new();
+            let mut path_params: HashMap<String, String> = HashMap::new();
+
+            for param in &params {
+                let val = extract_param_value(param);
+                match param.r#in.as_str() {
+                    "header" => { headers.insert(param.name.clone(), val); }
+                    "query" => { query_params.insert(param.name.clone(), val); }
+                    "path" => { path_params.insert(param.name.clone(), val); }
+                    _ => {}
+                }
+            }
+
+            // Resolve path template parameters (e.g. /users/{userId})
+            let resolved_url = if !path_params.is_empty() {
+                let mut resolved = url.clone();
+                for (key, val) in &path_params {
+                    resolved = resolved.replace(&format!("{{{}}}", key), val);
+                    resolved = resolved.replace(&format!("{{{{{}}}}}", key), val); // double-brace
+                }
+                resolved
+            } else {
+                url.clone()
+            };
+
+            // Build request body
+            let body = operation.request_body.as_ref()
+                .and_then(|rb| build_request_body(rb));
+
+            // Resolve auth
+            let auth = resolve_auth(&operation, &global_security, &doc.components);
+
+            items.push(ScenarioItem {
+                id: format!("openapi-item-{}", index),
+                name: item_name,
+                request: Some(Request {
+                    url: resolved_url,
+                    method: Method::from_str(method).unwrap_or(Method::GET),
+                    headers,
+                    query_params,
+                    body,
+                    auth,
+                    certificate: None,
+                    follow_redirects: true,
+                    timeout: None,
+                }),
+                prerequest: None,
+                test: None,
+                assertions: vec![],
+                items: vec![],
+            });
+
+            index += 1;
+        }
+    }
+
+    if items.is_empty() {
+        return Err(TropelError::Parse(
+            "OpenAPI spec has paths but no non-deprecated operations".into(),
+        ));
+    }
+
+    Ok(Scenario {
+        info: ScenarioInfo {
+            name: doc.info.title,
+            description: doc.info.description
+                .or_else(|| Some(format!("OpenAPI {} — {}", doc.openapi, doc.info.version))),
+            schema: None,
+        },
+        items,
+        variables: HashMap::new(),
+        auth: None,
+    })
+}
+
+/// True if the document declares Swagger 2.0.
+fn is_swagger2(doc: &Value) -> bool {
+    doc.get("swagger")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| s.starts_with("2."))
+}
+
+/// Resolve a server URL, substituting `{variable}` with its default value
+/// (or first enum value, or empty string).
+fn resolve_server_url(server: &OasServer) -> String {
+    let mut url = server.url.trim_end_matches('/').to_string();
+    for (name, var) in &server.variables {
+        let value = var
+            .default
+            .clone()
+            .or_else(|| var.r#enum.as_ref().and_then(|e| e.first().cloned()))
+            .unwrap_or_default();
+        url = url.replace(&format!("{{{}}}", name), &value);
+    }
+    url
+}
+
+// ── Swagger 2.0 → OpenAPI 3.x normalization ─────────────────────
+
+/// Normalize a Swagger 2.0 document into an OpenAPI 3.x-shaped Value so the
+/// single typed model handles both.
+///
+/// Transformations:
+/// - `swagger` → `openapi`
+/// - `host` + `basePath` + `schemes` → `servers[0]`
+/// - `definitions` → `components.schemas`
+/// - `securityDefinitions` → `components.securitySchemes` (basic stays basic)
+/// - global `parameters` / `responses` → `components.parameters` / `responses`
+/// - operation `parameters`: `in: body` → `requestBody`; inline `type` (no
+///   `schema`) is wrapped into a `schema` object (Swagger 2.0 puts the type
+///   directly on the parameter, OAS 3 requires it under `schema`).
+fn normalize_swagger2(doc: Value) -> Result<Value> {
+    let mut root = doc;
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| TropelError::Parse("Swagger 2.0 root must be an object".into()))?;
+
+    // openapi marker
+    obj.remove("swagger");
+    obj.insert("openapi".into(), serde_json::json!("3.0.0"));
+
+    // servers from host/basePath/schemes
+    let host = obj.get("host").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let base_path = obj.get("basePath").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let schemes = obj
+        .get("schemes")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str())
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec!["https".to_string()]);
+
+    if !host.is_empty() {
+        let scheme = schemes.first().cloned().unwrap_or_else(|| "https".to_string());
+        let url = format!("{}://{}{}", scheme, host, base_path);
+        obj.insert(
+            "servers".into(),
+            serde_json::json!([{ "url": url }]),
+        );
+    } else if !base_path.is_empty() {
+        obj.insert("servers".into(), serde_json::json!([{ "url": base_path }]));
+    }
+    obj.remove("host");
+    obj.remove("basePath");
+    obj.remove("schemes");
+
+    // definitions → components.schemas
+    if let Some(defs) = obj.remove("definitions") {
+        let components = obj
+            .entry("components")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(c) = components.as_object_mut() {
+            c.insert("schemas".into(), defs);
+        }
+    }
+
+    // securityDefinitions → components.securitySchemes
+    // Swagger 2.0's `{type: basic}` must become OAS 3's `{type: http,
+    // scheme: basic}` — the greedy ApiKey serde variant would otherwise
+    // swallow `basic` and produce ApiKey auth instead of Basic.
+    if let Some(sec_defs) = obj.remove("securityDefinitions") {
+        let components = obj
+            .entry("components")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(c) = components.as_object_mut() {
+            c.insert("securitySchemes".into(), normalize_security_definitions(sec_defs));
+        }
+    }
+
+    // global parameters / responses → components
+    if let Some(params) = obj.remove("parameters") {
+        let components = obj
+            .entry("components")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(c) = components.as_object_mut() {
+            c.insert("parameters".into(), params);
+        }
+    }
+    if let Some(responses) = obj.remove("responses") {
+        let components = obj
+            .entry("components")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(c) = components.as_object_mut() {
+            c.insert("responses".into(), responses);
+        }
+    }
+
+    // Per-operation: wrap inline `type` into `schema`, body params → requestBody
+    if let Some(paths) = obj.get_mut("paths").and_then(|p| p.as_object_mut()) {
+        for path_item in paths.values_mut() {
+            if let Some(pi) = path_item.as_object_mut() {
+                // path-item-level parameters
+                if let Some(params) = pi.get_mut("parameters") {
+                    *params = wrap_inline_param_types(params.clone());
+                }
+                for op_key in ["get", "put", "post", "delete", "options", "head", "patch", "trace"] {
+                    if let Some(op) = pi.get_mut(op_key) {
+                        normalize_swagger2_operation(op);
+                    }
+                }
+            }
+        }
+    }
+
+    // Rewrite Swagger 2.0 ref pointers (`#/definitions/...`) to their new
+    // OAS 3 locations (`#/components/schemas/...`) so the later $ref
+    // resolution step still finds them after the reorg above.
+    rewrite_ref_prefixes(&mut root);
+
+    Ok(root)
+}
+
+/// Normalize Swagger 2.0 `securityDefinitions` entries into OAS 3 shapes:
+/// - `{type: basic}` → `{type: http, scheme: basic}` (the greedy ApiKey
+///   serde variant would otherwise swallow `basic`)
+/// - flat OAuth2 (`{type: oauth2, flow, authorizationUrl, tokenUrl,
+///   scopes}`) → `{type: oauth2, flows: {implicit|password|
+///   clientCredentials|authorizationCode: {...}}}` (OAS 3 nests the flow
+///   data under `flows`; without this the OAuth2 variant never matches and
+///   the scheme falls into the greedy ApiKey arm → wrong auth type)
+fn normalize_security_definitions(defs: Value) -> Value {
+    let map = match defs {
+        Value::Object(m) => m,
+        other => return other,
+    };
+    let mut out = serde_json::Map::with_capacity(map.len());
+    for (name, mut scheme) in map {
+        if let Some(so) = scheme.as_object_mut() {
+            match so.get("type").and_then(|t| t.as_str()) {
+                Some("basic") => {
+                    scheme = serde_json::json!({"type": "http", "scheme": "basic"});
+                }
+                Some("oauth2") => {
+                    let mut flows = serde_json::Map::new();
+                    let mut flow = serde_json::Map::new();
+                    // Flatten the single `flow` into the right OAS 3 key.
+                    let flow_key = match so.get("flow").and_then(|f| f.as_str()) {
+                        Some("implicit") => "implicit",
+                        Some("password") => "password",
+                        Some("application") => "clientCredentials",
+                        Some("accessCode") => "authorizationCode",
+                        _ => "clientCredentials",
+                    };
+                    for key in ["authorizationUrl", "tokenUrl", "scopes"] {
+                        if let Some(v) = so.get(key) {
+                            flow.insert(key.to_string(), v.clone());
+                        }
+                    }
+                    flows.insert(flow_key.to_string(), Value::Object(flow));
+                    scheme = serde_json::json!({"type": "oauth2", "flows": Value::Object(flows)});
+                }
+                _ => {}
+            }
+        }
+        out.insert(name, scheme);
+    }
+    Value::Object(out)
+}
+
+/// Rewrite Swagger 2.0 ref pointers to their OAS 3 locations after the
+/// definitions/parameters/responses reorg:
+/// `#/definitions/` → `#/components/schemas/`,
+/// `#/parameters/` → `#/components/parameters/`,
+/// `#/responses/` → `#/components/responses/`.
+fn rewrite_ref_prefixes(value: &mut Value) {
+    const REWRITES: [(&str, &str); 3] = [
+        ("#/definitions/", "#/components/schemas/"),
+        ("#/parameters/", "#/components/parameters/"),
+        ("#/responses/", "#/components/responses/"),
+    ];
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(ref_str)) = map.get_mut("$ref") {
+                for (old, new) in &REWRITES {
+                    if let Some(rest) = ref_str.strip_prefix(old) {
+                        *ref_str = format!("{}{}", new, rest);
+                        break;
+                    }
+                }
+            }
+            for v in map.values_mut() {
+                rewrite_ref_prefixes(v);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                rewrite_ref_prefixes(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Wrap Swagger 2.0 inline parameter types (`{"name","in","type":...}`)
+/// into OAS 3's `schema` object.
+fn wrap_inline_param_types(params: Value) -> Value {
+    let arr = match params {
+        Value::Array(a) => a,
+        other => return other,
+    };
+    let out: Vec<Value> = arr
+        .into_iter()
+        .map(|mut p| {
+            if let Some(po) = p.as_object_mut() {
+                // Only wrap when there's no existing `schema` (body params
+                // already carry one in Swagger 2.0).
+                if !po.contains_key("schema") && !po.contains_key("$ref") {
+                    let mut schema = serde_json::Map::new();
+                    for key in ["type", "format", "items", "default", "enum", "minimum", "maximum"] {
+                        if let Some(v) = po.remove(key) {
+                            schema.insert(key.to_string(), v);
+                        }
+                    }
+                    if !schema.is_empty() {
+                        po.insert("schema".into(), Value::Object(schema));
+                    }
+                }
+            }
+            p
+        })
+        .collect();
+    Value::Array(out)
+}
+
+/// Normalize one Swagger 2.0 operation: move `in: body` parameters into
+/// `requestBody`, and wrap inline types for the rest.
+fn normalize_swagger2_operation(op: &mut Value) {
+    let Some(op_obj) = op.as_object_mut() else {
+        return;
+    };
+
+    let mut params = match op_obj.remove("parameters") {
+        Some(Value::Array(a)) => a,
+        _ => return,
+    };
+
+    // Separate body/formData params from the rest.
+    let mut body_schema: Option<Value> = None;
+    let mut form_props: serde_json::Map<String, Value> = serde_json::Map::new();
+    let mut form_required: Vec<String> = Vec::new();
+    let mut rest: Vec<Value> = Vec::new();
+
+    for mut p in params.drain(..) {
+        let in_loc = p.get("in").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        match in_loc.as_str() {
+            "body" => {
+                body_schema = p.get("schema").cloned();
+                // required flag moves to requestBody
+                if let Some(Value::Bool(b)) = p.get("required") {
+                    op_obj.insert("requestBodyRequired".into(), Value::Bool(*b));
+                }
+            }
+            "formData" => {
+                // Swagger 2.0 formData params → object schema under requestBody
+                let mut schema = serde_json::Map::new();
+                for key in ["type", "format", "items", "default", "enum", "minimum", "maximum"] {
+                    if let Some(v) = p.as_object_mut().and_then(|po| po.remove(key)) {
+                        schema.insert(key.to_string(), v);
+                    }
+                }
+                if let Some(Value::Bool(true)) = p.get("required") {
+                    form_required.push(name.clone());
+                }
+                form_props.insert(name, Value::Object(schema));
+            }
+            _ => {
+                rest.push(p);
+            }
+        }
+    }
+
+    // Build requestBody if body/formData params exist
+    if body_schema.is_some() || !form_props.is_empty() {
+        let mut content = serde_json::Map::new();
+        let mut required = false;
+        if let Some(Value::Bool(b)) = op_obj.remove("requestBodyRequired") {
+            required = b;
+        }
+        if let Some(schema) = body_schema {
+            content.insert(
+                "application/json".into(),
+                serde_json::json!({ "schema": schema }),
+            );
+        } else if !form_props.is_empty() {
+            let mut schema = serde_json::Map::new();
+            schema.insert("type".into(), Value::String("object".into()));
+            schema.insert("properties".into(), Value::Object(form_props));
+            if !form_required.is_empty() {
+                schema.insert("required".into(), serde_json::json!(form_required));
+            }
+            content.insert(
+                "application/x-www-form-urlencoded".into(),
+                serde_json::json!({ "schema": Value::Object(schema) }),
+            );
+        }
+        op_obj.insert(
+            "requestBody".into(),
+            serde_json::json!({
+                "content": Value::Object(content),
+                "required": required,
+            }),
+        );
+    }
+
+    // Wrap inline types on the remaining params
+    op_obj.insert("parameters".into(), wrap_inline_param_types(Value::Array(rest)));
+}
+
+// ── Intra-document $ref resolution ──────────────────────────────
+
+/// Resolve intra-document JSON References (`$ref: "#/components/..."`) by
+/// replacing the reference object with a deep copy of the target. External
+/// refs (`./other.yaml#/...`) are left untouched (they need file access).
+/// Cycle-safe: refs are resolved lazily and never inlined recursively.
+fn resolve_refs(doc: &Value) -> Value {
+    // Clone the root once; each $ref lookup reads from it.
+    let root = doc.clone();
+
+    fn resolve(value: &Value, root: &Value, depth: usize) -> Value {
+        // Depth guard: never inline a ref chain deeper than this.
+        if depth > 16 {
+            return value.clone();
+        }
+        match value {
+            Value::Object(map) => {
+                // A pure `{"$ref": "..."}` object → replace with target.
+                if map.len() == 1 {
+                    if let Some(Value::String(ref_str)) = map.get("$ref") {
+                        if let Some(target) = resolve_pointer(root, ref_str) {
+                            return resolve(&target, root, depth + 1);
+                        }
+                    }
+                }
+                // Otherwise recurse into members.
+                let mut out = serde_json::Map::with_capacity(map.len());
+                for (k, v) in map {
+                    out.insert(k.clone(), resolve(v, root, depth));
+                }
+                Value::Object(out)
+            }
+            Value::Array(arr) => {
+                Value::Array(arr.iter().map(|v| resolve(v, root, depth)).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    resolve(doc, &root, 0)
+}
+
+/// Resolve a JSON Reference pointer (`#/components/schemas/Foo`) against a
+/// document Value. Returns `None` for external refs or missing targets.
+fn resolve_pointer(root: &Value, pointer: &str) -> Option<Value> {
+    let pointer = pointer.strip_prefix('#')?;
+    if pointer.is_empty() {
+        return Some(root.clone());
+    }
+    let mut cur = root;
+    for part in pointer.trim_start_matches('/').split('/') {
+        // Decode JSON-pointer escapes: ~1 → '/', ~0 → '~'.
+        let decoded = part.replace("~1", "/").replace("~0", "~");
+        cur = match cur {
+            Value::Object(map) => map.get(&decoded)?,
+            Value::Array(arr) => arr.get(decoded.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(cur.clone())
+}
+
+// ── Extraction helpers ──────────────────────────────────────────
 
 /// Extract a parameter value from an OpenAPI parameter definition.
 fn extract_param_value(param: &OasParameter) -> String {
@@ -577,8 +1019,6 @@ fn resolve_auth(
     components: &Option<OasComponents>,
 ) -> Option<AuthConfig> {
     // Use as_deref() to get Option<&[Vec<...>]>, then unwrap_or to the global
-    // The Option<&Vec<...>> from operation.security.as_ref() gives us &Vec<...>
-    // which derefs to &[...], matching global_security's type.
     let sec_requirements: &[HashMap<String, Vec<String>>] = match operation.security.as_ref() {
         Some(v) => v.as_slice(),
         None => global_security,
@@ -624,7 +1064,15 @@ fn resolve_auth(
                 location: api_location,
             })
         }
-        _ => None,
+        // OAuth2 flows → bearer token placeholder. The token itself can't be
+        // generated from a static spec — the placeholder is substituted by
+        // the environment/variables at run time.
+        OasSecurityScheme::OAuth2 { .. } => Some(AuthConfig::Bearer {
+            token: "__access_token__".to_string(),
+        }),
+        OasSecurityScheme::OpenIdConnect { .. } => Some(AuthConfig::Bearer {
+            token: "__id_token__".to_string(),
+        }),
     }
 }
 
@@ -640,6 +1088,30 @@ mod tests {
         let data = br#"{
             "openapi": "3.0.3",
             "info": {"title": "Test API", "version": "1.0.0"},
+            "paths": {}
+        }"#;
+        assert!(adapter.detect(data));
+    }
+
+    #[test]
+    fn test_detect_openapi_spec_mentioning_log() {
+        // A legit spec whose description/path mentions "log" must STILL be
+        // detected — no substring exclusions.
+        let adapter = OpenApiInputAdapter;
+        let data = br#"{
+            "openapi": "3.0.3",
+            "info": {"title": "Log Service", "version": "1.0.0", "description": "query the log stream"},
+            "paths": {"/log": {"get": {"responses": {}}}}
+        }"#;
+        assert!(adapter.detect(data), "spec containing 'log' must be detected");
+    }
+
+    #[test]
+    fn test_detect_swagger2() {
+        let adapter = OpenApiInputAdapter;
+        let data = br#"{
+            "swagger": "2.0",
+            "info": {"title": "Legacy API", "version": "1.0.0"},
             "paths": {}
         }"#;
         assert!(adapter.detect(data));
@@ -693,7 +1165,158 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_multiple_paths() {
+    fn test_server_variables_resolved() {
+        let adapter = OpenApiInputAdapter;
+        let data = br#"{
+            "openapi": "3.0.0",
+            "info": {"title": "Env API", "version": "1.0"},
+            "servers": [{
+                "url": "https://{env}.example.com/v1",
+                "variables": {
+                    "env": {"default": "api", "enum": ["api", "staging"]}
+                }
+            }],
+            "paths": {
+                "/users": {"get": {"operationId": "listUsers", "responses": {"200": {"description": "OK"}}}}
+            }
+        }"#;
+        let scenario = adapter.parse(data).unwrap();
+        let req = scenario.items[0].request.as_ref().unwrap();
+        assert_eq!(req.url, "https://api.example.com/v1/users");
+    }
+
+    #[test]
+    fn test_ref_parameter_resolved() {
+        // A $ref'd parameter used to hard-fail serde. Now it must resolve.
+        let adapter = OpenApiInputAdapter;
+        let data = br##"{
+            "openapi": "3.0.0",
+            "info": {"title": "Refs", "version": "1.0"},
+            "paths": {
+                "/pets": {
+                    "get": {
+                        "operationId": "listPets",
+                        "parameters": [
+                            {"$ref": "#/components/parameters/Limit"}
+                        ],
+                        "responses": {"200": {"description": "OK"}}
+                    }
+                }
+            },
+            "components": {
+                "parameters": {
+                    "Limit": {
+                        "name": "limit",
+                        "in": "query",
+                        "schema": {"type": "integer"},
+                        "example": 25
+                    }
+                }
+            }
+        }"##;
+        let scenario = adapter.parse(data).unwrap();
+        assert_eq!(scenario.items.len(), 1);
+        let req = scenario.items[0].request.as_ref().unwrap();
+        assert_eq!(req.query_params.get("limit").unwrap(), "25");
+    }
+
+    #[test]
+    fn test_ref_request_body_resolved() {
+        let adapter = OpenApiInputAdapter;
+        let data = br##"{
+            "openapi": "3.0.0",
+            "info": {"title": "RefBody", "version": "1.0"},
+            "paths": {
+                "/pets": {
+                    "post": {
+                        "operationId": "createPet",
+                        "requestBody": {"$ref": "#/components/requestBodies/PetBody"},
+                        "responses": {"201": {"description": "Created"}}
+                    }
+                }
+            },
+            "components": {
+                "requestBodies": {
+                    "PetBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"name": {"type": "string"}}
+                                },
+                                "example": {"name": "Rex"}
+                            }
+                        }
+                    }
+                }
+            }
+        }"##;
+        let scenario = adapter.parse(data).unwrap();
+        let req = scenario.items[0].request.as_ref().unwrap();
+        assert!(req.body.is_some());
+        match req.body.as_ref().unwrap() {
+            Body::Json(v) => assert_eq!(v, &serde_json::json!({"name": "Rex"})),
+            other => panic!("Expected Body::Json, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_swagger2_parse() {
+        // host/basePath/schemes → servers; inline types wrapped; body params
+        // moved to requestBody.
+        let adapter = OpenApiInputAdapter;
+        let data = br#"{
+            "swagger": "2.0",
+            "info": {"title": "Legacy", "version": "1.0.0"},
+            "host": "api.example.com",
+            "basePath": "/v1",
+            "schemes": ["https"],
+            "paths": {
+                "/users": {
+                    "get": {
+                        "operationId": "listUsers",
+                        "parameters": [
+                            {"name": "limit", "in": "query", "type": "integer", "required": false}
+                        ],
+                        "responses": {"200": {"description": "OK"}}
+                    }
+                },
+                "/pets": {
+                    "post": {
+                        "operationId": "createUser",
+                        "parameters": [
+                            {
+                                "name": "body",
+                                "in": "body",
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"name": {"type": "string"}}
+                                }
+                            }
+                        ],
+                        "responses": {"201": {"description": "Created"}}
+                    }
+                }
+            }
+        }"#;
+        let scenario = adapter.parse(data).unwrap();
+        assert_eq!(scenario.items.len(), 2);
+        // Paths are sorted alphabetically: /pets (POST) before /users (GET).
+        let post = &scenario.items[0];
+        let post_req = post.request.as_ref().unwrap();
+        assert_eq!(post_req.url, "https://api.example.com/v1/pets");
+        assert!(post_req.body.is_some(), "in:body param must become a requestBody");
+
+        let get = &scenario.items[1];
+        let req = get.request.as_ref().unwrap();
+        assert_eq!(req.url, "https://api.example.com/v1/users");
+        assert_eq!(req.query_params.get("limit").unwrap(), "1");
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    fn test_multiple_paths() {
         let adapter = OpenApiInputAdapter;
         let data = br#"{
             "openapi": "3.0.0",
@@ -741,6 +1364,41 @@ mod tests {
         // Path params should be resolved
         assert!(!req.url.contains('{'), "Path params should be resolved: {}", req.url);
         assert_eq!(req.url, "/users/1/orders/example");
+    }
+
+    #[test]
+    fn test_oauth2_security_mapped() {
+        // OAuth2 security scheme used to silently map to None — now it maps
+        // to a bearer-token placeholder auth.
+        let adapter = OpenApiInputAdapter;
+        let data = br#"{
+            "openapi": "3.0.0",
+            "info": {"title": "OAuth API", "version": "1.0"},
+            "security": [{"oauth": []}],
+            "components": {
+                "securitySchemes": {
+                    "oauth": {
+                        "type": "oauth2",
+                        "flows": {
+                            "clientCredentials": {
+                                "tokenUrl": "https://auth.example.com/token",
+                                "scopes": {"read": "read access"}
+                            }
+                        }
+                    }
+                }
+            },
+            "paths": {
+                "/data": {"get": {"operationId": "getData", "responses": {"200": {"description": "OK"}}}}
+            }
+        }"#;
+        let scenario = adapter.parse(data).unwrap();
+        let req = scenario.items[0].request.as_ref().unwrap();
+        assert!(req.auth.is_some(), "OAuth2 security must map to an auth config");
+        match req.auth.as_ref().unwrap() {
+            AuthConfig::Bearer { token } => assert_eq!(token, "__access_token__"),
+            other => panic!("Expected Bearer placeholder, got {:?}", other),
+        }
     }
 
     #[test]
