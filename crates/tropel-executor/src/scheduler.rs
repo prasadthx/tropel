@@ -352,10 +352,16 @@ impl VUScheduler {
         }
 
         // max_duration is a CAP, not a mandatory wait.
-        // Race VU drain against the timeout.
+        // Race the JOIN of all VU handles against the timeout. The join only
+        // completes when every VU task has actually ended — unlike polling
+        // active_vus, which is still 0 at this point because VUs increment it
+        // asynchronously inside their spawned tasks (the startup race that made
+        // the old select! resolve immediately and drop the timeout branch).
         if let Some(max_dur) = max_duration {
+            let all_done = futures::future::join_all(handles.iter_mut());
+            tokio::pin!(all_done);
             tokio::select! {
-                _ = self.wait_for_active_vus_zero() => {
+                _ = &mut all_done => {
                     // All VUs finished before max_duration — done.
                     tracing::debug!(
                         "Shared iterations: all VUs drained before max_duration ({:?})",
@@ -363,7 +369,11 @@ impl VUScheduler {
                     );
                 }
                 _ = time::sleep(max_dur) => {
-                    // max_duration elapsed — signal stop (grace period applies).
+                    // max_duration elapsed — signal soft stop (grace applies).
+                    tracing::warn!(
+                        "Shared iterations: max_duration ({:?}) reached — requesting stop",
+                        max_dur
+                    );
                     self.request_stop();
                     self.wait_for_drain(grace).await;
                 }
@@ -648,10 +658,13 @@ impl VUScheduler {
         }
 
         // max_duration is a CAP, not a mandatory wait.
-        // Race VU drain against the timeout.
+        // Race the JOIN of all VU handles against the timeout (same startup-race
+        // fix as run_shared_iterations — see there).
         if let Some(max_dur) = max_duration {
+            let all_done = futures::future::join_all(handles.iter_mut());
+            tokio::pin!(all_done);
             tokio::select! {
-                _ = self.wait_for_active_vus_zero() => {
+                _ = &mut all_done => {
                     // All VUs finished before max_duration — done.
                     tracing::debug!(
                         "Per-VU iterations: all VUs drained before max_duration ({:?})",
@@ -660,6 +673,10 @@ impl VUScheduler {
                 }
                 _ = tokio::time::sleep(max_dur) => {
                     // max_duration elapsed — signal stop (grace period applies).
+                    tracing::warn!(
+                        "Per-VU iterations: max_duration ({:?}) reached — requesting stop",
+                        max_dur
+                    );
                     self.request_stop();
                     self.wait_for_drain(grace).await;
                 }
@@ -747,21 +764,6 @@ impl VUScheduler {
         }
     }
 
-    /// Wait for all VUs to naturally drain (active_vus reaches 0).
-    /// Has NO timeout and does NOT force-stop — designed for use with
-    /// `tokio::select!` to race against a max_duration timeout.
-    /// This allows maxDuration to act as a *cap*: VUs finish early when
-    /// their iteration budget is exhausted, rather than blocking for the
-    /// full max_duration.
-    async fn wait_for_active_vus_zero(&self) {
-        loop {
-            let active = *self.active_vus.lock().await;
-            if active == 0 {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
 }
 
 /// Parse an optional graceful_stop/graceful_ramp_down string into a Duration.

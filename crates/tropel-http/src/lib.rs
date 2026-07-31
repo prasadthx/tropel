@@ -6,6 +6,7 @@
 pub mod client;
 pub mod auth;
 pub mod protocol;
+pub mod blocking;
 
 pub use client::*;
 pub use auth::*;

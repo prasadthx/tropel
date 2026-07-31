@@ -3223,6 +3223,7 @@ dependencies = [
  "tropel-core",
  "tropel-es",
  "tropel-ext",
+ "tropel-http",
  "tropel-js",
  "tropel-native",
 ]

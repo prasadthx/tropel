@@ -26,14 +26,12 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use futures::executor::block_on;
 use regex::Regex;
 use rquickjs::function::Func;
 use tropel_core::{Result, TropelError};
 use tropel_core::types::{Body, Method, Request, TagMap};
-use tropel_ext::traits::{Driver, DriverHttpClient, DriverInstance, DriverRegistration, VuContext};
+use tropel_ext::traits::{Driver, DriverInstance, DriverRegistration, VuContext};
 use tropel_js::JsContext;
 
 // ══════════════════════════════════════════════════════════════════
@@ -223,7 +221,15 @@ impl K6DriverInstance {
                             follow_redirects: true,
                             timeout: None,
                         };
-                        match block_on(http_client.execute(&req)) {
+                        // Execute on the dedicated I/O runtime via the shared
+                        // blocking helper — safe from inside ctx.with on a
+                        // current-thread VU runtime. No block_on here: that
+                        // deadlocks the VU's own reactor.
+                        let http_for_io = http_client.clone();
+                        let result = tropel_http::blocking::execute_blocking(async move {
+                            http_for_io.execute(&req).await
+                        });
+                        match result {
                             Ok(resp) => {
                                 let body_text = String::from_utf8(resp.body).unwrap_or_default();
                                 serde_json::json!({

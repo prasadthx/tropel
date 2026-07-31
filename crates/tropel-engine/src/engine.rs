@@ -39,8 +39,6 @@ impl Engine {
         let pool = Arc::new(VUWorkerPool::new(num_workers));
         tracing::info!("VU worker pool: {} threads (available cores: {})", num_workers, num_workers);
 
-        let blocking_rt = Arc::new(tokio::runtime::Runtime::new()
-            .expect("Failed to create blocking tokio runtime"));
         let http_config = config.http.clone();
         let thresholds = config.thresholds.clone();
         let data_rows = config.iteration_data.clone();
@@ -95,7 +93,6 @@ impl Engine {
             let data_rows = data_rows.clone();
             let base_env = config.env.clone();
             let test_start = test_start;
-            let blocking_rt_sc = blocking_rt.clone();
             let registry_sc = registry.clone();
             let fmt_hint = format_hint.clone();
 
@@ -120,7 +117,7 @@ impl Engine {
                         run_scenario_vus(
                             sc_name, start_delay, sc_env, base_env, exec_cfg,
                             scenario, metrics, pool, http_cfg, thresholds, data_rows,
-                            test_start, blocking_rt_sc,
+                            test_start,
                         ).await;
                     }
                     ResolvedInput::Driver(driver) => {
@@ -275,7 +272,6 @@ async fn run_scenario_vus(
     thresholds: HashMap<String, tropel_core::config::ThresholdConfig>,
     data_rows: Vec<HashMap<String, serde_json::Value>>,
     test_start: Instant,
-    blocking_rt: Arc<tokio::runtime::Runtime>,
 ) {
     if start_delay > Duration::ZERO {
         tokio::time::sleep(start_delay).await;
@@ -306,7 +302,6 @@ async fn run_scenario_vus(
     let thresholds_c = thresholds.clone();
     let vu_env_c = vu_env.clone();
     let sc_name_c = sc_name.clone();
-    let blocking_rt_c = blocking_rt.clone();
 
     executor.run(move |sched, vu_id| {
         let metrics = metrics_c.clone();
@@ -322,7 +317,6 @@ async fn run_scenario_vus(
         let think_time = think_time_cfg.clone();
         let sc_name_vu = sc_name_c.clone();
         let is_per_vu_iterations = is_per_vu_iterations;
-        let blocking_rt = blocking_rt_c.clone();
 
         let (_, handle) = pool.spawn(async move {
             sched.add_active_vu(1).await;
@@ -341,7 +335,7 @@ async fn run_scenario_vus(
                 .with_expected_statuses(http_cfg.expected_statuses.clone());
             let pm_state = runner.state_handle();
 
-            let js_ctx = create_vu_js_context(vu_id, &pm_state, &bridge_client, blocking_rt).await;
+            let js_ctx = create_vu_js_context(vu_id, &pm_state, &bridge_client).await;
             if let Some(ctx) = js_ctx {
                 runner = runner.with_js_context(Box::new(ctx));
             }
@@ -785,7 +779,6 @@ async fn create_vu_js_context(
     vu_id: u32,
     pm_state: &tropel_pm::bridge::SharedPmState,
     http_client: &Arc<tropel_http::client::HttpClient>,
-    blocking_rt: Arc<tokio::runtime::Runtime>,
 ) -> Option<tropel_js::JsContext> {
     let ctx = match tropel_js::JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10))).await {
         Ok(ctx) => ctx,
@@ -827,7 +820,6 @@ async fn create_vu_js_context(
     let bridge = tropel_pm::bridge_fns::PmBridge::new(
         pm_state.clone(),
         http_client.clone(),
-        blocking_rt,
     );
     if let Err(e) = bridge.install(&ctx) {
         tracing::warn!("VU {}: Failed to install PM bridge functions: {}", vu_id, e);

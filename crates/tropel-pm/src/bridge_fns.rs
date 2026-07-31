@@ -146,21 +146,14 @@ pub struct PmBridge {
     state: SharedPmState,
     /// Per-VU HTTP client for executing pm.sendRequest synchronously.
     http_client: Arc<HttpClient>,
-    /// A separate multi-thread tokio runtime for blocking bridge calls.
-    /// Required because each VU runs on a current-thread runtime where
-    /// Handle::current().block_on() would panic. This independent runtime
-    /// is used instead for synchronous FFI bridge calls that need to await
-    /// async operations (like pm.sendRequest → reqwest HTTP calls).
-    blocking_rt: Arc<tokio::runtime::Runtime>,
 }
 
 impl PmBridge {
     pub fn new(
         state: SharedPmState,
         http_client: Arc<HttpClient>,
-        blocking_rt: Arc<tokio::runtime::Runtime>,
     ) -> Self {
-        Self { state, http_client, blocking_rt }
+        Self { state, http_client }
     }
 
     /// Register all bridge functions into the given JS context.
@@ -608,11 +601,13 @@ impl PmBridge {
 
             // ── sendRequest ──
             // Executes an HTTP request synchronously using the per-VU HTTP client.
-            // The bridge closure runs inside ctx.with() (synchronous), so we use
-            // a separate multi-thread tokio runtime (blocking_rt) to await the async
-            // client.execute(). This avoids the "cannot block from within a runtime"
-            // panic that would occur with Handle::current().block_on() on a
-            // current-thread runtime (thread-per-core architecture).
+            // The bridge closure runs inside ctx.with() (synchronous), so it uses
+            // the shared tropel_http::blocking::execute_blocking helper: the
+            // caller parks on a plain std channel (no tokio runtime entered on
+            // this thread → no "cannot block from within a runtime" panic), while
+            // the future runs on the dedicated multi-thread I/O runtime's reactor
+            // (no deadlock with the current-thread VU runtime). reqwest's own
+            // per-request timeout still fires normally.
             //
             // Supports the auth-token-fetch pattern: scripts can call pm.sendRequest
             // to obtain auth tokens or session data, then store them via pm.variables.set().
@@ -628,7 +623,6 @@ impl PmBridge {
             // Returns: JSON-encoded response with code, statusText, body, headers, responseTime
             let http = self.http_client.clone();
             let state_for_send = self.state.clone();
-            let blocking_rt = self.blocking_rt.clone();
             let _ = globals.set(
                 "__tropel_pm_send_request",
                 Func::from(
@@ -668,10 +662,14 @@ impl PmBridge {
                             timeout,
                         };
 
-                        // Execute the request on the independent blocking runtime.
-                        // This runtime is multi-thread, so block_on() works fine
-                        // even though we're inside a current-thread VU runtime.
-                        match blocking_rt.block_on(http.execute(&req, None)) {
+                        // Execute on the dedicated I/O runtime via the shared
+                        // blocking helper — safe from inside ctx.with on a
+                        // current-thread VU runtime.
+                        let http_for_io = http.clone();
+                        let result = tropel_http::blocking::execute_blocking(async move {
+                            http_for_io.execute(&req, None).await
+                        });
+                        match result {
                             Ok(http_resp) => {
                                 let body_text = String::from_utf8(http_resp.body.clone()).unwrap_or_default();
                                 serde_json::json!({
