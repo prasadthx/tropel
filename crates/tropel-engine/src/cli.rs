@@ -121,7 +121,12 @@ pub enum Commands {
 
     /// Build a custom Tropel binary with extensions
     Build {
-        /// Extension crates to include (e.g. `--with tropel-x-grpc --with ./my-ext`)
+        /// Extension crates to include.
+        /// Forms: `name` or `name@1.2.3` (crates.io), `./path` (local dir),
+        /// `https://host/user/repo` or `git@host:user/repo.git` (git),
+        /// and git refs: `git-url@main` (branch), `git-url@v1.2.3` (tag),
+        /// `git-url@<sha>` (rev).
+        /// Example: `--with tropel-x-grpc --with ./my-ext --with https://github.com/u/r@v0.2.0`
         #[arg(long = "with", required = true)]
         with: Vec<String>,
 
@@ -452,19 +457,15 @@ async fn list_extensions(plugins_dir: Option<&std::path::Path>) -> Result<()> {
 }
 
 async fn build_custom(with: &[String], output: &std::path::Path, release: bool) -> Result<()> {
-    use tropel_build::{build, BuildConfig, ExtensionDep};
+    use tropel_build::{build, BuildConfig};
 
-    let extensions: Vec<ExtensionDep> = with.iter().map(|s| {
-        if s.starts_with("http") || s.starts_with("git@") {
-            ExtensionDep::Git { name: s.rsplit('/').next().unwrap_or(s).trim_end_matches(".git").to_string(), url: s.clone(), reference: None }
-        } else if s.starts_with('.') || s.starts_with('/') || s.starts_with('~') {
-            let path = std::path::Path::new(s);
-            let name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("ext").to_string();
-            ExtensionDep::Path { name, path: s.to_string() }
-        } else {
-            ExtensionDep::Registry { name: s.clone(), version: "0.1".to_string() }
-        }
-    }).collect();
+    // Each `--with` spec is parsed AND validated here — names/versions/URLs
+    // are injected into the generated Cargo.toml, so a malformed or hostile
+    // value must fail before any file is written (build-time code injection).
+    let mut extensions = Vec::with_capacity(with.len());
+    for spec in with {
+        extensions.push(tropel_build::parse_dep_spec(spec)?);
+    }
 
     let config = BuildConfig {
         extensions,
