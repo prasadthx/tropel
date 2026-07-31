@@ -122,6 +122,7 @@ impl Engine {
             HashMap<String, String>,
             Duration,
             String,
+            Option<String>,
         )> = if let Some(scs) = declared_scenarios {
             scs.iter()
                 .map(|(name, sc)| {
@@ -134,6 +135,7 @@ impl Engine {
                         sc.tags.clone(),
                         start_delay,
                         input_path,
+                        sc.exec.clone(),
                     )
                 })
                 .collect()
@@ -151,6 +153,7 @@ impl Engine {
                         sc.tags.clone(),
                         start_delay,
                         input_path,
+                        sc.exec.clone(),
                     )
                 })
                 .collect()
@@ -164,6 +167,7 @@ impl Engine {
                     HashMap::new(),
                     Duration::ZERO,
                     config.input.clone(),
+                    None,
                 )
             ]
         };
@@ -174,12 +178,15 @@ impl Engine {
         );
         let mut scenario_handles = Vec::new();
 
-        for (scenario_name, exec_cfg, sc_env, sc_tags, start_delay, input_path) in &scenario_configs {
+        for (scenario_name, exec_cfg, sc_env, sc_tags, start_delay, input_path, sc_exec) in
+            &scenario_configs
+        {
             let sc_name = scenario_name.clone();
             let exec_cfg = exec_cfg.clone();
             let sc_env = sc_env.clone();
             let sc_tags = sc_tags.clone();
             let input_path = input_path.clone();
+            let sc_exec = sc_exec.clone();
             let start_delay = *start_delay;
             let metrics = metrics.clone();
             let pool = pool.clone();
@@ -239,6 +246,7 @@ impl Engine {
                             sc_tags,
                             base_env,
                             exec_cfg,
+                            sc_exec,
                             driver,
                             metrics,
                             pool,
@@ -647,6 +655,7 @@ async fn run_driver_vus(
     sc_tags: HashMap<String, String>,
     base_env: HashMap<String, String>,
     exec_cfg: ExecutionConfig,
+    sc_exec: Option<String>,
     driver: Box<dyn Driver>,
     metrics: Arc<MetricsCollector>,
     pool: Arc<VUWorkerPool>,
@@ -700,6 +709,7 @@ async fn run_driver_vus(
     let vu_env_c = vu_env.clone();
     let sc_name_c = sc_name.clone();
     let sc_tags_c = sc_tags.clone();
+    let sc_exec_c = sc_exec.clone();
     let driver_id_c = driver_id.clone();
     let input_bytes_c = input_bytes.clone();
     let input_p_c = input_p.clone();
@@ -723,6 +733,7 @@ async fn run_driver_vus(
         let input_p = input_p_c.clone();
         let registry = registry_c.clone();
         let sc_tags = sc_tags_c.clone();
+        let sc_exec = sc_exec_c.clone();
 
         let (_, handle) = pool.spawn(async move {
             sched.add_active_vu(1).await;
@@ -737,10 +748,19 @@ async fn run_driver_vus(
                 }
             };
 
-            let mut driver_instance = match driver.init(&input_bytes, Some(&input_p)).await {
+            let mut driver_instance = match driver
+                .init(&input_bytes, Some(&input_p), sc_exec.as_deref())
+                .await
+            {
                 Ok(inst) => inst,
                 Err(e) => {
-                    tracing::error!("VU {}: Driver '{}' init failed: {}", vu_id, driver_id, e);
+                    tracing::error!(
+                        "Scenario '{}' VU {}: Driver '{}' init failed: {}",
+                        sc_name_vu,
+                        vu_id,
+                        driver_id,
+                        e
+                    );
                     sched.remove_active_vu(1).await;
                     return;
                 }

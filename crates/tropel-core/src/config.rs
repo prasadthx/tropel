@@ -59,6 +59,12 @@ pub struct ScenarioConfig {
     /// Use staggered values to sequence scenario start times.
     #[serde(default)]
     pub start_time: String,
+    /// k6 `exec` selection — which exported function/flow this scenario runs.
+    /// Drivers that support named entry points (e.g. the k6 driver) install
+    /// this export as the iteration function; when absent, the script's
+    /// `default` export runs. Ignored by declarative (adapter) scenarios.
+    #[serde(default)]
+    pub exec: Option<String>,
 }
 
 /// Full configuration for a load test job.

@@ -150,10 +150,16 @@ pub trait Driver: Send + Sync {
     /// Initialize the driver from raw input bytes.
     /// This is called once at setup time, not per-iteration.
     /// Returns a boxed DriverInstance that is then called per-iteration.
+    ///
+    /// `exec` is the optional k6 scenario `exec` selection — the name of the
+    /// exported function this scenario should run. Drivers that support named
+    /// entry points (e.g. the k6 driver) install that export as the iteration
+    /// function; when `None`, the script's `default` export runs.
     async fn init(
         &self,
         bytes: &[u8],
         source_path: Option<&std::path::Path>,
+        exec: Option<&str>,
     ) -> Result<Box<dyn DriverInstance>>;
 
     /// Read load-profile options declared by the script itself (e.g. k6's

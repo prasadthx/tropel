@@ -134,12 +134,6 @@ impl K6Options {
                         );
                         continue;
                     };
-                    if let Some(exec_fn) = sc.exec.as_deref().filter(|e| !e.is_empty()) {
-                        tracing::warn!(
-                            "k6 scenario '{name}' declares exec '{exec_fn}' but Tropel always \
-                             runs the script's default export — the named function is ignored"
-                        );
-                    }
                     map.insert(
                         name.clone(),
                         ScenarioConfig {
@@ -148,6 +142,10 @@ impl K6Options {
                             env: sc.env.clone(),
                             tags: sc.tags.clone(),
                             start_time: sc.start_time.clone().unwrap_or_else(|| "0s".to_string()),
+                            // k6 `exec` names which exported function runs for
+                            // this scenario — threaded through to the driver
+                            // so it installs that export as __tropel_iteration.
+                            exec: sc.exec.clone(),
                         },
                     );
                 }

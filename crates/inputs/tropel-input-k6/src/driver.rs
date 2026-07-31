@@ -81,6 +81,7 @@ impl Driver for K6Driver {
         &self,
         bytes: &[u8],
         source_path: Option<&Path>,
+        exec: Option<&str>,
     ) -> Result<Box<dyn DriverInstance>> {
         let original = std::str::from_utf8(bytes)
             .map_err(|e| TropelError::Parse(format!("k6 script is not valid UTF-8: {}", e)))?;
@@ -98,11 +99,13 @@ impl Driver for K6Driver {
         // Step 3: Bootstrap shim libraries & native modules
         bootstrap_js_libs(&js_ctx).await?;
 
-        // Step 4: Eval the source as an ES module and install the default
-        // export as the global `__tropel_iteration` entry point. Modules are
+        // Step 4: Eval the source as an ES module and install the entry-point
+        // export as the global `__tropel_iteration`. When the scenario names
+        // an `exec` function (k6 multi-scenario), install THAT export;
+        // otherwise fall back to the module's `default` export. Modules are
         // the only mode where `export const options` (the k6 load profile) and
         // `export default function` survive together.
-        install_iteration_global(&js_ctx, &final_source)?;
+        install_iteration_global(&js_ctx, &final_source, exec)?;
 
         // Verify __tropel_iteration was defined
         let has_iter = js_ctx
@@ -616,9 +619,11 @@ fn read_module_export_string(
     Ok(Some(s))
 }
 
-/// Evaluate an ES module and install its `default` export as the global
-/// `__tropel_iteration` entry point (what `run_iteration` invokes).
-fn install_iteration_global(js_ctx: &JsContext, source: &str) -> Result<()> {
+/// Evaluate an ES module and install its entry-point export as the global
+/// `__tropel_iteration` (what `run_iteration` invokes). When `exec` names a
+/// specific exported function (k6 multi-scenario `exec` selection), that
+/// export is installed; otherwise the module's `default` export is used.
+fn install_iteration_global(js_ctx: &JsContext, source: &str, exec: Option<&str>) -> Result<()> {
     // Arm the per-eval timeout: this evals the module directly via with_ctx,
     // bypassing the eval-family methods that normally reset the deadline.
     js_ctx.reset_interrupt();
@@ -633,11 +638,12 @@ fn install_iteration_global(js_ctx: &JsContext, source: &str) -> Result<()> {
             .finish::<()>()
             .map_err(|e| TropelError::Other(format!("k6 script module resolve error: {}", e)))?;
 
-        match module.get::<_, rquickjs::Function>("default") {
-            Ok(default_fn) => {
+        let entry = exec.filter(|e| !e.is_empty()).unwrap_or("default");
+        match module.get::<_, rquickjs::Function>(entry) {
+            Ok(entry_fn) => {
                 rq_ctx
                     .globals()
-                    .set("__tropel_iteration", default_fn)
+                    .set("__tropel_iteration", entry_fn)
                     .map_err(|e| {
                         TropelError::Other(format!(
                             "failed to install __tropel_iteration: {}",
@@ -646,6 +652,15 @@ fn install_iteration_global(js_ctx: &JsContext, source: &str) -> Result<()> {
                     })?;
             }
             Err(e) => {
+                if entry != "default" {
+                    // k6 semantics: a scenario naming a non-existent exec
+                    // function errors loudly rather than silently running a
+                    // different flow (confusing metrics).
+                    return Err(TropelError::Other(format!(
+                        "k6 scenario exec '{entry}' is not an exported function ({e}) — \
+                         the named exec must be an `export function {entry}(...)` in the script"
+                    )));
+                }
                 // Not fatal: script mode tolerated a missing default export
                 // (warned + continued), so module mode does too.
                 tracing::warn!("k6 script has no default export function: {}", e);
@@ -960,6 +975,36 @@ mod tests {
             let f2: rquickjs::Function = module2.get("default").unwrap();
             let n: i32 = f2.call(()).unwrap();
             assert_eq!(n, 123);
+        });
+    }
+
+    #[test]
+    fn test_exec_selection_installs_named_export() {
+        // A scenario naming `exec: "browse"` must run the `browse` export,
+        // NOT the default export (k6 multi-scenario semantics).
+        let source = r#"
+            export function browse() { return "browse-ran"; }
+            export function checkout() { return "checkout-ran"; }
+            export default function() { return "default-ran"; }
+        "#;
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            let module = rquickjs::Module::declare(ctx, "exec-script", source).unwrap();
+            let (module, promise) = module.eval().unwrap();
+            promise.finish::<()>().unwrap();
+
+            // Same selection logic install_iteration_global uses.
+            let browse: rquickjs::Function = module.get("browse").unwrap();
+            let s: String = browse.call(()).unwrap();
+            assert_eq!(s, "browse-ran");
+
+            // A missing exec export errors (module.get fails) — k6 errors
+            // loudly rather than silently running the default flow.
+            assert!(
+                module.get::<_, rquickjs::Function>("nope").is_err(),
+                "missing exec export must error"
+            );
         });
     }
 
