@@ -164,11 +164,35 @@ impl InputAdapter for HarInputAdapter {
 
         // Drop static assets / unsupported URIs that would error or pollute
         // the load test (Chrome HARs record every image/CSS/script).
+        //
+        // One exception: the first 2xx `text/html` response is treated as the
+        // primary document and kept, even in `_resourceType`-less HARs
+        // (Firefox/Charles) where it would otherwise be filtered — dropping
+        // the document would leave a page-load workload with nothing to
+        // replay. Redirects/error pages never claim the slot, and all
+        // subsequent HTML (iframes, sub-navigations, error pages) is filtered
+        // as static by is_static_resource.
+        let mut html_kept = false;
         let entries: Vec<HarEntry> = root
             .log
             .entries
             .into_iter()
-            .filter(|e| !is_static_resource(e))
+            .filter(|e| {
+                let mime = e.response.content.mime_type.to_lowercase();
+                // Only a 2xx HTML response can claim the document slot — a
+                // 3xx redirect or 4xx/5xx error page with an HTML body must
+                // not consume it, or the real document that follows would be
+                // filtered out. All OTHER text/html (subsequent 2xx documents,
+                // redirects, error pages) is filtered as static by
+                // is_static_resource below.
+                let is_2xx_html =
+                    mime.starts_with("text/html") && (200..300).contains(&e.response.status);
+                if is_2xx_html && !html_kept {
+                    html_kept = true;
+                    return true;
+                }
+                !is_static_resource(e)
+            })
             .collect();
 
         if entries.is_empty() {
@@ -202,15 +226,32 @@ impl InputAdapter for HarInputAdapter {
     }
 }
 
-/// Should this HAR entry be dropped as a static asset?
+/// Should this HAR entry be dropped as a static asset or non-HTTP scheme?
 ///
-/// `data:` URIs are dropped unconditionally — reqwest refuses to send them
-/// and they'd surface as per-request errors. Everything else is classified
-/// by Chrome's `_resourceType` when present, falling back to the response
-/// content-type.
+/// Unsupported schemes are dropped unconditionally — reqwest refuses to send
+/// `data:`/`blob:` URIs (they'd surface as per-request errors), and
+/// `about:`/`javascript:`/`chrome-extension:`/`file:`/`ws:`/`wss:` aren't
+/// plain HTTP requests at all (WebSocket handshakes record as HTTP 101
+/// upgrades, which a plain GET would never reproduce).
+///
+/// Everything else is classified by Chrome's `_resourceType` when present,
+/// falling back to the response content-type. The MIME fallback is expanded
+/// to catch JavaScript and HTML payloads, so non-Chrome HARs (Firefox /
+/// Charles — no `_resourceType`) still drop static assets instead of
+/// replaying them as bogus API calls.
 fn is_static_resource(entry: &HarEntry) -> bool {
     let url = entry.request.url.to_lowercase();
-    if url.starts_with("data:") {
+    const UNSUPPORTED_SCHEMES: [&str; 8] = [
+        "data:",
+        "blob:",
+        "about:",
+        "javascript:",
+        "chrome-extension:",
+        "file:",
+        "ws:",
+        "wss:",
+    ];
+    if UNSUPPORTED_SCHEMES.iter().any(|s| url.starts_with(s)) {
         return true;
     }
     if let Some(rt) = &entry.resource_type {
@@ -223,11 +264,23 @@ fn is_static_resource(entry: &HarEntry) -> bool {
         }
     }
     let mime = entry.response.content.mime_type.to_lowercase();
-    mime.starts_with("image/")
+    // text/html IS filtered here — the primary document is preserved by
+    // parse() as a single exception (first 2xx HTML entry); everything else
+    // with an HTML body (redirects, error pages, sub-navigations) is static.
+    mime.starts_with("text/html") // also matches text/html; charset=...
+        || mime.starts_with("image/")
         || mime.starts_with("font/")
         || mime.starts_with("video/")
         || mime.starts_with("audio/")
         || mime.starts_with("text/css") // also matches text/css; charset=...
+        || mime.starts_with("text/javascript")
+        || mime.starts_with("application/javascript")
+        || mime.starts_with("application/x-javascript")
+        || mime.starts_with("application/ecmascript")
+        || mime.starts_with("application/wasm")
+        || mime.starts_with("application/font-woff")
+        || mime.starts_with("application/x-font")
+        || mime.starts_with("application/manifest+json")
 }
 
 /// Convert a HAR entry to a ScenarioItem.
@@ -662,6 +715,61 @@ mod tests {
             scenario.items[0].request.as_ref().unwrap().url,
             "https://api.example.com/users"
         );
+    }
+
+    #[test]
+    fn test_blob_and_non_chrome_mimes_filtered() {
+        // blob: URIs and JS/HTML payloads must be dropped even when the HAR
+        // has no `_resourceType` (Firefox/Charles exports) — the MIME fallback
+        // catches them, so they aren't replayed as bogus API calls.
+        let adapter = HarInputAdapter;
+        let data = br#"{
+            "log": {
+                "version": "1.2",
+                "entries": [
+                    {
+                        "request": {"method": "GET", "url": "blob:https://app.example.com/uuid", "headers": [], "queryString": []},
+                        "response": {"status": 200, "statusText": "OK"}
+                    },
+                    {
+                        "request": {"method": "GET", "url": "wss://app.example.com/socket", "headers": [], "queryString": []},
+                        "response": {"status": 101, "statusText": "Switching Protocols"}
+                    },
+                    {
+                        "request": {"method": "GET", "url": "https://app.example.com/bundle.js", "headers": [], "queryString": []},
+                        "response": {"status": 200, "statusText": "OK", "content": {"mimeType": "application/javascript"}}
+                    },
+                    {
+                        "request": {"method": "GET", "url": "https://app.example.com/", "headers": [], "queryString": []},
+                        "response": {"status": 200, "statusText": "OK", "content": {"mimeType": "text/html"}}
+                    },
+                    {
+                        "request": {"method": "GET", "url": "https://api.example.com/orders", "headers": [], "queryString": []},
+                        "response": {"status": 200, "statusText": "OK", "content": {"mimeType": "application/json"}}
+                    }
+                ]
+            }
+        }"#;
+        let scenario = adapter.parse(data).unwrap();
+        // blob / wss / JS are filtered; the first text/html (the document) is
+        // preserved, plus the API JSON entry → 2 survivors.
+        assert_eq!(
+            scenario.items.len(),
+            2,
+            "document HTML + API JSON should survive, got {:?}",
+            scenario
+                .items
+                .iter()
+                .map(|i| i.request.as_ref().map(|r| r.url.clone()).unwrap_or_default())
+                .collect::<Vec<_>>()
+        );
+        let urls: Vec<&str> = scenario
+            .items
+            .iter()
+            .filter_map(|i| i.request.as_ref().map(|r| r.url.as_str()))
+            .collect();
+        assert!(urls.contains(&"https://app.example.com/"));
+        assert!(urls.contains(&"https://api.example.com/orders"));
     }
 
     #[test]
