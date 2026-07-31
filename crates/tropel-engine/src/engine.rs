@@ -1,23 +1,23 @@
 use crate::worker::VUWorkerPool;
+use async_trait::async_trait;
+use rand::RngExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use rand::RngExt;
 use tokio::sync::broadcast;
 use tropel_core::config::{ExecutionConfig, HttpConfig, JobConfig, OutputConfig, ThinkTimeConfig};
 use tropel_core::scenario::Scenario;
+use tropel_core::types::{Request, Response, Sample, TagMap};
 use tropel_core::{Result, TropelError};
-use tropel_core::types::{Sample, TagMap, Request, Response};
 use tropel_executor::runner::VURunner;
 use tropel_executor::scheduler::VUScheduler;
 use tropel_ext::registry::ExtensionRegistry;
-use tropel_ext::traits::{Driver, VuContext, DriverHttpClient};
+use tropel_ext::traits::{Driver, DriverHttpClient, VuContext};
 use tropel_http::client::HttpClient;
 use tropel_http::AuthSigner;
 use tropel_metrics::collector::MetricsCollector;
 use tropel_metrics::thresholds::check_abort_on_fail;
 use tropel_report::{create_reporter, Reporter, StreamingStdoutOutput};
-use async_trait::async_trait;
 
 /// The engine orchestrates a complete load test job.
 pub struct Engine {
@@ -26,7 +26,9 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(registry: ExtensionRegistry) -> Self {
-        Self { extension_registry: registry }
+        Self {
+            extension_registry: registry,
+        }
     }
 
     pub async fn run(&self, config: &JobConfig) -> Result<EngineResult> {
@@ -35,9 +37,14 @@ impl Engine {
         let metrics = Arc::new(MetricsCollector::new());
 
         let num_workers = std::thread::available_parallelism()
-            .map(|n| n.get()).unwrap_or(4);
+            .map(|n| n.get())
+            .unwrap_or(4);
         let pool = Arc::new(VUWorkerPool::new(num_workers));
-        tracing::info!("VU worker pool: {} threads (available cores: {})", num_workers, num_workers);
+        tracing::info!(
+            "VU worker pool: {} threads (available cores: {})",
+            num_workers,
+            num_workers
+        );
 
         let http_config = config.http.clone();
         let thresholds = config.thresholds.clone();
@@ -60,24 +67,42 @@ impl Engine {
         }
 
         // Build scenario configs
-        let scenario_configs: Vec<(String, ExecutionConfig, HashMap<String, String>, Duration, String)> =
-            if !config.scenarios.is_empty() {
-                config.scenarios.iter().map(|(name, sc)| {
+        let scenario_configs: Vec<(
+            String,
+            ExecutionConfig,
+            HashMap<String, String>,
+            Duration,
+            String,
+        )> = if !config.scenarios.is_empty() {
+            config
+                .scenarios
+                .iter()
+                .map(|(name, sc)| {
                     let start_delay = parse_duration_str(&sc.start_time).unwrap_or(Duration::ZERO);
                     let input_path = sc.input.clone().unwrap_or_else(|| config.input.clone());
-                    (name.clone(), sc.execution.clone(), sc.env.clone(), start_delay, input_path)
-                }).collect()
-            } else {
-                vec![(
-                    "default".to_string(),
-                    config.execution.clone(),
-                    HashMap::new(),
-                    Duration::ZERO,
-                    config.input.clone(),
-                )]
-            };
+                    (
+                        name.clone(),
+                        sc.execution.clone(),
+                        sc.env.clone(),
+                        start_delay,
+                        input_path,
+                    )
+                })
+                .collect()
+        } else {
+            vec![(
+                "default".to_string(),
+                config.execution.clone(),
+                HashMap::new(),
+                Duration::ZERO,
+                config.input.clone(),
+            )]
+        };
 
-        tracing::info!("Starting Tropel load test: {} scenario(s)", scenario_configs.len());
+        tracing::info!(
+            "Starting Tropel load test: {} scenario(s)",
+            scenario_configs.len()
+        );
         let mut scenario_handles = Vec::new();
 
         for (scenario_name, exec_cfg, sc_env, start_delay, input_path) in &scenario_configs {
@@ -106,7 +131,12 @@ impl Engine {
                 let resolved = match resolved {
                     Ok(r) => r,
                     Err(e) => {
-                        tracing::error!("Scenario '{}': failed to resolve input '{}': {}", sc_name, input_path, e);
+                        tracing::error!(
+                            "Scenario '{}': failed to resolve input '{}': {}",
+                            sc_name,
+                            input_path,
+                            e
+                        );
                         return;
                     }
                 };
@@ -115,17 +145,39 @@ impl Engine {
                 match resolved {
                     ResolvedInput::Scenario(scenario) => {
                         run_scenario_vus(
-                            sc_name, start_delay, sc_env, base_env, exec_cfg,
-                            scenario, metrics, pool, http_cfg, thresholds, data_rows,
+                            sc_name,
+                            start_delay,
+                            sc_env,
+                            base_env,
+                            exec_cfg,
+                            scenario,
+                            metrics,
+                            pool,
+                            http_cfg,
+                            thresholds,
+                            data_rows,
                             test_start,
-                        ).await;
+                        )
+                        .await;
                     }
                     ResolvedInput::Driver(driver) => {
                         run_driver_vus(
-                            sc_name, start_delay, sc_env, base_env, exec_cfg,
-                            driver, metrics, pool, http_cfg, thresholds, data_rows,
-                            test_start, &input_path, registry_sc,
-                        ).await;
+                            sc_name,
+                            start_delay,
+                            sc_env,
+                            base_env,
+                            exec_cfg,
+                            driver,
+                            metrics,
+                            pool,
+                            http_cfg,
+                            thresholds,
+                            data_rows,
+                            test_start,
+                            &input_path,
+                            registry_sc,
+                        )
+                        .await;
                     }
                 }
 
@@ -167,7 +219,10 @@ impl Engine {
             if let Some(reporter) = create_reporter(name) {
                 reporters.push(reporter);
             } else if let Some(_ext) = self.extension_registry.get_output(name) {
-                tracing::warn!("Extension reporter '{}' not yet supported in engine runner", name);
+                tracing::warn!(
+                    "Extension reporter '{}' not yet supported in engine runner",
+                    name
+                );
             } else {
                 tracing::warn!("Unknown reporter: {}", name);
             }
@@ -222,41 +277,50 @@ fn resolve_input_or_driver(
     };
 
     if let Some(driver) = driver {
-        tracing::info!("Input '{}' resolved by driver '{}'", input_path, driver.id());
+        tracing::info!(
+            "Input '{}' resolved by driver '{}'",
+            input_path,
+            driver.id()
+        );
         return Ok(ResolvedInput::Driver(driver));
     }
 
     // 2. Fall back to input adapters
     let adapter: Box<dyn tropel_ext::traits::InputAdapter> = if let Some(fmt) = format_hint {
-        registry.resolve_input_by_id(fmt)
-            .ok_or_else(|| {
-                let available = registry.list_inputs();
-                TropelError::Config(format!(
-                    "Unknown input format '{}'. Available formats: {}",
-                    fmt, available.join(", ")
-                ))
-            })?
+        registry.resolve_input_by_id(fmt).ok_or_else(|| {
+            let available = registry.list_inputs();
+            TropelError::Config(format!(
+                "Unknown input format '{}'. Available formats: {}",
+                fmt,
+                available.join(", ")
+            ))
+        })?
     } else {
-        registry.resolve_input(&bytes)
-            .ok_or_else(|| {
-                let available = registry.list_inputs();
-                TropelError::Parse(format!(
-                    "No input adapter recognized '{}'. Available adapters: {}",
-                    input_path,
-                    if available.is_empty() {
-                        "(none registered — check build configuration)".to_string()
-                    } else {
-                        available.join(", ")
-                    }
-                ))
-            })?
+        registry.resolve_input(&bytes).ok_or_else(|| {
+            let available = registry.list_inputs();
+            TropelError::Parse(format!(
+                "No input adapter recognized '{}'. Available adapters: {}",
+                input_path,
+                if available.is_empty() {
+                    "(none registered — check build configuration)".to_string()
+                } else {
+                    available.join(", ")
+                }
+            ))
+        })?
     };
 
-    tracing::info!("Input '{}' resolved by adapter '{}'", input_path, adapter.id());
+    tracing::info!(
+        "Input '{}' resolved by adapter '{}'",
+        input_path,
+        adapter.id()
+    );
 
     let mut scenario = adapter.parse_with_path(&bytes, Some(input_p))?;
     for (key, val) in base_env {
-        scenario.variables.entry(key.clone())
+        scenario
+            .variables
+            .entry(key.clone())
             .or_insert_with(|| serde_json::Value::String(val.clone()));
     }
 
@@ -283,7 +347,11 @@ async fn run_scenario_vus(
 ) {
     if start_delay > Duration::ZERO {
         tokio::time::sleep(start_delay).await;
-        tracing::info!("Scenario '{}' started after {:?} delay", sc_name, start_delay);
+        tracing::info!(
+            "Scenario '{}' started after {:?} delay",
+            sc_name,
+            start_delay
+        );
     }
 
     let mut vu_env = base_env;
@@ -440,17 +508,23 @@ async fn run_scenario_vus(
     {
         let dropped = executor.take_dropped_iterations();
         if dropped > 0 {
-            metrics.record(&Sample {
-                metric: "dropped_iterations".into(), value: dropped as f64,
-                tags: TagMap::new(), timestamp: std::time::SystemTime::now(),
-                sample_type: tropel_core::types::SampleType::Counter,
-            }).await;
+            metrics
+                .record(&Sample {
+                    metric: "dropped_iterations".into(),
+                    value: dropped as f64,
+                    tags: TagMap::new(),
+                    timestamp: std::time::SystemTime::now(),
+                    sample_type: tropel_core::types::SampleType::Counter,
+                })
+                .await;
         }
     }
 
     loop {
         let active = executor.active_vus().await;
-        if active == 0 { break; }
+        if active == 0 {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -489,7 +563,11 @@ async fn run_driver_vus(
 ) {
     if start_delay > Duration::ZERO {
         tokio::time::sleep(start_delay).await;
-        tracing::info!("Scenario '{}' started after {:?} delay", sc_name, start_delay);
+        tracing::info!(
+            "Scenario '{}' started after {:?} delay",
+            sc_name,
+            start_delay
+        );
     }
 
     let mut vu_env = base_env;
@@ -682,17 +760,23 @@ async fn run_driver_vus(
     {
         let dropped = executor.take_dropped_iterations();
         if dropped > 0 {
-            metrics.record(&Sample {
-                metric: "dropped_iterations".into(), value: dropped as f64,
-                tags: TagMap::new(), timestamp: std::time::SystemTime::now(),
-                sample_type: tropel_core::types::SampleType::Counter,
-            }).await;
+            metrics
+                .record(&Sample {
+                    metric: "dropped_iterations".into(),
+                    value: dropped as f64,
+                    tags: TagMap::new(),
+                    timestamp: std::time::SystemTime::now(),
+                    sample_type: tropel_core::types::SampleType::Counter,
+                })
+                .await;
         }
     }
 
     loop {
         let active = executor.active_vus().await;
-        if active == 0 { break; }
+        if active == 0 {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -715,31 +799,57 @@ fn extract_think_time(exec_cfg: &ExecutionConfig) -> ThinkTimeConfig {
 async fn utils_emit_vus_metrics(metrics: &MetricsCollector, active: u32) {
     let now = std::time::SystemTime::now();
     let vus_tags = TagMap::new();
-    metrics.record_batch(&[
-        Sample { metric: "vus".into(), value: active as f64, tags: vus_tags.clone(), timestamp: now, sample_type: tropel_core::types::SampleType::Point },
-        Sample { metric: "vus_max".into(), value: active as f64, tags: vus_tags, timestamp: now, sample_type: tropel_core::types::SampleType::Point },
-    ]).await;
+    metrics
+        .record_batch(&[
+            Sample {
+                metric: "vus".into(),
+                value: active as f64,
+                tags: vus_tags.clone(),
+                timestamp: now,
+                sample_type: tropel_core::types::SampleType::Point,
+            },
+            Sample {
+                metric: "vus_max".into(),
+                value: active as f64,
+                tags: vus_tags,
+                timestamp: now,
+                sample_type: tropel_core::types::SampleType::Point,
+            },
+        ])
+        .await;
 }
 
 // ── Duration parsing (from old engine.rs) ──
 
 fn parse_duration_str(s: &str) -> Result<Duration> {
     let s = s.trim();
-    if s.is_empty() || s == "0" || s == "0s" { return Ok(Duration::ZERO); }
+    if s.is_empty() || s == "0" || s == "0s" {
+        return Ok(Duration::ZERO);
+    }
     if let Some(num_str) = s.strip_suffix("ms") {
-        let ms: u64 = num_str.parse().map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
+        let ms: u64 = num_str
+            .parse()
+            .map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
         Ok(Duration::from_millis(ms))
     } else if let Some(num_str) = s.strip_suffix('s') {
-        let secs: f64 = num_str.parse().map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
+        let secs: f64 = num_str
+            .parse()
+            .map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
         Ok(Duration::from_secs_f64(secs))
     } else if let Some(num_str) = s.strip_suffix('m') {
-        let mins: f64 = num_str.parse().map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
+        let mins: f64 = num_str
+            .parse()
+            .map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
         Ok(Duration::from_secs_f64(mins * 60.0))
     } else if let Some(num_str) = s.strip_suffix('h') {
-        let hours: f64 = num_str.parse().map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
+        let hours: f64 = num_str
+            .parse()
+            .map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
         Ok(Duration::from_secs_f64(hours * 3600.0))
     } else {
-        let secs: f64 = s.parse().map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
+        let secs: f64 = s
+            .parse()
+            .map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
         Ok(Duration::from_secs_f64(secs))
     }
 }
@@ -788,10 +898,16 @@ async fn create_vu_js_context(
     pm_state: &tropel_pm::bridge::SharedPmState,
     http_client: &Arc<tropel_http::client::HttpClient>,
 ) -> Option<tropel_js::JsContext> {
-    let ctx = match tropel_js::JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10))).await {
+    let ctx = match tropel_js::JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
+        .await
+    {
         Ok(ctx) => ctx,
         Err(e) => {
-            tracing::warn!("VU {}: Failed to create JS context: {} (scripts will be skipped)", vu_id, e);
+            tracing::warn!(
+                "VU {}: Failed to create JS context: {} (scripts will be skipped)",
+                vu_id,
+                e
+            );
             return None;
         }
     };
@@ -807,7 +923,12 @@ async fn create_vu_js_context(
 
     for (name, code) in &js_libraries {
         if let Err(e) = ctx.bootstrap_library(code).await {
-            tracing::warn!("VU {}: Failed to bootstrap JS library '{}': {}", vu_id, name, e);
+            tracing::warn!(
+                "VU {}: Failed to bootstrap JS library '{}': {}",
+                vu_id,
+                name,
+                e
+            );
         }
     }
 
@@ -817,7 +938,12 @@ async fn create_vu_js_context(
         ("exec-shim", exec_code),
     ] {
         if let Err(e) = ctx.bootstrap_library(code).await {
-            tracing::warn!("VU {}: Failed to bootstrap JS library '{}': {}", vu_id, name, e);
+            tracing::warn!(
+                "VU {}: Failed to bootstrap JS library '{}': {}",
+                vu_id,
+                name,
+                e
+            );
         }
     }
 
@@ -825,10 +951,7 @@ async fn create_vu_js_context(
         tracing::warn!("VU {}: Failed to install native modules: {}", vu_id, e);
     }
 
-    let bridge = tropel_pm::bridge_fns::PmBridge::new(
-        pm_state.clone(),
-        http_client.clone(),
-    );
+    let bridge = tropel_pm::bridge_fns::PmBridge::new(pm_state.clone(), http_client.clone());
     if let Err(e) = bridge.install(&ctx) {
         tracing::warn!("VU {}: Failed to install PM bridge functions: {}", vu_id, e);
     }
@@ -853,7 +976,8 @@ async fn create_vu_js_context(
         "    }",
         "  }",
         "}",
-    ].join("\n");
+    ]
+    .join("\n");
     let _ = ctx.eval(&sleep_code).await;
 
     Some(ctx)

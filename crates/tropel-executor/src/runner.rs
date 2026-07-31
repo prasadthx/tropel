@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use tropel_core::config::ExpectedStatus;
 use tropel_core::scenario::Scenario;
-use tropel_core::types::{Sample, SampleType, AuthConfig, TagMap};
+use tropel_core::types::{AuthConfig, Sample, SampleType, TagMap};
 use tropel_core::Result;
 use tropel_http::client::HttpClient;
 use tropel_js::JsContext;
@@ -57,9 +57,18 @@ pub struct VURunner {
 
 impl VURunner {
     /// Create a new VU runner with a dedicated HTTP client.
-    pub fn new(scenario: Arc<Scenario>, client: HttpClient, vu_id: u32, scenario_name: String) -> Self {
+    pub fn new(
+        scenario: Arc<Scenario>,
+        client: HttpClient,
+        vu_id: u32,
+        scenario_name: String,
+    ) -> Self {
         // Extract all item names in order for setNextRequest resolution
-        let names: Vec<String> = scenario.items.iter().map(|item| item.name.clone()).collect();
+        let names: Vec<String> = scenario
+            .items
+            .iter()
+            .map(|item| item.name.clone())
+            .collect();
         let pm_state = Arc::new(Mutex::new(PmState::new()));
         {
             let mut state = pm_state.lock().unwrap();
@@ -152,7 +161,9 @@ impl VURunner {
             // Process leaf items: execute the request (if present), then run scripts.
             // Items without a request (e.g. transpiled TS/ES module scripts) still
             // execute their prerequest and test scripts.
-            if item.items.is_empty() && (item.request.is_some() || item.prerequest.is_some() || item.test.is_some()) {
+            if item.items.is_empty()
+                && (item.request.is_some() || item.prerequest.is_some() || item.test.is_some())
+            {
                 // Set request info in PM state
                 {
                     let mut state = self.pm_state.lock().unwrap();
@@ -181,13 +192,20 @@ impl VURunner {
                     let resolved_url = resolver.resolve_deep(&request.url, &scope, 5);
 
                     // Resolve headers, query params, body
-                    let resolved_headers: HashMap<String, String> = request.headers.iter()
+                    let resolved_headers: HashMap<String, String> = request
+                        .headers
+                        .iter()
                         .map(|(k, v)| (k.clone(), resolver.resolve_deep(v, &scope, 5)))
                         .collect();
-                    let resolved_query: HashMap<String, String> = request.query_params.iter()
+                    let resolved_query: HashMap<String, String> = request
+                        .query_params
+                        .iter()
                         .map(|(k, v)| (k.clone(), resolver.resolve_deep(v, &scope, 5)))
                         .collect();
-                    let resolved_body = request.body.as_ref().map(|b| resolve_body(b, &resolver, &scope));
+                    let resolved_body = request
+                        .body
+                        .as_ref()
+                        .map(|b| resolve_body(b, &resolver, &scope));
 
                     // Build the fully resolved request
                     let resolved_req = tropel_core::types::Request {
@@ -203,7 +221,9 @@ impl VURunner {
                     };
 
                     // Build auth signer from request auth config, or use the scenario-level auth
-                    let auth_signer = resolved_req.auth.as_ref()
+                    let auth_signer = resolved_req
+                        .auth
+                        .as_ref()
                         .or(self.scenario.auth.as_ref())
                         .and_then(|auth| build_auth_signer(auth));
 
@@ -211,10 +231,17 @@ impl VURunner {
                     tracing::trace!("VU runner: executing request to {}", resolved_req.url);
 
                     let exec_start = Instant::now();
-                    let exec_result = self.client.execute(&resolved_req, auth_signer.as_deref()).await;
+                    let exec_result = self
+                        .client
+                        .execute(&resolved_req, auth_signer.as_deref())
+                        .await;
                     let duration = exec_start.elapsed();
 
-                    tracing::trace!("VU runner: request to {} completed in {:?}", resolved_req.url, duration);
+                    tracing::trace!(
+                        "VU runner: request to {} completed in {:?}",
+                        resolved_req.url,
+                        duration
+                    );
 
                     match exec_result {
                         Ok(http_response) => {
@@ -314,7 +341,12 @@ impl VURunner {
                             }
                         }
                         Err(e) => {
-                            tracing::warn!("VU {} request '{}' failed: {}", iteration_index, item.name, e);
+                            tracing::warn!(
+                                "VU {} request '{}' failed: {}",
+                                iteration_index,
+                                item.name,
+                                e
+                            );
                             let err_tags = TagMap::from_pairs([
                                 ("url", resolved_url.clone()),
                                 ("method", request.method.to_string()),
@@ -394,14 +426,19 @@ impl VURunner {
             let has_async = code.contains("await") || code.contains("Promise");
 
             if has_async {
-                ctx.run_script_async(code).await
-                    .map_err(|e| tropel_core::TropelError::Other(format!("Async script error: {}", e)))?;
+                ctx.run_script_async(code).await.map_err(|e| {
+                    tropel_core::TropelError::Other(format!("Async script error: {}", e))
+                })?;
             } else {
-                ctx.run_script_cached(code, source_url).await
+                ctx.run_script_cached(code, source_url)
+                    .await
                     .map_err(|e| tropel_core::TropelError::Other(format!("Script error: {}", e)))?;
             }
         } else {
-            tracing::trace!("Script execution skipped (no JS context): {} chars", code.len());
+            tracing::trace!(
+                "Script execution skipped (no JS context): {} chars",
+                code.len()
+            );
         }
         Ok(())
     }
@@ -426,16 +463,20 @@ fn resolve_body(
             // Resolve variables in JSON values by stringifying and re-parsing
             let s = serde_json::to_string(val).unwrap_or_default();
             let resolved = resolver.resolve_deep(&s, scope, 5);
-            tropel_core::types::Body::Json(serde_json::from_str(&resolved).unwrap_or_else(|_| val.clone()))
+            tropel_core::types::Body::Json(
+                serde_json::from_str(&resolved).unwrap_or_else(|_| val.clone()),
+            )
         }
         tropel_core::types::Body::FormData(map) => {
-            let resolved: HashMap<String, String> = map.iter()
+            let resolved: HashMap<String, String> = map
+                .iter()
                 .map(|(k, v)| (k.clone(), resolver.resolve_deep(v, scope, 5)))
                 .collect();
             tropel_core::types::Body::FormData(resolved)
         }
         tropel_core::types::Body::UrlEncoded(map) => {
-            let resolved: HashMap<String, String> = map.iter()
+            let resolved: HashMap<String, String> = map
+                .iter()
                 .map(|(k, v)| (k.clone(), resolver.resolve_deep(v, scope, 5)))
                 .collect();
             tropel_core::types::Body::UrlEncoded(resolved)
@@ -462,17 +503,24 @@ fn resolve_body(
 /// Build an auth signer from an AuthConfig.
 fn build_auth_signer(auth: &AuthConfig) -> Option<Box<dyn tropel_http::auth::AuthSigner>> {
     match auth {
-        AuthConfig::Bearer { token } => {
-            Some(Box::new(tropel_http::auth::BearerAuth::new(token)))
-        }
-        AuthConfig::Basic { username, password } => {
-            Some(Box::new(tropel_http::auth::BasicAuth::new(username, password)))
-        }
-        AuthConfig::ApiKey { key, value, location } => {
-            Some(Box::new(tropel_http::auth::ApiKeyAuth::new(key, value, location.clone())))
-        }
+        AuthConfig::Bearer { token } => Some(Box::new(tropel_http::auth::BearerAuth::new(token))),
+        AuthConfig::Basic { username, password } => Some(Box::new(
+            tropel_http::auth::BasicAuth::new(username, password),
+        )),
+        AuthConfig::ApiKey {
+            key,
+            value,
+            location,
+        } => Some(Box::new(tropel_http::auth::ApiKeyAuth::new(
+            key,
+            value,
+            location.clone(),
+        ))),
         _ => {
-            tracing::warn!("Auth type {:?} not yet implemented, sending without auth", auth);
+            tracing::warn!(
+                "Auth type {:?} not yet implemented, sending without auth",
+                auth
+            );
             None
         }
     }

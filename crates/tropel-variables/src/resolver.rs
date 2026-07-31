@@ -39,16 +39,18 @@ impl VariableResolver {
         let after_dynamic = self.dynamic_catalog.resolve(input);
 
         // Then resolve scoped variables ({{var_name}})
-        let result = self.var_re.replace_all(&after_dynamic, |caps: &regex::Captures| {
-            let var_name = caps.get(1).unwrap().as_str().trim();
+        let result = self
+            .var_re
+            .replace_all(&after_dynamic, |caps: &regex::Captures| {
+                let var_name = caps.get(1).unwrap().as_str().trim();
 
-            // Skip dynamic vars (already handled)
-            if var_name.starts_with('$') {
-                return caps.get(0).unwrap().as_str().to_string();
-            }
+                // Skip dynamic vars (already handled)
+                if var_name.starts_with('$') {
+                    return caps.get(0).unwrap().as_str().to_string();
+                }
 
-            self.resolve_variable(var_name, scope)
-        });
+                self.resolve_variable(var_name, scope)
+            });
 
         result.to_string()
     }
@@ -157,8 +159,14 @@ mod tests {
         let scope = VariableScope {
             data: HashMap::from([("key".into(), serde_json::Value::String("data-value".into()))]),
             env: HashMap::from([("key".into(), "env-value".into())]),
-            collection: HashMap::from([("key".into(), serde_json::Value::String("col-value".into()))]),
-            globals: HashMap::from([("key".into(), serde_json::Value::String("global-value".into()))]),
+            collection: HashMap::from([(
+                "key".into(),
+                serde_json::Value::String("col-value".into()),
+            )]),
+            globals: HashMap::from([(
+                "key".into(),
+                serde_json::Value::String("global-value".into()),
+            )]),
         };
 
         // Data takes priority

@@ -14,13 +14,15 @@ impl NativeModule for ExtraFunctionsModule {
         ctx.with_ctx(|rq_ctx| {
             let globals = rq_ctx.globals();
 
-            let _ = globals.set("__tropel_native_random_int", Func::from(|min: i64, max: i64| -> i64 {
-                random_int(min, max)
-            }));
+            let _ = globals.set(
+                "__tropel_native_random_int",
+                Func::from(|min: i64, max: i64| -> i64 { random_int(min, max) }),
+            );
 
-            let _ = globals.set("__tropel_native_random_float", Func::from(|| -> f64 {
-                random_float()
-            }));
+            let _ = globals.set(
+                "__tropel_native_random_float",
+                Func::from(|| -> f64 { random_float() }),
+            );
         });
 
         tracing::debug!("Installed extra functions native module");

@@ -15,36 +15,44 @@ impl NativeModule for EncodingModule {
             let globals = rq_ctx.globals();
 
             // ── Base64 encode/decode ──
-            let _ = globals.set("__tropel_native_base64_encode", Func::from(|data: Vec<u8>| -> String {
-                base64_encode(&data)
-            }));
-            let _ = globals.set("__tropel_native_base64_decode", Func::from(|data: String| -> Option<Vec<u8>> {
-                base64_decode(&data).ok()
-            }));
+            let _ = globals.set(
+                "__tropel_native_base64_encode",
+                Func::from(|data: Vec<u8>| -> String { base64_encode(&data) }),
+            );
+            let _ = globals.set(
+                "__tropel_native_base64_decode",
+                Func::from(|data: String| -> Option<Vec<u8>> { base64_decode(&data).ok() }),
+            );
 
             // ── Base64 URL-safe encode/decode ──
-            let _ = globals.set("__tropel_native_base64url_encode", Func::from(|data: Vec<u8>| -> String {
-                base64url_encode(&data)
-            }));
-            let _ = globals.set("__tropel_native_base64url_decode", Func::from(|data: String| -> Option<Vec<u8>> {
-                base64url_decode(&data).ok()
-            }));
+            let _ = globals.set(
+                "__tropel_native_base64url_encode",
+                Func::from(|data: Vec<u8>| -> String { base64url_encode(&data) }),
+            );
+            let _ = globals.set(
+                "__tropel_native_base64url_decode",
+                Func::from(|data: String| -> Option<Vec<u8>> { base64url_decode(&data).ok() }),
+            );
 
             // ── Hex encode/decode ──
-            let _ = globals.set("__tropel_native_hex_encode", Func::from(|data: Vec<u8>| -> String {
-                hex_encode(&data)
-            }));
-            let _ = globals.set("__tropel_native_hex_decode", Func::from(|data: String| -> Option<Vec<u8>> {
-                hex_decode(&data).ok()
-            }));
+            let _ = globals.set(
+                "__tropel_native_hex_encode",
+                Func::from(|data: Vec<u8>| -> String { hex_encode(&data) }),
+            );
+            let _ = globals.set(
+                "__tropel_native_hex_decode",
+                Func::from(|data: String| -> Option<Vec<u8>> { hex_decode(&data).ok() }),
+            );
 
             // ── URL encode/decode ──
-            let _ = globals.set("__tropel_native_url_encode", Func::from(|data: String| -> String {
-                url_encode(&data)
-            }));
-            let _ = globals.set("__tropel_native_url_decode", Func::from(|data: String| -> Option<String> {
-                url_decode(&data).ok()
-            }));
+            let _ = globals.set(
+                "__tropel_native_url_encode",
+                Func::from(|data: String| -> String { url_encode(&data) }),
+            );
+            let _ = globals.set(
+                "__tropel_native_url_decode",
+                Func::from(|data: String| -> Option<String> { url_decode(&data).ok() }),
+            );
         });
 
         tracing::debug!("Installed encoding native module");

@@ -14,9 +14,9 @@
 pub mod driver;
 
 use std::path::Path;
-use tropel_sdk::{Scenario, ScenarioInfo, ScenarioItem};
-use tropel_sdk::{Result, TropelError};
 use tropel_sdk::{InputAdapter, InputAdapterRegistration};
+use tropel_sdk::{Result, TropelError};
+use tropel_sdk::{Scenario, ScenarioInfo, ScenarioItem};
 
 /// Input adapter for k6-style JS/TS test scripts.
 pub struct K6ScriptAdapter;
@@ -42,8 +42,10 @@ impl InputAdapter for K6ScriptAdapter {
 
             let has_export_default = text.contains("export default");
             let has_k6_import = text.contains("from \"k6/") || text.contains("from 'k6/");
-            let has_test_patterns = text.contains("http.get") || text.contains("http.post")
-                || text.contains("check(") || text.contains("group(");
+            let has_test_patterns = text.contains("http.get")
+                || text.contains("http.post")
+                || text.contains("check(")
+                || text.contains("group(");
 
             has_export_default || has_k6_import || has_test_patterns
         } else {
@@ -65,7 +67,8 @@ impl InputAdapter for K6ScriptAdapter {
             .map_err(|_| TropelError::Parse("k6 script is not valid UTF-8".into()))?;
 
         let path = source_path.unwrap_or(Path::new("script.js"));
-        let name = path.file_stem()
+        let name = path
+            .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("script")
             .to_string();
@@ -83,7 +86,8 @@ fn build_scenario_from_source(js_code: &str, name: &str) -> Result<Scenario> {
     // regardless of request execution status.
     let wrapped_code = format!(
         "(function() {{\n{}    }})();",
-        js_code.lines()
+        js_code
+            .lines()
             .map(|l| format!("    {}", l))
             .collect::<Vec<_>>()
             .join("\n")
@@ -110,7 +114,9 @@ fn build_scenario_from_source(js_code: &str, name: &str) -> Result<Scenario> {
 }
 
 // Register K6ScriptAdapter for compile-time discovery by the engine.
-inventory::submit!(InputAdapterRegistration::new("k6", || Box::new(K6ScriptAdapter)));
+inventory::submit!(InputAdapterRegistration::new("k6", || Box::new(
+    K6ScriptAdapter
+)));
 
 #[cfg(test)]
 mod tests {
@@ -134,7 +140,10 @@ mod tests {
     fn test_detect_postman_not_k6() {
         let adapter = K6ScriptAdapter;
         let data = br#"{"info":{"name":"Test","schema":"https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},"item":[]}"#;
-        assert!(!adapter.detect(data), "Postman JSON should not be detected as k6");
+        assert!(
+            !adapter.detect(data),
+            "Postman JSON should not be detected as k6"
+        );
     }
 
     #[test]

@@ -3,12 +3,12 @@
 //! Protocol-agnostic domain types shared across all Tropel crates.
 //! This crate is a leaf — it depends on nothing in the workspace.
 
-pub mod error;
-pub mod types;
 pub mod config;
+pub mod error;
 pub mod scenario;
+pub mod types;
 
-pub use error::*;
-pub use types::*;
 pub use config::*;
+pub use error::*;
 pub use scenario::*;
+pub use types::*;

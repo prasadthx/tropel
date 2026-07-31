@@ -16,9 +16,10 @@ impl NativeModule for JsonModule {
             let globals = rq_ctx.globals();
 
             // uuid generation — simple string return
-            let _ = globals.set("__tropel_native_uuid", Func::from(|| -> String {
-                uuid::Uuid::new_v4().to_string()
-            }));
+            let _ = globals.set(
+                "__tropel_native_uuid",
+                Func::from(|| -> String { uuid::Uuid::new_v4().to_string() }),
+            );
 
             // Fast JSON parse — validates JSON from a string, returns the
             // canonical JSON string for JS-side JSON.parse().
@@ -120,12 +121,14 @@ mod tests {
     fn test_large_json() {
         // Build a realistically-sized JSON payload
         let data: Vec<serde_json::Value> = (0..1000)
-            .map(|i| serde_json::json!({
-                "id": i,
-                "name": format!("item-{}", i),
-                "active": i % 2 == 0,
-                "tags": ["a", "b", "c"]
-            }))
+            .map(|i| {
+                serde_json::json!({
+                    "id": i,
+                    "name": format!("item-{}", i),
+                    "active": i % 2 == 0,
+                    "tags": ["a", "b", "c"]
+                })
+            })
             .collect();
         let json_str = serde_json::to_string(&data).unwrap();
 
@@ -149,8 +152,14 @@ mod tests {
                 }
             }
         });
-        assert_eq!(json_get(&value, "user.name"), Some(&serde_json::json!("Alice")));
-        assert_eq!(json_get(&value, "user.address.city"), Some(&serde_json::json!("Wonderland")));
+        assert_eq!(
+            json_get(&value, "user.name"),
+            Some(&serde_json::json!("Alice"))
+        );
+        assert_eq!(
+            json_get(&value, "user.address.city"),
+            Some(&serde_json::json!("Wonderland"))
+        );
         assert_eq!(json_get(&value, "nonexistent"), None);
     }
 

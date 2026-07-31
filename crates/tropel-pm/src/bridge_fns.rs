@@ -1,10 +1,10 @@
-use std::collections::HashMap;
-use std::sync::Arc;
 use crate::bridge::SharedPmState;
 use rquickjs::function::Func;
 use serde_json::Value;
-use tropel_core::Result;
+use std::collections::HashMap;
+use std::sync::Arc;
 use tropel_core::types::{Body, Method, Request};
+use tropel_core::Result;
 use tropel_http::client::HttpClient;
 use tropel_js::JsContext;
 
@@ -42,7 +42,6 @@ fn resolve_vars(
 
     let mut result = String::with_capacity(url.len());
     let mut pos = 0;
-
 
     while pos < url.len() {
         // Find the next {{ marker
@@ -149,10 +148,7 @@ pub struct PmBridge {
 }
 
 impl PmBridge {
-    pub fn new(
-        state: SharedPmState,
-        http_client: Arc<HttpClient>,
-    ) -> Self {
+    pub fn new(state: SharedPmState, http_client: Arc<HttpClient>) -> Self {
         Self { state, http_client }
     }
 
@@ -218,8 +214,7 @@ impl PmBridge {
                     if let Some(val) = st.collection_vars.get(&key) {
                         return Some(variable_value_to_string(val));
                     }
-                    st.globals.get(&key)
-                        .map(|v| variable_value_to_string(v))
+                    st.globals.get(&key).map(|v| variable_value_to_string(v))
                 }),
             );
 
@@ -228,7 +223,8 @@ impl PmBridge {
                 "__tropel_pm_variables_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
-                    st.collection_vars.insert(key, serde_json::Value::String(value));
+                    st.collection_vars
+                        .insert(key, serde_json::Value::String(value));
                 }),
             );
 
@@ -258,7 +254,10 @@ impl PmBridge {
                 "__tropel_pm_response_status",
                 Func::from(move || -> String {
                     let st = state_clone.lock().unwrap();
-                    st.response.as_ref().map(|r| r.status_text.clone()).unwrap_or_default()
+                    st.response
+                        .as_ref()
+                        .map(|r| r.status_text.clone())
+                        .unwrap_or_default()
                 }),
             );
 
@@ -276,7 +275,8 @@ impl PmBridge {
                 "__tropel_pm_response_time",
                 Func::from(move || -> f64 {
                     let st = state_clone.lock().unwrap();
-                    st.response.as_ref()
+                    st.response
+                        .as_ref()
                         .map(|r| r.response_time.as_secs_f64() * 1000.0)
                         .unwrap_or(0.0)
                 }),
@@ -289,7 +289,10 @@ impl PmBridge {
                 "__tropel_pm_response_headers",
                 Func::from(move || -> HashMap<String, String> {
                     let st = state_clone.lock().unwrap();
-                    st.response.as_ref().map(|r| r.headers.clone()).unwrap_or_default()
+                    st.response
+                        .as_ref()
+                        .map(|r| r.headers.clone())
+                        .unwrap_or_default()
                 }),
             );
 
@@ -299,7 +302,9 @@ impl PmBridge {
                 "__tropel_pm_response_header",
                 Func::from(move |key: String| -> Option<String> {
                     let st = state_clone.lock().unwrap();
-                    st.response.as_ref().and_then(|r| r.headers.get(&key).cloned())
+                    st.response
+                        .as_ref()
+                        .and_then(|r| r.headers.get(&key).cloned())
                 }),
             );
 
@@ -310,9 +315,15 @@ impl PmBridge {
                 "__tropel_pm_response_cookies",
                 Func::from(move || -> HashMap<String, String> {
                     let st = state_clone.lock().unwrap();
-                    st.response.as_ref().map(|r| {
-                        r.cookies.iter().map(|c| (c.name.clone(), c.value.clone())).collect()
-                    }).unwrap_or_default()
+                    st.response
+                        .as_ref()
+                        .map(|r| {
+                            r.cookies
+                                .iter()
+                                .map(|c| (c.name.clone(), c.value.clone()))
+                                .collect()
+                        })
+                        .unwrap_or_default()
                 }),
             );
 
@@ -350,9 +361,9 @@ impl PmBridge {
                 "__tropel_pm_iteration_data_get",
                 Func::from(move |key: String| -> Option<String> {
                     let st = state_clone.lock().unwrap();
-                    st.iteration_data.as_ref().and_then(|data| {
-                        data.get(&key).map(|val| variable_value_to_string(val))
-                    })
+                    st.iteration_data
+                        .as_ref()
+                        .and_then(|data| data.get(&key).map(|val| variable_value_to_string(val)))
                 }),
             );
 
@@ -495,36 +506,38 @@ impl PmBridge {
             let state_clone = state.clone();
             let _ = globals.set(
                 "__tropel_pm_custom_metric_add",
-                Func::from(move |name: String, value: f64, tags_json: String, metric_type_str: String| {
-                    let mut st = state_clone.lock().unwrap();
-                    // Parse tags from JSON string
-                    let tags = if tags_json.is_empty() || tags_json == "{}" {
-                        tropel_core::types::TagMap::new()
-                    } else {
-                        let parsed: std::collections::HashMap<String, String> =
-                            serde_json::from_str(&tags_json).unwrap_or_default();
-                        tropel_core::types::TagMap::from_pairs(parsed)
-                    };
+                Func::from(
+                    move |name: String, value: f64, tags_json: String, metric_type_str: String| {
+                        let mut st = state_clone.lock().unwrap();
+                        // Parse tags from JSON string
+                        let tags = if tags_json.is_empty() || tags_json == "{}" {
+                            tropel_core::types::TagMap::new()
+                        } else {
+                            let parsed: std::collections::HashMap<String, String> =
+                                serde_json::from_str(&tags_json).unwrap_or_default();
+                            tropel_core::types::TagMap::from_pairs(parsed)
+                        };
 
-                    // Track the current value per metric+tags combo
-                    st.custom_metrics.insert(name.clone(), value);
+                        // Track the current value per metric+tags combo
+                        st.custom_metrics.insert(name.clone(), value);
 
-                    // Determine sample type from type string
-                    let sample_type = match metric_type_str.as_str() {
-                        "counter" => tropel_core::types::SampleType::Counter,
-                        "gauge" => tropel_core::types::SampleType::Point,
-                        "rate" => tropel_core::types::SampleType::Rate,
-                        _ => tropel_core::types::SampleType::Trend,
-                    };
+                        // Determine sample type from type string
+                        let sample_type = match metric_type_str.as_str() {
+                            "counter" => tropel_core::types::SampleType::Counter,
+                            "gauge" => tropel_core::types::SampleType::Point,
+                            "rate" => tropel_core::types::SampleType::Rate,
+                            _ => tropel_core::types::SampleType::Trend,
+                        };
 
-                    st.samples.push(tropel_core::types::Sample {
-                        metric: name,
-                        value,
-                        tags,
-                        timestamp: std::time::SystemTime::now(),
-                        sample_type,
-                    });
-                }),
+                        st.samples.push(tropel_core::types::Sample {
+                            metric: name,
+                            value,
+                            tags,
+                            timestamp: std::time::SystemTime::now(),
+                            sample_type,
+                        });
+                    },
+                ),
             );
 
             // ═══════════════════════════════════════════════════
@@ -534,18 +547,14 @@ impl PmBridge {
             let state_clone = state.clone();
             let _ = globals.set(
                 "__tropel_exec_vu_id",
-                Func::from(move || -> u32 {
-                    state_clone.lock().unwrap().vu_id
-                }),
+                Func::from(move || -> u32 { state_clone.lock().unwrap().vu_id }),
             );
 
             // exec.scenario.name — scenario name
             let state_clone = state.clone();
             let _ = globals.set(
                 "__tropel_exec_scenario_name",
-                Func::from(move || -> String {
-                    state_clone.lock().unwrap().scenario_name.clone()
-                }),
+                Func::from(move || -> String { state_clone.lock().unwrap().scenario_name.clone() }),
             );
 
             // Known limitation: exec.scenario.executor — executor type string
@@ -561,9 +570,7 @@ impl PmBridge {
             let state_clone = state.clone();
             let _ = globals.set(
                 "__tropel_exec_iteration",
-                Func::from(move || -> u64 {
-                    state_clone.lock().unwrap().iteration_index
-                }),
+                Func::from(move || -> u64 { state_clone.lock().unwrap().iteration_index }),
             );
 
             // Known limitation: exec.instance.iterationsCompleted — returns the
@@ -583,10 +590,7 @@ impl PmBridge {
             // Requires the scheduler's active_vus count to be passed to PmState
             // each iteration. k6 provides this via the instance object, but the
             // connection from VU runner to scheduler is indirect. Always returns 0.
-            let _ = globals.set(
-                "__tropel_exec_vus_active",
-                Func::from(|| -> u32 { 0 }),
-            );
+            let _ = globals.set("__tropel_exec_vus_active", Func::from(|| -> u32 { 0 }));
 
             // test.abort(message) — requests engine to abort the test
             let state_clone = state.clone();
@@ -626,7 +630,12 @@ impl PmBridge {
             let _ = globals.set(
                 "__tropel_pm_send_request",
                 Func::from(
-                    move |method: String, url: String, headers_json: String, body: String, timeout_ms: f64| -> String {
+                    move |method: String,
+                          url: String,
+                          headers_json: String,
+                          body: String,
+                          timeout_ms: f64|
+                          -> String {
                         // Resolve {{variables}} in the URL using current PM state
                         let resolved_url = {
                             let st = state_for_send.lock().unwrap();
@@ -635,8 +644,7 @@ impl PmBridge {
 
                         // Parse headers — supports both object form {"key":"val"} and
                         // Postman array form [{"key":"Content-Type","value":"application/json"}]
-                        let headers: HashMap<String, String> =
-                            parse_headers(&headers_json);
+                        let headers: HashMap<String, String> = parse_headers(&headers_json);
 
                         let request_body = if body.is_empty() {
                             None
@@ -671,24 +679,25 @@ impl PmBridge {
                         });
                         match result {
                             Ok(http_resp) => {
-                                let body_text = String::from_utf8(http_resp.body.clone()).unwrap_or_default();
+                                let body_text =
+                                    String::from_utf8(http_resp.body.clone()).unwrap_or_default();
                                 serde_json::json!({
                                     "code": http_resp.status_code,
                                     "statusText": http_resp.status_text,
                                     "body": body_text,
                                     "headers": http_resp.headers,
                                     "responseTime": http_resp.response_time.as_secs_f64() * 1000.0,
-                                }).to_string()
+                                })
+                                .to_string()
                             }
-                            Err(e) => {
-                                serde_json::json!({
-                                    "code": 0,
-                                    "statusText": format!("Request failed: {}", e),
-                                    "body": "",
-                                    "headers": {},
-                                    "responseTime": 0,
-                                }).to_string()
-                            }
+                            Err(e) => serde_json::json!({
+                                "code": 0,
+                                "statusText": format!("Request failed: {}", e),
+                                "body": "",
+                                "headers": {},
+                                "responseTime": 0,
+                            })
+                            .to_string(),
                         }
                     },
                 ),

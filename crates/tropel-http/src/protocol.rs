@@ -1,5 +1,5 @@
-use crate::client::HttpClient;
 use crate::auth::AuthSigner;
+use crate::client::HttpClient;
 use tropel_core::config::HttpConfig;
 use tropel_core::types::*;
 use tropel_core::Result;
@@ -24,7 +24,9 @@ impl HttpProtocol {
         resolved_url: &str,
         auth_signer: Option<&dyn AuthSigner>,
     ) -> Result<Sample> {
-        let request = item.request.as_ref()
+        let request = item
+            .request
+            .as_ref()
             .ok_or_else(|| TropelError::Http("Item has no request".into()))?;
 
         let resolved_req = Request {
@@ -39,7 +41,9 @@ impl HttpProtocol {
             timeout: request.timeout,
         };
 
-        self.execute_item_with_request(&resolved_req, auth_signer).await.map(|(sample, _)| sample)
+        self.execute_item_with_request(&resolved_req, auth_signer)
+            .await
+            .map(|(sample, _)| sample)
     }
 
     /// Execute a fully-resolved request and return a duration sample along with

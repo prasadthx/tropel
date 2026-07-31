@@ -15,7 +15,7 @@
 //! `register_builtins()` is invoked from the CLI at startup, before the
 //! `ExtensionRegistry` performs its `collect_inventory()` pass.
 
-use tropel_ext::traits::{InputAdapter, Driver};
+use tropel_ext::traits::{Driver, InputAdapter};
 
 /// Force-link every built-in input adapter and driver by constructing it.
 /// Returns the total number of built-ins so the call is observable.
@@ -26,9 +26,7 @@ pub fn link_builtins() -> usize {
         Box::new(tropel_input_openapi::OpenApiInputAdapter),
         Box::new(tropel_input_k6::K6ScriptAdapter),
     ];
-    let drivers: Vec<Box<dyn Driver>> = vec![
-        Box::new(tropel_input_k6::driver::K6Driver),
-    ];
+    let drivers: Vec<Box<dyn Driver>> = vec![Box::new(tropel_input_k6::driver::K6Driver)];
     adapters.len() + drivers.len()
 }
 

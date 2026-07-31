@@ -27,13 +27,13 @@
 //! classified by Chrome's `_resourceType` field or the response
 //! `content.mimeType`.
 
-use std::collections::HashMap;
 use base64::Engine;
-use tropel_sdk::{Scenario, ScenarioInfo, ScenarioItem};
-use tropel_sdk::{Body, Method, Request};
-use tropel_sdk::{Result, TropelError};
-use tropel_sdk::{InputAdapter, InputAdapterRegistration};
 use serde::Deserialize;
+use std::collections::HashMap;
+use tropel_sdk::{Body, Method, Request};
+use tropel_sdk::{InputAdapter, InputAdapterRegistration};
+use tropel_sdk::{Result, TropelError};
+use tropel_sdk::{Scenario, ScenarioInfo, ScenarioItem};
 
 // ── HAR data model (minimal — only what we need) ────────────────
 
@@ -130,7 +130,9 @@ struct HarPostParam {
 /// Input adapter for HTTP Archive (HAR) files.
 pub struct HarInputAdapter;
 
-inventory::submit!(InputAdapterRegistration::new("har", || Box::new(HarInputAdapter)));
+inventory::submit!(InputAdapterRegistration::new("har", || Box::new(
+    HarInputAdapter
+)));
 
 impl InputAdapter for HarInputAdapter {
     fn id(&self) -> &str {
@@ -149,8 +151,7 @@ impl InputAdapter for HarInputAdapter {
             Some(log) if log.is_object() => log,
             _ => return false,
         };
-        log.get("version").is_some()
-            && log.get("entries").map(|e| e.is_array()).unwrap_or(false)
+        log.get("version").is_some() && log.get("entries").map(|e| e.is_array()).unwrap_or(false)
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Scenario> {
@@ -245,7 +246,13 @@ fn har_entry_to_item(entry: HarEntry, index: usize) -> ScenarioItem {
     let query_params = if url.contains('?') {
         HashMap::new()
     } else {
-        merge_pairs(entry.request.query_string.into_iter().map(|q| (q.name, q.value)))
+        merge_pairs(
+            entry
+                .request
+                .query_string
+                .into_iter()
+                .map(|q| (q.name, q.value)),
+        )
     };
 
     let body = entry.request.post_data.map(build_body);
@@ -289,8 +296,8 @@ fn build_body(pd: HarPostData) -> Body {
 
     if mime.contains("json") {
         // Parse JSON text into serde_json::Value for Body::Json
-        let json_val = serde_json::from_str(&pd.text)
-            .unwrap_or_else(|_| serde_json::Value::String(pd.text));
+        let json_val =
+            serde_json::from_str(&pd.text).unwrap_or_else(|_| serde_json::Value::String(pd.text));
         Body::Json(json_val)
     } else if mime.contains("x-www-form-urlencoded") {
         if has_text {
@@ -298,12 +305,7 @@ fn build_body(pd: HarPostData) -> Body {
             // header is preserved from the HAR headers).
             Body::Raw(pd.text)
         } else {
-            Body::UrlEncoded(
-                pd.params
-                    .into_iter()
-                    .map(|p| (p.name, p.value))
-                    .collect(),
-            )
+            Body::UrlEncoded(pd.params.into_iter().map(|p| (p.name, p.value)).collect())
         }
     } else if mime.contains("form-data") || mime.contains("multipart") {
         if has_text {
@@ -311,12 +313,7 @@ fn build_body(pd: HarPostData) -> Body {
             // corrupt it. Content-Type header with boundary is preserved.
             Body::Raw(pd.text)
         } else {
-            Body::FormData(
-                pd.params
-                    .into_iter()
-                    .map(|p| (p.name, p.value))
-                    .collect(),
-            )
+            Body::FormData(pd.params.into_iter().map(|p| (p.name, p.value)).collect())
         }
     } else {
         Body::Raw(pd.text)
@@ -384,7 +381,10 @@ mod tests {
     fn test_detect_postman_not_har() {
         let adapter = HarInputAdapter;
         let data = br#"{"info":{"name":"Test","schema":"https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},"item":[]}"#;
-        assert!(!adapter.detect(data), "Postman JSON should not be detected as HAR");
+        assert!(
+            !adapter.detect(data),
+            "Postman JSON should not be detected as HAR"
+        );
     }
 
     #[test]
@@ -411,7 +411,10 @@ mod tests {
                 ]
             }
         }"#;
-        assert!(adapter.detect(data), "HAR with 'postman'/'collection' words in content must still be detected as HAR");
+        assert!(
+            adapter.detect(data),
+            "HAR with 'postman'/'collection' words in content must still be detected as HAR"
+        );
     }
 
     #[test]
@@ -448,8 +451,14 @@ mod tests {
 
         let scenario = adapter.parse(data).unwrap();
         assert_eq!(scenario.items.len(), 1);
-        assert_eq!(scenario.items[0].request.as_ref().unwrap().url, "https://api.example.com/users/123");
-        assert_eq!(scenario.items[0].request.as_ref().unwrap().method, Method::GET);
+        assert_eq!(
+            scenario.items[0].request.as_ref().unwrap().url,
+            "https://api.example.com/users/123"
+        );
+        assert_eq!(
+            scenario.items[0].request.as_ref().unwrap().method,
+            Method::GET
+        );
     }
 
     #[test]
@@ -506,7 +515,7 @@ mod tests {
         let req = scenario.items[0].request.as_ref().unwrap();
         assert!(req.body.is_some());
         match req.body.as_ref().unwrap() {
-            Body::Json(_) => {}, // valid JSON was parsed
+            Body::Json(_) => {} // valid JSON was parsed
             other => panic!("Expected Body::Json, got {:?}", other),
         }
     }
@@ -587,7 +596,10 @@ mod tests {
         }"#;
         let scenario = adapter.parse(data).unwrap();
         let req = scenario.items[0].request.as_ref().unwrap();
-        assert!(req.query_params.is_empty(), "query_params must be empty when URL already has a query");
+        assert!(
+            req.query_params.is_empty(),
+            "query_params must be empty when URL already has a query"
+        );
         assert_eq!(req.url, "https://api.example.com/users?limit=10&page=2");
     }
 
@@ -646,7 +658,10 @@ mod tests {
         }"#;
         let scenario = adapter.parse(data).unwrap();
         assert_eq!(scenario.items.len(), 1, "only the xhr entry should survive");
-        assert_eq!(scenario.items[0].request.as_ref().unwrap().url, "https://api.example.com/users");
+        assert_eq!(
+            scenario.items[0].request.as_ref().unwrap().url,
+            "https://api.example.com/users"
+        );
     }
 
     #[test]
@@ -665,8 +680,17 @@ mod tests {
 
         let scenario = adapter.parse(data).unwrap();
         assert_eq!(scenario.items.len(), 3);
-        assert_eq!(scenario.items[0].request.as_ref().unwrap().method, Method::GET);
-        assert_eq!(scenario.items[1].request.as_ref().unwrap().method, Method::POST);
-        assert_eq!(scenario.items[2].request.as_ref().unwrap().method, Method::DELETE);
+        assert_eq!(
+            scenario.items[0].request.as_ref().unwrap().method,
+            Method::GET
+        );
+        assert_eq!(
+            scenario.items[1].request.as_ref().unwrap().method,
+            Method::POST
+        );
+        assert_eq!(
+            scenario.items[2].request.as_ref().unwrap().method,
+            Method::DELETE
+        );
     }
 }

@@ -68,11 +68,9 @@ impl StreamingStdoutOutput {
             let mut state = LiveState::new();
 
             loop {
-                let result = tokio::time::timeout(
-                    Duration::from_secs(PROGRESS_INTERVAL_SECS),
-                    rx.recv(),
-                )
-                .await;
+                let result =
+                    tokio::time::timeout(Duration::from_secs(PROGRESS_INTERVAL_SECS), rx.recv())
+                        .await;
 
                 match result {
                     Ok(Ok(sample)) => {

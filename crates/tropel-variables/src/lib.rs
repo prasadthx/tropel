@@ -2,8 +2,8 @@
 //!
 //! {{var}} resolution with scope precedence and dynamic-variable catalog.
 
-pub mod resolver;
 pub mod catalog;
+pub mod resolver;
 
-pub use resolver::*;
 pub use catalog::*;
+pub use resolver::*;

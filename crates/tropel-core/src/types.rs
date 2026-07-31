@@ -107,7 +107,10 @@ pub enum Body {
     FormData(HashMap<String, String>),
     UrlEncoded(HashMap<String, String>),
     Binary(Vec<u8>),
-    GraphQL { query: String, variables: Option<HashMap<String, serde_json::Value>> },
+    GraphQL {
+        query: String,
+        variables: Option<HashMap<String, serde_json::Value>>,
+    },
 }
 
 /// HTTP response with lazy body decoding.
@@ -246,7 +249,11 @@ pub enum AuthConfig {
     #[serde(rename = "basic")]
     Basic { username: String, password: String },
     #[serde(rename = "apikey")]
-    ApiKey { key: String, value: String, location: ApiKeyLocation },
+    ApiKey {
+        key: String,
+        value: String,
+        location: ApiKeyLocation,
+    },
     #[serde(rename = "digest")]
     Digest { username: String, password: String },
     #[serde(rename = "oauth1")]
@@ -257,7 +264,10 @@ pub enum AuthConfig {
         token_secret: Option<String>,
     },
     #[serde(rename = "oauth2")]
-    OAuth2 { access_token: String, token_type: Option<String> },
+    OAuth2 {
+        access_token: String,
+        token_type: Option<String>,
+    },
     #[serde(rename = "aws-sigv4")]
     AwsSigV4 {
         access_key: String,
@@ -323,7 +333,9 @@ impl TagMap {
 
     /// Create a tag map from an iterator of (key, value) pairs.
     /// Both keys and values are interned as `Arc<str>`.
-    pub fn from_pairs(pairs: impl IntoIterator<Item = (impl Into<Arc<str>>, impl Into<Arc<str>>)>) -> Self {
+    pub fn from_pairs(
+        pairs: impl IntoIterator<Item = (impl Into<Arc<str>>, impl Into<Arc<str>>)>,
+    ) -> Self {
         let mut map = FxHashMap::default();
         for (k, v) in pairs {
             map.insert(k.into(), v.into());

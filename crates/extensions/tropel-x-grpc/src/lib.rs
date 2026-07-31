@@ -4,7 +4,7 @@
 //! This is a reference protocol extension implementing Protocol trait.
 
 use async_trait::async_trait;
-use tropel_sdk::{Request, Sample, Result, TropelError, Protocol};
+use tropel_sdk::{Protocol, Request, Result, Sample, TropelError};
 
 /// gRPC protocol executor (stub — requires tonic for full implementation).
 pub struct GrpcProtocol;
@@ -22,7 +22,8 @@ impl Protocol for GrpcProtocol {
         // This would use tonic to execute gRPC calls
 
         Err(TropelError::Extension(
-            "gRPC protocol not yet implemented — add tonic dependency and implement the executor".into()
+            "gRPC protocol not yet implemented — add tonic dependency and implement the executor"
+                .into(),
         ))
     }
 }

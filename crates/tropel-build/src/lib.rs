@@ -25,10 +25,10 @@
 //! 5. Copy the resulting binary to the output path.
 //! 6. Clean up the temp directory on success (or leave it on failure for debugging).
 
+use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
-use regex::Regex;
 use tropel_core::{Result, TropelError};
 
 /// Configuration for building a custom Tropel binary.
@@ -51,7 +51,11 @@ pub enum ExtensionDep {
     Path { name: String, path: String },
     /// A git dependency.
     /// e.g. `tropel-x-grpc = { git = "https://...", branch = "main" }`
-    Git { name: String, url: String, reference: Option<String> },
+    Git {
+        name: String,
+        url: String,
+        reference: Option<String>,
+    },
 }
 
 impl std::fmt::Debug for ExtensionDep {
@@ -59,9 +63,20 @@ impl std::fmt::Debug for ExtensionDep {
         match self {
             ExtensionDep::Registry { name, version } => write!(f, "{} = \"{}\"", name, version),
             ExtensionDep::Path { name, path } => write!(f, "{} = {{ path = \"{}\" }}", name, path),
-            ExtensionDep::Git { name, url, reference } => {
+            ExtensionDep::Git {
+                name,
+                url,
+                reference,
+            } => {
                 if let Some(ref r) = reference {
-                    write!(f, "{} = {{ git = \"{}\", {} = \"{}\" }}", name, url, git_ref_key(r), r)
+                    write!(
+                        f,
+                        "{} = {{ git = \"{}\", {} = \"{}\" }}",
+                        name,
+                        url,
+                        git_ref_key(r),
+                        r
+                    )
                 } else {
                     write!(f, "{} = {{ git = \"{}\" }}", name, url)
                 }
@@ -107,8 +122,7 @@ fn valid_version(version: &str) -> bool {
     !version.is_empty()
         && !version.chars().any(|c| c.is_control())
         && (version == "*"
-            || (version_re().is_match(version)
-                && version.chars().any(|c| c.is_ascii_digit())))
+            || (version_re().is_match(version) && version.chars().any(|c| c.is_ascii_digit())))
 }
 
 fn version_re() -> &'static Regex {
@@ -121,8 +135,7 @@ fn version_re() -> &'static Regex {
 /// A value that lands inside a TOML basic string must not contain `"`, `\`,
 /// or any control character (newline breaks the string, `\` escapes out).
 fn valid_toml_string(s: &str) -> bool {
-    !s.is_empty()
-        && !s.chars().any(|c| c == '"' || c == '\\' || c.is_control())
+    !s.is_empty() && !s.chars().any(|c| c == '"' || c == '\\' || c.is_control())
 }
 
 /// Classify a git reference for the generated `Cargo.toml` key:
@@ -174,7 +187,11 @@ pub fn validate_extension(ext: &ExtensionDep) -> Result<()> {
                 )));
             }
         }
-        ExtensionDep::Git { name, url, reference } => {
+        ExtensionDep::Git {
+            name,
+            url,
+            reference,
+        } => {
             if !valid_crate_name(name) {
                 return Err(TropelError::Other(format!(
                     "Invalid git crate name '{name}': must be a valid Rust crate identifier (^[a-zA-Z][a-zA-Z0-9_-]*$, no leading digit, not a reserved word like crate/self/super)"
@@ -233,7 +250,11 @@ pub fn parse_dep_spec(spec: &str) -> Result<ExtensionDep> {
         || spec.starts_with("git@")
     {
         split_git_spec(spec)
-    } else if spec.starts_with('.') || spec.starts_with('/') || spec.starts_with('~') || is_drive_path(spec) {
+    } else if spec.starts_with('.')
+        || spec.starts_with('/')
+        || spec.starts_with('~')
+        || is_drive_path(spec)
+    {
         // Normalize Windows backslashes to forward slashes BEFORE validation:
         // the generated Cargo.toml does the same normalization, so rejecting
         // the raw `\` would needlessly break `--with .\my-ext` on Windows.
@@ -267,7 +288,10 @@ pub fn parse_dep_spec(spec: &str) -> Result<ExtensionDep> {
 /// with a misleading "invalid crate name" error.
 fn is_drive_path(spec: &str) -> bool {
     let b = spec.as_bytes();
-    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b.get(2) == Some(&b'/') || b.get(2) == Some(&b'\\'))
+    b.len() >= 2
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b.get(2) == Some(&b'/') || b.get(2) == Some(&b'\\'))
 }
 
 /// Split a git URL spec into (url, optional reference).
@@ -357,7 +381,10 @@ pub fn build(config: &BuildConfig) -> Result<()> {
     if config.extensions.is_empty() {
         tracing::warn!("No extensions specified — building standard tropel binary");
     } else {
-        tracing::info!("Building custom Tropel binary with {} extension(s)", config.extensions.len());
+        tracing::info!(
+            "Building custom Tropel binary with {} extension(s)",
+            config.extensions.len()
+        );
     }
 
     let workspace_root = resolve_workspace_root()?;
@@ -395,7 +422,8 @@ pub fn build(config: &BuildConfig) -> Result<()> {
         cmd.arg("--release");
     }
 
-    let output = cmd.output()
+    let output = cmd
+        .output()
         .map_err(|e| TropelError::Other(format!("Failed to run cargo build: {}", e)))?;
 
     if !output.status.success() {
@@ -414,8 +442,15 @@ pub fn build(config: &BuildConfig) -> Result<()> {
     }
 
     // Find the built binary
-    let build_target_dir = temp_path.join("target").join(if config.release { "release" } else { "debug" });
-    let binary_name = if cfg!(windows) { "tropel.exe" } else { "tropel" };
+    let build_target_dir =
+        temp_path
+            .join("target")
+            .join(if config.release { "release" } else { "debug" });
+    let binary_name = if cfg!(windows) {
+        "tropel.exe"
+    } else {
+        "tropel"
+    };
     let built_binary = build_target_dir.join(binary_name);
 
     if !built_binary.exists() {
@@ -423,7 +458,8 @@ pub fn build(config: &BuildConfig) -> Result<()> {
         std::mem::forget(temp_dir); // prevent cleanup — preserve artifacts for debugging
         return Err(TropelError::Other(format!(
             "Built binary not found at '{}'. Artifacts left at: {}",
-            built_binary.display(), temp_path.display()
+            built_binary.display(),
+            temp_path.display()
         )));
     }
 
@@ -439,8 +475,13 @@ pub fn build(config: &BuildConfig) -> Result<()> {
             .map_err(|e| TropelError::Other(format!("Failed to create output dir: {}", e)))?;
     }
 
-    std::fs::copy(&built_binary, &output_path)
-        .map_err(|e| TropelError::Other(format!("Failed to copy binary to '{}': {}", output_path.display(), e)))?;
+    std::fs::copy(&built_binary, &output_path).map_err(|e| {
+        TropelError::Other(format!(
+            "Failed to copy binary to '{}': {}",
+            output_path.display(),
+            e
+        ))
+    })?;
 
     // Make the binary executable (no-op on Windows)
     #[cfg(not(windows))]
@@ -481,7 +522,7 @@ fn resolve_workspace_root() -> Result<PathBuf> {
         }
         if !current.pop() {
             return Err(TropelError::Other(
-                "Could not find workspace root (no Cargo.toml with [workspace] found)".into()
+                "Could not find workspace root (no Cargo.toml with [workspace] found)".into(),
             ));
         }
     }
@@ -494,7 +535,8 @@ fn generate_cargo_toml(config: &BuildConfig, workspace_root: &PathBuf) -> String
 
     // Always depend on tropel-engine (re-exports everything needed)
     deps_lines.push_str(&format!(
-        "tropel-engine = {{ path = \"{}/crates/tropel-engine\" }}\n", root
+        "tropel-engine = {{ path = \"{}/crates/tropel-engine\" }}\n",
+        root
     ));
 
     // Add each extension as a dependency
@@ -505,17 +547,27 @@ fn generate_cargo_toml(config: &BuildConfig, workspace_root: &PathBuf) -> String
             }
             ExtensionDep::Path { name, path } => {
                 let resolved = if path.starts_with(".") || path.starts_with("..") {
-                    workspace_root.join(path).to_string_lossy().replace('\\', "/")
+                    workspace_root
+                        .join(path)
+                        .to_string_lossy()
+                        .replace('\\', "/")
                 } else {
                     path.replace('\\', "/")
                 };
                 deps_lines.push_str(&format!("{} = {{ path = \"{}\" }}\n", name, resolved));
             }
-            ExtensionDep::Git { name, url, reference } => {
+            ExtensionDep::Git {
+                name,
+                url,
+                reference,
+            } => {
                 if let Some(r) = reference {
                     deps_lines.push_str(&format!(
                         "{} = {{ git = \"{}\", {} = \"{}\" }}\n",
-                        name, url, git_ref_key(r), r
+                        name,
+                        url,
+                        git_ref_key(r),
+                        r
                     ));
                 } else {
                     deps_lines.push_str(&format!("{} = {{ git = \"{}\" }}\n", name, url));
@@ -594,7 +646,13 @@ mod tests {
 
     #[test]
     fn valid_crate_names_accepted() {
-        for name in ["tropel-x-grpc", "tropel_x_websocket", "Ext123", "a", "A_1-B"] {
+        for name in [
+            "tropel-x-grpc",
+            "tropel_x_websocket",
+            "Ext123",
+            "a",
+            "A_1-B",
+        ] {
             assert!(valid_crate_name(name), "should accept '{name}'");
         }
     }
@@ -654,7 +712,11 @@ mod tests {
         // express refs containing '/', which `@`-heuristics mis-parse.
         let dep = parse_dep_spec("https://github.com/user/repo#feature/foo").unwrap();
         match &dep {
-            ExtensionDep::Git { name, url, reference } => {
+            ExtensionDep::Git {
+                name,
+                url,
+                reference,
+            } => {
                 assert_eq!(name, "repo");
                 assert_eq!(url, "https://github.com/user/repo");
                 assert_eq!(reference.as_deref(), Some("feature/foo"));
@@ -666,7 +728,11 @@ mod tests {
         // Also works with tag / scp-style ssh URLs
         let dep = parse_dep_spec("git@github.com:user/repo.git#v2.0.0").unwrap();
         match &dep {
-            ExtensionDep::Git { name, url, reference } => {
+            ExtensionDep::Git {
+                name,
+                url,
+                reference,
+            } => {
                 assert_eq!(name, "repo");
                 assert_eq!(url, "git@github.com:user/repo.git");
                 assert_eq!(reference.as_deref(), Some("v2.0.0"));
@@ -682,10 +748,7 @@ mod tests {
         // charset regex but would emit `extern crate {name};` that fails to
         // compile in the generated main.rs — must be rejected at --with time.
         for spec in ["9lives", "crate", "self", "super", "Self"] {
-            assert!(
-                parse_dep_spec(spec).is_err(),
-                "should reject '{spec}'"
-            );
+            assert!(parse_dep_spec(spec).is_err(), "should reject '{spec}'");
         }
         // ...but a legit registry crate with digits mid-name is still fine.
         assert!(parse_dep_spec("tropel-x-grpc2").is_ok());
@@ -694,8 +757,19 @@ mod tests {
     #[test]
     fn versions_accepted() {
         for v in [
-            "0.1", "1.2.3", "^1.2", "~0.1.0", "*", ">=1.0, <2.0", "1.2.3-alpha.1",
-            "1.2.3+build.5", "0.1.0-rc1", "2", "1.*", "^1.2.3-alpha", "latest2",
+            "0.1",
+            "1.2.3",
+            "^1.2",
+            "~0.1.0",
+            "*",
+            ">=1.0, <2.0",
+            "1.2.3-alpha.1",
+            "1.2.3+build.5",
+            "0.1.0-rc1",
+            "2",
+            "1.*",
+            "^1.2.3-alpha",
+            "latest2",
         ] {
             assert!(valid_version(v), "should accept '{v}'");
         }
@@ -703,7 +777,15 @@ mod tests {
 
     #[test]
     fn versions_rejected() {
-        for v in ["", "abc", "1.2\"3", "1.2\n3", "\"; malicious = true", "{1}", "a\tb"] {
+        for v in [
+            "",
+            "abc",
+            "1.2\"3",
+            "1.2\n3",
+            "\"; malicious = true",
+            "{1}",
+            "a\tb",
+        ] {
             assert!(!valid_version(v), "should reject '{v}'");
         }
     }
@@ -711,7 +793,10 @@ mod tests {
     #[test]
     fn git_ref_key_classification() {
         assert_eq!(git_ref_key("deadbeef"), "rev");
-        assert_eq!(git_ref_key("0123456789abcdef0123456789abcdef01234567"), "rev");
+        assert_eq!(
+            git_ref_key("0123456789abcdef0123456789abcdef01234567"),
+            "rev"
+        );
         assert_eq!(git_ref_key("v1.2.3"), "tag");
         assert_eq!(git_ref_key("1.2.3"), "tag");
         assert_eq!(git_ref_key("1.2.3-rc.1"), "tag");
@@ -809,7 +894,11 @@ mod tests {
         // `https://TOKEN@github.com/u/r` — the '@' is userinfo, not a ref.
         let dep = parse_dep_spec("https://TOKEN@github.com/user/repo").unwrap();
         match &dep {
-            ExtensionDep::Git { name, url, reference } => {
+            ExtensionDep::Git {
+                name,
+                url,
+                reference,
+            } => {
                 assert_eq!(name, "repo");
                 assert_eq!(url, "https://TOKEN@github.com/user/repo");
                 assert!(reference.is_none());
@@ -823,7 +912,11 @@ mod tests {
         // ssh:// transport with a userinfo '@' AND a trailing ref
         let dep = parse_dep_spec("ssh://git@github.com/user/repo@main").unwrap();
         match &dep {
-            ExtensionDep::Git { name, url, reference } => {
+            ExtensionDep::Git {
+                name,
+                url,
+                reference,
+            } => {
                 assert_eq!(name, "repo");
                 assert_eq!(url, "ssh://git@github.com/user/repo");
                 assert_eq!(reference.as_deref(), Some("main"));
@@ -837,7 +930,11 @@ mod tests {
         // default branch
         let dep = parse_dep_spec("https://github.com/user/repo").unwrap();
         match &dep {
-            ExtensionDep::Git { name, url, reference } => {
+            ExtensionDep::Git {
+                name,
+                url,
+                reference,
+            } => {
                 assert_eq!(name, "repo");
                 assert_eq!(url, "https://github.com/user/repo");
                 assert!(reference.is_none());
@@ -848,7 +945,11 @@ mod tests {
         // explicit tag
         let dep = parse_dep_spec("https://github.com/user/repo@v1.2.3").unwrap();
         match &dep {
-            ExtensionDep::Git { name, url, reference } => {
+            ExtensionDep::Git {
+                name,
+                url,
+                reference,
+            } => {
                 assert_eq!(name, "repo");
                 assert_eq!(url, "https://github.com/user/repo");
                 assert_eq!(reference.as_deref(), Some("v1.2.3"));
@@ -860,7 +961,11 @@ mod tests {
         // SSH url + branch ref
         let dep = parse_dep_spec("git@github.com:user/repo.git@main").unwrap();
         match &dep {
-            ExtensionDep::Git { name, url, reference } => {
+            ExtensionDep::Git {
+                name,
+                url,
+                reference,
+            } => {
                 assert_eq!(name, "repo");
                 assert_eq!(url, "git@github.com:user/repo.git");
                 assert_eq!(reference.as_deref(), Some("main"));
@@ -870,7 +975,9 @@ mod tests {
         }
 
         // SHA rev
-        let dep = parse_dep_spec("https://github.com/user/repo@0123456789abcdef0123456789abcdef01234567").unwrap();
+        let dep =
+            parse_dep_spec("https://github.com/user/repo@0123456789abcdef0123456789abcdef01234567")
+                .unwrap();
         match &dep {
             ExtensionDep::Git { reference, .. } => {
                 assert_eq!(git_ref_key(reference.as_deref().unwrap()), "rev");

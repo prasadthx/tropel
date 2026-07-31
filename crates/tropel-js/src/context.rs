@@ -62,33 +62,29 @@ impl CachedScript {
             .clone()
             .restore(ctx)
             .map_err(|e| JsError::Eval(format!("Script restore error: {}", e)))?;
-        func.call::<_, rquickjs::Value>(())
-            .map_err(|e| {
-                let err_msg = format!("{}", e);
-                let adjusted = adjust_error_lines(
-                    &err_msg,
-                    self.wrapper_offset,
-                    self.source_url.as_deref(),
-                );
-                // Show adjusted error + source excerpt
-                let label = self.source_url.as_deref().unwrap_or("<script>");
-                // Show first N lines of source for context
-                let max_preview_lines = 20usize;
-                let source_lines: Vec<&str> = self.source.lines().collect();
-                let source_preview = if source_lines.len() > max_preview_lines {
-                    format!(
-                        "{}... ({} lines total)",
-                        source_lines[..max_preview_lines].join("\n"),
-                        source_lines.len()
-                    )
-                } else {
-                    self.source.to_string()
-                };
-                JsError::Eval(format!(
-                    "Script error ({}): {}\n--- source ---\n{}\n--------------",
-                    label, adjusted, source_preview
-                ))
-            })?;
+        func.call::<_, rquickjs::Value>(()).map_err(|e| {
+            let err_msg = format!("{}", e);
+            let adjusted =
+                adjust_error_lines(&err_msg, self.wrapper_offset, self.source_url.as_deref());
+            // Show adjusted error + source excerpt
+            let label = self.source_url.as_deref().unwrap_or("<script>");
+            // Show first N lines of source for context
+            let max_preview_lines = 20usize;
+            let source_lines: Vec<&str> = self.source.lines().collect();
+            let source_preview = if source_lines.len() > max_preview_lines {
+                format!(
+                    "{}... ({} lines total)",
+                    source_lines[..max_preview_lines].join("\n"),
+                    source_lines.len()
+                )
+            } else {
+                self.source.to_string()
+            };
+            JsError::Eval(format!(
+                "Script error ({}): {}\n--- source ---\n{}\n--------------",
+                label, adjusted, source_preview
+            ))
+        })?;
         Ok(())
     }
 }
@@ -122,10 +118,7 @@ fn adjust_error_lines(msg: &str, offset: u32, source_url: Option<&str>) -> Strin
 
         // Pattern 3: SyntaxError format "(line N, column M)"
         // Only match when preceded by '(' to avoid false positives.
-        if bytes[i] == b'('
-            && i + 7 <= bytes.len()
-            && &bytes[i + 1..i + 6] == b"line "
-        {
+        if bytes[i] == b'(' && i + 7 <= bytes.len() && &bytes[i + 1..i + 6] == b"line " {
             out.push('(');
             out.push_str("line ");
             i += 6;
@@ -135,14 +128,9 @@ fn adjust_error_lines(msg: &str, offset: u32, source_url: Option<&str>) -> Strin
                 i += 1;
             }
             if i > line_start {
-                let line_str =
-                    std::str::from_utf8(&bytes[line_start..i]).unwrap_or("0");
+                let line_str = std::str::from_utf8(&bytes[line_start..i]).unwrap_or("0");
                 if let Ok(line) = line_str.parse::<u32>() {
-                    let adjusted = if line > offset {
-                        line - offset
-                    } else {
-                        1
-                    };
+                    let adjusted = if line > offset { line - offset } else { 1 };
                     out.push_str(&adjusted.to_string());
                 } else {
                     out.push_str(line_str);
@@ -182,14 +170,9 @@ fn adjust_error_lines(msg: &str, offset: u32, source_url: Option<&str>) -> Strin
                     }
 
                     if i > line_start {
-                        let line_str = std::str::from_utf8(&bytes[line_start..i])
-                            .unwrap_or("0");
+                        let line_str = std::str::from_utf8(&bytes[line_start..i]).unwrap_or("0");
                         if let Ok(line) = line_str.parse::<u32>() {
-                            let adjusted = if line > offset {
-                                line - offset
-                            } else {
-                                1
-                            };
+                            let adjusted = if line > offset { line - offset } else { 1 };
                             out.push_str(&adjusted.to_string());
                         } else {
                             out.push_str(line_str);
@@ -250,7 +233,10 @@ fn now_nanos() -> u64 {
 
 impl JsContext {
     /// Create a new JS context with memory cap and interrupt handler.
-    pub async fn new(memory_limit: Option<usize>, max_execution_time: Option<Duration>) -> Result<Self> {
+    pub async fn new(
+        memory_limit: Option<usize>,
+        max_execution_time: Option<Duration>,
+    ) -> Result<Self> {
         let rt = Runtime::new()
             .map_err(|e| JsError::ContextCreation(format!("Runtime creation failed: {}", e)))?;
 
@@ -278,15 +264,24 @@ impl JsContext {
             let global = ctx.globals();
             let console = rquickjs::Object::new(ctx).ok();
             if let Some(console) = console {
-                let _ = console.set("log", Func::from(|msg: String| {
-                    tracing::trace!("[JS console.log] {}", msg);
-                }));
-                let _ = console.set("warn", Func::from(|msg: String| {
-                    tracing::warn!("[JS console.warn] {}", msg);
-                }));
-                let _ = console.set("error", Func::from(|msg: String| {
-                    tracing::error!("[JS console.error] {}", msg);
-                }));
+                let _ = console.set(
+                    "log",
+                    Func::from(|msg: String| {
+                        tracing::trace!("[JS console.log] {}", msg);
+                    }),
+                );
+                let _ = console.set(
+                    "warn",
+                    Func::from(|msg: String| {
+                        tracing::warn!("[JS console.warn] {}", msg);
+                    }),
+                );
+                let _ = console.set(
+                    "error",
+                    Func::from(|msg: String| {
+                        tracing::error!("[JS console.error] {}", msg);
+                    }),
+                );
                 let _ = global.set("console", console);
             }
         });
@@ -336,7 +331,10 @@ impl JsContext {
             }
         }
         if pump_count >= max_iterations {
-            tracing::warn!("Promise queue reached max pump iterations ({}), possible infinite loop", max_iterations);
+            tracing::warn!(
+                "Promise queue reached max pump iterations ({}), possible infinite loop",
+                max_iterations
+            );
         }
         Ok(pump_count)
     }
@@ -347,14 +345,13 @@ impl JsContext {
     pub async fn eval(&self, code: &str) -> Result<String> {
         self.reset_interrupt();
         let code = code.to_string();
-        let result = self.ctx
-            .with(move |ctx| {
-                let value: rquickjs::Value = ctx
-                    .eval(code)
-                    .map_err(|e| JsError::Eval(format!("JS eval error: {}", e)))?;
+        let result = self.ctx.with(move |ctx| {
+            let value: rquickjs::Value = ctx
+                .eval(code)
+                .map_err(|e| JsError::Eval(format!("JS eval error: {}", e)))?;
 
-                value_to_string(&value, &ctx)
-            })?;
+            value_to_string(&value, &ctx)
+        })?;
 
         // Pump the promise queue to resolve microtasks
         self.pump_promise_queue()?;
@@ -396,13 +393,12 @@ impl JsContext {
     pub async fn set_global_str(&self, name: &str, value: &str) -> Result<()> {
         let name = name.to_string();
         let value = value.to_string();
-        self.ctx
-            .with(move |ctx| {
-                let globals = ctx.globals();
-                globals
-                    .set(name, value)
-                    .map_err(|e| JsError::Conversion(format!("set_global_str error: {}", e)))
-            })
+        self.ctx.with(move |ctx| {
+            let globals = ctx.globals();
+            globals
+                .set(name, value)
+                .map_err(|e| JsError::Conversion(format!("set_global_str error: {}", e)))
+        })
     }
 
     /// Set a global variable from a JSON value.
@@ -411,39 +407,39 @@ impl JsContext {
             .map_err(|e| JsError::Conversion(format!("JSON serialization error: {}", e)))?;
         let name = name.to_string();
 
-        self.ctx
-            .with(move |ctx| {
-                // Parse JSON as a JS value
-                let val: rquickjs::Value = ctx
-                    .eval(format!(
-                        "JSON.parse({})",
-                        serde_json::to_string(&s).unwrap_or_default()
-                    ))
-                    .map_err(|e| JsError::Conversion(format!("JSON parse in JS context error: {}", e)))?;
+        self.ctx.with(move |ctx| {
+            // Parse JSON as a JS value
+            let val: rquickjs::Value = ctx
+                .eval(format!(
+                    "JSON.parse({})",
+                    serde_json::to_string(&s).unwrap_or_default()
+                ))
+                .map_err(|e| {
+                    JsError::Conversion(format!("JSON parse in JS context error: {}", e))
+                })?;
 
-                let globals = ctx.globals();
-                globals
-                    .set(name, val)
-                    .map_err(|e| JsError::Conversion(format!("set_global_json error: {}", e)))
-            })
+            let globals = ctx.globals();
+            globals
+                .set(name, val)
+                .map_err(|e| JsError::Conversion(format!("set_global_json error: {}", e)))
+        })
     }
 
     /// Get a global variable as a string.
     pub async fn get_global(&self, name: &str) -> Result<Option<String>> {
         let name = name.to_string();
-        self.ctx
-            .with(move |ctx| {
-                let globals = ctx.globals();
-                let val: rquickjs::Value = globals
-                    .get(&name)
-                    .map_err(|e| JsError::Conversion(format!("get_global error: {}", e)))?;
+        self.ctx.with(move |ctx| {
+            let globals = ctx.globals();
+            let val: rquickjs::Value = globals
+                .get(&name)
+                .map_err(|e| JsError::Conversion(format!("get_global error: {}", e)))?;
 
-                if val.is_undefined() || val.is_null() {
-                    return Ok(None);
-                }
+            if val.is_undefined() || val.is_null() {
+                return Ok(None);
+            }
 
-                value_to_string(&val, &ctx).map(Some)
-            })
+            value_to_string(&val, &ctx).map(Some)
+        })
     }
 
     /// Execute a JS script and return whether it completed successfully.
@@ -549,16 +545,14 @@ impl JsContext {
                 "(function __tropel_script(){{\n//# sourceURL={}\n{source}\n}})",
                 source_url_str
             );
-            let func: Function = ctx
-                .eval(wrapped.as_str())
-                .map_err(|e| {
-                    let err_msg = format!("{}", e);
-                    let adjusted = adjust_error_lines(&err_msg, WRAPPER_OFFSET, Some(source_url_str));
-                    JsError::Eval(format!(
-                        "Script compile error ({}): {}",
-                        source_url_str, adjusted
-                    ))
-                })?;
+            let func: Function = ctx.eval(wrapped.as_str()).map_err(|e| {
+                let err_msg = format!("{}", e);
+                let adjusted = adjust_error_lines(&err_msg, WRAPPER_OFFSET, Some(source_url_str));
+                JsError::Eval(format!(
+                    "Script compile error ({}): {}",
+                    source_url_str, adjusted
+                ))
+            })?;
 
             let script = CachedScript::compile(
                 &ctx,

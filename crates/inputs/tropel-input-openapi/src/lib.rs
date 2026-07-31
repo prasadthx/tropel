@@ -28,13 +28,13 @@
 //! - Swagger 2.0 documents are normalized to an OpenAPI 3.x shape.
 //! - Server variables (`https://{env}.example.com`) use their default value.
 
-use std::collections::HashMap;
-use tropel_sdk::{Scenario, ScenarioInfo, ScenarioItem};
-use tropel_sdk::{ApiKeyLocation, AuthConfig, Body, Method, Request};
-use tropel_sdk::{Result, TropelError};
-use tropel_sdk::{InputAdapter, InputAdapterRegistration};
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
+use tropel_sdk::{ApiKeyLocation, AuthConfig, Body, Method, Request};
+use tropel_sdk::{InputAdapter, InputAdapterRegistration};
+use tropel_sdk::{Result, TropelError};
+use tropel_sdk::{Scenario, ScenarioInfo, ScenarioItem};
 
 // ── OpenAPI 3.x data model (minimal — only what we need) ────────
 
@@ -109,14 +109,30 @@ struct OasPathItem {
 impl OasPathItem {
     fn operations(&self) -> Vec<(&str, &OasOperation)> {
         let mut ops = Vec::new();
-        if let Some(ref op) = self.get { ops.push(("get", op)); }
-        if let Some(ref op) = self.put { ops.push(("put", op)); }
-        if let Some(ref op) = self.post { ops.push(("post", op)); }
-        if let Some(ref op) = self.delete { ops.push(("delete", op)); }
-        if let Some(ref op) = self.options { ops.push(("options", op)); }
-        if let Some(ref op) = self.head { ops.push(("head", op)); }
-        if let Some(ref op) = self.patch { ops.push(("patch", op)); }
-        if let Some(ref op) = self.trace { ops.push(("trace", op)); }
+        if let Some(ref op) = self.get {
+            ops.push(("get", op));
+        }
+        if let Some(ref op) = self.put {
+            ops.push(("put", op));
+        }
+        if let Some(ref op) = self.post {
+            ops.push(("post", op));
+        }
+        if let Some(ref op) = self.delete {
+            ops.push(("delete", op));
+        }
+        if let Some(ref op) = self.options {
+            ops.push(("options", op));
+        }
+        if let Some(ref op) = self.head {
+            ops.push(("head", op));
+        }
+        if let Some(ref op) = self.patch {
+            ops.push(("patch", op));
+        }
+        if let Some(ref op) = self.trace {
+            ops.push(("trace", op));
+        }
         ops
     }
 }
@@ -277,7 +293,9 @@ struct OauthFlow {
 /// Input adapter for OpenAPI 3.x / Swagger 2.0 specification files.
 pub struct OpenApiInputAdapter;
 
-inventory::submit!(InputAdapterRegistration::new("openapi", || Box::new(OpenApiInputAdapter)));
+inventory::submit!(InputAdapterRegistration::new("openapi", || Box::new(
+    OpenApiInputAdapter
+)));
 
 impl InputAdapter for OpenApiInputAdapter {
     fn id(&self) -> &str {
@@ -314,8 +332,9 @@ impl InputAdapter for OpenApiInputAdapter {
 
         // 2. Swagger 2.0 → normalize to an OpenAPI 3.x-shaped document.
         if is_swagger2(&doc) {
-            doc = normalize_swagger2(doc)
-                .map_err(|e| TropelError::Parse(format!("Failed to normalize Swagger 2.0 spec: {}", e)))?;
+            doc = normalize_swagger2(doc).map_err(|e| {
+                TropelError::Parse(format!("Failed to normalize Swagger 2.0 spec: {}", e))
+            })?;
         }
 
         // 3. Resolve intra-document $refs (#/components/...) so parameter /
@@ -361,14 +380,18 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
                 continue;
             }
 
-            let item_name = operation.operation_id.clone()
+            let item_name = operation
+                .operation_id
+                .clone()
                 .or_else(|| operation.summary.clone())
                 .unwrap_or_else(|| format!("{} {}", method.to_uppercase(), path_str));
 
             let url = format!("{}{}", base_url, path_str);
 
             // Collect parameters — path-item-level + operation-level
-            let params: Vec<&OasParameter> = path_item.parameters.iter()
+            let params: Vec<&OasParameter> = path_item
+                .parameters
+                .iter()
                 .chain(operation.parameters.iter())
                 .collect();
 
@@ -379,9 +402,15 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
             for param in &params {
                 let val = extract_param_value(param);
                 match param.r#in.as_str() {
-                    "header" => { headers.insert(param.name.clone(), val); }
-                    "query" => { query_params.insert(param.name.clone(), val); }
-                    "path" => { path_params.insert(param.name.clone(), val); }
+                    "header" => {
+                        headers.insert(param.name.clone(), val);
+                    }
+                    "query" => {
+                        query_params.insert(param.name.clone(), val);
+                    }
+                    "path" => {
+                        path_params.insert(param.name.clone(), val);
+                    }
                     _ => {}
                 }
             }
@@ -391,7 +420,8 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
                 let mut resolved = url.clone();
                 for (key, val) in &path_params {
                     resolved = resolved.replace(&format!("{{{}}}", key), val);
-                    resolved = resolved.replace(&format!("{{{{{}}}}}", key), val); // double-brace
+                    resolved = resolved.replace(&format!("{{{{{}}}}}", key), val);
+                    // double-brace
                 }
                 resolved
             } else {
@@ -399,7 +429,9 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
             };
 
             // Build request body
-            let body = operation.request_body.as_ref()
+            let body = operation
+                .request_body
+                .as_ref()
                 .and_then(|rb| build_request_body(rb));
 
             // Resolve auth
@@ -438,7 +470,9 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
     Ok(Scenario {
         info: ScenarioInfo {
             name: doc.info.title,
-            description: doc.info.description
+            description: doc
+                .info
+                .description
                 .or_else(|| Some(format!("OpenAPI {} — {}", doc.openapi, doc.info.version))),
             schema: None,
         },
@@ -495,8 +529,16 @@ fn normalize_swagger2(doc: Value) -> Result<Value> {
     obj.insert("openapi".into(), serde_json::json!("3.0.0"));
 
     // servers from host/basePath/schemes
-    let host = obj.get("host").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let base_path = obj.get("basePath").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let host = obj
+        .get("host")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let base_path = obj
+        .get("basePath")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let schemes = obj
         .get("schemes")
         .and_then(|v| v.as_array())
@@ -509,12 +551,12 @@ fn normalize_swagger2(doc: Value) -> Result<Value> {
         .unwrap_or_else(|| vec!["https".to_string()]);
 
     if !host.is_empty() {
-        let scheme = schemes.first().cloned().unwrap_or_else(|| "https".to_string());
+        let scheme = schemes
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "https".to_string());
         let url = format!("{}://{}{}", scheme, host, base_path);
-        obj.insert(
-            "servers".into(),
-            serde_json::json!([{ "url": url }]),
-        );
+        obj.insert("servers".into(), serde_json::json!([{ "url": url }]));
     } else if !base_path.is_empty() {
         obj.insert("servers".into(), serde_json::json!([{ "url": base_path }]));
     }
@@ -541,7 +583,10 @@ fn normalize_swagger2(doc: Value) -> Result<Value> {
             .entry("components")
             .or_insert_with(|| serde_json::json!({}));
         if let Some(c) = components.as_object_mut() {
-            c.insert("securitySchemes".into(), normalize_security_definitions(sec_defs));
+            c.insert(
+                "securitySchemes".into(),
+                normalize_security_definitions(sec_defs),
+            );
         }
     }
 
@@ -571,7 +616,9 @@ fn normalize_swagger2(doc: Value) -> Result<Value> {
                 if let Some(params) = pi.get_mut("parameters") {
                     *params = wrap_inline_param_types(params.clone());
                 }
-                for op_key in ["get", "put", "post", "delete", "options", "head", "patch", "trace"] {
+                for op_key in [
+                    "get", "put", "post", "delete", "options", "head", "patch", "trace",
+                ] {
                     if let Some(op) = pi.get_mut(op_key) {
                         normalize_swagger2_operation(op);
                     }
@@ -684,7 +731,9 @@ fn wrap_inline_param_types(params: Value) -> Value {
                 // already carry one in Swagger 2.0).
                 if !po.contains_key("schema") && !po.contains_key("$ref") {
                     let mut schema = serde_json::Map::new();
-                    for key in ["type", "format", "items", "default", "enum", "minimum", "maximum"] {
+                    for key in [
+                        "type", "format", "items", "default", "enum", "minimum", "maximum",
+                    ] {
                         if let Some(v) = po.remove(key) {
                             schema.insert(key.to_string(), v);
                         }
@@ -719,8 +768,16 @@ fn normalize_swagger2_operation(op: &mut Value) {
     let mut rest: Vec<Value> = Vec::new();
 
     for mut p in params.drain(..) {
-        let in_loc = p.get("in").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let in_loc = p
+            .get("in")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let name = p
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         match in_loc.as_str() {
             "body" => {
                 body_schema = p.get("schema").cloned();
@@ -732,7 +789,9 @@ fn normalize_swagger2_operation(op: &mut Value) {
             "formData" => {
                 // Swagger 2.0 formData params → object schema under requestBody
                 let mut schema = serde_json::Map::new();
-                for key in ["type", "format", "items", "default", "enum", "minimum", "maximum"] {
+                for key in [
+                    "type", "format", "items", "default", "enum", "minimum", "maximum",
+                ] {
                     if let Some(v) = p.as_object_mut().and_then(|po| po.remove(key)) {
                         schema.insert(key.to_string(), v);
                     }
@@ -782,7 +841,10 @@ fn normalize_swagger2_operation(op: &mut Value) {
     }
 
     // Wrap inline types on the remaining params
-    op_obj.insert("parameters".into(), wrap_inline_param_types(Value::Array(rest)));
+    op_obj.insert(
+        "parameters".into(),
+        wrap_inline_param_types(Value::Array(rest)),
+    );
 }
 
 // ── Intra-document $ref resolution ──────────────────────────────
@@ -907,7 +969,9 @@ fn value_to_string(val: &serde_json::Value) -> String {
 fn build_request_body(rb: &OasRequestBody) -> Option<Body> {
     // Prefer application/json
     if let Some(mt) = rb.content.get("application/json") {
-        let json_val = mt.example.clone()
+        let json_val = mt
+            .example
+            .clone()
             .or_else(|| generate_schema_example(mt.schema.as_ref()));
         return Some(json_val.map_or(Body::Json(serde_json::Value::Null), Body::Json));
     }
@@ -918,7 +982,9 @@ fn build_request_body(rb: &OasRequestBody) -> Option<Body> {
             let mut map = HashMap::new();
             if let Some(ref props) = schema.properties {
                 for (name, prop_schema) in props {
-                    let val = prop_schema.example.clone()
+                    let val = prop_schema
+                        .example
+                        .clone()
                         .or_else(|| prop_schema.default.clone())
                         .map(|v| value_to_string(&v))
                         .unwrap_or_else(|| "example".to_string());
@@ -936,7 +1002,9 @@ fn build_request_body(rb: &OasRequestBody) -> Option<Body> {
             let mut map = HashMap::new();
             if let Some(ref props) = schema.properties {
                 for (name, prop_schema) in props {
-                    let val = prop_schema.example.clone()
+                    let val = prop_schema
+                        .example
+                        .clone()
                         .or_else(|| prop_schema.default.clone())
                         .map(|v| value_to_string(&v))
                         .unwrap_or_else(|| "example".to_string());
@@ -950,7 +1018,9 @@ fn build_request_body(rb: &OasRequestBody) -> Option<Body> {
 
     // Fallback: take any content type
     if let Some((_, mt)) = rb.content.iter().next() {
-        let json_val = mt.example.clone()
+        let json_val = mt
+            .example
+            .clone()
             .or_else(|| generate_schema_example(mt.schema.as_ref()));
         return Some(json_val.map_or(Body::Raw(String::new()), |v| Body::Json(v)));
     }
@@ -983,16 +1053,15 @@ fn generate_schema_example(schema: Option<&OasSchema>) -> Option<serde_json::Val
         }
         Some("array") => {
             if let Some(ref items) = schema.items {
-                let val = generate_schema_example(Some(items))
-                    .unwrap_or(serde_json::Value::Null);
+                let val = generate_schema_example(Some(items)).unwrap_or(serde_json::Value::Null);
                 Some(serde_json::Value::Array(vec![val]))
             } else {
                 Some(serde_json::Value::Array(vec![]))
             }
         }
-        Some("string") if schema.format.as_deref() == Some("uuid") => {
-            Some(serde_json::Value::String("550e8400-e29b-41d4-a716-446655440000".into()))
-        }
+        Some("string") if schema.format.as_deref() == Some("uuid") => Some(
+            serde_json::Value::String("550e8400-e29b-41d4-a716-446655440000".into()),
+        ),
         Some("string") if schema.format.as_deref() == Some("email") => {
             Some(serde_json::Value::String("user@example.com".into()))
         }
@@ -1033,23 +1102,25 @@ fn resolve_auth(
     let (scheme_name, _scopes) = first_sec.iter().next()?;
 
     // Look up the scheme in components
-    let schemes = components.as_ref()
+    let schemes = components
+        .as_ref()
         .and_then(|c| c.security_schemes.as_ref())?;
     let scheme = schemes.get(scheme_name)?;
 
     match scheme {
-        OasSecurityScheme::Http { scheme: http_scheme, .. } => {
-            match http_scheme.to_lowercase().as_str() {
-                "bearer" => Some(AuthConfig::Bearer {
-                    token: "__token__".to_string(),
-                }),
-                "basic" => Some(AuthConfig::Basic {
-                    username: "__username__".to_string(),
-                    password: "__password__".to_string(),
-                }),
-                _ => None,
-            }
-        }
+        OasSecurityScheme::Http {
+            scheme: http_scheme,
+            ..
+        } => match http_scheme.to_lowercase().as_str() {
+            "bearer" => Some(AuthConfig::Bearer {
+                token: "__token__".to_string(),
+            }),
+            "basic" => Some(AuthConfig::Basic {
+                username: "__username__".to_string(),
+                password: "__password__".to_string(),
+            }),
+            _ => None,
+        },
         OasSecurityScheme::ApiKey { name, location, .. } => {
             let key_name = name.clone().unwrap_or_else(|| "api_key".to_string());
             let loc = location.as_deref().unwrap_or("header");
@@ -1103,7 +1174,10 @@ mod tests {
             "info": {"title": "Log Service", "version": "1.0.0", "description": "query the log stream"},
             "paths": {"/log": {"get": {"responses": {}}}}
         }"#;
-        assert!(adapter.detect(data), "spec containing 'log' must be detected");
+        assert!(
+            adapter.detect(data),
+            "spec containing 'log' must be detected"
+        );
     }
 
     #[test]
@@ -1121,14 +1195,20 @@ mod tests {
     fn test_detect_postman_not_openapi() {
         let adapter = OpenApiInputAdapter;
         let data = br#"{"info":{"name":"Test","schema":"https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},"item":[]}"#;
-        assert!(!adapter.detect(data), "Postman JSON should not be detected as OpenAPI");
+        assert!(
+            !adapter.detect(data),
+            "Postman JSON should not be detected as OpenAPI"
+        );
     }
 
     #[test]
     fn test_detect_har_not_openapi() {
         let adapter = OpenApiInputAdapter;
         let data = br#"{"log":{"version":"1.2","entries":[]}}"#;
-        assert!(!adapter.detect(data), "HAR should not be detected as OpenAPI");
+        assert!(
+            !adapter.detect(data),
+            "HAR should not be detected as OpenAPI"
+        );
     }
 
     #[test]
@@ -1306,7 +1386,10 @@ mod tests {
         let post = &scenario.items[0];
         let post_req = post.request.as_ref().unwrap();
         assert_eq!(post_req.url, "https://api.example.com/v1/pets");
-        assert!(post_req.body.is_some(), "in:body param must become a requestBody");
+        assert!(
+            post_req.body.is_some(),
+            "in:body param must become a requestBody"
+        );
 
         let get = &scenario.items[1];
         let req = get.request.as_ref().unwrap();
@@ -1362,7 +1445,11 @@ mod tests {
         let scenario = adapter.parse(data).unwrap();
         let req = scenario.items[0].request.as_ref().unwrap();
         // Path params should be resolved
-        assert!(!req.url.contains('{'), "Path params should be resolved: {}", req.url);
+        assert!(
+            !req.url.contains('{'),
+            "Path params should be resolved: {}",
+            req.url
+        );
         assert_eq!(req.url, "/users/1/orders/example");
     }
 
@@ -1394,7 +1481,10 @@ mod tests {
         }"#;
         let scenario = adapter.parse(data).unwrap();
         let req = scenario.items[0].request.as_ref().unwrap();
-        assert!(req.auth.is_some(), "OAuth2 security must map to an auth config");
+        assert!(
+            req.auth.is_some(),
+            "OAuth2 security must map to an auth config"
+        );
         match req.auth.as_ref().unwrap() {
             AuthConfig::Bearer { token } => assert_eq!(token, "__access_token__"),
             other => panic!("Expected Bearer placeholder, got {:?}", other),

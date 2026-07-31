@@ -47,9 +47,9 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
-use tropel_sdk::{Scenario, ScenarioInfo};
-use tropel_sdk::{Result, TropelError};
 use tropel_sdk::InputAdapter;
+use tropel_sdk::{Result, TropelError};
+use tropel_sdk::{Scenario, ScenarioInfo};
 
 /// Default per-call timeout for the subprocess. A child that outlives this
 /// is killed (DoS guard — a hanging adapter must not hang the host).
@@ -184,10 +184,12 @@ impl SubprocessAdapter {
                         output.extend_from_slice(&chunk[..n]);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => break Err(TropelError::Other(format!(
-                        "Failed to read subprocess '{}' stdout: {}",
-                        command, e
-                    ))),
+                    Err(e) => {
+                        break Err(TropelError::Other(format!(
+                            "Failed to read subprocess '{}' stdout: {}",
+                            command, e
+                        )))
+                    }
                 }
             };
             let _ = tx.send(result);
@@ -300,39 +302,51 @@ impl InputAdapter for SubprocessAdapter {
     fn parse(&self, bytes: &[u8]) -> Result<Scenario> {
         let output = self.run("--parse", "TROPEL_PARSE", bytes)?;
 
-        let raw_scenario: serde_json::Value = serde_json::from_slice(&output)
-            .map_err(|e| TropelError::Parse(format!(
+        let raw_scenario: serde_json::Value = serde_json::from_slice(&output).map_err(|e| {
+            TropelError::Parse(format!(
                 "Subprocess '{}' returned invalid JSON: {}. Raw output: {}",
-                self.command, e,
+                self.command,
+                e,
                 String::from_utf8_lossy(&output[..output.len().min(200)])
-            )))?;
+            ))
+        })?;
 
         // Accept either a full Scenario or an array of items
-        let scenario = if raw_scenario.get("info").is_some() || raw_scenario.get("items").is_some() {
-            serde_json::from_value::<Scenario>(raw_scenario)
-                .map_err(|e| TropelError::Parse(format!(
-                    "Subprocess '{}' returned invalid Scenario: {}", self.command, e
-                )))?
+        let scenario = if raw_scenario.get("info").is_some() || raw_scenario.get("items").is_some()
+        {
+            serde_json::from_value::<Scenario>(raw_scenario).map_err(|e| {
+                TropelError::Parse(format!(
+                    "Subprocess '{}' returned invalid Scenario: {}",
+                    self.command, e
+                ))
+            })?
         } else if let Some(items) = raw_scenario.as_array() {
             // Treat a JSON array as items, auto-generate a name
             Scenario {
                 info: ScenarioInfo {
                     name: format!("subprocess-{}", self.command),
-                    description: Some(format!("Imported via subprocess adapter '{}'", self.command)),
+                    description: Some(format!(
+                        "Imported via subprocess adapter '{}'",
+                        self.command
+                    )),
                     schema: None,
                 },
-                items: items.iter().map(|v| {
-                    serde_json::from_value(v.clone())
-                        .unwrap_or_else(|_| tropel_sdk::ScenarioItem {
-                            id: format!("item-{}", rand::random::<u64>()),
-                            name: "Imported item".to_string(),
-                            request: None,
-                            prerequest: None,
-                            test: None,
-                            assertions: vec![],
-                            items: vec![],
+                items: items
+                    .iter()
+                    .map(|v| {
+                        serde_json::from_value(v.clone()).unwrap_or_else(|_| {
+                            tropel_sdk::ScenarioItem {
+                                id: format!("item-{}", rand::random::<u64>()),
+                                name: "Imported item".to_string(),
+                                request: None,
+                                prerequest: None,
+                                test: None,
+                                assertions: vec![],
+                                items: vec![],
+                            }
                         })
-                }).collect(),
+                    })
+                    .collect(),
                 variables: HashMap::new(),
                 auth: None,
             }
@@ -398,7 +412,11 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         let msg = format!("{}", err);
-        assert!(msg.contains("Failed to spawn"), "Expected spawn error, got: {}", msg);
+        assert!(
+            msg.contains("Failed to spawn"),
+            "Expected spawn error, got: {}",
+            msg
+        );
     }
 
     #[test]
@@ -456,9 +474,8 @@ mod tests {
         // full duration (on MSYS even `exec sleep` is fork-emulated). A busy
         // loop runs inside `sh` itself — killing `sh` closes the pipe and
         // unblocks the reader thread promptly.
-        let adapter =
-            script_adapter("busy.sh", "#!/bin/sh\nwhile :; do :; done\n")
-                .with_timeout(Duration::from_millis(300));
+        let adapter = script_adapter("busy.sh", "#!/bin/sh\nwhile :; do :; done\n")
+            .with_timeout(Duration::from_millis(300));
         let start = std::time::Instant::now();
         let result = adapter.parse(b"hello");
         assert!(result.is_err());
@@ -484,10 +501,6 @@ mod tests {
         let result = adapter.parse(&payload);
         assert!(result.is_err(), "output cap must reject chatty subprocess");
         let msg = format!("{}", result.unwrap_err());
-        assert!(
-            msg.contains("exceeded"),
-            "expected cap error, got: {}",
-            msg
-        );
+        assert!(msg.contains("exceeded"), "expected cap error, got: {}", msg);
     }
 }

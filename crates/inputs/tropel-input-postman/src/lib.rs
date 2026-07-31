@@ -4,8 +4,8 @@
 //! produces a protocol-agnostic `Scenario`.
 
 use tropel_collection::{collection_to_scenario, parse_collection};
-use tropel_sdk::{Scenario, Result, TropelError};
 use tropel_sdk::{InputAdapter, InputAdapterRegistration};
+use tropel_sdk::{Result, Scenario, TropelError};
 
 /// Input adapter for Postman Collection files.
 pub struct PostmanInputAdapter;
@@ -14,7 +14,9 @@ pub struct PostmanInputAdapter;
 // When `tropel-ext` calls `ExtensionRegistry::collect_inventory()`, this
 // registration is picked up and the adapter is added to the registry.
 // Uses a fn pointer (captureless closure) for const-compatibility with inventory.
-inventory::submit!(InputAdapterRegistration::new("postman", || Box::new(PostmanInputAdapter)));
+inventory::submit!(InputAdapterRegistration::new("postman", || Box::new(
+    PostmanInputAdapter
+)));
 
 impl InputAdapter for PostmanInputAdapter {
     fn id(&self) -> &str {
@@ -40,10 +42,14 @@ impl InputAdapter for PostmanInputAdapter {
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Scenario> {
-        let collection = parse_collection(bytes)
-            .map_err(|e| TropelError::Parse(format!("Failed to parse Postman collection: {}", e)))?;
+        let collection = parse_collection(bytes).map_err(|e| {
+            TropelError::Parse(format!("Failed to parse Postman collection: {}", e))
+        })?;
 
-        Ok(collection_to_scenario(collection, std::collections::HashMap::new()))
+        Ok(collection_to_scenario(
+            collection,
+            std::collections::HashMap::new(),
+        ))
     }
 }
 
@@ -80,14 +86,18 @@ mod tests {
                 }]
             }
         }"#;
-        assert!(!adapter.detect(data), "HAR content mentioning postman must not be detected as a Postman collection");
+        assert!(
+            !adapter.detect(data),
+            "HAR content mentioning postman must not be detected as a Postman collection"
+        );
     }
 
     #[test]
     fn test_detect_requires_schema_url() {
         // The schema field must be the actual getpostman.com URL.
         let adapter = PostmanInputAdapter;
-        let data = br#"{"info":{"name":"Test","schema":"https://example.com/collection.json"},"item":[]}"#;
+        let data =
+            br#"{"info":{"name":"Test","schema":"https://example.com/collection.json"},"item":[]}"#;
         assert!(!adapter.detect(data));
     }
 

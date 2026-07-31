@@ -129,7 +129,11 @@ impl PmApi {
     /// Get response cookies.
     pub fn response_cookies(&self) -> Vec<tropel_core::types::Cookie> {
         let state = self.state.lock().unwrap();
-        state.response.as_ref().map(|r| r.cookies.clone()).unwrap_or_default()
+        state
+            .response
+            .as_ref()
+            .map(|r| r.cookies.clone())
+            .unwrap_or_default()
     }
 
     // ── Test ──
@@ -145,7 +149,10 @@ impl PmApi {
     /// Get the current iteration data value.
     pub fn iteration_data_get(&self, key: &str) -> Option<Value> {
         let state = self.state.lock().unwrap();
-        state.iteration_data.as_ref().and_then(|data| data.get(key).cloned())
+        state
+            .iteration_data
+            .as_ref()
+            .and_then(|data| data.get(key).cloned())
     }
 
     // ── Flow Control ──

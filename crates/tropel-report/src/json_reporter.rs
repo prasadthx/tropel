@@ -28,17 +28,20 @@ impl Reporter for JsonReporter {
         let mut metrics_map = serde_json::Map::new();
 
         for metric in &result.metrics {
-            metrics_map.insert(metric.key.clone(), json!({
-                "count": metric.count,
-                "sum": metric.sum,
-                "mean": metric.mean,
-                "min": metric.min,
-                "max": metric.max,
-                "p50": metric.p50,
-                "p90": metric.p90,
-                "p95": metric.p95,
-                "p99": metric.p99,
-            }));
+            metrics_map.insert(
+                metric.key.clone(),
+                json!({
+                    "count": metric.count,
+                    "sum": metric.sum,
+                    "mean": metric.mean,
+                    "min": metric.min,
+                    "max": metric.max,
+                    "p50": metric.p50,
+                    "p90": metric.p90,
+                    "p95": metric.p95,
+                    "p99": metric.p99,
+                }),
+            );
         }
 
         let output = json!({
@@ -54,8 +57,9 @@ impl Reporter for JsonReporter {
             "data_sent": result.data_sent,
         });
 
-        let json_str = serde_json::to_string_pretty(&output)
-            .map_err(|e| tropel_core::TropelError::Report(format!("JSON serialization error: {}", e)))?;
+        let json_str = serde_json::to_string_pretty(&output).map_err(|e| {
+            tropel_core::TropelError::Report(format!("JSON serialization error: {}", e))
+        })?;
 
         if let Some(path) = &self.output_path {
             tokio::fs::write(path, &json_str)

@@ -23,89 +23,106 @@ impl NativeModule for CryptoModule {
             let globals = rq_ctx.globals();
 
             // ── Hashes ──
-            let _ = globals.set("__tropel_native_sha256", Func::from(|data: Vec<u8>| -> Vec<u8> {
-                sha256(&data)
-            }));
+            let _ = globals.set(
+                "__tropel_native_sha256",
+                Func::from(|data: Vec<u8>| -> Vec<u8> { sha256(&data) }),
+            );
 
-            let _ = globals.set("__tropel_native_sha384", Func::from(|data: Vec<u8>| -> Vec<u8> {
-                sha384(&data)
-            }));
+            let _ = globals.set(
+                "__tropel_native_sha384",
+                Func::from(|data: Vec<u8>| -> Vec<u8> { sha384(&data) }),
+            );
 
-            let _ = globals.set("__tropel_native_sha512", Func::from(|data: Vec<u8>| -> Vec<u8> {
-                sha512(&data)
-            }));
+            let _ = globals.set(
+                "__tropel_native_sha512",
+                Func::from(|data: Vec<u8>| -> Vec<u8> { sha512(&data) }),
+            );
 
-            let _ = globals.set("__tropel_native_sha1", Func::from(|data: Vec<u8>| -> Vec<u8> {
-                sha1(&data)
-            }));
+            let _ = globals.set(
+                "__tropel_native_sha1",
+                Func::from(|data: Vec<u8>| -> Vec<u8> { sha1(&data) }),
+            );
 
-            let _ = globals.set("__tropel_native_md5", Func::from(|data: Vec<u8>| -> Vec<u8> {
-                md5(&data)
-            }));
+            let _ = globals.set(
+                "__tropel_native_md5",
+                Func::from(|data: Vec<u8>| -> Vec<u8> { md5(&data) }),
+            );
 
-            let _ = globals.set("__tropel_native_sha3_256", Func::from(|data: Vec<u8>| -> Vec<u8> {
-                sha3_256(&data)
-            }));
+            let _ = globals.set(
+                "__tropel_native_sha3_256",
+                Func::from(|data: Vec<u8>| -> Vec<u8> { sha3_256(&data) }),
+            );
 
-            let _ = globals.set("__tropel_native_ripemd160", Func::from(|data: Vec<u8>| -> Vec<u8> {
-                ripemd160(&data)
-            }));
+            let _ = globals.set(
+                "__tropel_native_ripemd160",
+                Func::from(|data: Vec<u8>| -> Vec<u8> { ripemd160(&data) }),
+            );
 
             // ── HMACs ──
-            let _ = globals.set("__tropel_native_hmac_sha256", Func::from(|key: Vec<u8>, data: Vec<u8>| -> Vec<u8> {
-                hmac_sha256(&key, &data)
-            }));
+            let _ = globals.set(
+                "__tropel_native_hmac_sha256",
+                Func::from(|key: Vec<u8>, data: Vec<u8>| -> Vec<u8> { hmac_sha256(&key, &data) }),
+            );
 
-            let _ = globals.set("__tropel_native_hmac_sha1", Func::from(|key: Vec<u8>, data: Vec<u8>| -> Vec<u8> {
-                hmac_sha1(&key, &data)
-            }));
+            let _ = globals.set(
+                "__tropel_native_hmac_sha1",
+                Func::from(|key: Vec<u8>, data: Vec<u8>| -> Vec<u8> { hmac_sha1(&key, &data) }),
+            );
 
-            let _ = globals.set("__tropel_native_hmac_sha512", Func::from(|key: Vec<u8>, data: Vec<u8>| -> Vec<u8> {
-                hmac_sha512(&key, &data)
-            }));
+            let _ = globals.set(
+                "__tropel_native_hmac_sha512",
+                Func::from(|key: Vec<u8>, data: Vec<u8>| -> Vec<u8> { hmac_sha512(&key, &data) }),
+            );
 
-            let _ = globals.set("__tropel_native_hmac_md5", Func::from(|key: Vec<u8>, data: Vec<u8>| -> Vec<u8> {
-                hmac_md5(&key, &data)
-            }));
+            let _ = globals.set(
+                "__tropel_native_hmac_md5",
+                Func::from(|key: Vec<u8>, data: Vec<u8>| -> Vec<u8> { hmac_md5(&key, &data) }),
+            );
 
             // ── AES-256-GCM (authenticated encryption) ──
             // Returns None on error (wrong key/nonce length, auth failure)
             // instead of panicking across the FFI boundary.
             let _ = globals.set(
                 "__tropel_native_aes_gcm_encrypt",
-                Func::from(|key: Vec<u8>, nonce: Vec<u8>, plaintext: Vec<u8>| -> Option<Vec<u8>> {
-                    aes_gcm_encrypt(&key, &nonce, &plaintext).ok()
-                }),
+                Func::from(
+                    |key: Vec<u8>, nonce: Vec<u8>, plaintext: Vec<u8>| -> Option<Vec<u8>> {
+                        aes_gcm_encrypt(&key, &nonce, &plaintext).ok()
+                    },
+                ),
             );
 
             let _ = globals.set(
                 "__tropel_native_aes_gcm_decrypt",
-                Func::from(|key: Vec<u8>, nonce: Vec<u8>, ciphertext: Vec<u8>| -> Option<Vec<u8>> {
-                    aes_gcm_decrypt(&key, &nonce, &ciphertext).ok()
-                }),
+                Func::from(
+                    |key: Vec<u8>, nonce: Vec<u8>, ciphertext: Vec<u8>| -> Option<Vec<u8>> {
+                        aes_gcm_decrypt(&key, &nonce, &ciphertext).ok()
+                    },
+                ),
             );
 
             // ── AES-256-CBC (PKCS7 padding) ──
             let _ = globals.set(
                 "__tropel_native_aes_cbc_encrypt",
-                Func::from(|key: Vec<u8>, iv: Vec<u8>, plaintext: Vec<u8>| -> Option<Vec<u8>> {
-                    aes_cbc_encrypt(&key, &iv, &plaintext).ok()
-                }),
+                Func::from(
+                    |key: Vec<u8>, iv: Vec<u8>, plaintext: Vec<u8>| -> Option<Vec<u8>> {
+                        aes_cbc_encrypt(&key, &iv, &plaintext).ok()
+                    },
+                ),
             );
 
             let _ = globals.set(
                 "__tropel_native_aes_cbc_decrypt",
-                Func::from(|key: Vec<u8>, iv: Vec<u8>, ciphertext: Vec<u8>| -> Option<Vec<u8>> {
-                    aes_cbc_decrypt(&key, &iv, &ciphertext).ok()
-                }),
+                Func::from(
+                    |key: Vec<u8>, iv: Vec<u8>, ciphertext: Vec<u8>| -> Option<Vec<u8>> {
+                        aes_cbc_decrypt(&key, &iv, &ciphertext).ok()
+                    },
+                ),
             );
 
             // ── CSPRNG: generate cryptographically secure random bytes ──
             let _ = globals.set(
                 "__tropel_native_random_bytes",
-                Func::from(|n: u32| -> Vec<u8> {
-                    random_bytes(n as usize)
-                }),
+                Func::from(|n: u32| -> Vec<u8> { random_bytes(n as usize) }),
             );
 
             // ── EVP_BytesToKey (OpenSSL-compatible key derivation for CryptoJS interop) ──
@@ -113,10 +130,13 @@ impl NativeModule for CryptoModule {
             // Returns JSON: {"key": [...], "iv": [...]}
             let _ = globals.set(
                 "__tropel_native_evp_bytes_to_key",
-                Func::from(|password: Vec<u8>, salt: Vec<u8>, key_len: u32, iv_len: u32| -> String {
-                    let (key, iv) = evp_bytes_to_key(&password, &salt, key_len as usize, iv_len as usize);
-                    serde_json::json!({"key": key, "iv": iv}).to_string()
-                }),
+                Func::from(
+                    |password: Vec<u8>, salt: Vec<u8>, key_len: u32, iv_len: u32| -> String {
+                        let (key, iv) =
+                            evp_bytes_to_key(&password, &salt, key_len as usize, iv_len as usize);
+                        serde_json::json!({"key": key, "iv": iv}).to_string()
+                    },
+                ),
             );
         });
 
@@ -184,8 +204,8 @@ pub fn ripemd160(data: &[u8]) -> Vec<u8> {
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     use hmac::digest::KeyInit;
     use hmac::Mac;
-    let mut mac = <hmac::Hmac::<sha2::Sha256> as KeyInit>::new_from_slice(key)
-        .expect("HMAC key length");
+    let mut mac =
+        <hmac::Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key).expect("HMAC key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }
@@ -194,8 +214,8 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
 pub fn hmac_sha1(key: &[u8], data: &[u8]) -> Vec<u8> {
     use hmac::digest::KeyInit;
     use hmac::Mac;
-    let mut mac = <hmac::Hmac::<sha1::Sha1> as KeyInit>::new_from_slice(key)
-        .expect("HMAC key length");
+    let mut mac =
+        <hmac::Hmac<sha1::Sha1> as KeyInit>::new_from_slice(key).expect("HMAC key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }
@@ -204,8 +224,8 @@ pub fn hmac_sha1(key: &[u8], data: &[u8]) -> Vec<u8> {
 pub fn hmac_sha512(key: &[u8], data: &[u8]) -> Vec<u8> {
     use hmac::digest::KeyInit;
     use hmac::Mac;
-    let mut mac = <hmac::Hmac::<sha2::Sha512> as KeyInit>::new_from_slice(key)
-        .expect("HMAC key length");
+    let mut mac =
+        <hmac::Hmac<sha2::Sha512> as KeyInit>::new_from_slice(key).expect("HMAC key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }
@@ -214,8 +234,7 @@ pub fn hmac_sha512(key: &[u8], data: &[u8]) -> Vec<u8> {
 pub fn hmac_md5(key: &[u8], data: &[u8]) -> Vec<u8> {
     use hmac::digest::KeyInit;
     use hmac::Mac;
-    let mut mac = <hmac::Hmac::<md5::Md5> as KeyInit>::new_from_slice(key)
-        .expect("HMAC key length");
+    let mut mac = <hmac::Hmac<md5::Md5> as KeyInit>::new_from_slice(key).expect("HMAC key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }
@@ -239,7 +258,12 @@ pub fn random_bytes(n: usize) -> Vec<u8> {
 ///   D_i = MD5(D_{i-1} || password || salt)
 ///   Concatenate D_1, D_2, ... until key_len + iv_len bytes are produced
 ///   key = first key_len bytes, iv = next iv_len bytes
-pub fn evp_bytes_to_key(password: &[u8], salt: &[u8], key_len: usize, iv_len: usize) -> (Vec<u8>, Vec<u8>) {
+pub fn evp_bytes_to_key(
+    password: &[u8],
+    salt: &[u8],
+    key_len: usize,
+    iv_len: usize,
+) -> (Vec<u8>, Vec<u8>) {
     let total = key_len + iv_len;
     let mut derived = Vec::with_capacity(total);
     let mut prev_hash: Vec<u8> = Vec::new();

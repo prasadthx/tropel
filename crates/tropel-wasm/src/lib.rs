@@ -63,8 +63,8 @@ use tropel_core::types::{AuthConfig, Body, Method, Request};
 use tropel_core::{Result, TropelError};
 use tropel_ext::traits::InputAdapter;
 use wasmtime::{
-    Config, Engine, ExternType, Instance, InstanceAllocationStrategy, InstancePre, Linker,
-    Memory, MemoryType, Module, PoolingAllocationConfig, Store,
+    Config, Engine, ExternType, Instance, InstanceAllocationStrategy, InstancePre, Linker, Memory,
+    MemoryType, Module, PoolingAllocationConfig, Store,
 };
 
 // ══════════════════════════════════════════════════════════════════
@@ -168,10 +168,7 @@ fn build_link_strategy(engine: &Engine, module: &Module) -> anyhow::Result<LinkS
 /// wasmtime's engine-level memory limits. Plugin authors should declare a
 /// bounded maximum for exported memories as well.
 fn clamp_memory_type(mem_ty: MemoryType) -> MemoryType {
-    let max = mem_ty
-        .maximum()
-        .map(|m| m.min(256) as u32)
-        .unwrap_or(256);
+    let max = mem_ty.maximum().map(|m| m.min(256) as u32).unwrap_or(256);
     let min = (mem_ty.minimum() as u32).min(max);
     MemoryType::new(min, Some(max))
 }
@@ -231,9 +228,7 @@ impl WasmPlugin {
                 std::fs::metadata(path).map(|src_md| {
                     cache_md
                         .modified()
-                        .is_ok_and(|cache_t| {
-                            src_md.modified().is_ok_and(|src_t| cache_t >= src_t)
-                        })
+                        .is_ok_and(|cache_t| src_md.modified().is_ok_and(|src_t| cache_t >= src_t))
                 })
             })
             .unwrap_or(false);
@@ -263,7 +258,11 @@ impl WasmPlugin {
     ) -> std::result::Result<Module, anyhow::Error> {
         let compiled = engine.precompile_module(wasm_bytes)?;
         if let Err(e) = std::fs::write(cache_path, &compiled) {
-            tracing::warn!("Failed to write WASM AOT cache '{}': {}", cache_path.display(), e);
+            tracing::warn!(
+                "Failed to write WASM AOT cache '{}': {}",
+                cache_path.display(),
+                e
+            );
         }
         // SAFETY: `compiled` was just produced by `Engine::precompile_module`
         // on this same engine.
@@ -285,11 +284,9 @@ impl WasmPlugin {
         let (instance, memory) = match &self.link_strategy {
             LinkStrategy::PreLinked(pre) => {
                 let instance = pre.instantiate(&mut store)?;
-                let memory = instance
-                    .get_memory(&mut store, "memory")
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("WASM module must export a 'memory' (or import one)")
-                    })?;
+                let memory = instance.get_memory(&mut store, "memory").ok_or_else(|| {
+                    anyhow::anyhow!("WASM module must export a 'memory' (or import one)")
+                })?;
                 (instance, memory)
             }
             LinkStrategy::MemoryImport {
@@ -361,9 +358,8 @@ impl WasmPlugin {
     pub fn detect(&self, bytes: &[u8]) -> bool {
         let result = self.with_instance(|store, instance, memory, has_malloc| {
             let mut arena_next = FALLBACK_BASE;
-            let ptr = Self::write_bytes(
-                store, instance, &memory, bytes, has_malloc, &mut arena_next,
-            )?;
+            let ptr =
+                Self::write_bytes(store, instance, &memory, bytes, has_malloc, &mut arena_next)?;
 
             let detect_fn =
                 instance.get_typed_func::<(i32, i32), i32>(&mut *store, "adapter_detect")?;
@@ -377,9 +373,8 @@ impl WasmPlugin {
     pub fn parse(&self, bytes: &[u8]) -> Result<Scenario> {
         let result = self.with_instance(|store, instance, memory, has_malloc| {
             let mut arena_next = FALLBACK_BASE;
-            let input_ptr = Self::write_bytes(
-                store, instance, &memory, bytes, has_malloc, &mut arena_next,
-            )?;
+            let input_ptr =
+                Self::write_bytes(store, instance, &memory, bytes, has_malloc, &mut arena_next)?;
 
             let parse_fn = instance
                 .get_typed_func::<(i32, i32, i32, i32), i32>(&mut *store, "adapter_parse")?;
@@ -695,10 +690,8 @@ pub struct WasmInputAdapter {
 
 impl WasmInputAdapter {
     pub fn new(wasm_bytes: &[u8]) -> Result<Self> {
-        let plugin =
-            WasmPlugin::load(wasm_bytes).map_err(|e| {
-                TropelError::Other(format!("Failed to load WASM plugin: {}", e))
-            })?;
+        let plugin = WasmPlugin::load(wasm_bytes)
+            .map_err(|e| TropelError::Other(format!("Failed to load WASM plugin: {}", e)))?;
         Ok(Self { plugin })
     }
 
@@ -955,8 +948,8 @@ mod tests {
     fn test_memory_import_module() {
         // Load-path fix (a): a module that *imports* memory must get a
         // host-supplied memory (no exported 'memory' required).
-        let plugin = WasmPlugin::load(MEMORY_IMPORT_WAT.as_bytes())
-            .expect("memory-import module must load");
+        let plugin =
+            WasmPlugin::load(MEMORY_IMPORT_WAT.as_bytes()).expect("memory-import module must load");
         assert_eq!(plugin.id(), "import-plugin");
         assert!(plugin.detect(&[0x7f, 9, 9]));
 

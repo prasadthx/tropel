@@ -31,7 +31,9 @@ pub fn evaluate_thresholds(
             actual: result.1,
             threshold: result.2,
             abort_on_fail: config.abort_on_fail,
-            delay_abort_eval: config.delay_abort_eval.as_ref()
+            delay_abort_eval: config
+                .delay_abort_eval
+                .as_ref()
                 .and_then(|s| parse_duration(s).ok()),
         });
     }
@@ -65,7 +67,8 @@ pub fn check_abort_on_fail(
         if !passed {
             tracing::error!(
                 "Threshold '{}' ({}) breached with abortOnFail — aborting test",
-                name, config.expression
+                name,
+                config.expression
             );
             return true;
         }
@@ -117,7 +120,7 @@ fn parse_metric_ref(metric_ref: &str) -> (&str, Vec<(&str, &str)>, Option<&str>)
 
     // Step 2: Extract tags from inside `{...}`
     let tags = if let (Some(bs), Some(bc)) = (brace_start, brace_close) {
-        metric_ref[bs+1..bc]
+        metric_ref[bs + 1..bc]
             .split(',')
             .filter_map(|pair| {
                 let pair = pair.trim();
@@ -177,7 +180,11 @@ fn evaluate_single_threshold(expression: &str, metrics: &MetricsResult) -> (bool
     let threshold: f64 = match parts[2].parse() {
         Ok(v) => v,
         Err(_) => {
-            tracing::warn!("Invalid threshold value in '{}': '{}'", expression, parts[2]);
+            tracing::warn!(
+                "Invalid threshold value in '{}': '{}'",
+                expression,
+                parts[2]
+            );
             return (true, 0.0, 0.0);
         }
     };
@@ -202,7 +209,11 @@ fn evaluate_single_threshold(expression: &str, metrics: &MetricsResult) -> (bool
         "==" => (actual - threshold).abs() < f64::EPSILON,
         "!=" => (actual - threshold).abs() > f64::EPSILON,
         _ => {
-            tracing::warn!("Unknown operator '{}' in threshold '{}'", operator, expression);
+            tracing::warn!(
+                "Unknown operator '{}' in threshold '{}'",
+                operator,
+                expression
+            );
             true
         }
     };
@@ -263,7 +274,10 @@ fn get_tag_scoped_metric_value(
         }
         Some("min") => {
             // Return the MINIMUM min across all matches
-            matched.iter().map(|m| m.min as f64).fold(f64::MAX, f64::min)
+            matched
+                .iter()
+                .map(|m| m.min as f64)
+                .fold(f64::MAX, f64::min)
         }
         Some("max") => {
             // Return the MAXIMUM max across all matches
@@ -272,33 +286,23 @@ fn get_tag_scoped_metric_value(
         Some("p50") | Some("median") => {
             matched.iter().map(|m| m.p50 as f64).fold(0.0_f64, f64::max)
         }
-        Some("p90") => {
-            matched.iter().map(|m| m.p90 as f64).fold(0.0_f64, f64::max)
-        }
-        Some("p95") => {
-            matched.iter().map(|m| m.p95 as f64).fold(0.0_f64, f64::max)
-        }
-        Some("p99") => {
-            matched.iter().map(|m| m.p99 as f64).fold(0.0_f64, f64::max)
-        }
-        Some("count") => {
-            matched.iter().map(|m| m.count as f64).sum()
-        }
+        Some("p90") => matched.iter().map(|m| m.p90 as f64).fold(0.0_f64, f64::max),
+        Some("p95") => matched.iter().map(|m| m.p95 as f64).fold(0.0_f64, f64::max),
+        Some("p99") => matched.iter().map(|m| m.p99 as f64).fold(0.0_f64, f64::max),
+        Some("count") => matched.iter().map(|m| m.count as f64).sum(),
         Some("rate") => {
             let total_sum: f64 = matched.iter().map(|m| m.sum).sum();
             let total_count: f64 = matched.iter().map(|m| m.count as f64).sum();
-            if total_count > 0.0 { total_sum / total_count } else { 0.0 }
+            if total_count > 0.0 {
+                total_sum / total_count
+            } else {
+                0.0
+            }
         }
-        Some("sum") => {
-            matched.iter().map(|m| m.sum).sum()
-        }
-        Some("last") => {
-            matched.last().map(|m| m.last).unwrap_or(0.0)
-        }
+        Some("sum") => matched.iter().map(|m| m.sum).sum(),
+        Some("last") => matched.last().map(|m| m.last).unwrap_or(0.0),
         // Default (no stat or unknown stat) — return WORST mean
-        _ => {
-            matched.iter().map(|m| m.mean).fold(0.0_f64, f64::max)
-        }
+        _ => matched.iter().map(|m| m.mean).fold(0.0_f64, f64::max),
     }
 }
 
@@ -359,7 +363,7 @@ fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collector::{MetricSummary, MetricsResult, MetricType};
+    use crate::collector::{MetricSummary, MetricType, MetricsResult};
 
     fn make_metrics() -> MetricsResult {
         MetricsResult {
@@ -470,7 +474,8 @@ mod tests {
     fn test_tag_scoped_p95_under() {
         let metrics = make_tag_scoped_metrics();
         // http_req_duration{status=200}.p95 < 1000
-        let result = evaluate_single_threshold("http_req_duration{status=200}.p95 < 1000", &metrics);
+        let result =
+            evaluate_single_threshold("http_req_duration{status=200}.p95 < 1000", &metrics);
         assert!(result.0, "p95 900 should be < 1000");
         assert_eq!(result.1, 900.0);
         assert_eq!(result.2, 1000.0);
@@ -480,7 +485,8 @@ mod tests {
     fn test_tag_scoped_p95_over() {
         let metrics = make_tag_scoped_metrics();
         // http_req_duration{status=500}.p95 < 2000
-        let result = evaluate_single_threshold("http_req_duration{status=500}.p95 < 2000", &metrics);
+        let result =
+            evaluate_single_threshold("http_req_duration{status=500}.p95 < 2000", &metrics);
         assert!(!result.0, "p95 2800 should NOT be < 2000");
         assert_eq!(result.1, 2800.0);
         assert_eq!(result.2, 2000.0);
@@ -507,7 +513,8 @@ mod tests {
     fn test_tag_scoped_colon_syntax() {
         let metrics = make_tag_scoped_metrics();
         // Use colon syntax: {status:200}
-        let result = evaluate_single_threshold("http_req_duration{status:200}.p95 < 1000", &metrics);
+        let result =
+            evaluate_single_threshold("http_req_duration{status:200}.p95 < 1000", &metrics);
         assert!(result.0, "colon syntax should work");
         assert_eq!(result.1, 900.0);
     }
@@ -563,4 +570,3 @@ mod tests {
         assert_eq!(stat, Some("pass_rate"));
     }
 }
-

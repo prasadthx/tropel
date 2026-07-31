@@ -51,21 +51,31 @@ impl DynamicCatalog {
         // {{$randomInt}} — fresh random integer per occurrence
         if result.contains("{{$randomInt}}") {
             let re = Regex::new(r"\{\{\$randomInt\}\}").unwrap();
-            result = self.replace_with_func(&result, &re, |_| rng.random_range(0..1000u32).to_string());
+            result =
+                self.replace_with_func(&result, &re, |_| rng.random_range(0..1000u32).to_string());
         }
 
         // {{$randomFloat}} — fresh random float per occurrence
         if result.contains("{{$randomFloat}}") {
             let re = Regex::new(r"\{\{\$randomFloat\}\}").unwrap();
-            result = self.replace_with_func(&result, &re, |_| format!("{:.6}", rng.random::<f64>() * 1000.0));
+            result = self.replace_with_func(&result, &re, |_| {
+                format!("{:.6}", rng.random::<f64>() * 1000.0)
+            });
         }
 
         // {{$randomString[:length]}}
         if result.contains("{{$randomString") {
             let re = Regex::new(r"\{\{\$randomString(?::(\d+))?\}\}").unwrap();
             result = self.replace_with_func(&result, &re, |caps| {
-                let len = caps.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(10);
-                random_string(&mut rng, len, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+                let len = caps
+                    .get(1)
+                    .and_then(|m| m.as_str().parse().ok())
+                    .unwrap_or(10);
+                random_string(
+                    &mut rng,
+                    len,
+                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+                )
             });
         }
 
@@ -73,8 +83,15 @@ impl DynamicCatalog {
         if result.contains("{{$randomAlphabetic") {
             let re = Regex::new(r"\{\{\$randomAlphabetic(?::(\d+))?\}\}").unwrap();
             result = self.replace_with_func(&result, &re, |caps| {
-                let len = caps.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(10);
-                random_string(&mut rng, len, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+                let len = caps
+                    .get(1)
+                    .and_then(|m| m.as_str().parse().ok())
+                    .unwrap_or(10);
+                random_string(
+                    &mut rng,
+                    len,
+                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                )
             });
         }
 
@@ -82,8 +99,15 @@ impl DynamicCatalog {
         if result.contains("{{$randomAlphanumeric") {
             let re = Regex::new(r"\{\{\$randomAlphanumeric(?::(\d+))?\}\}").unwrap();
             result = self.replace_with_func(&result, &re, |caps| {
-                let len = caps.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(10);
-                random_string(&mut rng, len, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+                let len = caps
+                    .get(1)
+                    .and_then(|m| m.as_str().parse().ok())
+                    .unwrap_or(10);
+                random_string(
+                    &mut rng,
+                    len,
+                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+                )
             });
         }
 
@@ -97,7 +121,10 @@ impl DynamicCatalog {
         if result.contains("{{$randomHex") {
             let re = Regex::new(r"\{\{\$randomHex(?::(\d+))?\}\}").unwrap();
             result = self.replace_with_func(&result, &re, |caps| {
-                let len = caps.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(8);
+                let len = caps
+                    .get(1)
+                    .and_then(|m| m.as_str().parse().ok())
+                    .unwrap_or(8);
                 random_string(&mut rng, len, "0123456789abcdef")
             });
         }
@@ -105,18 +132,76 @@ impl DynamicCatalog {
         // {{$randomEmail}} — fresh email per occurrence
         if result.contains("{{$randomEmail}}") {
             let re = Regex::new(r"\{\{\$randomEmail\}\}").unwrap();
-            result = self.replace_with_func(&result, &re, |_| {
-                let name = random_string(&mut rng, 8, "abcdefghijklmnopqrstuvwxyz");
-                let domain = random_string(&mut rng, 6, "abcdefghijklmnopqrstuvwxyz");
-                format!("{}@{}.com", name, domain)
+            result = self.replace_with_func(&result, &re, |_| random_email(&mut rng));
+        }
+
+        // {{$randomPhone}} / {{$randomPhoneNumber}}
+        if result.contains("{{$randomPhone") {
+            let re = Regex::new(r"\{\{\$randomPhone(?:Number)?\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| random_phone_number(&mut rng));
+        }
+
+        // {{$randomCompany}} / {{$randomCompanyName}}
+        if result.contains("{{$randomCompany") {
+            let re = Regex::new(r"\{\{\$randomCompany(?:Name)?\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| random_company_name(&mut rng));
+        }
+
+        // {{$randomLorem}} — one paragraph of lorem-style text
+        if result.contains("{{$randomLorem}}") {
+            let re = Regex::new(r"\{\{\$randomLorem\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| random_lorem_paragraph(&mut rng));
+        }
+
+        // {{$randomSentence}} / {{$randomWords[:count]}} / {{$randomWord}}
+        if result.contains("{{$randomSentence}}") {
+            let re = Regex::new(r"\{\{\$randomSentence\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| random_sentence(&mut rng));
+        }
+        if result.contains("{{$randomWords") {
+            let re = Regex::new(r"\{\{\$randomWords(?::(\d+))?\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |caps| {
+                let count = caps
+                    .get(1)
+                    .and_then(|m| m.as_str().parse().ok())
+                    .unwrap_or(5);
+                random_words(&mut rng, count)
             });
+        }
+        if result.contains("{{$randomWord}}") {
+            let re = Regex::new(r"\{\{\$randomWord\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| random_word(&mut rng));
+        }
+
+        // {{$randomDate}} / {{$randomDatePast}} / {{$randomDateFuture}} / {{$randomTime}}
+        if result.contains("{{$randomDatePast}}") {
+            let re = Regex::new(r"\{\{\$randomDatePast\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| random_date_past(&mut rng));
+        }
+        if result.contains("{{$randomDateFuture}}") {
+            let re = Regex::new(r"\{\{\$randomDateFuture\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| random_date_future(&mut rng));
+        }
+        if result.contains("{{$randomDate}}") {
+            let re = Regex::new(r"\{\{\$randomDate\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| random_date(&mut rng));
+        }
+        if result.contains("{{$randomTime}}") {
+            let re = Regex::new(r"\{\{\$randomTime\}\}").unwrap();
+            result = self.replace_with_func(&result, &re, |_| random_time(&mut rng));
         }
 
         // {{$randomIP}} — fresh IP per occurrence
         if result.contains("{{$randomIP}}") {
             let re = Regex::new(r"\{\{\$randomIP\}\}").unwrap();
             result = self.replace_with_func(&result, &re, |_| {
-                format!("{}.{}.{}.{}", rng.random_range(1..255u32), rng.random_range(0..255u32), rng.random_range(0..255u32), rng.random_range(1..255u32))
+                format!(
+                    "{}.{}.{}.{}",
+                    rng.random_range(1..255u32),
+                    rng.random_range(0..255u32),
+                    rng.random_range(0..255u32),
+                    rng.random_range(1..255u32)
+                )
             });
         }
 
@@ -125,52 +210,52 @@ impl DynamicCatalog {
         // {{$randomName}}, {{$randomColor}}, {{$randomMAC}}
         if result.contains("{{$randomCity}}") {
             let re = Regex::new(r"\{\{\$randomCity\}\}").unwrap();
-            result = self.replace_with_func(&result, &re, |_| random_string(&mut rng, 8, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+            result = self.replace_with_func(&result, &re, |_| random_city(&mut rng));
         }
         if result.contains("{{$randomCountry}}") {
             let re = Regex::new(r"\{\{\$randomCountry\}\}").unwrap();
-            result = self.replace_with_func(&result, &re, |_| random_string(&mut rng, 8, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+            result = self.replace_with_func(&result, &re, |_| random_country(&mut rng));
         }
         if result.contains("{{$randomStreet}}") {
             let re = Regex::new(r"\{\{\$randomStreet\}\}").unwrap();
-            result = self.replace_with_func(&result, &re, |_| random_string(&mut rng, 8, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+            result = self.replace_with_func(&result, &re, |_| random_street(&mut rng));
         }
         if result.contains("{{$randomPostcode}}") {
             let re = Regex::new(r"\{\{\$randomPostcode\}\}").unwrap();
-            result = self.replace_with_func(&result, &re, |_| random_string(&mut rng, 5, "0123456789"));
+            result = self.replace_with_func(&result, &re, |_| random_postcode(&mut rng));
         }
         if result.contains("{{$randomName}}") {
             // Note: {{$randomName}} is the base pattern; longer forms like
             // {{$randomNameFullName}} are handled later with more specific regexes.
             let re = Regex::new(r"\{\{\$randomName\}\}").unwrap();
-            result = self.replace_with_func(&result, &re, |_| random_string(&mut rng, 8, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+            result = self.replace_with_func(&result, &re, |_| random_full_name(&mut rng));
         }
         if result.contains("{{$randomNameFullName}}") {
             let re = Regex::new(r"\{\{\$randomNameFullName\}\}").unwrap();
-            result = self.replace_with_func(&result, &re, |_| {
-                format!("{} {}", 
-                    random_string(&mut rng, 6, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"),
-                    random_string(&mut rng, 8, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
-                )
-            });
+            result = self.replace_with_func(&result, &re, |_| random_full_name(&mut rng));
         }
         if result.contains("{{$randomNameFirstName}}") {
             let re = Regex::new(r"\{\{\$randomNameFirstName\}\}").unwrap();
-            result = self.replace_with_func(&result, &re, |_| random_string(&mut rng, 6, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+            result = self.replace_with_func(&result, &re, |_| random_first_name(&mut rng));
         }
         if result.contains("{{$randomNameLastName}}") {
             let re = Regex::new(r"\{\{\$randomNameLastName\}\}").unwrap();
-            result = self.replace_with_func(&result, &re, |_| random_string(&mut rng, 8, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+            result = self.replace_with_func(&result, &re, |_| random_last_name(&mut rng));
         }
         if result.contains("{{$randomColor}}") {
             let re = Regex::new(r"\{\{\$randomColor\}\}").unwrap();
-            result = self.replace_with_func(&result, &re, |_| random_string(&mut rng, 6, "0123456789abcdef"));
+            result = self.replace_with_func(&result, &re, |_| random_color(&mut rng));
         }
         if result.contains("{{$randomMAC}}") {
             let re = Regex::new(r"\{\{\$randomMAC\}\}").unwrap();
             result = self.replace_with_func(&result, &re, |_| {
                 let hex = random_string(&mut rng, 12, "0123456789abcdef");
-                hex.chars().collect::<Vec<_>>().chunks(2).map(|c| c.iter().collect::<String>()).collect::<Vec<_>>().join(":")
+                hex.chars()
+                    .collect::<Vec<_>>()
+                    .chunks(2)
+                    .map(|c| c.iter().collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join(":")
             });
         }
 
@@ -178,8 +263,15 @@ impl DynamicCatalog {
         if result.contains("{{$randomPassword") {
             let re = Regex::new(r"\{\{\$randomPassword(?::(\d+))?\}\}").unwrap();
             result = self.replace_with_func(&result, &re, |caps| {
-                let len = caps.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(12);
-                random_string(&mut rng, len, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*")
+                let len = caps
+                    .get(1)
+                    .and_then(|m| m.as_str().parse().ok())
+                    .unwrap_or(12);
+                random_string(
+                    &mut rng,
+                    len,
+                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*",
+                )
             });
         }
 
@@ -215,9 +307,328 @@ impl Default for DynamicCatalog {
     }
 }
 
+const FIRST_NAMES: &[&str] = &[
+    "Ava",
+    "Liam",
+    "Noah",
+    "Emma",
+    "Olivia",
+    "Elijah",
+    "Sophia",
+    "Mia",
+    "Charlotte",
+    "Amelia",
+    "James",
+    "Benjamin",
+    "Lucas",
+    "Ethan",
+    "Harper",
+    "Evelyn",
+    "Abigail",
+    "William",
+    "Henry",
+    "Ella",
+];
+
+const LAST_NAMES: &[&str] = &[
+    "Smith",
+    "Johnson",
+    "Williams",
+    "Brown",
+    "Jones",
+    "Garcia",
+    "Miller",
+    "Davis",
+    "Rodriguez",
+    "Martinez",
+    "Hernandez",
+    "Lopez",
+    "Gonzalez",
+    "Wilson",
+    "Anderson",
+    "Thomas",
+    "Taylor",
+    "Moore",
+    "Jackson",
+    "Martin",
+];
+
+const COMPANY_NAMES: &[&str] = &[
+    "Acme Corporation",
+    "Globex Corporation",
+    "Initech",
+    "Stark Industries",
+    "Wayne Enterprises",
+    "Umbrella Corporation",
+    "Cyberdyne Systems",
+    "Massive Dynamic",
+    "Wonka Industries",
+    "Blue Origin",
+    "Aperture Labs",
+    "Pioneer Logistics",
+    "Evergreen Technologies",
+    "TrueNorth Consulting",
+    "Redwood Analytics",
+    "Summit Systems",
+    "Liberty Software",
+    "Silverline Media",
+    "Veridian Dynamics",
+    "Northstar Financial",
+];
+
+const CITY_NAMES: &[&str] = &[
+    "New York",
+    "London",
+    "Paris",
+    "Tokyo",
+    "Berlin",
+    "Sydney",
+    "Toronto",
+    "San Francisco",
+    "Chicago",
+    "Barcelona",
+    "Amsterdam",
+    "Singapore",
+    "Dubai",
+    "Los Angeles",
+    "Seattle",
+    "Dublin",
+    "Vienna",
+    "Cape Town",
+    "Mumbai",
+    "Helsinki",
+];
+
+const COUNTRY_NAMES: &[&str] = &[
+    "United States",
+    "Canada",
+    "United Kingdom",
+    "Australia",
+    "Germany",
+    "France",
+    "Japan",
+    "Spain",
+    "Italy",
+    "Netherlands",
+    "Sweden",
+    "Norway",
+    "Brazil",
+    "Mexico",
+    "India",
+    "Singapore",
+    "South Africa",
+    "Switzerland",
+    "Austria",
+    "Ireland",
+];
+
+const STREET_NAMES: &[&str] = &[
+    "Maple", "Oak", "Pine", "Cedar", "Elm", "Walnut", "Chestnut", "Birch", "Willow", "Aspen",
+    "Sunset", "River", "Hill", "Grove", "Park", "Meadow", "Lake", "Forest", "Jackson", "Lincoln",
+];
+
+const STREET_SUFFIXES: &[&str] = &[
+    "Street",
+    "Avenue",
+    "Boulevard",
+    "Lane",
+    "Drive",
+    "Court",
+    "Place",
+    "Terrace",
+    "Way",
+    "Row",
+];
+
+const EMAIL_DOMAINS: &[&str] = &[
+    "example.com",
+    "example.org",
+    "mail.com",
+    "test.com",
+    "acme.com",
+    "globex.com",
+    "true-north.com",
+    "evergreen.io",
+];
+
+const LOREM_WORDS: &[&str] = &[
+    "lorem",
+    "ipsum",
+    "dolor",
+    "sit",
+    "amet",
+    "consectetur",
+    "adipiscing",
+    "elit",
+    "sed",
+    "do",
+    "eiusmod",
+    "tempor",
+    "incididunt",
+    "ut",
+    "labore",
+    "et",
+    "dolore",
+    "magna",
+    "aliqua",
+    "enim",
+    "ad",
+    "minim",
+    "veniam",
+    "quis",
+    "nostrud",
+    "exercitation",
+    "ullamco",
+    "laboris",
+    "nisi",
+    "ut",
+];
+
+fn random_choice<'a, R: RngExt>(rng: &mut R, items: &'a [&'a str]) -> &'a str {
+    items[rng.random_range(0..items.len())]
+}
+
+fn random_word<R: RngExt>(rng: &mut R) -> String {
+    random_choice(rng, LOREM_WORDS).to_string()
+}
+
+fn random_words<R: RngExt>(rng: &mut R, count: usize) -> String {
+    (0..count)
+        .map(|_| random_choice(rng, LOREM_WORDS))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn random_sentence<R: RngExt>(rng: &mut R) -> String {
+    let count = rng.random_range(5..12);
+    let sentence = random_words(rng, count);
+    capitalize_first_letter(sentence) + "."
+}
+
+fn random_lorem_paragraph<R: RngExt>(rng: &mut R) -> String {
+    let sentences = rng.random_range(2..5);
+    (0..sentences)
+        .map(|_| random_sentence(rng))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn random_email<R: RngExt>(rng: &mut R) -> String {
+    let first = random_first_name(rng).to_lowercase();
+    let last = random_last_name(rng).to_lowercase();
+    let domain = random_choice(rng, EMAIL_DOMAINS);
+    match rng.random_range(0..3) {
+        0 => format!("{}@{}", first, domain),
+        1 => format!("{}.{}@{}", first, last, domain),
+        _ => format!("{}{}@{}", first, rng.random_range(1..100), domain),
+    }
+}
+
+fn random_phone_number<R: RngExt>(rng: &mut R) -> String {
+    format!(
+        "({}) {}-{}",
+        rng.random_range(200..999),
+        rng.random_range(200..999),
+        rng.random_range(1000..10000)
+    )
+}
+
+fn random_company_name<R: RngExt>(rng: &mut R) -> String {
+    random_choice(rng, COMPANY_NAMES).to_string()
+}
+
+fn random_city<R: RngExt>(rng: &mut R) -> String {
+    random_choice(rng, CITY_NAMES).to_string()
+}
+
+fn random_country<R: RngExt>(rng: &mut R) -> String {
+    random_choice(rng, COUNTRY_NAMES).to_string()
+}
+
+fn random_street<R: RngExt>(rng: &mut R) -> String {
+    format!(
+        "{} {} {}",
+        rng.random_range(100..9999),
+        random_choice(rng, STREET_NAMES),
+        random_choice(rng, STREET_SUFFIXES)
+    )
+}
+
+fn random_postcode<R: RngExt>(rng: &mut R) -> String {
+    format!("{:05}", rng.random_range(10000..100000))
+}
+
+fn random_full_name<R: RngExt>(rng: &mut R) -> String {
+    format!("{} {}", random_first_name(rng), random_last_name(rng))
+}
+
+fn random_first_name<R: RngExt>(rng: &mut R) -> String {
+    random_choice(rng, FIRST_NAMES).to_string()
+}
+
+fn random_last_name<R: RngExt>(rng: &mut R) -> String {
+    random_choice(rng, LAST_NAMES).to_string()
+}
+
+fn random_color<R: RngExt>(rng: &mut R) -> String {
+    format!("{:06x}", rng.random::<u32>() & 0xFFFFFF)
+}
+
+fn random_date<R: RngExt>(rng: &mut R) -> String {
+    let start = chrono::NaiveDate::from_ymd_opt(1990, 1, 1).unwrap();
+    let end = chrono::NaiveDate::from_ymd_opt(2035, 12, 31).unwrap();
+    random_date_in_range(rng, start, end)
+}
+
+fn random_date_past<R: RngExt>(rng: &mut R) -> String {
+    let now = chrono::Utc::now().date_naive();
+    let start = now - chrono::Duration::days(3650);
+    random_date_in_range(rng, start, now)
+}
+
+fn random_date_future<R: RngExt>(rng: &mut R) -> String {
+    let now = chrono::Utc::now().date_naive();
+    let end = now + chrono::Duration::days(3650);
+    random_date_in_range(rng, now, end)
+}
+
+fn random_time<R: RngExt>(rng: &mut R) -> String {
+    format!(
+        "{:02}:{:02}:{:02}",
+        rng.random_range(0..24),
+        rng.random_range(0..60),
+        rng.random_range(0..60)
+    )
+}
+
+fn random_date_in_range<R: RngExt>(
+    rng: &mut R,
+    start: chrono::NaiveDate,
+    end: chrono::NaiveDate,
+) -> String {
+    let days = (end - start).num_days();
+    let offset = if days <= 0 {
+        0
+    } else {
+        rng.random_range(0..=days as u32) as i64
+    };
+    let date = start + chrono::Duration::days(offset);
+    date.format("%Y-%m-%d").to_string()
+}
+
+fn capitalize_first_letter(text: String) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        None => text,
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
 fn random_string(rng: &mut impl RngExt, length: usize, charset: &str) -> String {
     let chars: Vec<char> = charset.chars().collect();
-    (0..length).map(|_| chars[rng.random_range(0..chars.len())]).collect()
+    (0..length)
+        .map(|_| chars[rng.random_range(0..chars.len())])
+        .collect()
 }
 
 fn chrono_now_iso() -> String {
@@ -235,7 +646,9 @@ mod tests {
         let result = catalog.resolve("prefix-{{$guid}}-suffix");
         assert!(result.starts_with("prefix-"));
         assert!(result.ends_with("-suffix"));
-        let guid = result.trim_start_matches("prefix-").trim_end_matches("-suffix");
+        let guid = result
+            .trim_start_matches("prefix-")
+            .trim_end_matches("-suffix");
         assert_eq!(guid.len(), 36); // UUID v4 with hyphens
     }
 
@@ -275,7 +688,10 @@ mod tests {
         assert_eq!(parts[0].len(), 36);
         assert_eq!(parts[1].len(), 36);
         // They should be different UUIDs (extremely unlikely to collide)
-        assert_ne!(parts[0], parts[1], "{{$guid}}-{{$guid}} should produce two different values");
+        assert_ne!(
+            parts[0], parts[1],
+            "{{$guid}}-{{$guid}} should produce two different values"
+        );
     }
 
     #[test]
@@ -314,5 +730,48 @@ mod tests {
         let result = catalog.resolve("hex={{$randomHex:16}}");
         assert!(result.starts_with("hex="));
         assert_eq!(result.len(), "hex=".len() + 16);
+    }
+
+    #[test]
+    fn test_random_phone_number() {
+        let catalog = DynamicCatalog::new();
+        let result = catalog.resolve("tel={{$randomPhoneNumber}}");
+        assert!(!result.contains("{{$randomPhoneNumber}}"));
+        assert!(result.starts_with("tel=("));
+    }
+
+    #[test]
+    fn test_random_company_name() {
+        let catalog = DynamicCatalog::new();
+        let result = catalog.resolve("company={{$randomCompany}}");
+        assert!(!result.contains("{{$randomCompany}}"));
+        assert!(result.contains(' '));
+    }
+
+    #[test]
+    fn test_random_lorem_paragraph() {
+        let catalog = DynamicCatalog::new();
+        let result = catalog.resolve("text={{$randomLorem}}");
+        assert!(!result.contains("{{$randomLorem}}"));
+        assert!(result.ends_with('.'));
+        assert!(result.contains(' '));
+    }
+
+    #[test]
+    fn test_random_date_variants() {
+        let catalog = DynamicCatalog::new();
+        let past = catalog.resolve("past={{$randomDatePast}}");
+        let future = catalog.resolve("future={{$randomDateFuture}}");
+        let date = catalog.resolve("date={{$randomDate}}");
+        let time = catalog.resolve("time={{$randomTime}}");
+
+        assert!(!past.contains("{{$randomDatePast}}"));
+        assert!(!future.contains("{{$randomDateFuture}}"));
+        assert!(!date.contains("{{$randomDate}}"));
+        assert!(!time.contains("{{$randomTime}}"));
+        assert!(past.starts_with("past="));
+        assert!(future.starts_with("future="));
+        assert!(date.starts_with("date="));
+        assert!(time.starts_with("time="));
     }
 }

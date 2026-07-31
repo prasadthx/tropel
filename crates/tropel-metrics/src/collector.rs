@@ -157,8 +157,12 @@ impl MetricSet {
                 // Gauge: track min, max, last, count, sum (for avg)
                 self.count += 1.0;
                 self.sum += value;
-                if value < self.min { self.min = value; }
-                if value > self.max { self.max = value; }
+                if value < self.min {
+                    self.min = value;
+                }
+                if value > self.max {
+                    self.max = value;
+                }
                 self.last = value;
             }
             MetricType::Trend => {
@@ -323,7 +327,12 @@ impl MetricsCollector {
     /// Get aggregated results — sends a request and waits for the response.
     pub async fn results(&self) -> MetricsResult {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        if self.tx.send(MetricsEvent::GetResults(resp_tx)).await.is_err() {
+        if self
+            .tx
+            .send(MetricsEvent::GetResults(resp_tx))
+            .await
+            .is_err()
+        {
             return MetricsResult::default();
         }
         resp_rx.await.unwrap_or_default()
@@ -477,8 +486,16 @@ impl Aggregator {
                     count: set.count as u64,
                     sum: set.sum,
                     mean: set.mean(),
-                    min: if set.min == f64::MAX { 0 } else { set.min as u64 },
-                    max: if set.max == f64::MIN { 0 } else { set.max as u64 },
+                    min: if set.min == f64::MAX {
+                        0
+                    } else {
+                        set.min as u64
+                    },
+                    max: if set.max == f64::MIN {
+                        0
+                    } else {
+                        set.max as u64
+                    },
                     p50: 0,
                     p90: 0,
                     p95: 0,
@@ -634,8 +651,16 @@ impl Aggregator {
             data_received,
             data_sent,
             errors,
-            dropped_iterations: self.totals.get("dropped_iterations").copied().unwrap_or(0.0) as u64,
-            http_req_failed: if http_req_failed_total > 0.0 { http_req_failed_count / http_req_failed_total } else { 0.0 },
+            dropped_iterations: self
+                .totals
+                .get("dropped_iterations")
+                .copied()
+                .unwrap_or(0.0) as u64,
+            http_req_failed: if http_req_failed_total > 0.0 {
+                http_req_failed_count / http_req_failed_total
+            } else {
+                0.0
+            },
             iterations,
             vus_max,
         }
@@ -734,7 +759,10 @@ mod tests {
         let key1 = MetricKey::new("http_req_duration", &tags1);
         let key2 = MetricKey::new("http_req_duration", &tags2);
 
-        assert_eq!(key1, key2, "keys should be equal regardless of tag insertion order");
+        assert_eq!(
+            key1, key2,
+            "keys should be equal regardless of tag insertion order"
+        );
         assert_eq!(key1.to_key_string(), key2.to_key_string());
     }
 

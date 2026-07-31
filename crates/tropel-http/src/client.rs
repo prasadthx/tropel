@@ -33,7 +33,9 @@ impl HttpClient {
         }
 
         if config.max_redirects > 0 {
-            builder = builder.redirect(reqwest::redirect::Policy::limited(config.max_redirects as usize));
+            builder = builder.redirect(reqwest::redirect::Policy::limited(
+                config.max_redirects as usize,
+            ));
         } else {
             builder = builder.redirect(reqwest::redirect::Policy::none());
         }
@@ -75,7 +77,9 @@ impl HttpClient {
         let total_start = std::time::Instant::now();
 
         // Calculate request body size for data_sent tracking
-        let request_body_size: u64 = request.body.as_ref()
+        let request_body_size: u64 = request
+            .body
+            .as_ref()
             .map(|b| body_size(b) as u64)
             .unwrap_or(0);
 
@@ -161,7 +165,11 @@ impl HttpClient {
         let waiting_duration = waiting_start.elapsed();
 
         let status_code = response.status().as_u16();
-        let status_text = response.status().canonical_reason().unwrap_or("Unknown").to_string();
+        let status_text = response
+            .status()
+            .canonical_reason()
+            .unwrap_or("Unknown")
+            .to_string();
 
         // Collect response headers
         let headers: HashMap<String, String> = response
@@ -214,9 +222,7 @@ impl HttpClient {
             AuthConfig::Basic { username, password } => {
                 Some(Box::new(crate::auth::BasicAuth::new(username, password)))
             }
-            AuthConfig::Bearer { token } => {
-                Some(Box::new(crate::auth::BearerAuth::new(token)))
-            }
+            AuthConfig::Bearer { token } => Some(Box::new(crate::auth::BearerAuth::new(token))),
             _ => None, // Other auth types not yet fully implemented
         }
     }
@@ -286,11 +292,10 @@ pub fn body_size(body: &Body) -> usize {
                 .map(|(k, v)| k.len() + v.len() + 1) // key=value
                 .sum::<usize>()
         }
-        Body::UrlEncoded(map) => {
-            map.iter()
-                .map(|(k, v)| k.len() + v.len() + 1)
-                .sum::<usize>()
-        }
+        Body::UrlEncoded(map) => map
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + 1)
+            .sum::<usize>(),
         Body::Binary(data) => data.len(),
         Body::GraphQL { query, .. } => query.len() + 50, // approximate JSON wrapper
     }
@@ -315,7 +320,10 @@ fn body_to_reqwest(body: &Body) -> reqwest::Body {
             reqwest::Body::from(serde_urlencoded::to_string(params).unwrap_or_default())
         }
         Body::Binary(data) => data.clone().into(),
-        Body::GraphQL { query, variables: _ } => {
+        Body::GraphQL {
+            query,
+            variables: _,
+        } => {
             let body = serde_json::json!({ "query": query });
             serde_json::to_string(&body).unwrap_or_default().into()
         }
@@ -325,20 +333,30 @@ fn body_to_reqwest(body: &Body) -> reqwest::Body {
 fn parse_duration(s: &str) -> Result<Duration> {
     let s = s.trim();
     if let Some(num_str) = s.strip_suffix("ms") {
-        let ms: u64 = num_str.parse().map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
+        let ms: u64 = num_str
+            .parse()
+            .map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
         Ok(Duration::from_millis(ms))
     } else if let Some(num_str) = s.strip_suffix('s') {
-        let secs: f64 = num_str.parse().map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
+        let secs: f64 = num_str
+            .parse()
+            .map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
         Ok(Duration::from_secs_f64(secs))
     } else if let Some(num_str) = s.strip_suffix('m') {
-        let mins: f64 = num_str.parse().map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
+        let mins: f64 = num_str
+            .parse()
+            .map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
         Ok(Duration::from_secs_f64(mins * 60.0))
     } else if let Some(num_str) = s.strip_suffix('h') {
-        let hours: f64 = num_str.parse().map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
+        let hours: f64 = num_str
+            .parse()
+            .map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
         Ok(Duration::from_secs_f64(hours * 3600.0))
     } else {
         // Default to seconds
-        let secs: f64 = s.parse().map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
+        let secs: f64 = s
+            .parse()
+            .map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
         Ok(Duration::from_secs_f64(secs))
     }
 }
@@ -375,11 +393,23 @@ mod tests {
 
     #[test]
     fn test_parse_duration() {
-        assert_eq!(super::parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(
+            super::parse_duration("500ms").unwrap(),
+            Duration::from_millis(500)
+        );
         assert_eq!(super::parse_duration("5s").unwrap(), Duration::from_secs(5));
-        assert_eq!(super::parse_duration("1.5s").unwrap(), Duration::from_millis(1500));
-        assert_eq!(super::parse_duration("2m").unwrap(), Duration::from_secs(120));
-        assert_eq!(super::parse_duration("1h").unwrap(), Duration::from_secs(3600));
+        assert_eq!(
+            super::parse_duration("1.5s").unwrap(),
+            Duration::from_millis(1500)
+        );
+        assert_eq!(
+            super::parse_duration("2m").unwrap(),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            super::parse_duration("1h").unwrap(),
+            Duration::from_secs(3600)
+        );
     }
 
     #[test]
@@ -387,7 +417,8 @@ mod tests {
         let result = super::serde_urlencoded::to_string(vec![
             ("key".to_string(), "value".to_string()),
             ("name".to_string(), "hello world".to_string()),
-        ]).unwrap();
+        ])
+        .unwrap();
         assert_eq!(result, "key=value&name=hello+world");
     }
 }

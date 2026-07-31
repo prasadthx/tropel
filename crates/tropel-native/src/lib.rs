@@ -4,12 +4,12 @@
 //! context at bootstrap. These provide Rust execution for crypto, hashing,
 //! encoding, JSON, and assertions that scripts use.
 
-pub mod crypto;
-pub mod hash;
-pub mod encoding;
 pub mod assert;
-pub mod json;
+pub mod crypto;
+pub mod encoding;
 pub mod r#fn;
+pub mod hash;
+pub mod json;
 
 use tropel_core::Result;
 use tropel_js::JsContext;
@@ -54,7 +54,9 @@ mod tests {
     /// 2. A function was renamed — update this list to match
     #[tokio::test]
     async fn test_all_native_functions_are_registered() {
-        let ctx = tropel_js::JsContext::new(Some(1024 * 1024), Some(Duration::from_secs(5))).await.unwrap();
+        let ctx = tropel_js::JsContext::new(Some(1024 * 1024), Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
         install_all(&ctx).await.unwrap();
 
         // Every expected global. When adding a new native module or function,
@@ -109,15 +111,14 @@ mod tests {
         ];
 
         for &name in expected_globals {
-            let exists = ctx
-                .with_ctx(|rq_ctx| {
-                    let globals = rq_ctx.globals();
-                    // Check if the global exists and is a function
-                    match globals.get::<_, rquickjs::Value>(name) {
-                        Ok(val) => val.is_function(),
-                        Err(_) => false,
-                    }
-                });
+            let exists = ctx.with_ctx(|rq_ctx| {
+                let globals = rq_ctx.globals();
+                // Check if the global exists and is a function
+                match globals.get::<_, rquickjs::Value>(name) {
+                    Ok(val) => val.is_function(),
+                    Err(_) => false,
+                }
+            });
             assert!(
                 exists,
                 "Native function '{}' is NOT registered as a JS global. \

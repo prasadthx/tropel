@@ -178,8 +178,19 @@ pub async fn run_cli() -> Result<()> {
     match cli.command {
         Commands::Run { .. } => run_command(cli).await,
         Commands::Extensions { plugins_dir } => list_extensions(plugins_dir.as_deref()).await,
-        Commands::Build { ref with, ref output, debug } => {
-            build_custom(with, output.as_deref().unwrap_or(&PathBuf::from("./tropel-custom")), !debug).await
+        Commands::Build {
+            ref with,
+            ref output,
+            debug,
+        } => {
+            build_custom(
+                with,
+                output
+                    .as_deref()
+                    .unwrap_or(&PathBuf::from("./tropel-custom")),
+                !debug,
+            )
+            .await
         }
         Commands::Version => print_version(),
     }
@@ -187,10 +198,26 @@ pub async fn run_cli() -> Result<()> {
 
 async fn run_command(cli: Cli) -> Result<()> {
     let Commands::Run {
-        input, format, vus, duration, env, env_file, data_file,
-        reporter, output, threshold, insecure, verbose: _,
-        mode, stages, iterations, subprocess_adapter, plugins_dir, ..
-    } = &cli.command else {
+        input,
+        format,
+        vus,
+        duration,
+        env,
+        env_file,
+        data_file,
+        reporter,
+        output,
+        threshold,
+        insecure,
+        verbose: _,
+        mode,
+        stages,
+        iterations,
+        subprocess_adapter,
+        plugins_dir,
+        ..
+    } = &cli.command
+    else {
         return Err(TropelError::Other("Not a Run command".into()));
     };
 
@@ -231,13 +258,18 @@ async fn run_command(cli: Cli) -> Result<()> {
                                 entry.get("key").and_then(|k| k.as_str()),
                                 entry.get("value").and_then(|v| v.as_str()),
                             ) {
-                                let enabled = entry.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true);
+                                let enabled = entry
+                                    .get("enabled")
+                                    .and_then(|e| e.as_bool())
+                                    .unwrap_or(true);
                                 if enabled {
                                     env_map.insert(key.to_string(), value.to_string());
                                 }
                             }
                         }
-                    } else if let Ok(flat_env) = serde_json::from_value::<HashMap<String, String>>(postman_env.clone()) {
+                    } else if let Ok(flat_env) =
+                        serde_json::from_value::<HashMap<String, String>>(postman_env.clone())
+                    {
                         env_map.extend(flat_env);
                     } else {
                         tracing::warn!("Unrecognized env-file format in '{}': expected Postman env or flat JSON", env_path.display());
@@ -271,45 +303,42 @@ async fn run_command(cli: Cli) -> Result<()> {
                 think_time: ThinkTimeConfig::default(),
             }
         }
-        "shared-iterations" => {
-            ExecutionConfig::SharedIterations {
-                iterations: iterations.unwrap_or(100),
-                max_duration: duration.clone(),
-                vus: vus.unwrap_or(1),
-                graceful_stop: Some("30s".to_string()),
-                think_time: ThinkTimeConfig::default(),
-            }
-        }
-        "arrival-rate" | "constant-arrival-rate" => {
-            ExecutionConfig::ConstantArrivalRate {
-                rate: vus.unwrap_or(1) as f64,
-                time_unit: "1s".to_string(),
-                duration: duration.clone().unwrap_or_else(|| "30s".to_string()),
-                pre_alloc_vus: 1,
-                max_vus: vus.unwrap_or(10).max(10),
-                graceful_stop: Some("30s".to_string()),
-                think_time: ThinkTimeConfig::default(),
-            }
-        }
-        _ => {
-            ExecutionConfig::ConstantVus {
-                vus: vus.unwrap_or(1),
-                duration: duration.clone().unwrap_or_else(|| "30s".to_string()),
-                graceful_stop: Some("30s".to_string()),
-                think_time: ThinkTimeConfig::default(),
-            }
-        }
+        "shared-iterations" => ExecutionConfig::SharedIterations {
+            iterations: iterations.unwrap_or(100),
+            max_duration: duration.clone(),
+            vus: vus.unwrap_or(1),
+            graceful_stop: Some("30s".to_string()),
+            think_time: ThinkTimeConfig::default(),
+        },
+        "arrival-rate" | "constant-arrival-rate" => ExecutionConfig::ConstantArrivalRate {
+            rate: vus.unwrap_or(1) as f64,
+            time_unit: "1s".to_string(),
+            duration: duration.clone().unwrap_or_else(|| "30s".to_string()),
+            pre_alloc_vus: 1,
+            max_vus: vus.unwrap_or(10).max(10),
+            graceful_stop: Some("30s".to_string()),
+            think_time: ThinkTimeConfig::default(),
+        },
+        _ => ExecutionConfig::ConstantVus {
+            vus: vus.unwrap_or(1),
+            duration: duration.clone().unwrap_or_else(|| "30s".to_string()),
+            graceful_stop: Some("30s".to_string()),
+            think_time: ThinkTimeConfig::default(),
+        },
     };
 
     // Parse thresholds
     let mut threshold_map: HashMap<String, ThresholdConfig> = HashMap::new();
     for t in &thresholds {
         let name = format!("threshold_{}", threshold_map.len());
-        threshold_map.insert(name, ThresholdConfig {
-            expression: t.clone(),
-            abort_on_fail: false,
-            delay_abort_eval: None,
-        });
+        threshold_map.insert(
+            name,
+            ThresholdConfig {
+                expression: t.clone(),
+                abort_on_fail: false,
+                delay_abort_eval: None,
+            },
+        );
     }
 
     // Load data file if provided
@@ -345,7 +374,7 @@ async fn run_command(cli: Cli) -> Result<()> {
         ..Default::default()
     };
 
-    tracing::info!("Execution config: {:?}", config.execution);    // Create the engine with extension registry
+    tracing::info!("Execution config: {:?}", config.execution); // Create the engine with extension registry
     let mut registry = ExtensionRegistry::new();
 
     // Register any subprocess adapters specified via --subprocess-adapter
@@ -355,44 +384,65 @@ async fn run_command(cli: Cli) -> Result<()> {
         let cmd_clone = cmd.clone();
         registry.register_adapter_factory(
             &id,
-            Arc::new(move || {
-                Box::new(tropel_input_subprocess::SubprocessAdapter::new(&cmd_clone))
-            }),
+            Arc::new(move || Box::new(tropel_input_subprocess::SubprocessAdapter::new(&cmd_clone))),
         );
     }
 
     // Register WASM plugins from --plugins-dir (Tier 2 no-recompile adapters).
     if let Some(dir) = plugins_dir {
         let adapters = tropel_wasm::discover_plugins(dir);
-        tracing::info!("Loaded {} WASM plugin(s) from {}", adapters.len(), dir.display());
+        tracing::info!(
+            "Loaded {} WASM plugin(s) from {}",
+            adapters.len(),
+            dir.display()
+        );
         for adapter in adapters {
             let id = format!("wasm:{}", adapter.plugin_id());
             let adapter = adapter.clone();
-            registry.register_adapter_factory(
-                &id,
-                Arc::new(move || Box::new(adapter.clone())),
-            );
+            registry.register_adapter_factory(&id, Arc::new(move || Box::new(adapter.clone())));
         }
     }
 
     let engine = Engine::new(registry);
     let result = engine.run(&config).await?;
 
-    tracing::info!("Load test completed: {} total requests", result.metrics.http_reqs);
-    tracing::info!("Checks: {}/{} passed", result.metrics.checks_passed, result.metrics.checks_total);
+    tracing::info!(
+        "Load test completed: {} total requests",
+        result.metrics.http_reqs
+    );
+    tracing::info!(
+        "Checks: {}/{} passed",
+        result.metrics.checks_passed,
+        result.metrics.checks_total
+    );
 
     // Evaluate thresholds and drive exit code
     let threshold_results = evaluate_thresholds(&config.thresholds, &result.metrics);
     let mut any_failed = false;
     for tr in &threshold_results {
         if tr.passed {
-            tracing::info!("  ✓ Threshold '{}': {:.2} {} {:.2} (PASS)", tr.name, tr.actual, tr.expression.split_whitespace().nth(1).unwrap_or("<?>"), tr.threshold);
+            tracing::info!(
+                "  ✓ Threshold '{}': {:.2} {} {:.2} (PASS)",
+                tr.name,
+                tr.actual,
+                tr.expression.split_whitespace().nth(1).unwrap_or("<?>"),
+                tr.threshold
+            );
         } else {
-            tracing::error!("  ✗ Threshold '{}': {:.2} {} {:.2} (FAIL)", tr.name, tr.actual, tr.expression.split_whitespace().nth(1).unwrap_or("<?>"), tr.threshold);
+            tracing::error!(
+                "  ✗ Threshold '{}': {:.2} {} {:.2} (FAIL)",
+                tr.name,
+                tr.actual,
+                tr.expression.split_whitespace().nth(1).unwrap_or("<?>"),
+                tr.threshold
+            );
             any_failed = true;
             if tr.abort_on_fail {
                 tracing::error!("Aborting due to threshold '{}'", tr.name);
-                return Err(TropelError::Other(format!("Threshold '{}' failed (abort-on-fail)", tr.name)));
+                return Err(TropelError::Other(format!(
+                    "Threshold '{}' failed (abort-on-fail)",
+                    tr.name
+                )));
             }
         }
     }
@@ -410,14 +460,15 @@ async fn list_extensions(plugins_dir: Option<&std::path::Path>) -> Result<()> {
     // Include WASM plugins from --plugins-dir in the listing.
     if let Some(dir) = plugins_dir {
         let adapters = tropel_wasm::discover_plugins(dir);
-        tracing::info!("Loaded {} WASM plugin(s) from {}", adapters.len(), dir.display());
+        tracing::info!(
+            "Loaded {} WASM plugin(s) from {}",
+            adapters.len(),
+            dir.display()
+        );
         for adapter in adapters {
             let id = format!("wasm:{}", adapter.plugin_id());
             let adapter = adapter.clone();
-            registry.register_adapter_factory(
-                &id,
-                Arc::new(move || Box::new(adapter.clone())),
-            );
+            registry.register_adapter_factory(&id, Arc::new(move || Box::new(adapter.clone())));
         }
     }
 
@@ -432,7 +483,10 @@ async fn list_extensions(plugins_dir: Option<&std::path::Path>) -> Result<()> {
     } else {
         println!("  Input formats:");
         for fmt in &inputs {
-            println!("    - {}  (use: `tropel run input.{} --format {})", fmt, fmt, fmt);
+            println!(
+                "    - {}  (use: `tropel run input.{} --format {})",
+                fmt, fmt, fmt
+            );
         }
         println!();
         println!("  Use `tropel run <file> --format <name>` to select a specific format.");
@@ -489,8 +543,7 @@ fn print_version() -> Result<()> {
 
 /// Load iteration data from a CSV or JSON file.
 fn load_data_file(path: &PathBuf) -> Result<Vec<HashMap<String, serde_json::Value>>> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| TropelError::Io(e))?;
+    let content = std::fs::read_to_string(path).map_err(|e| TropelError::Io(e))?;
 
     let trimmed = content.trim();
 
@@ -506,7 +559,8 @@ fn load_data_file(path: &PathBuf) -> Result<Vec<HashMap<String, serde_json::Valu
             .flexible(true)
             .from_reader(content.as_bytes());
 
-        let headers: Vec<String> = reader.headers()
+        let headers: Vec<String> = reader
+            .headers()
             .map_err(|e| TropelError::Parse(format!("CSV header error: {}", e)))?
             .iter()
             .map(|h| h.to_string())
@@ -514,12 +568,15 @@ fn load_data_file(path: &PathBuf) -> Result<Vec<HashMap<String, serde_json::Valu
 
         let mut rows = Vec::new();
         for result in reader.records() {
-            let record = result
-                .map_err(|e| TropelError::Parse(format!("CSV record error: {}", e)))?;
+            let record =
+                result.map_err(|e| TropelError::Parse(format!("CSV record error: {}", e)))?;
             let mut map = HashMap::new();
             for (i, field) in record.iter().enumerate() {
                 if i < headers.len() {
-                    map.insert(headers[i].clone(), serde_json::Value::String(field.to_string()));
+                    map.insert(
+                        headers[i].clone(),
+                        serde_json::Value::String(field.to_string()),
+                    );
                 }
             }
             rows.push(map);

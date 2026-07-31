@@ -29,8 +29,16 @@ impl Reporter for CsvReporter {
         for metric in &result.metrics {
             csv_output.push_str(&format!(
                 "{},{},{},{:.2},{},{},{},{},{},{}\n",
-                metric.key, metric.count, metric.sum, metric.mean,
-                metric.min, metric.max, metric.p50, metric.p90, metric.p95, metric.p99
+                metric.key,
+                metric.count,
+                metric.sum,
+                metric.mean,
+                metric.min,
+                metric.max,
+                metric.p50,
+                metric.p90,
+                metric.p95,
+                metric.p99
             ));
         }
 

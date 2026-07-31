@@ -123,39 +123,41 @@ fn convert_enums(s: &str) -> String {
 
     // Find enum blocks: `enum Name { ... }`
     let enum_re = Regex::new(r"\benum\s+(\w+)\s*\{([^}]*)\}").unwrap();
-    result = enum_re.replace_all(&result, |caps: &regex::Captures| {
-        let name = &caps[1];
-        let body = &caps[2];
+    result = enum_re
+        .replace_all(&result, |caps: &regex::Captures| {
+            let name = &caps[1];
+            let body = &caps[2];
 
-        // Parse members with proper numeric assignments
-        let mut members = Vec::new();
-        let mut next_val: i64 = 0;
+            // Parse members with proper numeric assignments
+            let mut members = Vec::new();
+            let mut next_val: i64 = 0;
 
-        for member in body.split(',') {
-            let member = member.trim();
-            if member.is_empty() {
-                continue;
-            }
-            // Check for explicit initializer: `Name = value`
-            if let Some(eq_pos) = member.find('=') {
-                let mem_name = member[..eq_pos].trim();
-                let val_str = member[eq_pos + 1..].trim();
-                if let Ok(val) = val_str.parse::<i64>() {
-                    members.push(format!("{}: {}", mem_name, val));
-                    next_val = val + 1;
-                } else {
-                    // String or computed value — just reference the original
-                    members.push(format!("{}: {}", mem_name, val_str));
+            for member in body.split(',') {
+                let member = member.trim();
+                if member.is_empty() {
+                    continue;
                 }
-            } else {
-                // No initializer — use auto-increment
-                members.push(format!("{}: {}", member, next_val));
-                next_val += 1;
+                // Check for explicit initializer: `Name = value`
+                if let Some(eq_pos) = member.find('=') {
+                    let mem_name = member[..eq_pos].trim();
+                    let val_str = member[eq_pos + 1..].trim();
+                    if let Ok(val) = val_str.parse::<i64>() {
+                        members.push(format!("{}: {}", mem_name, val));
+                        next_val = val + 1;
+                    } else {
+                        // String or computed value — just reference the original
+                        members.push(format!("{}: {}", mem_name, val_str));
+                    }
+                } else {
+                    // No initializer — use auto-increment
+                    members.push(format!("{}: {}", member, next_val));
+                    next_val += 1;
+                }
             }
-        }
 
-        format!("const {} = {{ {} }}", name, members.join(", "))
-    }).to_string();
+            format!("const {} = {{ {} }}", name, members.join(", "))
+        })
+        .to_string();
 
     result
 }
@@ -173,17 +175,22 @@ fn remove_generics_from_calls(s: &str) -> String {
     let mut result = s.to_string();
     // Match: identifier or dotted path followed by <type, ...>( or <type>( etc.
     let re = Regex::new(r"([\w.]+)\s*<([^<>]+)>\s*\(").unwrap();
-    result = re.replace_all(&result, |caps: &regex::Captures| {
-        let name = &caps[1];
-        let inside = &caps[2];
-        // Heuristic: if the inside contains only identifiers, dots, and commas,
-        // it's likely a generic type argument, not a comparison
-        if inside.chars().all(|c| c.is_alphanumeric() || c == '.' || c == ',' || c == ' ' || c == '_') {
-            format!("{}(", name)
-        } else {
-            caps[0].to_string() // Keep as-is — probably a comparison
-        }
-    }).to_string();
+    result = re
+        .replace_all(&result, |caps: &regex::Captures| {
+            let name = &caps[1];
+            let inside = &caps[2];
+            // Heuristic: if the inside contains only identifiers, dots, and commas,
+            // it's likely a generic type argument, not a comparison
+            if inside
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '.' || c == ',' || c == ' ' || c == '_')
+            {
+                format!("{}(", name)
+            } else {
+                caps[0].to_string() // Keep as-is — probably a comparison
+            }
+        })
+        .to_string();
     result
 }
 
@@ -232,9 +239,11 @@ fn remove_variable_types(s: &str) -> String {
     let mut result = s.to_string();
     for _ in 0..3 {
         let before = result.clone();
-        result = re.replace_all(&result, |caps: &regex::Captures| {
-            format!("{} {} =", &caps[1], &caps[2])
-        }).to_string();
+        result = re
+            .replace_all(&result, |caps: &regex::Captures| {
+                format!("{} {} =", &caps[1], &caps[2])
+            })
+            .to_string();
         if result == before {
             break;
         }
@@ -255,15 +264,19 @@ fn remove_exports(s: &str) -> String {
 
     // `export default X` → `/* export default X */` (any other default)
     let re3 = Regex::new(r"\bexport\s+default\s+").unwrap();
-    result = re3.replace_all(&result, "/* export default */ ").to_string();
+    result = re3
+        .replace_all(&result, "/* export default */ ")
+        .to_string();
 
     // `export function Name(...` → `function Name(...`
     // Use a closure to avoid any $N expansion ambiguity in the replacement string.
     let re4 = Regex::new(r"\bexport\s+(async\s+)?function\b").unwrap();
-    result = re4.replace_all(&result, |caps: &regex::Captures| {
-        let async_prefix = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-        format!("{}function", async_prefix)
-    }).to_string();
+    result = re4
+        .replace_all(&result, |caps: &regex::Captures| {
+            let async_prefix = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            format!("{}function", async_prefix)
+        })
+        .to_string();
 
     // `export class Name` → `class Name`
     let re5 = Regex::new(r"\bexport\s+class\b").unwrap();
@@ -275,10 +288,13 @@ fn remove_exports(s: &str) -> String {
 
     // `export { ... }` — named export block, comment it out
     let re7 = Regex::new(r"\bexport\s*\{[^}]*\}\s*;").unwrap();
-    result = re7.replace_all(&result, "/* named exports stripped */").to_string();
+    result = re7
+        .replace_all(&result, "/* named exports stripped */")
+        .to_string();
 
     // `export * from '...'` / `export { x } from '...'` — re-exports
-    result = result.lines()
+    result = result
+        .lines()
         .map(|line| {
             let trimmed = line.trim();
             if trimmed.starts_with("export ")
@@ -334,7 +350,6 @@ fn remove_as_casts(s: &str) -> String {
 
     result
 }
-
 
 fn remove_empty_lines(s: &str) -> String {
     // Remove lines that are empty or only contain whitespace
@@ -457,7 +472,11 @@ mod tests {
             }
         "#;
         let js = strip_types(ts);
-        assert!(js.contains("function add(a, b) {"), "Expected 'function add(a, b) {{' in output, got: {}", js);
+        assert!(
+            js.contains("function add(a, b) {"),
+            "Expected 'function add(a, b) {{' in output, got: {}",
+            js
+        );
         assert!(js.contains("return a + b"));
     }
 

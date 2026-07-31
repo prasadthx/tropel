@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time;
@@ -103,9 +103,10 @@ impl VUScheduler {
     pub fn try_acquire_arrival_token(&self) -> bool {
         let current = self.arrival_tokens.load(Ordering::Relaxed);
         current > 0
-            && self.arrival_tokens.compare_exchange(
-                current, current - 1, Ordering::Relaxed, Ordering::Relaxed,
-            ).is_ok()
+            && self
+                .arrival_tokens
+                .compare_exchange(current, current - 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
     }
 
     /// Get the Notify for waking VUs when tokens are added.
@@ -174,48 +175,98 @@ impl VUScheduler {
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
         match &self.config {
-            ExecutionConfig::ConstantVus { vus, duration, graceful_stop, .. } => {
+            ExecutionConfig::ConstantVus {
+                vus,
+                duration,
+                graceful_stop,
+                ..
+            } => {
                 let duration = parse_duration(duration)?;
                 let grace = graceful_stop_duration(graceful_stop);
                 self.run_constant(*vus, duration, grace, &run_vu).await;
                 Ok(())
             }
-            ExecutionConfig::RampingVus { stages, start_vus, graceful_ramp_down, graceful_stop, .. } => {
+            ExecutionConfig::RampingVus {
+                stages,
+                start_vus,
+                graceful_ramp_down,
+                graceful_stop,
+                ..
+            } => {
                 let grace_rd = graceful_stop_duration(graceful_ramp_down);
                 let grace = graceful_stop_duration(graceful_stop);
-                self.run_ramping(*start_vus, stages, grace_rd, grace, &run_vu).await;
+                self.run_ramping(*start_vus, stages, grace_rd, grace, &run_vu)
+                    .await;
                 Ok(())
             }
-            ExecutionConfig::SharedIterations { iterations, max_duration, graceful_stop, .. } => {
+            ExecutionConfig::SharedIterations {
+                iterations,
+                max_duration,
+                graceful_stop,
+                ..
+            } => {
                 // Default maxDuration to 10 minutes (matching k6 behavior)
-                let max_dur = max_duration.as_ref()
+                let max_dur = max_duration
+                    .as_ref()
                     .and_then(|d| parse_duration(d).ok())
                     .or(Some(Duration::from_secs(600)));
                 let grace = graceful_stop_duration(graceful_stop);
                 // Duration::ZERO here — think_time/pacing is handled in the VU loop in engine.rs
-                self.run_shared_iterations(*iterations, max_dur, grace, &run_vu).await;
+                self.run_shared_iterations(*iterations, max_dur, grace, &run_vu)
+                    .await;
                 Ok(())
             }
-            ExecutionConfig::ConstantArrivalRate { rate, duration, pre_alloc_vus, max_vus, graceful_stop, .. } => {
+            ExecutionConfig::ConstantArrivalRate {
+                rate,
+                duration,
+                pre_alloc_vus,
+                max_vus,
+                graceful_stop,
+                ..
+            } => {
                 let duration = parse_duration(duration)?;
                 let grace = graceful_stop_duration(graceful_stop);
                 // Duration::ZERO here — think_time/pacing is handled in the VU loop in engine.rs
-                self.run_arrival_rate(*rate, *pre_alloc_vus, *max_vus, duration, grace, &run_vu).await;
+                self.run_arrival_rate(*rate, *pre_alloc_vus, *max_vus, duration, grace, &run_vu)
+                    .await;
                 Ok(())
             }
-            ExecutionConfig::PerVUIterations { vus, iterations, max_duration, graceful_stop, .. } => {
+            ExecutionConfig::PerVUIterations {
+                vus,
+                iterations,
+                max_duration,
+                graceful_stop,
+                ..
+            } => {
                 // Default maxDuration to 10 minutes (matching k6 behavior)
-                let max_dur = max_duration.as_ref()
+                let max_dur = max_duration
+                    .as_ref()
                     .and_then(|d| parse_duration(d).ok())
                     .or(Some(Duration::from_secs(600)));
                 let grace = graceful_stop_duration(graceful_stop);
                 // Duration::ZERO here — think_time/pacing is handled in the VU loop in engine.rs
-                self.run_per_vu_iterations(*vus, *iterations, max_dur, grace, &run_vu).await;
+                self.run_per_vu_iterations(*vus, *iterations, max_dur, grace, &run_vu)
+                    .await;
                 Ok(())
             }
-            ExecutionConfig::RampingArrivalRate { start_rate, stages, pre_alloc_vus, max_vus, graceful_stop, .. } => {
+            ExecutionConfig::RampingArrivalRate {
+                start_rate,
+                stages,
+                pre_alloc_vus,
+                max_vus,
+                graceful_stop,
+                ..
+            } => {
                 let grace = graceful_stop_duration(graceful_stop);
-                self.run_ramping_arrival_rate(*start_rate, stages, *pre_alloc_vus, *max_vus, grace, &run_vu).await;
+                self.run_ramping_arrival_rate(
+                    *start_rate,
+                    stages,
+                    *pre_alloc_vus,
+                    *max_vus,
+                    grace,
+                    &run_vu,
+                )
+                .await;
                 Ok(())
             }
         }
@@ -226,7 +277,12 @@ impl VUScheduler {
     where
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
-        tracing::info!("Starting constant VUs: {} for {:?} (graceful_stop: {:?})", vus, duration, grace);
+        tracing::info!(
+            "Starting constant VUs: {} for {:?} (graceful_stop: {:?})",
+            vus,
+            duration,
+            grace
+        );
 
         // Spawn VUs (active count incremented by each VU task itself)
         let mut handles = Vec::new();
@@ -253,9 +309,14 @@ impl VUScheduler {
     }
 
     /// Run with ramping VUs.
-    async fn run_ramping<F>(&self, start_vus: u32, stages: &[tropel_core::config::Stage],
-                            grace_rd: Duration, grace: Duration, run_vu: &F)
-    where
+    async fn run_ramping<F>(
+        &self,
+        start_vus: u32,
+        stages: &[tropel_core::config::Stage],
+        grace_rd: Duration,
+        grace: Duration,
+        run_vu: &F,
+    ) where
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
         tracing::info!("Starting ramping VUs: start={}", start_vus);
@@ -274,7 +335,12 @@ impl VUScheduler {
             let stage_duration = parse_duration(&stage.duration).unwrap_or(Duration::from_secs(10));
             let target = stage.target;
 
-            tracing::info!("Ramping stage: {} -> {} over {:?}", current_vus, target, stage_duration);
+            tracing::info!(
+                "Ramping stage: {} -> {} over {:?}",
+                current_vus,
+                target,
+                stage_duration
+            );
             let steps = 10.max((target as i64 - current_vus as i64).unsigned_abs());
             let step_delay = stage_duration / steps as u32;
 
@@ -298,12 +364,15 @@ impl VUScheduler {
                 // Wait for the surplus VUs to drain within the graceful_ramp_down window
                 tracing::debug!(
                     "Ramp-down: waiting for {} VUs to exit (grace: {:?}, target: {})",
-                    to_stop, grace_rd, target
+                    to_stop,
+                    grace_rd,
+                    target
                 );
                 self.wait_for_drain_while(grace_rd, || async {
                     let active = *self.active_vus.lock().await;
                     active <= target
-                }).await;
+                })
+                .await;
 
                 current_vus = target;
             }
@@ -329,9 +398,13 @@ impl VUScheduler {
     /// to finish their iterations, but can complete earlier. The method uses
     /// `select!` between VUs draining naturally and the max_duration timeout
     /// so a 10-iteration run doesn't block for the full 10-minute default cap.
-    async fn run_shared_iterations<F>(&self, total_iterations: u64,
-                                      max_duration: Option<Duration>, grace: Duration, run_vu: &F)
-    where
+    async fn run_shared_iterations<F>(
+        &self,
+        total_iterations: u64,
+        max_duration: Option<Duration>,
+        grace: Duration,
+        run_vu: &F,
+    ) where
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
         // For simplicity, use a fixed set of VUs and shared iteration counter
@@ -342,7 +415,10 @@ impl VUScheduler {
 
         tracing::info!(
             "Starting shared iterations: {} across {} VUs (max_duration: {:?}, grace: {:?})",
-            total_iterations, vus, max_duration, grace
+            total_iterations,
+            vus,
+            max_duration,
+            grace
         );
 
         let mut handles = Vec::new();
@@ -394,14 +470,24 @@ impl VUScheduler {
     /// Uses a time-based token bucket (no 1ms timer floor — resilient at high rates)
     /// and a dynamically growing VU pool (`pre_alloc_vus → max_vus`). VUs are
     /// spawned on demand when the current pool is saturated.
-    async fn run_arrival_rate<F>(&self, rate: f64, pre_alloc: u32, max_vus: u32,
-                                 duration: Duration, grace: Duration, run_vu: &F)
-    where
+    async fn run_arrival_rate<F>(
+        &self,
+        rate: f64,
+        pre_alloc: u32,
+        max_vus: u32,
+        duration: Duration,
+        grace: Duration,
+        run_vu: &F,
+    ) where
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
         tracing::info!(
             "Starting constant arrival rate: {}/s for {:?} (pre_alloc={}, max_vus={}, grace: {:?})",
-            rate, duration, pre_alloc, max_vus, grace
+            rate,
+            duration,
+            pre_alloc,
+            max_vus,
+            grace
         );
 
         // Pre-spawn initial VU pool
@@ -448,7 +534,9 @@ impl VUScheduler {
                             }
                             tracing::debug!(
                                 "Arrival-rate: VU pool {} → {} (rate={}/s)",
-                                current_vus, current_vus + grow_by, rate
+                                current_vus,
+                                current_vus + grow_by,
+                                rate
                             );
                             current_vus += grow_by;
                         }
@@ -484,7 +572,10 @@ impl VUScheduler {
         }
 
         let dropped_total = self.arrival_dropped.load(Ordering::Relaxed);
-        tracing::info!("Constant arrival rate finished (dropped: {})", dropped_total);
+        tracing::info!(
+            "Constant arrival rate finished (dropped: {})",
+            dropped_total
+        );
     }
 
     /// Run with ramping arrival rate — stages of target rate (iterations/sec).
@@ -493,9 +584,15 @@ impl VUScheduler {
     /// Uses a time-based token bucket (same as `run_arrival_rate`) but the rate
     /// linearly interpolates across stages over the total stage duration.
     /// VUs are spawned on demand when the current pool is saturated, up to max_vus.
-    async fn run_ramping_arrival_rate<F>(&self, start_rate: f64, stages: &[tropel_core::config::ArrivalRateStage],
-                                         pre_alloc: u32, max_vus: u32, grace: Duration, run_vu: &F)
-    where
+    async fn run_ramping_arrival_rate<F>(
+        &self,
+        start_rate: f64,
+        stages: &[tropel_core::config::ArrivalRateStage],
+        pre_alloc: u32,
+        max_vus: u32,
+        grace: Duration,
+        run_vu: &F,
+    ) where
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
         // Compute total duration from all stages
@@ -606,7 +703,9 @@ impl VUScheduler {
                             }
                             tracing::debug!(
                                 "Ramping arrival-rate: VU pool {} → {} at t={:.1}s",
-                                current_vus, current_vus + grow_by, elapsed_secs
+                                current_vus,
+                                current_vus + grow_by,
+                                elapsed_secs
                             );
                             current_vus += grow_by;
                         }
@@ -641,9 +740,14 @@ impl VUScheduler {
     /// `max_duration` is treated as a **cap**: VUs get at most this much time
     /// to finish their iterations, but can complete earlier. Uses `select!`
     /// between VU drain and the timeout so a fast run doesn't block.
-    async fn run_per_vu_iterations<F>(&self, vus: u32, per_vu_iters: u64,
-                                      max_duration: Option<Duration>, grace: Duration, run_vu: &F)
-    where
+    async fn run_per_vu_iterations<F>(
+        &self,
+        vus: u32,
+        per_vu_iters: u64,
+        max_duration: Option<Duration>,
+        grace: Duration,
+        run_vu: &F,
+    ) where
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
         tracing::info!(
@@ -727,7 +831,8 @@ impl VUScheduler {
             if time::Instant::now() >= deadline {
                 tracing::warn!(
                     "Grace period ({:?}) expired with {} active VUs — force stopping",
-                    grace, active
+                    grace,
+                    active
                 );
                 self.request_force_stop();
                 return;
@@ -763,7 +868,6 @@ impl VUScheduler {
             time::sleep(Duration::from_millis(10)).await;
         }
     }
-
 }
 
 /// Parse an optional graceful_stop/graceful_ramp_down string into a Duration.
@@ -780,19 +884,29 @@ fn graceful_stop_duration(s: &Option<String>) -> Duration {
 fn parse_duration(s: &str) -> Result<Duration> {
     let s = s.trim();
     if let Some(num) = s.strip_suffix("ms") {
-        let v: u64 = num.parse().map_err(|_| tropel_core::TropelError::Config(format!("Invalid duration: {}", s)))?;
+        let v: u64 = num
+            .parse()
+            .map_err(|_| tropel_core::TropelError::Config(format!("Invalid duration: {}", s)))?;
         Ok(Duration::from_millis(v))
     } else if let Some(num) = s.strip_suffix('s') {
-        let v: f64 = num.parse().map_err(|_| tropel_core::TropelError::Config(format!("Invalid duration: {}", s)))?;
+        let v: f64 = num
+            .parse()
+            .map_err(|_| tropel_core::TropelError::Config(format!("Invalid duration: {}", s)))?;
         Ok(Duration::from_secs_f64(v))
     } else if let Some(num) = s.strip_suffix('m') {
-        let v: f64 = num.parse().map_err(|_| tropel_core::TropelError::Config(format!("Invalid duration: {}", s)))?;
+        let v: f64 = num
+            .parse()
+            .map_err(|_| tropel_core::TropelError::Config(format!("Invalid duration: {}", s)))?;
         Ok(Duration::from_secs_f64(v * 60.0))
     } else if let Some(num) = s.strip_suffix('h') {
-        let v: f64 = num.parse().map_err(|_| tropel_core::TropelError::Config(format!("Invalid duration: {}", s)))?;
+        let v: f64 = num
+            .parse()
+            .map_err(|_| tropel_core::TropelError::Config(format!("Invalid duration: {}", s)))?;
         Ok(Duration::from_secs_f64(v * 3600.0))
     } else {
-        let v: f64 = s.parse().map_err(|_| tropel_core::TropelError::Config(format!("Invalid duration: {}", s)))?;
+        let v: f64 = s
+            .parse()
+            .map_err(|_| tropel_core::TropelError::Config(format!("Invalid duration: {}", s)))?;
         Ok(Duration::from_secs_f64(v))
     }
 }

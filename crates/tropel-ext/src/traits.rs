@@ -47,7 +47,11 @@ pub trait InputAdapter: Send + Sync {
     /// The default implementation ignores the path and calls `parse()`.
     /// Adapters that need file-system context (e.g. k6 for module
     /// resolution) can override this to use the path.
-    fn parse_with_path(&self, bytes: &[u8], _source_path: Option<&std::path::Path>) -> Result<Scenario> {
+    fn parse_with_path(
+        &self,
+        bytes: &[u8],
+        _source_path: Option<&std::path::Path>,
+    ) -> Result<Scenario> {
         self.parse(bytes)
     }
 }
@@ -145,7 +149,11 @@ pub trait Driver: Send + Sync {
     /// Initialize the driver from raw input bytes.
     /// This is called once at setup time, not per-iteration.
     /// Returns a boxed DriverInstance that is then called per-iteration.
-    async fn init(&self, bytes: &[u8], source_path: Option<&std::path::Path>) -> Result<Box<dyn DriverInstance>>;
+    async fn init(
+        &self,
+        bytes: &[u8],
+        source_path: Option<&std::path::Path>,
+    ) -> Result<Box<dyn DriverInstance>>;
 }
 
 /// A driver instance ready to run iterations.
@@ -167,7 +175,9 @@ pub struct ProtocolRegistration {
 
 impl ProtocolRegistration {
     pub fn new(factory: impl Fn() -> Box<dyn Protocol> + Send + Sync + 'static) -> Self {
-        Self { factory: Arc::new(factory) }
+        Self {
+            factory: Arc::new(factory),
+        }
     }
 }
 
@@ -178,7 +188,9 @@ pub struct OutputRegistration {
 
 impl OutputRegistration {
     pub fn new(factory: impl Fn() -> Box<dyn Output> + Send + Sync + 'static) -> Self {
-        Self { factory: Arc::new(factory) }
+        Self {
+            factory: Arc::new(factory),
+        }
     }
 }
 
@@ -189,7 +201,9 @@ pub struct JsModuleRegistration {
 
 impl JsModuleRegistration {
     pub fn new(factory: impl Fn() -> Box<dyn JsModule> + Send + Sync + 'static) -> Self {
-        Self { factory: Arc::new(factory) }
+        Self {
+            factory: Arc::new(factory),
+        }
     }
 }
 
@@ -200,7 +214,9 @@ pub struct AuthSignerRegistration {
 
 impl AuthSignerRegistration {
     pub fn new(factory: impl Fn() -> Box<dyn AuthSigner> + Send + Sync + 'static) -> Self {
-        Self { factory: Arc::new(factory) }
+        Self {
+            factory: Arc::new(factory),
+        }
     }
 }
 
@@ -246,4 +262,3 @@ impl DriverRegistration {
 // This must be in the crate that defines the type (`tropel-ext`).
 inventory::collect!(InputAdapterRegistration);
 inventory::collect!(DriverRegistration);
-

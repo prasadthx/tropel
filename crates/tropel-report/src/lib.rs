@@ -3,15 +3,15 @@
 //! Reporters consuming aggregated metrics: stdout summary, JSON, CSV.
 //! Streaming outputs consuming individual samples during the run.
 
-pub mod stdout;
-pub mod json_reporter;
 pub mod csv_reporter;
+pub mod json_reporter;
 pub mod output;
+pub mod stdout;
 
-pub use stdout::*;
-pub use json_reporter::*;
 pub use csv_reporter::*;
+pub use json_reporter::*;
 pub use output::*;
+pub use stdout::*;
 
 use async_trait::async_trait;
 use tropel_core::Result;

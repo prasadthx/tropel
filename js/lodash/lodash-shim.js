@@ -345,13 +345,31 @@ var _ = _ || {};
         };
     };
 
+    function scheduleTimeout(fn, delay) {
+        if (typeof setTimeout === 'function') {
+            return setTimeout(fn, delay);
+        }
+        if (typeof Promise === 'function' && typeof Promise.resolve === 'function') {
+            Promise.resolve().then(fn);
+            return null;
+        }
+        fn();
+        return null;
+    }
+
+    function cancelTimeout(handle) {
+        if (typeof clearTimeout === 'function') {
+            clearTimeout(handle);
+        }
+    }
+
     _.debounce = function (func, wait) {
         var timeout;
         return function () {
             var context = this;
             var args = arguments;
-            clearTimeout(timeout);
-            timeout = setTimeout(function () {
+            cancelTimeout(timeout);
+            timeout = scheduleTimeout(function () {
                 func.apply(context, args);
             }, wait);
         };

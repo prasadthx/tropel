@@ -97,7 +97,10 @@ fn resolve_import_path(spec: &str, base_dir: &Path) -> std::result::Result<PathB
                 return Ok(shim_path);
             }
         }
-        Err(format!("Vendored shim '{}' not found at expected path", spec))
+        Err(format!(
+            "Vendored shim '{}' not found at expected path",
+            spec
+        ))
     } else {
         // NPM-style imports that aren't vendored — return the spec as-is
         Err(format!("Import '{}' has no local path", spec))
@@ -106,7 +109,10 @@ fn resolve_import_path(spec: &str, base_dir: &Path) -> std::result::Result<PathB
 
 /// Check if an import specifier is a known vendored shim name.
 fn is_vendored_shim(spec: &str) -> bool {
-    matches!(spec, "lodash" | "crypto-js" | "cryptojs" | "chai" | "pm-api" | "pm")
+    matches!(
+        spec,
+        "lodash" | "crypto-js" | "cryptojs" | "chai" | "pm-api" | "pm"
+    )
 }
 
 /// Map a vendored shim name to its relative path within the project.
@@ -180,28 +186,33 @@ fn resolve_import(spec: &str, base_dir: &Path) -> Result<(PathBuf, String)> {
                     .map_err(|e| tropel_core::TropelError::Io(e))?;
 
                 // Transpile if it's TypeScript
-                let js_source = if crate::transpiler::is_typescript_file(&candidate.to_string_lossy()) {
-                    crate::transpiler::typescript_to_javascript(&source, &candidate.to_string_lossy())
-                        .map_err(|e| tropel_core::TropelError::Parse(format!("TS transpile error: {}", e)))?
-                } else {
-                    source
-                };
+                let js_source =
+                    if crate::transpiler::is_typescript_file(&candidate.to_string_lossy()) {
+                        crate::transpiler::typescript_to_javascript(
+                            &source,
+                            &candidate.to_string_lossy(),
+                        )
+                        .map_err(|e| {
+                            tropel_core::TropelError::Parse(format!("TS transpile error: {}", e))
+                        })?
+                    } else {
+                        source
+                    };
 
                 return Ok((candidate, js_source));
             }
         }
-        return Err(tropel_core::TropelError::Parse(
-            format!("Module '{}' not found (tried extensions: .ts, .mts, .js, .mjs, /index.ts, /index.js)", spec)
-        ));
+        return Err(tropel_core::TropelError::Parse(format!(
+            "Module '{}' not found (tried extensions: .ts, .mts, .js, .mjs, /index.ts, /index.js)",
+            spec
+        )));
     }
 
     // NPM-style bare import (e.g., "lodash", "crypto-js")
     // For load-test scripts, we look in vendored JS shims first, then
     // try node_modules relative to the project root, then fall back
     // to a bundled shim directory.
-    let vendored_shims = [
-        "lodash", "crypto-js", "chai", "pm-api",
-    ];
+    let vendored_shims = ["lodash", "crypto-js", "chai", "pm-api"];
 
     if vendored_shims.contains(&spec) {
         // Map npm names to our vendored shim paths
@@ -210,9 +221,12 @@ fn resolve_import(spec: &str, base_dir: &Path) -> Result<(PathBuf, String)> {
             "crypto-js" | "cryptojs" => "js/cryptojs-shim/cryptojs.js",
             "chai" => "js/chai/chai-shim.js",
             "pm-api" | "pm" => "js/pm-api/pm.js",
-            _ => return Err(tropel_core::TropelError::Parse(
-                format!("Unknown vendored shim: {}", spec)
-            )),
+            _ => {
+                return Err(tropel_core::TropelError::Parse(format!(
+                    "Unknown vendored shim: {}",
+                    spec
+                )))
+            }
         };
 
         // Try to locate the shim relative to the project root
@@ -222,8 +236,8 @@ fn resolve_import(spec: &str, base_dir: &Path) -> Result<(PathBuf, String)> {
 
         let shim_path = project_root.join(shim_path);
         if shim_path.exists() {
-            let source = std::fs::read_to_string(&shim_path)
-                .map_err(|e| tropel_core::TropelError::Io(e))?;
+            let source =
+                std::fs::read_to_string(&shim_path).map_err(|e| tropel_core::TropelError::Io(e))?;
             return Ok((shim_path, source));
         }
     }
@@ -238,9 +252,10 @@ fn resolve_import(spec: &str, base_dir: &Path) -> Result<(PathBuf, String)> {
         return Ok((index_candidate, source));
     }
 
-    Err(tropel_core::TropelError::Parse(
-        format!("Module '{}' not found", spec)
-    ))
+    Err(tropel_core::TropelError::Parse(format!(
+        "Module '{}' not found",
+        spec
+    )))
 }
 
 /// Extract a string literal (the content between quotes) from a JS snippet.
@@ -328,7 +343,10 @@ mod tests {
 
     #[test]
     fn test_sanitize_module_name() {
-        assert_eq!(sanitize_module_name(Path::new("utils/helpers.ts")), "helpers");
+        assert_eq!(
+            sanitize_module_name(Path::new("utils/helpers.ts")),
+            "helpers"
+        );
         assert_eq!(sanitize_module_name(Path::new("my-module.js")), "my_module");
     }
 

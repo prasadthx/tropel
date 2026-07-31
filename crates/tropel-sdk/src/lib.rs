@@ -75,8 +75,8 @@
 
 pub use tropel_core::scenario::{Scenario, ScenarioInfo, ScenarioItem};
 pub use tropel_core::types::{
-    ApiKeyLocation, AuthConfig, Body, CertificateConfig, Cookie, Method, Request, Response,
-    Sample, SampleType, Timings,
+    ApiKeyLocation, AuthConfig, Body, CertificateConfig, Cookie, Method, Request, Response, Sample,
+    SampleType, Timings,
 };
 
 // ═══════════════════════════════════════════════════════════════════
@@ -87,7 +87,9 @@ pub use tropel_core::types::{
 pub use tropel_ext::traits::{InputAdapter, InputAdapterRegistration};
 
 // Driver/DriverInstance + VuContext are stable — the imperative input contract.
-pub use tropel_ext::traits::{Driver, DriverInstance, DriverRegistration, VuContext, DriverHttpClient};
+pub use tropel_ext::traits::{
+    Driver, DriverHttpClient, DriverInstance, DriverRegistration, VuContext,
+};
 
 // Protocol, Output, and AuthSigner traits are gated behind feature flags.
 // They exist in the backing crate but aren't yet wired into engine dispatch.
@@ -197,8 +199,12 @@ mod tests {
 
     struct DummyAdapter;
     impl InputAdapter for DummyAdapter {
-        fn id(&self) -> &str { "test-adapter" }
-        fn detect(&self, _bytes: &[u8]) -> bool { false }
+        fn id(&self) -> &str {
+            "test-adapter"
+        }
+        fn detect(&self, _bytes: &[u8]) -> bool {
+            false
+        }
         fn parse(&self, _bytes: &[u8]) -> std::result::Result<Scenario, TropelError> {
             Err(TropelError::Parse("not implemented".into()))
         }
@@ -248,9 +254,7 @@ mod tests {
             .exports
             .values()
             .find_map(|item| match item {
-                wit_parser::WorldItem::Interface { id, .. } => {
-                    resolve.interfaces.get(*id)
-                }
+                wit_parser::WorldItem::Interface { id, .. } => resolve.interfaces.get(*id),
                 _ => None,
             })
             .expect("world must export an interface (tropel-adapter)");

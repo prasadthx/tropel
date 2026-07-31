@@ -1,8 +1,8 @@
 use crate::error::*;
 use crate::model::*;
+use std::collections::HashMap;
 use tropel_core::scenario::{Scenario, ScenarioInfo, ScenarioItem};
 use tropel_core::types::*;
-use std::collections::HashMap;
 
 /// Parse a Postman Collection from JSON bytes.
 pub fn parse_collection(bytes: &[u8]) -> Result<Collection> {
@@ -36,7 +36,10 @@ fn validate_collection(collection: &Collection) -> Result<()> {
 }
 
 /// Convert a Collection into a protocol-agnostic Scenario.
-pub fn collection_to_scenario(collection: Collection, _env_vars: HashMap<String, String>) -> Scenario {
+pub fn collection_to_scenario(
+    collection: Collection,
+    _env_vars: HashMap<String, String>,
+) -> Scenario {
     let mut scenario = Scenario {
         info: ScenarioInfo {
             name: collection.info.name.clone(),
@@ -91,11 +94,7 @@ fn convert_items(items: &[CollectionItem], parent_events: &[Event]) -> Vec<Scena
     result
 }
 
-fn convert_request_item(
-    req: &RequestItem,
-    parent_events: &[Event],
-    index: usize,
-) -> ScenarioItem {
+fn convert_request_item(req: &RequestItem, parent_events: &[Event], index: usize) -> ScenarioItem {
     let request = convert_request(&req.request, &req.auth);
     let events = if req.event.is_empty() {
         parent_events
@@ -202,17 +201,19 @@ fn convert_body(body: Option<&RequestBody>) -> Option<Body> {
                 )
             }),
             "graphql" => b.graphql.as_ref().map(|gql| {
-                let variables = gql.variables.as_ref().and_then(|v| {
-                    serde_json::from_str(v).ok()
-                });
+                let variables = gql
+                    .variables
+                    .as_ref()
+                    .and_then(|v| serde_json::from_str(v).ok());
                 Body::GraphQL {
                     query: gql.query.clone().unwrap_or_default(),
                     variables,
                 }
             }),
-            "file" => b.file.as_ref().and_then(|f| {
-                f.content.clone().map(Body::Raw)
-            }),
+            "file" => b
+                .file
+                .as_ref()
+                .and_then(|f| f.content.clone().map(Body::Raw)),
             _ => b.raw.clone().map(Body::Raw),
         },
         None => None,
@@ -242,7 +243,11 @@ fn convert_auth(auth: Option<&CollectionAuth>) -> Option<AuthConfig> {
             } else {
                 ApiKeyLocation::Header
             };
-            Some(AuthConfig::ApiKey { key, value, location })
+            Some(AuthConfig::ApiKey {
+                key,
+                value,
+                location,
+            })
         }
         "digest" => {
             let username = get_auth_attr(&auth.digest, "username").unwrap_or_default();
@@ -411,7 +416,10 @@ mod tests {
         let scenario = collection_to_scenario(collection, HashMap::new());
 
         assert_eq!(scenario.info.name, "Test");
-        assert_eq!(scenario.variables.get("base_url").unwrap(), "https://api.example.com");
+        assert_eq!(
+            scenario.variables.get("base_url").unwrap(),
+            "https://api.example.com"
+        );
         assert_eq!(scenario.items.len(), 1);
     }
 

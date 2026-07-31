@@ -13,7 +13,9 @@ pub struct BearerAuth {
 
 impl BearerAuth {
     pub fn new(token: &str) -> Self {
-        Self { token: token.to_string() }
+        Self {
+            token: token.to_string(),
+        }
     }
 }
 

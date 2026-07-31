@@ -55,7 +55,8 @@ where
     });
     // Plain thread park: NO tokio runtime entered here → no panic; future runs
     // on io_rt's reactor → no deadlock.
-    rx.recv().map_err(|_| TropelError::Http("io task dropped".into()))?
+    rx.recv()
+        .map_err(|_| TropelError::Http("io task dropped".into()))?
 }
 
 #[cfg(test)]
@@ -92,9 +93,8 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let out = rt.block_on(async {
-            execute_blocking(async { Ok::<i32, TropelError>(7) }).unwrap()
-        });
+        let out =
+            rt.block_on(async { execute_blocking(async { Ok::<i32, TropelError>(7) }).unwrap() });
         assert_eq!(out, 7);
     }
 }
