@@ -25,9 +25,32 @@ pub fn typescript_to_javascript(source: &str, _filename: &str) -> anyhow::Result
     Ok(js)
 }
 
-/// Strip TypeScript type annotations from source code.
+/// Transpile TypeScript source code to plain JavaScript, **keeping** the
+/// `export` modifiers intact.
+///
+/// The regular `typescript_to_javascript` strips `export` keywords so the
+/// output can be eval'd in script mode (QuickJS rejects `export` outside a
+/// module). Callers that want to evaluate the transpiled source as an ES
+/// module — e.g. to read k6's `export const options` — must keep the exports,
+/// so this variant skips the `remove_exports` pass.
+pub fn typescript_to_javascript_keep_exports(
+    source: &str,
+    _filename: &str,
+) -> anyhow::Result<String> {
+    let js = strip_types_inner(source, false);
+    Ok(js)
+}
+
+/// Strip TypeScript type annotations from source code (exports removed).
 /// This is a multi-pass process that removes each TS construct.
 fn strip_types(source: &str) -> String {
+    strip_types_inner(source, true)
+}
+
+/// Internal implementation. When `strip_exports` is true the `export` keyword
+/// is stripped from declarations (script-mode eval); when false the exports
+/// are preserved (module-mode eval).
+fn strip_types_inner(source: &str, strip_exports: bool) -> String {
     let mut result = source.to_string();
 
     // Order matters: remove larger constructs first
@@ -72,12 +95,14 @@ fn strip_types(source: &str) -> String {
     //     BUT careful: `obj[key]: value` in object literals
     result = remove_variable_types(&result);
 
-    // 11. Remove `export` keyword from declarations:
+    // 11. Remove `export` keyword from declarations (script-mode only):
     //     `export function foo()` → `function foo()`
     //     `export default function()` → `function()`
     //     `export const x = 1` → `const x = 1`
     //     `export { x, y }` → `/* export { x, y } */`
-    result = remove_exports(&result);
+    if strip_exports {
+        result = remove_exports(&result);
+    }
 
     // 12. Remove `as Type` assertions:
     //     `value as SomeType` → `value`

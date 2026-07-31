@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
-use tropel_core::config::{ExecutionConfig, HttpConfig, JobConfig, OutputConfig, ThinkTimeConfig};
+use tropel_core::config::{
+    ExecutionConfig, HttpConfig, JobConfig, OutputConfig, ScenarioConfig, ThinkTimeConfig,
+};
 use tropel_core::scenario::Scenario;
 use tropel_core::types::{Request, Response, Sample, TagMap};
 use tropel_core::{Result, TropelError};
@@ -47,9 +49,54 @@ impl Engine {
         );
 
         let http_config = config.http.clone();
-        let thresholds = config.thresholds.clone();
+        let mut thresholds = config.thresholds.clone();
         let data_rows = config.iteration_data.clone();
         let test_start = Instant::now();
+
+        // Script-declared load profile (k6 `export const options`). Applied only
+        // when the user did not set an explicit load profile — i.e. no
+        // vus/duration/mode/stages/iterations CLI flags (or a config file that
+        // marked execution_explicit). This is what makes a k6 script's own
+        // vus/duration/stages/scenarios/thresholds drive the run instead of
+        // being silently ignored.
+        let mut declared_scenarios: Option<HashMap<String, ScenarioConfig>> = None;
+        let mut declared_execution: Option<ExecutionConfig> = None;
+        if !config.execution_explicit && config.scenarios.is_empty() {
+            let input_path = std::path::Path::new(&config.input);
+            let bytes = std::fs::read(&config.input).ok();
+            if let (Some(bytes), Ok(ResolvedInput::Driver(driver))) = (
+                bytes,
+                resolve_input_or_driver(
+                    &config.input,
+                    config.input_type.as_deref(),
+                    &registry,
+                    &config.env,
+                ),
+            ) {
+                if let Some(decl) = driver
+                    .declared_options(&bytes, Some(input_path), &config.env)
+                    .await
+                {
+                    // Merge script-declared thresholds (CLI/config keys win on
+                    // collision — CLI keys are "threshold_N", so no clash).
+                    for (k, v) in &decl.thresholds {
+                        thresholds.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                    if let Some(scs) = decl.scenarios {
+                        if !scs.is_empty() {
+                            tracing::info!(
+                                "Using script-declared scenarios: {}",
+                                scs.keys().cloned().collect::<Vec<_>>().join(", ")
+                            );
+                            declared_scenarios = Some(scs);
+                        }
+                    } else if let Some(exec) = decl.execution {
+                        tracing::info!("Using script-declared execution: {:?}", exec);
+                        declared_execution = Some(exec);
+                    }
+                }
+            }
+        }
 
         // Streaming outputs
         let mut output_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -64,16 +111,33 @@ impl Engine {
         }
         if output_handles.is_empty() {
             metrics.set_sample_sink(None);
-        }
-
-        // Build scenario configs
+        }        // Build scenario configs. Script-declared scenarios/execution (from a
+        // k6 `export const options`) take precedence over the default profile
+        // but not over explicit user config (execution_explicit check above).
+        // Tuple: (name, execution, env, tags, start_delay, input_path).
         let scenario_configs: Vec<(
             String,
             ExecutionConfig,
             HashMap<String, String>,
+            HashMap<String, String>,
             Duration,
             String,
-        )> = if !config.scenarios.is_empty() {
+        )> = if let Some(scs) = declared_scenarios {
+            scs.iter()
+                .map(|(name, sc)| {
+                    let start_delay = parse_duration_str(&sc.start_time).unwrap_or(Duration::ZERO);
+                    let input_path = sc.input.clone().unwrap_or_else(|| config.input.clone());
+                    (
+                        name.clone(),
+                        sc.execution.clone(),
+                        sc.env.clone(),
+                        sc.tags.clone(),
+                        start_delay,
+                        input_path,
+                    )
+                })
+                .collect()
+        } else if !config.scenarios.is_empty() {
             config
                 .scenarios
                 .iter()
@@ -84,19 +148,24 @@ impl Engine {
                         name.clone(),
                         sc.execution.clone(),
                         sc.env.clone(),
+                        sc.tags.clone(),
                         start_delay,
                         input_path,
                     )
                 })
                 .collect()
         } else {
-            vec![(
-                "default".to_string(),
-                config.execution.clone(),
-                HashMap::new(),
-                Duration::ZERO,
-                config.input.clone(),
-            )]
+            let exec = declared_execution.unwrap_or_else(|| config.execution.clone());
+            vec![
+                (
+                    "default".to_string(),
+                    exec,
+                    HashMap::new(),
+                    HashMap::new(),
+                    Duration::ZERO,
+                    config.input.clone(),
+                )
+            ]
         };
 
         tracing::info!(
@@ -105,10 +174,11 @@ impl Engine {
         );
         let mut scenario_handles = Vec::new();
 
-        for (scenario_name, exec_cfg, sc_env, start_delay, input_path) in &scenario_configs {
+        for (scenario_name, exec_cfg, sc_env, sc_tags, start_delay, input_path) in &scenario_configs {
             let sc_name = scenario_name.clone();
             let exec_cfg = exec_cfg.clone();
             let sc_env = sc_env.clone();
+            let sc_tags = sc_tags.clone();
             let input_path = input_path.clone();
             let start_delay = *start_delay;
             let metrics = metrics.clone();
@@ -148,6 +218,7 @@ impl Engine {
                             sc_name,
                             start_delay,
                             sc_env,
+                            sc_tags,
                             base_env,
                             exec_cfg,
                             scenario,
@@ -165,6 +236,7 @@ impl Engine {
                             sc_name,
                             start_delay,
                             sc_env,
+                            sc_tags,
                             base_env,
                             exec_cfg,
                             driver,
@@ -210,7 +282,14 @@ impl Engine {
             reporter.report(&results).await?;
         }
 
-        Ok(EngineResult { metrics: results })
+        Ok(EngineResult {
+            metrics: results,
+            // The effective threshold set — CLI/config thresholds merged with
+            // any script-declared (k6 options) thresholds. The CLI reports
+            // against THIS set so k6 SLOs appear in the end-of-run summary,
+            // not just mid-run abort checks.
+            effective_thresholds: thresholds,
+        })
     }
 
     fn create_reporters(&self, config: &OutputConfig) -> Vec<Box<dyn Reporter>> {
@@ -248,6 +327,11 @@ impl Default for Engine {
 #[derive(Debug)]
 pub struct EngineResult {
     pub metrics: tropel_metrics::collector::MetricsResult,
+    /// The thresholds actually applied to the run: the job's own thresholds
+    /// merged with any script-declared thresholds (e.g. from a k6
+    /// `export const options`). Consumers should report/evaluate against this
+    /// set rather than the raw `JobConfig.thresholds`.
+    pub effective_thresholds: HashMap<String, tropel_core::config::ThresholdConfig>,
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -335,6 +419,7 @@ async fn run_scenario_vus(
     sc_name: String,
     start_delay: Duration,
     sc_env: HashMap<String, String>,
+    sc_tags: HashMap<String, String>,
     base_env: HashMap<String, String>,
     exec_cfg: ExecutionConfig,
     scenario: Arc<Scenario>,
@@ -378,6 +463,7 @@ async fn run_scenario_vus(
     let thresholds_c = thresholds.clone();
     let vu_env_c = vu_env.clone();
     let sc_name_c = sc_name.clone();
+    let sc_tags_c = sc_tags.clone();
 
     executor.run(move |sched, vu_id| {
         let metrics = metrics_c.clone();
@@ -393,6 +479,7 @@ async fn run_scenario_vus(
         let think_time = think_time_cfg.clone();
         let sc_name_vu = sc_name_c.clone();
         let is_per_vu_iterations = is_per_vu_iterations;
+        let sc_tags = sc_tags_c.clone();
 
         let (_, handle) = pool.spawn(async move {
             sched.add_active_vu(1).await;
@@ -429,7 +516,7 @@ async fn run_scenario_vus(
                 vu_sample_counter += 1;
                 if vu_sample_counter % 100 == 0 {
                     let active = sched.active_vus().await;
-                    utils_emit_vus_metrics(&metrics, active).await;
+                    utils_emit_vus_metrics(&metrics, active, &sc_tags).await;
                 }
 
                 let iter_start = Instant::now();
@@ -455,6 +542,9 @@ async fn run_scenario_vus(
                         let empty_tags = TagMap::new();
                         iter_samples.push(Sample { metric: "iterations".into(), value: 1.0, tags: empty_tags.clone(), timestamp: now, sample_type: tropel_core::types::SampleType::Counter });
                         iter_samples.push(Sample { metric: "iteration_duration".into(), value: iter_dur.as_micros() as f64, tags: empty_tags, timestamp: now, sample_type: tropel_core::types::SampleType::Trend });
+                        // Merge per-scenario tags into every sample so tag-scoped
+                        // thresholds (e.g. {scenario=load}) work end-to-end.
+                        merge_scenario_tags(&mut iter_samples, &sc_tags);
                         metrics.record_batch(&iter_samples).await;
 
                         if has_abort_thresholds {
@@ -504,15 +594,20 @@ async fn run_scenario_vus(
         handle
     }).await.ok();
 
-    // Record dropped iterations
+    // Record dropped iterations (carries the scenario tags like every other
+    // sample this scenario emits)
     {
         let dropped = executor.take_dropped_iterations();
         if dropped > 0 {
+            let mut dropped_tags = TagMap::new();
+            for (k, v) in &sc_tags {
+                dropped_tags.insert(k.clone(), v.clone());
+            }
             metrics
                 .record(&Sample {
                     metric: "dropped_iterations".into(),
                     value: dropped as f64,
-                    tags: TagMap::new(),
+                    tags: dropped_tags,
                     timestamp: std::time::SystemTime::now(),
                     sample_type: tropel_core::types::SampleType::Counter,
                 })
@@ -549,6 +644,7 @@ async fn run_driver_vus(
     sc_name: String,
     start_delay: Duration,
     sc_env: HashMap<String, String>,
+    sc_tags: HashMap<String, String>,
     base_env: HashMap<String, String>,
     exec_cfg: ExecutionConfig,
     driver: Box<dyn Driver>,
@@ -603,6 +699,7 @@ async fn run_driver_vus(
     let thresholds_c = thresholds.clone();
     let vu_env_c = vu_env.clone();
     let sc_name_c = sc_name.clone();
+    let sc_tags_c = sc_tags.clone();
     let driver_id_c = driver_id.clone();
     let input_bytes_c = input_bytes.clone();
     let input_p_c = input_p.clone();
@@ -625,6 +722,7 @@ async fn run_driver_vus(
         let input_bytes = input_bytes_c.clone();
         let input_p = input_p_c.clone();
         let registry = registry_c.clone();
+        let sc_tags = sc_tags_c.clone();
 
         let (_, handle) = pool.spawn(async move {
             sched.add_active_vu(1).await;
@@ -671,7 +769,7 @@ async fn run_driver_vus(
                 vu_sample_counter += 1;
                 if vu_sample_counter % 100 == 0 {
                     let active = sched.active_vus().await;
-                    utils_emit_vus_metrics(&metrics, active).await;
+                    utils_emit_vus_metrics(&metrics, active, &sc_tags).await;
                 }
 
                 let iter_start = Instant::now();
@@ -696,8 +794,10 @@ async fn run_driver_vus(
                         ctx.http_client = Some(http_client_handle.clone());
 
                         let result = driver_instance.run_iteration(&mut ctx).await;
-                        let ctx_samples = std::mem::take(&mut ctx.samples);
+                        let mut ctx_samples = std::mem::take(&mut ctx.samples);
                         if !ctx_samples.is_empty() {
+                            // Merge per-scenario tags into every sample.
+                            merge_scenario_tags(&mut ctx_samples, &sc_tags);
                             metrics.record_batch(&ctx_samples).await;
                         }
 
@@ -714,10 +814,12 @@ async fn run_driver_vus(
                         let iter_dur = iter_start_time.elapsed();
                         let now = std::time::SystemTime::now();
                         let empty_tags = TagMap::new();
-                        metrics.record_batch(&[
+                        let mut iter_samples = vec![
                             Sample { metric: "iterations".into(), value: 1.0, tags: empty_tags.clone(), timestamp: now, sample_type: tropel_core::types::SampleType::Counter },
                             Sample { metric: "iteration_duration".into(), value: iter_dur.as_micros() as f64, tags: empty_tags, timestamp: now, sample_type: tropel_core::types::SampleType::Trend },
-                        ]).await;
+                        ];
+                        merge_scenario_tags(&mut iter_samples, &sc_tags);
+                        metrics.record_batch(&iter_samples).await;
 
                         if has_abort_thresholds {
                             let elapsed = test_start.elapsed();
@@ -756,15 +858,20 @@ async fn run_driver_vus(
         handle
     }).await.ok();
 
-    // Record dropped iterations
+    // Record dropped iterations (carries the scenario tags like every other
+    // sample this scenario emits)
     {
         let dropped = executor.take_dropped_iterations();
         if dropped > 0 {
+            let mut dropped_tags = TagMap::new();
+            for (k, v) in &sc_tags {
+                dropped_tags.insert(k.clone(), v.clone());
+            }
             metrics
                 .record(&Sample {
                     metric: "dropped_iterations".into(),
                     value: dropped as f64,
-                    tags: TagMap::new(),
+                    tags: dropped_tags,
                     timestamp: std::time::SystemTime::now(),
                     sample_type: tropel_core::types::SampleType::Counter,
                 })
@@ -785,6 +892,20 @@ async fn run_driver_vus(
 // Helpers
 // ══════════════════════════════════════════════════════════════════
 
+/// Merge per-scenario tags into a batch of samples (k6 semantics: scenario
+/// tags apply to every metric the scenario emits). Scenario tags win over a
+/// sample's own tags on key collision.
+fn merge_scenario_tags(samples: &mut [Sample], tags: &HashMap<String, String>) {
+    if tags.is_empty() {
+        return;
+    }
+    for sample in samples.iter_mut() {
+        for (k, v) in tags {
+            sample.tags.insert(k.clone(), v.clone());
+        }
+    }
+}
+
 fn extract_think_time(exec_cfg: &ExecutionConfig) -> ThinkTimeConfig {
     match exec_cfg {
         ExecutionConfig::ConstantVus { think_time, .. } => think_time.clone(),
@@ -796,9 +917,13 @@ fn extract_think_time(exec_cfg: &ExecutionConfig) -> ThinkTimeConfig {
     }
 }
 
-async fn utils_emit_vus_metrics(metrics: &MetricsCollector, active: u32) {
+async fn utils_emit_vus_metrics(metrics: &MetricsCollector, active: u32, sc_tags: &HashMap<String, String>) {
     let now = std::time::SystemTime::now();
-    let vus_tags = TagMap::new();
+    let mut vus_tags = TagMap::new();
+    // k6 tags vus/vus_max per scenario; carry the scenario tags along.
+    for (k, v) in sc_tags {
+        vus_tags.insert(k.clone(), v.clone());
+    }
     metrics
         .record_batch(&[
             Sample {

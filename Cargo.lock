@@ -3227,6 +3227,7 @@ dependencies = [
  "inventory",
  "regex",
  "rquickjs",
+ "serde",
  "serde_json",
  "tracing",
  "tropel-es",

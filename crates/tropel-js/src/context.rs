@@ -300,7 +300,11 @@ impl JsContext {
 
     /// Reset the interrupt deadline to now + max_execution_time.
     /// Called before each eval/eval_async to ensure per-script timeouts.
-    fn reset_interrupt(&self) {
+    ///
+    /// Public so callers that evaluate code outside the `eval`-family methods
+    /// (e.g. raw ES-module evaluation via `with_ctx`) can also arm the
+    /// per-eval timeout instead of inheriting a stale deadline.
+    pub fn reset_interrupt(&self) {
         let deadline = now_nanos() + self.max_execution_time.as_nanos() as u64;
         self.interrupt_deadline.store(deadline, Ordering::Relaxed);
     }

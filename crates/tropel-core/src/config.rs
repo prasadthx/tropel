@@ -104,6 +104,14 @@ pub struct JobConfig {
     /// Extension configuration.
     #[serde(default)]
     pub extensions: HashMap<String, serde_json::Value>,
+    /// Whether the load profile (`execution` / `scenarios`) was explicitly
+    /// provided by the user (CLI flags or a config file). When false, an
+    /// input driver that declares its own load profile — e.g. a k6 script's
+    /// `export const options` (vus/duration/stages/scenarios/thresholds) —
+    /// may override the job's execution config. Defaults to false so k6
+    /// scripts drive their own runs unless the user opts out via flags.
+    #[serde(default)]
+    pub execution_explicit: bool,
 }
 
 /// How to execute the load test.
@@ -445,6 +453,7 @@ impl Default for JobConfig {
             http: HttpConfig::default(),
             tls: TlsConfig::default(),
             extensions: HashMap::new(),
+            execution_explicit: false,
         }
     }
 }

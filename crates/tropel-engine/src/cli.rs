@@ -80,8 +80,10 @@ pub enum Commands {
         verbose: bool,
 
         /// Run mode: constant-vus, ramping-vus, shared-iterations, arrival-rate
-        #[arg(short = 'm', long = "mode", default_value = "constant-vus")]
-        mode: String,
+        /// (optional — when absent, a k6 script's own `export const options`
+        /// drives the load profile; passing this flag makes the CLI profile win)
+        #[arg(short = 'm', long = "mode")]
+        mode: Option<String>,
 
         /// Ramping stages (JSON array, for ramping-vus mode)
         #[arg(long = "stages")]
@@ -232,7 +234,11 @@ async fn run_command(cli: Cli) -> Result<()> {
     let output = output.clone();
     let thresholds = threshold.clone();
     let insecure = *insecure;
-    let mode = mode.clone();
+    // `mode` is now optional so we can tell whether the user explicitly chose
+    // a load profile (mode/vus/duration/stages/iterations flags). When none of
+    // them are set, a k6 script's own `export const options` may drive the run.
+    let mode_explicit = mode.is_some();
+    let mode = mode.clone().unwrap_or_else(|| "constant-vus".to_string());
     let stages = stages.clone();
     let iterations = *iterations;
 
@@ -354,11 +360,21 @@ async fn run_command(cli: Cli) -> Result<()> {
         vec![]
     };
 
+    // The user provided a load profile when they passed any of the load
+    // flags. Otherwise (bare `tropel run script.js`) a k6 script's own
+    // `export const options` is allowed to drive the run.
+    let load_profile_explicit = vus.is_some()
+        || duration.is_some()
+        || mode_explicit
+        || stages.is_some()
+        || iterations.is_some();
+
     // Build the full job config
     let config = JobConfig {
         input: input.to_string_lossy().to_string(),
         input_type: format,
         execution,
+        execution_explicit: load_profile_explicit,
         env: env_map,
         iteration_data,
         output: OutputConfig {
@@ -416,8 +432,10 @@ async fn run_command(cli: Cli) -> Result<()> {
         result.metrics.checks_total
     );
 
-    // Evaluate thresholds and drive exit code
-    let threshold_results = evaluate_thresholds(&config.thresholds, &result.metrics);
+    // Evaluate thresholds and drive exit code. Uses the engine's EFFECTIVE
+    // threshold set (job thresholds merged with script-declared ones, e.g.
+    // k6 `export const options` thresholds) so k6 SLOs are reported too.
+    let threshold_results = evaluate_thresholds(&result.effective_thresholds, &result.metrics);
     let mut any_failed = false;
     for tr in &threshold_results {
         if tr.passed {

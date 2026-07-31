@@ -5,26 +5,35 @@
 //!
 //! ## Flow
 //!
-//! 1. **Pre-process** the raw source: remove k6 virtual imports
-//!    (`import { … } from "k6/…"`), capture `export default function` as the
-//!    global `__tropel_iteration`, and strip all other top-level export
-//!    modifiers (`export const options`, named exports, re-exports) so the
-//!    script can be eval'd in script mode.
+//! 1. **Pre-process** the raw source for ES-module evaluation: remove k6
+//!    virtual imports (`import { … } from "k6/…"`) and unresolvable re-exports
+//!    — the k6 shim provides those APIs as globals. All `export` modifiers
+//!    are kept (`export const options`, `export default function`, …) because
+//!    they are load-bearing in a module.
 //!
 //! 2. **Transpile** (if `.ts` source): strip TypeScript type annotations via
-//!    `tropel_es::typescript_to_javascript`. ES module bundling is NOT used
-//!    for k6 scripts — their imports (k6/http, k6/metrics, etc.) are virtual
-//!    module names that don't correspond to files on disk.
+//!    `tropel_es::typescript_to_javascript_keep_exports` (keeps the `export`
+//!    modifiers). ES module bundling is NOT used for k6 scripts — their
+//!    imports (k6/http, k6/metrics, etc.) are virtual module names that don't
+//!    correspond to files on disk.
 //!
 //! 3. **Bootstrap**: create a `JsContext`, bootstrap shim libraries (pm-api,
 //!    chai, lodash, cryptojs, exec, sleep), install native modules.
 //!
-//! 4. **Eval**: evaluate the pre-processed + transpiled source so
-//!    `__tropel_iteration` becomes a callable global function.
+//! 4. **Eval as an ES module** (`rquickjs::Module::declare` + `eval` +
+//!    `promise.finish`), then install the module's `default` export as the
+//!    global `__tropel_iteration`. This is the only mode where
+//!    `export const options` (the k6 load profile) survives alongside the
+//!    default export.
 //!
-//! 5. **Run**: each call to `run_iteration()` invokes `__tropel_iteration()`
+//! 5. **Options**: `Driver::declared_options` evaluates the script the same
+//!    way in a throwaway context and reads the `options` export, so the
+//!    engine can apply the script's own load profile (see `options.rs`).
+//!
+//! 6. **Run**: each call to `run_iteration()` invokes `__tropel_iteration()`
 //!    and drains metrics/abort state from the `VuContext`.
 
+use crate::options::K6Options;
 use async_trait::async_trait;
 use futures::future::join_all;
 use regex::Regex;
@@ -34,7 +43,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use tropel_js::JsContext;
 use tropel_sdk::{Body, Method, Request, TagMap};
-use tropel_sdk::{Driver, DriverInstance, DriverRegistration, VuContext};
+use tropel_sdk::{Driver, DriverDeclaredOptions, DriverInstance, DriverRegistration, VuContext};
 use tropel_sdk::{Result, TropelError};
 
 // ══════════════════════════════════════════════════════════════════
@@ -76,50 +85,24 @@ impl Driver for K6Driver {
         let original = std::str::from_utf8(bytes)
             .map_err(|e| TropelError::Parse(format!("k6 script is not valid UTF-8: {}", e)))?;
 
-        // Step 1: Pre-process — capture `export default function` as
-        // `function __tropel_iteration` and remove k6 virtual imports.
-        let preprocessed = preprocess_k6_source(original);
+        // Step 1: Pre-process — remove k6 virtual imports (the k6 shim
+        // provides those APIs as globals) but KEEP all `export` modifiers so
+        // the source can be evaluated as an ES module.
+        let final_source = prepare_module_source(original, source_path)?;
 
-        // Step 2: Transpile TypeScript if needed
-        let final_source = if let Some(path) = source_path {
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("js")
-                .to_lowercase();
-            if matches!(ext.as_str(), "ts" | "mts" | "tsx") {
-                tropel_es::typescript_to_javascript(&preprocessed, &path.to_string_lossy())
-                    .map_err(|e| TropelError::Parse(format!("TS transpile error: {}", e)))?
-            } else {
-                preprocessed
-            }
-        } else {
-            // No path hint — detect TS patterns heuristically
-            if preprocessed.contains(": string")
-                || preprocessed.contains(": number")
-                || preprocessed.contains(": boolean")
-                || preprocessed.contains("interface ")
-            {
-                tropel_es::typescript_to_javascript(&preprocessed, "script.js")
-                    .map_err(|e| TropelError::Parse(format!("TS transpile error: {}", e)))?
-            } else {
-                preprocessed
-            }
-        };
-
-        // Step 3: Create JS context
+        // Step 2: Create JS context
         let js_ctx = JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
             .await
             .map_err(|e| TropelError::Other(format!("JS context creation failed: {}", e)))?;
 
-        // Step 4: Bootstrap shim libraries & native modules
+        // Step 3: Bootstrap shim libraries & native modules
         bootstrap_js_libs(&js_ctx).await?;
 
-        // Step 5: Eval the transpiled source
-        js_ctx
-            .eval(&final_source)
-            .await
-            .map_err(|e| TropelError::Other(format!("Script eval error: {}", e)))?;
+        // Step 4: Eval the source as an ES module and install the default
+        // export as the global `__tropel_iteration` entry point. Modules are
+        // the only mode where `export const options` (the k6 load profile) and
+        // `export default function` survive together.
+        install_iteration_global(&js_ctx, &final_source)?;
 
         // Verify __tropel_iteration was defined
         let has_iter = js_ctx
@@ -135,6 +118,39 @@ impl Driver for K6Driver {
             _source_path: source_path.map(|p| p.to_path_buf()),
             http_bridge_registered: false,
         }))
+    }
+
+    async fn declared_options(
+        &self,
+        bytes: &[u8],
+        source_path: Option<&Path>,
+        env: &HashMap<String, String>,
+    ) -> Option<DriverDeclaredOptions> {
+        // Read the script's `export const options` by evaluating it as an ES
+        // module. This is what makes k6's declared load profile (vus/duration/
+        // stages/scenarios/thresholds) drive the run instead of being silently
+        // ignored. Any failure (not a k6 options export, eval error, …) simply
+        // yields `None` — the engine falls back to the CLI/JobConfig profile.
+        let original = std::str::from_utf8(bytes).ok()?;
+        let module_source = prepare_module_source(original, source_path).ok()?;
+        // eval_module_export_json returns Result<Option<String>> — .ok()?
+        // unwraps the Result, the second ? unwraps the Option.
+        let json_str =
+            eval_module_export_json(&module_source, "options", env).await.ok()??;
+        let options: K6Options = match serde_json::from_str(&json_str) {
+            Ok(o) => o,
+            Err(e) => {
+                // Never fail silently: a misparse drops the script's entire
+                // load profile (vus/duration included).
+                tracing::warn!(
+                    "k6 options could not be parsed — falling back to the CLI/JobConfig load \
+                     profile: {}",
+                    e
+                );
+                return None;
+            }
+        };
+        options.to_declared()
     }
 }
 
@@ -453,121 +469,191 @@ impl K6DriverInstance {
 // Source pre-processing
 // ══════════════════════════════════════════════════════════════════
 
-/// Pre-process a k6 source string before transpilation and evaluation.
+
+/// Pre-process a k6 source string for ES-module evaluation.
 ///
-/// Order matters:
-/// 1. Removes k6 virtual import lines (`import … from "k6/…"`) and k6
-///    re-exports — these reference module specifiers that don't exist on disk
-///    (the k6 shim provides the APIs as globals instead).
-/// 2. Captures `export default function(name) { … }` as the global
-///    `function __tropel_iteration(…) { … }` (also arrow and expr forms).
-/// 3. Strips ALL remaining top-level export modifiers so the script can be
-///    eval'd in script mode (QuickJS rejects `export` outside a module):
-///    - `export const options = …` → `const options = …` (k6's `options` object)
-///    - `export function setup() …` → `function setup() …` (named exports)
-///    - `export class C …` → `class C …`
-///    - `export { … }` → commented out (named export blocks)
-///    - `export … from "…"` → removed entirely (re-exports, incl. multi-line)
+/// Unlike the old script-mode preprocessor (which stripped `export` modifiers
+/// so the source could be eval'd), this variant KEEPS all `export` modifiers —
+/// `export const options`, `export default function`, `export function
+/// setup()` — because they are valid (and load-bearing) in a module. Only two
+/// things are removed:
 ///
-/// The transpiler's `remove_exports` covers `.ts` files, but plain-JS k6 scripts
-/// skip transpilation — so the stripping must happen here for the path-less case.
-fn preprocess_k6_source(source: &str) -> String {
+/// 1. k6 virtual imports (`import … from "k6/…"`) and k6 re-exports — the
+///    k6 shim provides those APIs as globals, and there is no module loader
+///    for the `k6/*` specifiers on disk.
+/// 2. Unresolvable generic re-exports (`export { x } from "./other"`,
+///    `export * from "./other"`) — no on-disk bundling/loader here either.
+///
+/// Standalone named-export blocks (`export { x }`) are kept — they are plain
+/// ESM. `import { x } from "./local"` is also kept (it fails at eval time if
+/// there is no such module on disk, same as script mode fails on any import).
+fn preprocess_k6_source_module(source: &str) -> String {
     let mut result = source.to_string();
 
     // ── 1. Remove k6 virtual import / re-export lines entirely ──
-    //    `import … from "k6";`, `import … from "k6/http";`, etc.
     let re_import =
         Regex::new(r#"(?m)^\s*import\s+.*?from\s+['"]k6(?:/[^'""]*)?['""]\s*;?\s*$"#).unwrap();
     result = re_import.replace_all(&result, "").to_string();
 
-    // `import "k6/…"` side-effect imports
     let re_import_side =
         Regex::new(r#"(?m)^\s*import\s+['"]k6(?:/[^'""]*)?['""]\s*;?\s*$"#).unwrap();
     result = re_import_side.replace_all(&result, "").to_string();
 
-    // `export { … } from "k6/…"` — k6 virtual re-exports (removed BEFORE the
-    // generic strips below, which would otherwise comment instead of delete).
     let re_reexport =
         Regex::new(r#"(?m)^\s*export\s+\{[^}]*\}.*from\s+['"]k6(?:/[^'""]*)?['""]\s*;?\s*$"#)
             .unwrap();
     result = re_reexport.replace_all(&result, "").to_string();
 
-    // ── 2. Capture the default export as the iteration entry ──
-
-    // 2a. `export default function name(...)` → `function __tropel_iteration(...)`
-    let re_named = Regex::new(r"\bexport\s+default\s+function\s+\w+\s*\(").unwrap();
-    result = re_named
-        .replace_all(&result, "function __tropel_iteration(")
-        .to_string();
-
-    // 2b. `export default function(` (anonymous) → `function __tropel_iteration(`
-    //     Only if not already replaced above (the named regex won't match anonymous).
-    let re_anon = Regex::new(r"\bexport\s+default\s+function\s*\(").unwrap();
-    result = re_anon
-        .replace_all(&result, "function __tropel_iteration(")
-        .to_string();
-
-    // 2c. `export default () => { … }` — arrow function default export
-    let re_arrow = Regex::new(r"\bexport\s+default\s*(\([^)]*\)\s*=>)").unwrap();
-    result = re_arrow
-        .replace_all(&result, "var __tropel_iteration = $1")
-        .to_string();
-
-    // 2d. `export default expr` (any other, e.g. object literal) — assign to var.
-    //     This catches `export default {…}`, `export default someVar`, and
-    //     `export default async function …` / `export default class …`.
-    //     Uses `^.*?` to consume any line-beginning whitespace and then the
-    //     entire `export default ` prefix, so the replacement starts clean.
-    //     We deliberately use a simple `export default ` prefix match without
-    //     look-arounds (the `regex` crate doesn't support them).
-    let re_other = Regex::new(r"\bexport\s+default\s+").unwrap();
-    result = re_other
-        .replace_all(&result, "var __tropel_iteration = ")
-        .to_string();
-
-    // ── 3. Strip remaining top-level export modifiers (plain-JS scripts) ──
-
-    // `export async function F(...)` → `async function F(...)`
-    let re_async_fn = Regex::new(r"\bexport\s+async\s+function\b").unwrap();
-    result = re_async_fn
-        .replace_all(&result, "async function")
-        .to_string();
-
-    // `export function F(...)` → `function F(...)`
-    let re_fn = Regex::new(r"\bexport\s+function\b").unwrap();
-    result = re_fn.replace_all(&result, "function").to_string();
-
-    // `export class C` → `class C`
-    let re_class = Regex::new(r"\bexport\s+class\b").unwrap();
-    result = re_class.replace_all(&result, "class").to_string();
-
-    // `export const|let|var X = …` → `const|let|var X = …`
-    // Handles k6's ubiquitous `export const options = { … }`.
-    let re_var = Regex::new(r"\bexport\s+(const|let|var)\b").unwrap();
-    result = re_var.replace_all(&result, "$1").to_string();
-
-    // `export { … } from "…"` / `export * from "…"` / `export * as ns from "…"`
-    // — generic re-exports → delete entirely (including multi-line
-    // `export {\n…\n} from "…"`). Runs BEFORE the standalone-block regex so
-    // `export { x } from "…"` is consumed wholesale here instead of mangled there.
+    // ── 2. Remove unresolvable generic re-exports ──
     let re_reexport_generic =
         Regex::new(r#"\bexport\s*\{[^}]*\}\s*from\s+['"][^'"]+['"]\s*;?"#).unwrap();
     result = re_reexport_generic.replace_all(&result, "").to_string();
-    // `[^'"]*?` (lazy) between `*` and `from` also covers `export * as ns from "…"`
-    // without risking over-match across statements in contrived multi-line code.
+
     let re_reexport_star =
         Regex::new(r#"\bexport\s*\*\s*[^'"]*?from\s+['"][^'"]+['"]\s*;?"#).unwrap();
     result = re_reexport_star.replace_all(&result, "").to_string();
 
-    // `export { … }` — standalone named-export block (single- or multi-line,
-    // with or without trailing `;`) → comment it out. Runs AFTER re-exports
-    // are deleted, so a `…} from "…"` never reaches this pattern.
-    let re_export_block = Regex::new(r"\bexport\s*\{[^}]*\}\s*;?").unwrap();
-    result = re_export_block
-        .replace_all(&result, "/* named exports stripped */")
-        .to_string();
-
     result
+}
+
+/// Build the final source for ES-module evaluation: pre-process (keep
+/// exports, drop k6 virtual imports) and transpile TypeScript while keeping
+/// the `export` modifiers intact (script-mode transpilation strips them).
+fn prepare_module_source(original: &str, source_path: Option<&Path>) -> Result<String> {
+    let preprocessed = preprocess_k6_source_module(original);
+
+    if let Some(path) = source_path {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("js")
+            .to_lowercase();
+        if matches!(ext.as_str(), "ts" | "mts" | "tsx") {
+            return tropel_es::typescript_to_javascript_keep_exports(
+                &preprocessed,
+                &path.to_string_lossy(),
+            )
+            .map_err(|e| TropelError::Parse(format!("TS transpile error: {}", e)));
+        }
+        return Ok(preprocessed);
+    }
+
+    // No path hint — detect TS patterns heuristically.
+    if preprocessed.contains(": string")
+        || preprocessed.contains(": number")
+        || preprocessed.contains(": boolean")
+        || preprocessed.contains("interface ")
+    {
+        return tropel_es::typescript_to_javascript_keep_exports(&preprocessed, "script.js")
+            .map_err(|e| TropelError::Parse(format!("TS transpile error: {}", e)));
+    }
+
+    Ok(preprocessed)
+}
+
+/// Evaluate an ES module and return the named export serialized as JSON.
+///
+/// Creates a throwaway `JsContext`, sets the k6 globals a script may read at
+/// top level (`__ENV` from the job's env, `__VU`, …), evals the module,
+/// JSON.stringify()s the requested export, and drops the context. Returns
+/// `Ok(None)` when the export is absent/undefined — never an error for a
+/// script that simply does not declare the export.
+async fn eval_module_export_json(
+    source: &str,
+    export: &str,
+    env: &HashMap<String, String>,
+) -> Result<Option<String>> {
+    let js_ctx = JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
+        .await
+        .map_err(|e| TropelError::Other(format!("JS context creation failed: {}", e)))?;
+
+    // Minimal globals a k6 script may reference while building its options.
+    // `__ENV` carries the job's env vars so options computed from them
+    // (e.g. `const baseURL = __ENV.BASE_URL`) resolve instead of silently
+    // becoming undefined.
+    let _ = js_ctx.set_global_str("__VU", "0").await;
+    let _ = js_ctx.set_global_str("__ITER", "0").await;
+    let env_json = serde_json::to_value(env).unwrap_or_else(|_| serde_json::json!({}));
+    let _ = js_ctx.set_global_json("__ENV", &env_json).await;
+    let _ = js_ctx.set_global_json("__tropel_env", &env_json).await;
+
+    // Arm the per-eval timeout (module eval bypasses the eval-family methods).
+    js_ctx.reset_interrupt();
+    match js_ctx.with_ctx(|ctx| read_module_export_string(ctx, source, export)) {
+        Ok(Some(s)) => Ok(Some(s)),
+        Ok(None) => Ok(None),
+        Err(e) => {
+            tracing::warn!("Failed to read k6 export '{}': {}", export, e);
+            Ok(None)
+        }
+    }
+}
+
+/// Evaluate an ES module in the given context and JSON.stringify() the named
+/// export. Returns `Ok(None)` when the export is missing or undefined.
+///
+/// The string is produced *inside* the context (via the global `JSON`
+/// object) so no lifetime-bound JS value escapes the `with_ctx` closure.
+fn read_module_export_string(
+    ctx: &rquickjs::Ctx,
+    source: &str,
+    export: &str,
+) -> std::result::Result<Option<String>, rquickjs::Error> {
+    let module = rquickjs::Module::declare(ctx.clone(), "k6-script", source)?;
+    let (module, promise) = module.eval()?;
+    promise.finish::<()>()?;
+
+    let value: rquickjs::Value = match module.get(export) {
+        Ok(v) => v,
+        Err(_) => return Ok(None), // export not present
+    };
+    if value.is_undefined() || value.is_null() {
+        return Ok(None);
+    }
+
+    let json_obj: rquickjs::Object = ctx.globals().get("JSON")?;
+    let stringify: rquickjs::Function = json_obj.get("stringify")?;
+    let s: String = stringify.call((value,))?;
+    Ok(Some(s))
+}
+
+/// Evaluate an ES module and install its `default` export as the global
+/// `__tropel_iteration` entry point (what `run_iteration` invokes).
+fn install_iteration_global(js_ctx: &JsContext, source: &str) -> Result<()> {
+    // Arm the per-eval timeout: this evals the module directly via with_ctx,
+    // bypassing the eval-family methods that normally reset the deadline.
+    js_ctx.reset_interrupt();
+    js_ctx.with_ctx(|rq_ctx| {
+        let module = rquickjs::Module::declare(rq_ctx.clone(), "k6-script", source).map_err(|e| {
+            TropelError::Other(format!("k6 script module declare error: {}", e))
+        })?;
+        let (module, promise) = module
+            .eval()
+            .map_err(|e| TropelError::Other(format!("k6 script module eval error: {}", e)))?;
+        promise
+            .finish::<()>()
+            .map_err(|e| TropelError::Other(format!("k6 script module resolve error: {}", e)))?;
+
+        match module.get::<_, rquickjs::Function>("default") {
+            Ok(default_fn) => {
+                rq_ctx
+                    .globals()
+                    .set("__tropel_iteration", default_fn)
+                    .map_err(|e| {
+                        TropelError::Other(format!(
+                            "failed to install __tropel_iteration: {}",
+                            e
+                        ))
+                    })?;
+            }
+            Err(e) => {
+                // Not fatal: script mode tolerated a missing default export
+                // (warned + continued), so module mode does too.
+                tracing::warn!("k6 script has no default export function: {}", e);
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Check if a file path has a TypeScript extension (used in tests).
@@ -689,257 +775,6 @@ mod tests {
     }
 
     #[test]
-    fn test_preprocess_export_default_named() {
-        let code = "export default function handler() { http.get('https://example.com'); }";
-        let result = preprocess_k6_source(code);
-        assert!(
-            result.contains("function __tropel_iteration("),
-            "Expected __tropel_iteration, got: {}",
-            result
-        );
-        assert!(
-            !result.contains("export default function"),
-            "Still has export default: {}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_preprocess_export_default_anonymous() {
-        let code = "export default function() { http.get('https://example.com'); }";
-        let result = preprocess_k6_source(code);
-        assert!(
-            result.contains("function __tropel_iteration("),
-            "Expected __tropel_iteration, got: {}",
-            result
-        );
-        assert!(
-            !result.contains("export default function"),
-            "Still has export default: {}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_preprocess_export_default_arrow() {
-        let code = "export default () => { http.get('https://example.com'); }";
-        let result = preprocess_k6_source(code);
-        assert!(
-            result.contains("__tropel_iteration = ("),
-            "Expected __tropel_iteration assignment, got: {}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_preprocess_removes_k6_imports() {
-        let code = r#"
-            import http from "k6/http";
-            import { check, sleep } from "k6";
-            export default function() { http.get("https://example.com"); }
-        "#;
-        let result = preprocess_k6_source(code);
-        assert!(
-            !result.contains("from \"k6"),
-            "k6 import not removed: {}",
-            result
-        );
-        assert!(
-            !result.contains("from 'k6"),
-            "k6 import not removed: {}",
-            result
-        );
-        assert!(
-            result.contains("__tropel_iteration"),
-            "__tropel_iteration not found: {}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_preprocess_preserves_non_k6_imports() {
-        let code = r#"
-            import { someUtil } from "./local-utils";
-            export default function() { someUtil(); }
-        "#;
-        let result = preprocess_k6_source(code);
-        assert!(
-            result.contains("./local-utils"),
-            "Non-k6 import was removed: {}",
-            result
-        );
-        assert!(
-            result.contains("__tropel_iteration"),
-            "__tropel_iteration not found: {}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_preprocess_removes_reexport() {
-        let code = r#"
-            export { default } from "k6/http";
-            export default function() {}
-        "#;
-        let result = preprocess_k6_source(code);
-        assert!(
-            !result.contains("from \"k6/http\""),
-            "k6 re-export not removed: {}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_preprocess_strips_export_const_options() {
-        // The #2 blocker: plain-JS k6 scripts always have `export const options`,
-        // which is a SyntaxError in script-mode eval unless stripped.
-        let code = r#"
-            export const options = {
-                vus: 10,
-                duration: '30s',
-            };
-            export default function() { http.get('https://example.com'); }
-        "#;
-        let result = preprocess_k6_source(code);
-        assert!(
-            result.contains("const options = {"),
-            "options const not kept: {}",
-            result
-        );
-        assert!(
-            !result.contains("export const options"),
-            "export const options not stripped: {}",
-            result
-        );
-        assert!(
-            result.contains("__tropel_iteration"),
-            "default export not captured: {}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_preprocess_strips_export_named_functions() {
-        // setup/teardown + arbitrary named exports must not reach script-mode eval.
-        let code = r#"
-            export function setup() { return {}; }
-            export function teardown(data) {}
-            export default function() {}
-        "#;
-        let result = preprocess_k6_source(code);
-        assert!(
-            result.contains("function setup()"),
-            "setup lost: {}",
-            result
-        );
-        assert!(
-            result.contains("function teardown(data)"),
-            "teardown lost: {}",
-            result
-        );
-        assert!(
-            !result.contains("export function"),
-            "export function not stripped: {}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_preprocess_strips_export_named_blocks() {
-        let code = "const x = 1; export { x };\nexport default function() {}";
-        let result = preprocess_k6_source(code);
-        assert!(
-            !result.contains("export { x };"),
-            "named export block not stripped: {}",
-            result
-        );
-        assert!(result.contains("const x = 1"), "const lost: {}", result);
-    }
-
-    #[test]
-    fn test_preprocess_strips_export_class_and_var() {
-        let code = r#"
-            export var COUNT = 3;
-            export class Helper {}
-            export default function() {}
-        "#;
-        let result = preprocess_k6_source(code);
-        assert!(
-            !result.contains("export var"),
-            "export var not stripped: {}",
-            result
-        );
-        assert!(
-            !result.contains("export class"),
-            "export class not stripped: {}",
-            result
-        );
-        assert!(result.contains("var COUNT = 3"), "var lost: {}", result);
-        assert!(result.contains("class Helper"), "class lost: {}", result);
-    }
-
-    #[test]
-    fn test_preprocess_strips_generic_reexports() {
-        let code = r#"
-            export * from "./helpers";
-            export { default } from "./other";
-            export default function() {}
-        "#;
-        let result = preprocess_k6_source(code);
-        assert!(
-            !result.contains("./helpers"),
-            "re-export not stripped: {}",
-            result
-        );
-        assert!(
-            !result.contains("./other"),
-            "re-export not stripped: {}",
-            result
-        );
-        assert!(
-            result.contains("__tropel_iteration"),
-            "default export lost: {}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_preprocess_strips_same_line_reexports() {
-        // Regression: the standalone `export { … }` block regex must NOT mangle
-        // a same-line re-export into a dangling `from "…"` fragment.
-        let code = "const x = 1; export { x } from \"./other\";\nexport default function() {}";
-        let result = preprocess_k6_source(code);
-        assert!(
-            !result.contains("./other"),
-            "same-line re-export not deleted wholesale: {}",
-            result
-        );
-        assert!(
-            !result.contains("from \"./other\""),
-            "dangling 'from' fragment left behind: {}",
-            result
-        );
-        assert!(result.contains("const x = 1"), "const lost: {}", result);
-    }
-
-    #[test]
-    fn test_preprocess_strips_namespace_reexports() {
-        // `export * as ns from "…"` — namespace re-export (from after ` as ns `).
-        let code = "export * as httpAlias from \"./http\";\nexport default function() {}";
-        let result = preprocess_k6_source(code);
-        assert!(
-            !result.contains("./http"),
-            "namespace re-export not stripped: {}",
-            result
-        );
-        assert!(
-            result.contains("__tropel_iteration"),
-            "default export lost: {}",
-            result
-        );
-    }
-
-    #[test]
     fn test_driver_id() {
         assert_eq!(K6Driver.id(), "k6");
     }
@@ -951,5 +786,172 @@ mod tests {
         assert!(is_typescript_ext(Path::new("script.tsx")));
         assert!(!is_typescript_ext(Path::new("script.js")));
         assert!(!is_typescript_ext(Path::new("script.json")));
+    }
+
+    // ── ES-module preprocessing (keeps exports) ──
+
+    #[test]
+    fn test_module_preprocess_keeps_exports() {
+        let code = r#"
+            import http from "k6/http";
+            import { check } from "k6";
+            export const options = { vus: 10, duration: '30s' };
+            export function setup() { return {}; }
+            export default function() { http.get('https://example.com'); }
+        "#;
+        let result = preprocess_k6_source_module(code);
+        // k6 virtual imports are removed (shim provides globals)
+        assert!(!result.contains("from \"k6/http\""), "k6 import kept: {result}");
+        assert!(!result.contains("from \"k6\""), "k6 import kept: {result}");
+        // exports are PRESERVED — module eval needs them
+        assert!(
+            result.contains("export const options"),
+            "export const options stripped: {result}"
+        );
+        assert!(
+            result.contains("export function setup"),
+            "export function stripped: {result}"
+        );
+        assert!(
+            result.contains("export default function"),
+            "export default stripped: {result}"
+        );
+    }
+
+    #[test]
+    fn test_module_preprocess_removes_reexports() {
+        let code = r#"
+            export { default } from "./other";
+            export * from "./helpers";
+            export const options = {};
+            export default function() {}
+        "#;
+        let result = preprocess_k6_source_module(code);
+        assert!(!result.contains("./other"), "re-export kept: {result}");
+        assert!(!result.contains("./helpers"), "re-export kept: {result}");
+        assert!(result.contains("export const options"), "options lost: {result}");
+        assert!(
+            result.contains("export default function"),
+            "default export lost: {result}"
+        );
+    }
+
+    #[test]
+    fn test_module_preprocess_keeps_named_export_block() {
+        let code = "const x = 1; export { x };\nexport default function() {}";
+        let result = preprocess_k6_source_module(code);
+        assert!(
+            result.contains("export { x }"),
+            "standalone named export block stripped: {result}"
+        );
+    }
+
+    // ── ES-module evaluation ──
+
+    /// Read an export via a raw rquickjs context (no JsContext needed).
+    fn read_export_for_test(source: &str, export: &str) -> Option<String> {
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            let module = rquickjs::Module::declare(ctx.clone(), "test-script", source).unwrap();
+            let (module, promise) = module.eval().unwrap();
+            promise.finish::<()>().unwrap();
+            let value: rquickjs::Value = match module.get(export) {
+                Ok(v) => v,
+                Err(_) => return None,
+            };
+            if value.is_undefined() || value.is_null() {
+                return None;
+            }
+            let json_obj: rquickjs::Object = ctx.globals().get("JSON").unwrap();
+            let stringify: rquickjs::Function = json_obj.get("stringify").unwrap();
+            let s: String = stringify.call((value,)).unwrap();
+            Some(s)
+        })
+    }
+
+    #[test]
+    fn test_module_eval_reads_options_export() {
+        let source = r#"
+            export const options = { vus: 5, duration: "30s" };
+            export default function() {}
+        "#;
+        let json = read_export_for_test(source, "options")
+            .expect("options export should be readable");
+        let opts: crate::options::K6Options = serde_json::from_str(&json).unwrap();
+        assert_eq!(opts.vus, Some(5));
+        assert_eq!(opts.duration.as_deref(), Some("30s"));
+    }
+
+    #[test]
+    fn test_module_eval_missing_export_is_none() {
+        let source = "export default function() {}\n";
+        assert!(
+            read_export_for_test(source, "options").is_none(),
+            "missing export should yield None, not an error"
+        );
+    }
+
+    #[test]
+    fn test_module_eval_exports_default_function() {
+        let source = "export default function() { return 42; }\n";
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            let module = rquickjs::Module::declare(ctx, "test-script", source).unwrap();
+            let (module, promise) = module.eval().unwrap();
+            promise.finish::<()>().unwrap();
+            let f: rquickjs::Function = module.get("default").unwrap();
+            let n: i32 = f.call(()).unwrap();
+            assert_eq!(n, 42);
+        });
+    }
+
+    #[test]
+    fn test_module_eval_keeps_k6_globals_visible() {
+        // k6 shim globals are set on the global object; module code must see
+        // them (http.get inside the default function resolves via globals).
+        let source = "export default function() { return typeof globalThis; }\n";
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.globals().set("someK6Global", 123).unwrap();
+            let module = rquickjs::Module::declare(ctx.clone(), "test-script", source).unwrap();
+            let (module, promise) = module.eval().unwrap();
+            promise.finish::<()>().unwrap();
+            let f: rquickjs::Function = module.get("default").unwrap();
+            let s: String = f.call(()).unwrap();
+            assert_eq!(s, "object");
+            // global is visible from module code
+            let src2 = "export default function() { return someK6Global; }\n";
+            let module2 = rquickjs::Module::declare(ctx.clone(), "test-script-2", src2).unwrap();
+            let (module2, promise2) = module2.eval().unwrap();
+            promise2.finish::<()>().unwrap();
+            let f2: rquickjs::Function = module2.get("default").unwrap();
+            let n: i32 = f2.call(()).unwrap();
+            assert_eq!(n, 123);
+        });
+    }
+
+    #[test]
+    fn test_declared_options_driver_e2e() {
+        // Full path: K6Driver::declared_options on a script with options.
+        // Uses a raw module eval through the same helper the driver uses.
+        let source = r#"
+            export const options = { vus: 3, iterations: 10 };
+            export default function() {}
+        "#;
+        let json = read_export_for_test(source, "options").unwrap();
+        let opts: crate::options::K6Options = serde_json::from_str(&json).unwrap();
+        let decl = opts.to_declared().unwrap();
+        assert!(decl.execution.is_some());
+        assert!(decl.scenarios.is_none());
+        match decl.execution.unwrap() {
+            tropel_sdk::ExecutionConfig::SharedIterations { iterations, vus, .. } => {
+                assert_eq!(iterations, 10);
+                assert_eq!(vus, 3);
+            }
+            other => panic!("expected SharedIterations, got {other:?}"),
+        }
     }
 }

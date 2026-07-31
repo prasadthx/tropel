@@ -12,6 +12,7 @@
 //! serves as a fallback for older execution paths.
 
 pub mod driver;
+mod options;
 
 use std::path::Path;
 use tropel_sdk::{InputAdapter, InputAdapterRegistration};

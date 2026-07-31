@@ -404,7 +404,12 @@ impl WasmPlugin {
                 anyhow::bail!("WASM adapter returned parse error (code: {})", written);
             }
 
-            let json_str = read_wasm_buffer(&*store, &memory, output_ptr, written as u32);
+            // DoS guard: clamp the plugin's claimed written length. We handed
+            // the adapter a MAX_OUTPUT_BYTES buffer, so anything larger is a
+            // lie; trusting it would allocate vec![0u8; written] and abort the
+            // host for ~2 GB claims (defeating the fuel guard's purpose).
+            let written = written.min(MAX_OUTPUT_BYTES as i32) as u32;
+            let json_str = read_wasm_buffer(&*store, &memory, output_ptr, written);
             Ok(json_str)
         });
 
@@ -980,6 +985,42 @@ mod tests {
         let plugin2 = WasmInputAdapter::from_file(&wasm_path).expect("cached load must succeed");
         assert_eq!(plugin2.plugin_id(), "roundtrip-plugin");
         assert!(plugin2.detect(&[0x7f]));
+    }
+
+    const HOSTILE_LENGTH_WAT: &str = r#"
+(module
+  (memory (export "memory") 64 256)
+  (data (i32.const 0) "hostile-length-plugin\00")
+  (func (export "adapter_id") (result i32) (i32.const 0))
+  (func (export "adapter_detect") (param $p i32) (param $n i32) (result i32)
+    (i32.const 1))
+  (func (export "adapter_parse") (param $in i32) (param $in_len i32) (param $out i32) (param $out_len i32) (result i32)
+    ;; Claim a ~2 GB written length without writing anything. The host must
+    ;; clamp to MAX_OUTPUT_BYTES instead of allocating 2 GB (DoS guard).
+    (i32.const 2147483647))
+)
+"#;
+
+    #[test]
+    fn test_hostile_written_length_clamped() {
+        // A plugin claiming an absurd written length must not OOM/abort the
+        // host. parse() clamps to MAX_OUTPUT_BYTES, reads that many bytes
+        // (mostly zeroed memory -> invalid JSON) and returns a Parse error.
+        let plugin = WasmPlugin::load(HOSTILE_LENGTH_WAT.as_bytes())
+            .expect("module must load");
+        assert_eq!(plugin.id(), "hostile-length-plugin");
+
+        let start = std::time::Instant::now();
+        let result = plugin.parse(&[0x7f, 1, 2, 3]);
+        assert!(
+            result.is_err(),
+            "hostile written length must produce a parse error, got {:?}",
+            result
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "clamped read must complete quickly"
+        );
     }
 
     #[test]

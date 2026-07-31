@@ -74,6 +74,9 @@
 // ═══════════════════════════════════════════════════════════════════
 
 pub use tropel_core::scenario::{Scenario, ScenarioInfo, ScenarioItem};
+pub use tropel_core::config::{
+    ArrivalRateStage, ExecutionConfig, ScenarioConfig, Stage, ThinkTimeConfig, ThresholdConfig,
+};
 pub use tropel_core::types::{
     ApiKeyLocation, AuthConfig, Body, CertificateConfig, Cookie, Method, Request, Response, Sample,
     SampleType, Timings,
@@ -88,7 +91,7 @@ pub use tropel_ext::traits::{InputAdapter, InputAdapterRegistration};
 
 // Driver/DriverInstance + VuContext are stable — the imperative input contract.
 pub use tropel_ext::traits::{
-    Driver, DriverHttpClient, DriverInstance, DriverRegistration, VuContext,
+    Driver, DriverDeclaredOptions, DriverHttpClient, DriverInstance, DriverRegistration, VuContext,
 };
 
 // Protocol, Output, and AuthSigner traits are gated behind feature flags.

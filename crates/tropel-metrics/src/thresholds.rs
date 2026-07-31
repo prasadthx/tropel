@@ -332,6 +332,14 @@ fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
                     Some("p95") => d.p95 as f64,
                     Some("p99") => d.p99 as f64,
                     Some("count") => d.count as f64,
+                    // Rate = sum/count (mirrors the custom-metric loop).
+                    Some("rate") => {
+                        if d.count > 0 {
+                            d.sum / d.count as f64
+                        } else {
+                            0.0
+                        }
+                    }
                     _ => d.mean, // default to mean if no stat specified
                 }
             } else {
@@ -351,6 +359,16 @@ fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
                         Some("p95") => m.p95 as f64,
                         Some("p99") => m.p99 as f64,
                         Some("count") => m.count as f64,
+                        // Rate = sum/count. For 0/1 samples (e.g.
+                        // http_req_failed) this equals the mean, so the arm is
+                        // only distinct for non-binary Rate metrics.
+                        Some("rate") => {
+                            if m.count > 0 {
+                                m.sum / m.count as f64
+                            } else {
+                                0.0
+                            }
+                        }
                         _ => m.mean,
                     };
                 }

@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tropel_core::config::{ExecutionConfig, ScenarioConfig, ThresholdConfig};
 use tropel_core::scenario::Scenario;
 use tropel_core::types::{Request, Response, Sample};
 use tropel_core::Result;
@@ -154,6 +155,47 @@ pub trait Driver: Send + Sync {
         bytes: &[u8],
         source_path: Option<&std::path::Path>,
     ) -> Result<Box<dyn DriverInstance>>;
+
+    /// Read load-profile options declared by the script itself (e.g. k6's
+    /// `export const options`).
+    ///
+    /// The engine calls this once per scenario *before* spawning VUs, and
+    /// applies the result (execution config, thresholds, named scenarios)
+    /// only when the user did not set an explicit load profile (no
+    /// `-u`/`-d`/`--mode`/`--stages`/`--iterations` flags). This is how a
+    /// k6 script's own `vus`/`duration`/`stages`/`scenarios`/`thresholds`
+    /// drive the run instead of being silently ignored.
+    ///
+    /// `env` carries the job's environment variables so scripts that compute
+    /// their options from `__ENV` (a common k6 pattern) see them.
+    ///
+    /// The default implementation declares no options.
+    async fn declared_options(
+        &self,
+        _bytes: &[u8],
+        _source_path: Option<&std::path::Path>,
+        _env: &HashMap<String, String>,
+    ) -> Option<DriverDeclaredOptions> {
+        None
+    }
+}
+
+/// Load-profile options declared by a script itself (e.g. k6's
+/// `export const options = { vus, duration, stages, scenarios, thresholds }`).
+///
+/// Returned by [`Driver::declared_options`].
+#[derive(Debug, Clone, Default)]
+pub struct DriverDeclaredOptions {
+    /// A single-executor load profile (k6 top-level `vus`/`duration`/
+    /// `iterations`/`stages`). `None` when the script declares named
+    /// scenarios instead.
+    pub execution: Option<ExecutionConfig>,
+    /// Named scenarios, each with its own executor (k6 `options.scenarios`).
+    /// When present and non-empty, this takes precedence over `execution`.
+    pub scenarios: Option<HashMap<String, ScenarioConfig>>,
+    /// Thresholds declared by the script (k6 `options.thresholds`),
+    /// merged into the job's thresholds.
+    pub thresholds: HashMap<String, ThresholdConfig>,
 }
 
 /// A driver instance ready to run iterations.
