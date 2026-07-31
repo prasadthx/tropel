@@ -160,6 +160,11 @@ impl PmBridge {
             let globals = rq_ctx.globals();
 
             // ── Environment ──
+            // NOTE: environment values are returned RAW (not JSON-encoded) on
+            // purpose — Postman environment variables are always strings, and
+            // the shim's `pm.environment.get` returns them as-is (no
+            // JSON.parse). Do NOT "harmonize" this with variables_get's JSON
+            // encoding, or env vars like "123" would round-trip as numbers.
             let state_clone = state.clone();
             let _ = globals.set(
                 "__tropel_pm_environment_get",
@@ -705,5 +710,46 @@ impl PmBridge {
         });
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The JS shim round-trips a variable through `JSON.parse`:
+    /// bridge returns a JSON-encoded string → shim JSON.parses it. This test
+    /// locks the typing contract so an env var "123" stays the STRING "123"
+    /// (never the number 123) and a collection/global object survives.
+    #[test]
+    fn test_variable_json_roundtrip_preserves_type() {
+        // Env vars are HashMap<String, String> — the bridge JSON-encodes them.
+        let env_str = string_to_json_encoded("123");
+        assert_eq!(env_str, "\"123\"");
+        // Shim does JSON.parse → must come back as the string "123".
+        let parsed: serde_json::Value = serde_json::from_str(&env_str).unwrap();
+        assert!(parsed.is_string());
+        assert_eq!(parsed.as_str().unwrap(), "123");
+
+        // Boolean-looking and null-looking env values stay strings too.
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&string_to_json_encoded("true")).unwrap(),
+                   serde_json::Value::String("true".into()));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&string_to_json_encoded("null")).unwrap(),
+                   serde_json::Value::String("null".into()));
+
+        // Plain string (the common case) round-trips unchanged.
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&string_to_json_encoded("hello")).unwrap(),
+                   serde_json::Value::String("hello".into()));
+
+        // Collection/global vars are serde_json::Value — objects round-trip
+        // as objects, numbers as numbers, strings as strings.
+        let obj = serde_json::json!({ "a": 1, "b": [true, null] });
+        let encoded = variable_value_to_string(&obj);
+        let parsed: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(parsed, obj);
+
+        let num = serde_json::json!(123);
+        let parsed: serde_json::Value = serde_json::from_str(&variable_value_to_string(&num)).unwrap();
+        assert!(parsed.is_number());
     }
 }
