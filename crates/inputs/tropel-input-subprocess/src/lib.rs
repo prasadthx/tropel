@@ -22,26 +22,41 @@
 //!
 //! ## Registration
 //!
-//! This adapter is registered via `inventory::submit!` at compile time.
-//! Unlike static adapters (Postman, HAR, OpenAPI), the subprocess adapter
-//! takes a runtime argument — the command to run — so it is constructed
-//! with a specific command string and added to the registry at startup
-//! (not by `collect_inventory()`).
+//! This adapter is **factory-only**: it takes a runtime argument — the
+//! command to run — so it cannot be a compile-time `inventory::submit!`
+//! registration. The CLI registers one factory per `--subprocess-adapter
+//! <cmd>` via `ExtensionRegistry::register_adapter_factory` under the id
+//! `subprocess:<cmd>`. There is deliberately **no** static registration:
+//! a placeholder would be probed during content auto-detection on every
+//! run (spawning a bogus `echo`) and listed as a real format.
 //!
 //! ## Safety
 //!
 //! The subprocess runs with the same privileges as the tropel process.
 //! The command is configured by the user (via `--subprocess-adapter`),
 //! so the user is responsible for trusting the command they specify.
+//! Each call is bounded by a timeout (default 30s) and an output-size cap
+//! (default 16 MiB) so a hanging or chatty subprocess can't stall or OOM
+//! the host.
 
 use std::collections::HashMap;
 
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::io::Write;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 use tropel_core::scenario::{Scenario, ScenarioInfo};
 use tropel_core::{Result, TropelError};
-use tropel_ext::traits::{InputAdapter, InputAdapterRegistration};
+use tropel_ext::traits::InputAdapter;
+
+/// Default per-call timeout for the subprocess. A child that outlives this
+/// is killed (DoS guard — a hanging adapter must not hang the host).
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Cap on how many bytes we read from the subprocess stdout. Prevents a
+/// misbehaving adapter from exhausting host memory.
+const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
 /// A subprocess-based input adapter.
 ///
@@ -53,6 +68,10 @@ pub struct SubprocessAdapter {
     /// Parsed command parts for spawning.
     program: String,
     args: Vec<String>,
+    /// Per-call timeout; the child is killed when it expires.
+    timeout: Duration,
+    /// Max stdout bytes accepted per call.
+    max_output: usize,
 }
 
 impl SubprocessAdapter {
@@ -70,10 +89,38 @@ impl SubprocessAdapter {
             command: command.to_string(),
             program,
             args,
+            timeout: DEFAULT_TIMEOUT,
+            max_output: MAX_OUTPUT_BYTES,
         }
     }
 
+    /// Set the per-call timeout. The child is killed when it expires.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Set the per-call stdout byte cap (default 16 MiB).
+    pub fn with_max_output(mut self, max_output: usize) -> Self {
+        self.max_output = max_output;
+        self
+    }
+
     /// Run the subprocess with the given mode flag and input bytes.
+    ///
+    /// I/O is **concurrent**: stdin is fed by a dedicated writer thread and
+    /// stdout is drained by a dedicated reader thread, while the caller
+    /// waits on a channel. The old implementation did `write_all(stdin)`
+    /// before reading stdout — with a large payload the child's stdout pipe
+    /// fills while it's still reading stdin, and the parent's blocked
+    /// `write_all` meets the child's blocked stdout write: a classic pipe
+    /// deadlock.
+    ///
+    /// The call is bounded by [`Self::timeout`]: the caller blocks on
+    /// `recv_timeout`, so even a **silent** child that merely holds stdout
+    /// open (e.g. `sleep 60`) is killed on expiry — a deadline checked only
+    /// *between* blocking reads would never fire for such a child. Stdout is
+    /// also capped at [`Self::max_output`] bytes.
     fn run(&self, flag: &str, env_var: &str, bytes: &[u8]) -> Result<Vec<u8>> {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args)
@@ -83,42 +130,155 @@ impl SubprocessAdapter {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
 
-        let mut child = cmd.spawn()
-            .map_err(|e| TropelError::Other(format!(
+        let mut child = cmd.spawn().map_err(|e| {
+            TropelError::Other(format!(
                 "Failed to spawn subprocess adapter '{}': {}. Is '{}' installed and on PATH?",
                 self.command, e, self.program
-            )))?;
+            ))
+        })?;
 
-        // Write input bytes to stdin
-        if let Some(stdin) = child.stdin.as_mut() {
-            stdin.write_all(bytes)
-                .map_err(|e| TropelError::Other(format!(
-                    "Failed to write to subprocess stdin: {}", e
-                )))?;
+        // Take both pipes BEFORE spawning any helper thread, so no helper
+        // can leak if a `take()` fails.
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            TropelError::Other(format!("Subprocess '{}' stdin unavailable", self.command))
+        })?;
+        let mut stdout = child.stdout.take().ok_or_else(|| {
+            TropelError::Other(format!("Subprocess '{}' stdout unavailable", self.command))
+        })?;
+
+        // Hard overall budget for the whole call (spawn → child exit).
+        let deadline = Instant::now() + self.timeout;
+        let remaining = || deadline.saturating_duration_since(Instant::now());
+
+        // Writer thread: feed stdin so the child can start emitting stdout
+        // before it has drained stdin (no pipe deadlock on large I/O).
+        let input = bytes.to_vec();
+        let writer = thread::spawn(move || {
+            if let Err(e) = stdin.write_all(&input) {
+                // Broken pipe is normal when the child exits early or
+                // ignores stdin — not an adapter failure.
+                tracing::debug!("Subprocess stdin write failed: {}", e);
+            }
+        });
+
+        // Reader thread: drain stdout (with a byte cap) and send the result
+        // over a channel. Doing the read off the caller thread is what makes
+        // the timeout real: `recv_timeout` fires even if the child writes
+        // nothing and merely keeps the pipe open.
+        let max_output = self.max_output;
+        let command = self.command.clone();
+        let (tx, rx) = mpsc::channel::<Result<Vec<u8>>>();
+        let reader = thread::spawn(move || {
+            let mut output = Vec::new();
+            let mut chunk = [0u8; 8192];
+            let result = loop {
+                match stdout.read(&mut chunk) {
+                    Ok(0) => break Ok(output), // EOF
+                    Ok(n) => {
+                        if output.len() + n > max_output {
+                            break Err(TropelError::Other(format!(
+                                "Subprocess '{}' output exceeded {} bytes",
+                                command, max_output
+                            )));
+                        }
+                        output.extend_from_slice(&chunk[..n]);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => break Err(TropelError::Other(format!(
+                        "Failed to read subprocess '{}' stdout: {}",
+                        command, e
+                    ))),
+                }
+            };
+            let _ = tx.send(result);
+        });
+
+        // Wait for the reader with a hard timeout. The reader thread may
+        // still be blocked in `read` when we time out — killing the child
+        // closes the pipe, which unblocks it so we can join cleanly.
+        // NOTE: `child.kill()` only terminates the DIRECT child process. If
+        // the configured command spawns long-lived grandchildren (a shell
+        // wrapper that does not `exec` its payload, or a fork-emulated exec
+        // on MSYS/Windows), those can keep the pipe open and delay the join
+        // until they exit; adapter commands should avoid such wrappers.
+        let read_outcome = match rx.recv_timeout(remaining()) {
+            Ok(res) => res,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(TropelError::Other(format!(
+                "Subprocess '{}' timed out after {:?}",
+                self.command, self.timeout
+            ))),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(TropelError::Other(format!(
+                "Subprocess '{}' reader thread terminated unexpectedly",
+                self.command
+            ))),
+        };
+
+        match read_outcome {
+            Err(e) => {
+                // Timeout / cap / I/O failure: stop the child, join both
+                // helper threads, and surface the error.
+                kill_and_join(&mut child, writer, reader);
+                Err(e)
+            }
+            Ok(output) => {
+                // Normal EOF: reap the child within the remaining budget.
+                let status = loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => break status,
+                        Ok(None) => {
+                            if Instant::now() >= deadline {
+                                kill_and_join(&mut child, writer, reader);
+                                return Err(TropelError::Other(format!(
+                                    "Subprocess '{}' timed out after {:?}",
+                                    self.command, self.timeout
+                                )));
+                            }
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => {
+                            kill_and_join(&mut child, writer, reader);
+                            return Err(TropelError::Other(format!(
+                                "Failed to wait for subprocess '{}': {}",
+                                self.command, e
+                            )));
+                        }
+                    }
+                };
+                let _ = writer.join();
+                let _ = reader.join();
+
+                if !status.success() {
+                    return Err(TropelError::Other(format!(
+                        "Subprocess '{}' exited with {}",
+                        self.command, status
+                    )));
+                }
+
+                Ok(output)
+            }
         }
-
-        // Wait for output
-        let output = child.wait_with_output()
-            .map_err(|e| TropelError::Other(format!(
-                "Subprocess '{}' failed: {}", self.command, e
-            )))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout_preview = String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(200)]);
-            return Err(TropelError::Other(format!(
-                "Subprocess '{}' exited with {}: stderr={} stdout={}",
-                self.command, output.status, stderr.trim(), stdout_preview.trim()
-            )));
-        }
-
-        Ok(output.stdout)
     }
+}
+
+/// Kill the child, reap it, and join both helper threads. Consumes the
+/// handles so it can be called from any error path without borrow issues.
+fn kill_and_join(
+    child: &mut std::process::Child,
+    writer: std::thread::JoinHandle<()>,
+    reader: std::thread::JoinHandle<()>,
+) {
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = writer.join();
+    let _ = reader.join();
 }
 
 impl InputAdapter for SubprocessAdapter {
     fn id(&self) -> &str {
-        // Derive a stable ID from the command
+        // Derive a stable ID from the command.
+        // The registry key (set by the CLI) is `subprocess:<command>`; the
+        // adapter's own id is the command itself. No phantom "subprocess"
+        // id pointing at an "echo" adapter — factory-only registration.
         &self.command
     }
 
@@ -193,12 +353,6 @@ impl InputAdapter for SubprocessAdapter {
     }
 }
 
-// Register a placeholder — the CLI replaces this with the real command
-// via `registry.register_input_adapter()` when `--subprocess-adapter` is used.
-inventory::submit!(InputAdapterRegistration::new("subprocess", || {
-    Box::new(SubprocessAdapter::new("echo"))
-}));
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,11 +409,85 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Write a small `sh` script to a per-test temp dir and return an
+    /// adapter command that runs it. The adapter appends `--parse`/`--detect`
+    /// to the command; these scripts **ignore** that argument, so we can test
+    /// echo/timeout behaviour with plain tools (`cat`, `sleep`) that would
+    /// otherwise reject the unknown flag and exit 1.
+    fn script_adapter(name: &str, body: &str) -> SubprocessAdapter {
+        let dir = std::env::temp_dir().join(format!("tropel-sub-tests-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("write script");
+        let cmd = format!("sh {}", path.to_string_lossy().replace('\\', "/"));
+        SubprocessAdapter::new(&cmd)
+    }
+
     #[test]
-    fn test_default_registration() {
-        // The inventory-registered factory creates a fallback "echo" adapter
-        let create_fn: fn() -> Box<dyn InputAdapter> = || Box::new(SubprocessAdapter::new("echo"));
-        let adapter = create_fn();
-        assert_eq!(adapter.id(), "echo");
+    fn test_large_io_no_deadlock() {
+        // Regression: the old code wrote ALL stdin before reading stdout.
+        // With a >pipe-buffer payload, the child's stdout pipe filled while
+        // the parent was still blocked in write_all → deadlock. The writer
+        // thread makes this safe; 1 MiB through `cat` must complete quickly.
+        let adapter = script_adapter("echo1.sh", "#!/bin/sh\nexec cat\n");
+        let start = std::time::Instant::now();
+        let payload = vec![b'x'; 1024 * 1024];
+        let result = adapter.parse(&payload);
+        // The script echoes the bytes back; not valid JSON, but crucially it
+        // must return an error (JSON parse) rather than hang.
+        assert!(result.is_err(), "large I/O must not deadlock");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("invalid JSON"), "unexpected error: {}", msg);
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "1 MiB echo must not deadlock (took {:?})",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn test_timeout_kills_silent_subprocess() {
+        // A child that never writes stdout and never exits must be killed by
+        // the timeout. `sleep 60` holds the pipe open but is silent — the
+        // reader thread + `recv_timeout` is what makes this terminate.
+        // The script must NOT spawn a long-lived subprocess: `child.kill()`
+        // only terminates the direct child, so if `sleep` were a grandchild
+        // it would keep the stdout pipe open and the test would hang its
+        // full duration (on MSYS even `exec sleep` is fork-emulated). A busy
+        // loop runs inside `sh` itself — killing `sh` closes the pipe and
+        // unblocks the reader thread promptly.
+        let adapter =
+            script_adapter("busy.sh", "#!/bin/sh\nwhile :; do :; done\n")
+                .with_timeout(Duration::from_millis(300));
+        let start = std::time::Instant::now();
+        let result = adapter.parse(b"hello");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("timed out"),
+            "expected timeout error, got: {}",
+            msg
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "timeout must kill the child promptly (took {:?})",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn test_output_cap_limits_chatty_subprocess() {
+        // A child that emits more than the cap must be stopped with an error.
+        // The echo script returns its 1 MiB input on stdout; a 4 KiB cap trips.
+        let adapter = script_adapter("echo2.sh", "#!/bin/sh\nexec cat\n").with_max_output(4 * 1024);
+        let payload = vec![b'x'; 1024 * 1024];
+        let result = adapter.parse(&payload);
+        assert!(result.is_err(), "output cap must reject chatty subprocess");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("exceeded"),
+            "expected cap error, got: {}",
+            msg
+        );
     }
 }

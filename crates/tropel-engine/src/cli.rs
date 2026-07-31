@@ -94,9 +94,9 @@ pub enum Commands {
         /// Subprocess adapter command (e.g. `--subprocess-adapter "python3 my-adapter.py"`).
         /// Runs the command for each detect/parse call, passing bytes on stdin
         /// and reading a JSON Scenario from stdout.
-        /// Note: when using this flag, you should also pass `--format subprocess:<cmd>`
-        /// to select the subprocess adapter (auto-detection from bytes won't work
-        /// until the adapter processes its first input).
+        /// The adapter is registered as `subprocess:<cmd>` (use with `--format`)
+        /// and is also probed during content auto-detection, like WASM plugins.
+        /// Each call is bounded by a 30s timeout and a 16 MiB output cap.
         #[arg(long = "subprocess-adapter")]
         subprocess_adapter: Vec<String>,
 

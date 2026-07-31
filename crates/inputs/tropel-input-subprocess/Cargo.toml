@@ -10,7 +10,6 @@ description = "Subprocess/JSON input adapter — runs an external command that r
 [dependencies]
 tropel-core.workspace = true
 tropel-ext.workspace = true
-inventory.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
 rand.workspace = true

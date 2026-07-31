@@ -2991,7 +2991,6 @@ dependencies = [
 name = "tropel-input-subprocess"
 version = "0.1.0"
 dependencies = [
- "inventory",
  "rand 0.8.7",
  "serde_json",
  "tracing",
