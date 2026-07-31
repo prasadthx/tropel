@@ -26,6 +26,7 @@
 //!    and drains metrics/abort state from the `VuContext`.
 
 use async_trait::async_trait;
+use futures::future::join_all;
 use regex::Regex;
 use rquickjs::function::Func;
 use std::collections::HashMap;
@@ -223,6 +224,7 @@ impl K6DriverInstance {
 
         self.js_ctx.with_ctx(|rq_ctx| {
             let globals = rq_ctx.globals();
+            let http_client_request = http_client.clone();
             let _ = globals.set(
                 "__tropel_k6_http_request",
                 Func::from(
@@ -254,7 +256,7 @@ impl K6DriverInstance {
                         // blocking helper — safe from inside ctx.with on a
                         // current-thread VU runtime. No block_on here: that
                         // deadlocks the VU's own reactor.
-                        let http_for_io = http_client.clone();
+                        let http_for_io = http_client_request.clone();
                         let result = tropel_http::blocking::execute_blocking(async move {
                             http_for_io.execute(&req).await
                         });
@@ -283,6 +285,111 @@ impl K6DriverInstance {
                         }
                     },
                 ),
+            );
+
+            let _ = globals.set(
+                "__tropel_k6_http_batch",
+                Func::from(move |requests_json: String| -> String {
+                    let batch_requests: Vec<serde_json::Value> =
+                        serde_json::from_str(&requests_json).unwrap_or_default();
+
+                    let http_for_io = http_client.clone();
+                    let futures = batch_requests.into_iter().map(move |entry| {
+                        let key = entry.get("key").cloned().unwrap_or_else(|| serde_json::Value::String(String::new()));
+                        let method = entry
+                            .get("method")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("GET")
+                            .to_string();
+                        let url = entry
+                            .get("url")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let headers_json = entry
+                            .get("headers_json")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("{}");
+                        let headers: HashMap<String, String> =
+                            serde_json::from_str(headers_json).unwrap_or_default();
+                        let body = entry
+                            .get("body")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let request_body = if body.is_empty() {
+                            None
+                        } else {
+                            Some(Body::Raw(body))
+                        };
+                        let timeout_ms = entry
+                            .get("timeout_ms")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(30000.0);
+                        let timeout = if timeout_ms > 0.0 {
+                            Some(Duration::from_millis(timeout_ms as u64))
+                        } else {
+                            None
+                        };
+                        let req = Request {
+                            url,
+                            method: Method::from_str(&method).unwrap_or(Method::GET),
+                            headers,
+                            query_params: HashMap::new(),
+                            body: request_body,
+                            auth: None,
+                            certificate: None,
+                            follow_redirects: true,
+                            timeout,
+                        };
+                        let http_client = http_for_io.clone();
+                        async move {
+                            let resp = http_client.execute(&req).await;
+                            (key, resp)
+                        }
+                    });
+
+                    let responses = tropel_http::blocking::execute_blocking(async move {
+                        let results = join_all(futures).await;
+                        Ok(results)
+                    });
+
+                    let mut response_map = serde_json::Map::new();
+                    if let Ok(results) = responses {
+                        for (key, result) in results {
+                            let key_str = match key {
+                                serde_json::Value::String(s) => s,
+                                serde_json::Value::Number(n) => n.to_string(),
+                                serde_json::Value::Bool(b) => b.to_string(),
+                                other => serde_json::to_string(&other).unwrap_or_default(),
+                            };
+                            let entry_resp = match result {
+                                Ok(resp) => {
+                                    let body_text = String::from_utf8(resp.body).unwrap_or_default();
+                                    serde_json::json!({
+                                        "code": resp.status_code,
+                                        "status": resp.status_code,
+                                        "status_text": resp.status_text,
+                                        "body": body_text,
+                                        "headers": resp.headers,
+                                        "response_time": resp.response_time.as_secs_f64() * 1000.0,
+                                    })
+                                }
+                                Err(e) => serde_json::json!({
+                                    "code": 0,
+                                    "status": 0,
+                                    "status_text": format!("HTTP error: {}", e),
+                                    "body": "",
+                                    "headers": {},
+                                    "response_time": 0,
+                                }),
+                            };
+                            response_map.insert(key_str, entry_resp);
+                        }
+                    }
+
+                    serde_json::Value::Object(response_map).to_string()
+                }),
             );
         });
 

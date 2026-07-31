@@ -7,6 +7,7 @@ use tropel_core::Result;
 use tropel_core::TropelError;
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MULTIPART_BOUNDARY: &str = "------------------------tropel-boundary-7a2f24b9";
 
 /// Per-VU HTTP client with auth and response tracking.
 #[derive(Clone)]
@@ -84,6 +85,12 @@ impl HttpClient {
             .unwrap_or(0);
 
         // Build the reqwest request
+        let multipart_content_type = if matches!(request.body, Some(Body::FormData(_))) {
+            Some(format!("multipart/form-data; boundary={}", MULTIPART_BOUNDARY))
+        } else {
+            None
+        };
+
         let mut req_builder = match request.method {
             Method::GET => self.inner.get(&request.url),
             Method::POST => {
@@ -120,6 +127,15 @@ impl HttpClient {
         };
 
         // Add headers
+        if let Some(content_type) = multipart_content_type {
+            if !request
+                .headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("content-type"))
+            {
+                req_builder = req_builder.header("Content-Type", content_type);
+            }
+        }
         for (key, value) in &request.headers {
             req_builder = req_builder.header(key.as_str(), value.as_str());
         }
@@ -287,11 +303,7 @@ pub fn body_size(body: &Body) -> usize {
     match body {
         Body::Raw(s) => s.len(),
         Body::Json(val) => serde_json::to_string(val).unwrap_or_default().len(),
-        Body::FormData(map) => {
-            map.iter()
-                .map(|(k, v)| k.len() + v.len() + 1) // key=value
-                .sum::<usize>()
-        }
+        Body::FormData(map) => multipart_form_data_bytes(map).len(),
         Body::UrlEncoded(map) => map
             .iter()
             .map(|(k, v)| k.len() + v.len() + 1)
@@ -301,17 +313,35 @@ pub fn body_size(body: &Body) -> usize {
     }
 }
 
+fn multipart_form_data_bytes(map: &HashMap<String, String>) -> Vec<u8> {
+    let mut body = Vec::new();
+
+    for (name, value) in map {
+        body.extend_from_slice(format!("--{}\r\n", MULTIPART_BOUNDARY).as_bytes());
+        body.extend_from_slice(
+            format!(
+                "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
+                escape_multipart_field_name(name)
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+
+    body.extend_from_slice(format!("--{}--\r\n", MULTIPART_BOUNDARY).as_bytes());
+    body
+}
+
+fn escape_multipart_field_name(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn body_to_reqwest(body: &Body) -> reqwest::Body {
     match body {
         Body::Raw(s) => s.clone().into(),
         Body::Json(val) => serde_json::to_string(val).unwrap_or_default().into(),
-        Body::FormData(map) => {
-            let params: Vec<(String, String)> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone().to_string()))
-                .collect();
-            reqwest::Body::from(serde_urlencoded::to_string(params).unwrap_or_default())
-        }
+        Body::FormData(map) => reqwest::Body::from(multipart_form_data_bytes(map)),
         Body::UrlEncoded(map) => {
             let params: Vec<(String, String)> = map
                 .iter()
@@ -327,6 +357,29 @@ fn body_to_reqwest(body: &Body) -> reqwest::Body {
             let body = serde_json::json!({ "query": query });
             serde_json::to_string(&body).unwrap_or_default().into()
         }
+    }
+}
+
+#[cfg(test)]
+mod multipart_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn multipart_form_data_serializes_with_boundary() {
+        let mut formdata = HashMap::new();
+        formdata.insert("field1".to_string(), "value1".to_string());
+        formdata.insert("field 2".to_string(), "two".to_string());
+
+        let bytes = multipart_form_data_bytes(&formdata);
+        let text = String::from_utf8(bytes.clone()).expect("multipart body must be UTF-8");
+
+        assert!(text.contains("Content-Disposition: form-data; name=\"field1\""));
+        assert!(text.contains("Content-Disposition: form-data; name=\"field 2\""));
+        assert!(text.contains("value1"));
+        assert!(text.contains("two"));
+        assert!(text.ends_with("------------------------tropel-boundary-7a2f24b9--\r\n"));
+        assert_eq!(body_size(&Body::FormData(formdata)), bytes.len());
     }
 }
 
@@ -422,3 +475,4 @@ mod tests {
         assert_eq!(result, "key=value&name=hello+world");
     }
 }
+

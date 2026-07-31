@@ -246,6 +246,35 @@ pm.iterationData = {
     }
 };
 
+function buildMultipartBody(formdata) {
+    var boundary = '----TropelFormBoundary' + Math.random().toString(36).slice(2);
+    var parts = [];
+    for (var i = 0; i < formdata.length; i++) {
+        var fp = formdata[i];
+        if (!fp || !fp.key) continue;
+        var value = fp.value == null ? '' : fp.value;
+        if (typeof value !== 'string') {
+            try {
+                value = JSON.stringify(value);
+            } catch (e) {
+                value = String(value);
+            }
+        }
+        parts.push('--' + boundary + '\r\n');
+        parts.push('Content-Disposition: form-data; name="' + escapeMultipartFieldName(fp.key) + '"\r\n\r\n');
+        parts.push(value + '\r\n');
+    }
+    parts.push('--' + boundary + '--\r\n');
+    return {
+        body: parts.join(''),
+        contentType: 'multipart/form-data; boundary=' + boundary
+    };
+}
+
+function escapeMultipartFieldName(name) {
+    return String(name).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
 // ── pm.sendRequest (for chaining requests within a test) ──
 // Supports the auth-token-fetch pattern: send a request to obtain
 // an auth token, then store it via pm.variables.set().
@@ -308,14 +337,11 @@ pm.sendRequest = function (options, callback) {
                             break;
                         case 'formdata':
                             if (options.body.formdata && Array.isArray(options.body.formdata)) {
-                                var formPairs = [];
-                                for (var k = 0; k < options.body.formdata.length; k++) {
-                                    var fp = options.body.formdata[k];
-                                    if (fp && fp.key) {
-                                        formPairs.push(encodeURIComponent(fp.key) + '=' + encodeURIComponent(fp.value || ''));
-                                    }
+                                var multipart = buildMultipartBody(options.body.formdata);
+                                body = multipart.body;
+                                if (!headers['Content-Type'] && !headers['content-type']) {
+                                    headers['Content-Type'] = multipart.contentType;
                                 }
-                                body = formPairs.join('&');
                             }
                             break;
                         case 'graphql':

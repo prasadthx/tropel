@@ -23,49 +23,30 @@
 // ══════════════════════════════════════════════════════════════════
 
 function k6HTTPRequest(method, url, body, params) {
-    method = (method || 'GET').toUpperCase();
-    params = params || {};
-
-    // Process headers
-    var headers = params.headers || {};
-    var timeout = params.timeout || '30s';
-
-    // Convert timeout string to milliseconds
-    var timeoutMs = 30000;
-    if (typeof timeout === 'string') {
-        var match = timeout.match(/^(\d+)(ms|s|m)?$/);
-        if (match) {
-            var val = parseInt(match[1], 10);
-            var unit = match[2] || 'ms';
-            if (unit === 's') timeoutMs = val * 1000;
-            else if (unit === 'm') timeoutMs = val * 60000;
-            else timeoutMs = val;
-        }
-    } else if (typeof timeout === 'number') {
-        timeoutMs = timeout;
-    }
-
-    // Serialize body
-    var bodyStr = '';
-    if (body !== null && body !== undefined) {
-        if (typeof body === 'string') {
-            bodyStr = body;
-        } else if (body instanceof ArrayBuffer) {
-            bodyStr = '';
-        } else {
-            try {
-                bodyStr = JSON.stringify(body);
-                if (!headers['Content-Type'] && !headers['content-type']) {
-                    headers['Content-Type'] = 'application/json';
-                }
-            } catch (e) {
-                bodyStr = String(body);
-            }
-        }
-    }
-
-    var headersJson = JSON.stringify(headers);
+    var canonical = normalizeK6Request(method, url, body, params);
+    var headersJson = JSON.stringify(canonical.headers);
     var resultJson = null;
+
+    // Try the k6-native HTTP bridge first (lazy-registered by K6DriverInstance)
+    if (typeof __tropel_k6_http_request === 'function') {
+        resultJson = __tropel_k6_http_request(
+            canonical.method,
+            canonical.url,
+            headersJson,
+            canonical.body,
+            canonical.timeoutMs
+        );
+    }
+    // Fall back to the PM bridge (if installed)
+    else if (typeof __tropel_pm_send_request === 'function') {
+        resultJson = __tropel_pm_send_request(
+            canonical.method,
+            canonical.url,
+            headersJson,
+            canonical.body,
+            canonical.timeoutMs
+        );
+    }
 
     // Try the k6-native HTTP bridge first (lazy-registered by K6DriverInstance)
     if (typeof __tropel_k6_http_request === 'function') {
@@ -125,6 +106,112 @@ function k6HTTPRequest(method, url, body, params) {
     return new K6Response(respCode, respBody, normalizedHeaders, timings, url);
 }
 
+function normalizeK6Request(method, url, body, params) {
+    method = (method || 'GET').toUpperCase();
+    params = params || {};
+
+    var headers = params.headers || {};
+    var timeout = params.timeout || '30s';
+
+    var timeoutMs = 30000;
+    if (typeof timeout === 'string') {
+        var match = timeout.match(/^(\d+)(ms|s|m)?$/);
+        if (match) {
+            var val = parseInt(match[1], 10);
+            var unit = match[2] || 'ms';
+            if (unit === 's') timeoutMs = val * 1000;
+            else if (unit === 'm') timeoutMs = val * 60000;
+            else timeoutMs = val;
+        }
+    } else if (typeof timeout === 'number') {
+        timeoutMs = timeout;
+    }
+
+    var serialized = serializeK6Body(body, headers);
+    return {
+        method: method,
+        url: url,
+        headers: serialized.headers,
+        body: serialized.body,
+        timeoutMs: timeoutMs,
+    };
+}
+
+function serializeK6Body(body, headers) {
+    var bodyStr = '';
+    if (body !== null && body !== undefined) {
+        if (typeof body === 'string') {
+            bodyStr = body;
+        } else if (body instanceof ArrayBuffer) {
+            bodyStr = '';
+        } else {
+            var contentType = headers['Content-Type'] || headers['content-type'];
+            if (contentType && contentType.indexOf('multipart/form-data') !== -1 && typeof body === 'object') {
+                var multipart = buildMultipartFormData(body);
+                bodyStr = multipart.body;
+                if (!headers['Content-Type'] && !headers['content-type']) {
+                    headers['Content-Type'] = multipart.contentType;
+                }
+            } else if (contentType && contentType.indexOf('application/x-www-form-urlencoded') !== -1 && typeof body === 'object') {
+                bodyStr = serializeUrlEncoded(body);
+            } else {
+                try {
+                    bodyStr = JSON.stringify(body);
+                    if (!headers['Content-Type'] && !headers['content-type']) {
+                        headers['Content-Type'] = 'application/json';
+                    }
+                } catch (e) {
+                    bodyStr = String(body);
+                }
+            }
+        }
+    }
+
+    return { body: bodyStr, headers: headers };
+}
+
+function buildMultipartFormData(object) {
+    var boundary = '----TropelFormBoundary' + Math.random().toString(36).slice(2);
+    var body = '';
+
+    for (var key in object) {
+        if (!object.hasOwnProperty(key)) continue;
+        var value = object[key];
+        if (value === undefined || value === null) {
+            value = '';
+        } else if (typeof value !== 'string') {
+            try {
+                value = JSON.stringify(value);
+            } catch (e) {
+                value = String(value);
+            }
+        }
+        body += '--' + boundary + '\r\n';
+        body += 'Content-Disposition: form-data; name="' + escapeMultipartFieldName(key) + '"\r\n\r\n';
+        body += value + '\r\n';
+    }
+    body += '--' + boundary + '--\r\n';
+
+    return { body: body, contentType: 'multipart/form-data; boundary=' + boundary };
+}
+
+function serializeUrlEncoded(object) {
+    var parts = [];
+    for (var key in object) {
+        if (!object.hasOwnProperty(key)) continue;
+        var value = object[key];
+        if (value === undefined || value === null) {
+            value = '';
+        }
+        parts.push(encodeURIComponent(key) + '=' + encodeURIComponent(String(value)));
+    }
+    return parts.join('&');
+}
+
+function escapeMultipartFieldName(name) {
+    return String(name).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
 // ══════════════════════════════════════════════════════════════════
 // Response object (k6-compatible)
 // ══════════════════════════════════════════════════════════════════
@@ -181,11 +268,35 @@ http.batch = function (requests) {
     }
 
     var results = {};
-    for (var ei = 0; ei < entries.length; ei++) {
-        var entry = entries[ei];
-        var key = entry.key != null ? String(entry.key) : String(ei);
-        var resp = k6HTTPRequest(entry.method, entry.url, entry.body, entry.params);
-        results[key] = resp;
+
+    if (typeof __tropel_k6_http_batch === 'function') {
+        var normalized = [];
+        for (var ei = 0; ei < entries.length; ei++) {
+            var entry = entries[ei];
+            var canonical = normalizeK6Request(entry.method, entry.url, entry.body, entry.params);
+            normalized.push({
+                key: entry.key != null ? entry.key : String(ei),
+                method: canonical.method,
+                url: canonical.url,
+                headers_json: JSON.stringify(canonical.headers),
+                body: canonical.body,
+                timeout_ms: canonical.timeoutMs,
+            });
+        }
+
+        var batchResultJson = __tropel_k6_http_batch(JSON.stringify(normalized));
+        var batchResult = JSON.parse(batchResultJson);
+        for (var ei = 0; ei < entries.length; ei++) {
+            var key = entries[ei].key != null ? String(entries[ei].key) : String(ei);
+            results[key] = batchResult[key];
+        }
+    } else {
+        for (var ei = 0; ei < entries.length; ei++) {
+            var entry = entries[ei];
+            var key = entry.key != null ? String(entry.key) : String(ei);
+            var resp = k6HTTPRequest(entry.method, entry.url, entry.body, entry.params);
+            results[key] = resp;
+        }
     }
 
     return results;
