@@ -518,7 +518,7 @@ async fn run_scenario_vus(
                 if sched.is_force_stop_requested() || sched.is_stop_requested() { break; }
                 {
                     let active = sched.active_vus().await;
-                    if sched.should_ramp_down(active).await { break; }
+                    if sched.try_claim_ramp_down(active).await { break; }
                 }
 
                 vu_sample_counter += 1;
@@ -528,63 +528,87 @@ async fn run_scenario_vus(
                 }
 
                 let iter_start = Instant::now();
-                tokio::select! {
-                    _ = stop.notified() => { break; }
-                    result = async {
-                        let data_row = if data_rows.is_empty() { None }
-                            else { Some(data_rows[(iteration_index as usize + vu_id as usize) % data_rows.len()].clone()) };
 
-                        if sched.is_arrival_rate() {
-                            sched.mark_idle();
-                            loop {
-                                if sched.try_acquire_arrival_token() { sched.mark_busy(); break; }
-                                sched.arrival_notify().notified().await;
-                            }
+                // Arrival-rate mode: wait for an iteration token. The wait is
+                // ALSO woken by the stop signal so an idle VU observes the
+                // level-triggered stop flag and exits promptly instead of
+                // waiting forever for a token the ended run will never add.
+                // The idle/busy marks are balanced on every exit path.
+                if sched.is_arrival_rate() {
+                    sched.mark_idle();
+                    let arrival_notify = sched.arrival_notify();
+                    let mut got_token = false;
+                    loop {
+                        if sched.is_stop_requested() || sched.is_force_stop_requested() { break; }
+                        if sched.try_acquire_arrival_token() { got_token = true; break; }
+                        tokio::select! {
+                            _ = arrival_notify.notified() => {}
+                            _ = stop.notified() => {}
                         }
+                    }
+                    sched.mark_busy();
+                    if !got_token { break; }
+                }
 
-                        let iter_start_time = Instant::now();
-                        let iter_result = runner.run_iteration(iteration_index, data_row, &vu_env).await;
-                        let iter_dur = iter_start_time.elapsed();
-                        let mut iter_samples = iter_result.samples;
-                        let now = std::time::SystemTime::now();
-                        let empty_tags = TagMap::new();
-                        iter_samples.push(Sample { metric: "iterations".into(), value: 1.0, tags: empty_tags.clone(), timestamp: now, sample_type: tropel_core::types::SampleType::Counter });
-                        iter_samples.push(Sample { metric: "iteration_duration".into(), value: iter_dur.as_micros() as f64, tags: empty_tags, timestamp: now, sample_type: tropel_core::types::SampleType::Trend });
-                        // Merge per-scenario tags into every sample so tag-scoped
-                        // thresholds (e.g. {scenario=load}) work end-to-end.
-                        merge_scenario_tags(&mut iter_samples, &sc_tags);
-                        metrics.record_batch(&iter_samples).await;
+                // Run ONE full iteration to completion. Deliberately no
+                // `stop.notified()` select here — gracefulStop must DRAIN
+                // in-flight iterations (let them finish), not cancel them.
+                // The level-triggered stop flag ends the VU between
+                // iterations; the scheduler's wait_for_drain enforces the
+                // grace window with a force-stop backstop.
+                let result = async {
+                    let data_row = if data_rows.is_empty() { None }
+                        else { Some(data_rows[(iteration_index as usize + vu_id as usize) % data_rows.len()].clone()) };
 
-                        if has_abort_thresholds {
-                            let elapsed = test_start.elapsed();
-                            if elapsed > Duration::from_secs(1) {
-                                let slot = elapsed.as_secs() / 2;
-                                let prev = (elapsed - Duration::from_millis(100)).as_secs() / 2;
-                                if slot != prev {
-                                    let results = metrics.results().await;
-                                    if check_abort_on_fail(&thresholds, &results, elapsed) {
-                                        sched.request_stop();
-                                    }
+                    let iter_start_time = Instant::now();
+                    let iter_result = runner.run_iteration(iteration_index, data_row, &vu_env).await;
+                    let iter_dur = iter_start_time.elapsed();
+                    let mut iter_samples = iter_result.samples;
+                    let now = std::time::SystemTime::now();
+                    let empty_tags = TagMap::new();
+                    iter_samples.push(Sample { metric: "iterations".into(), value: 1.0, tags: empty_tags.clone(), timestamp: now, sample_type: tropel_core::types::SampleType::Counter });
+                    iter_samples.push(Sample { metric: "iteration_duration".into(), value: iter_dur.as_micros() as f64, tags: empty_tags, timestamp: now, sample_type: tropel_core::types::SampleType::Trend });
+                    // Merge per-scenario tags into every sample so tag-scoped
+                    // thresholds (e.g. {scenario=load}) work end-to-end.
+                    merge_scenario_tags(&mut iter_samples, &sc_tags);
+                    metrics.record_batch(&iter_samples).await;
+
+                    if has_abort_thresholds {
+                        let elapsed = test_start.elapsed();
+                        if elapsed > Duration::from_secs(1) {
+                            let slot = elapsed.as_secs() / 2;
+                            let prev = (elapsed - Duration::from_millis(100)).as_secs() / 2;
+                            if slot != prev {
+                                let results = metrics.results().await;
+                                if check_abort_on_fail(&thresholds, &results, elapsed) {
+                                    sched.request_stop();
                                 }
                             }
                         }
+                    }
 
-                        {
-                            let state = pm_state.lock().unwrap();
-                            if state.abort_requested {
-                                let msg = state.abort_message.clone().unwrap_or_else(|| "Test aborted by script".to_string());
-                                tracing::warn!("test.abort(): {} — stopping", msg);
-                                drop(state);
-                                sched.request_stop();
-                            }
+                    {
+                        let state = pm_state.lock().unwrap();
+                        if state.abort_requested {
+                            let msg = state.abort_message.clone().unwrap_or_else(|| "Test aborted by script".to_string());
+                            tracing::warn!("test.abort(): {} — stopping", msg);
+                            drop(state);
+                            sched.request_stop();
                         }
+                    }
 
-                        sched.increment_iterations().await;
-                        iteration_index
-                    } => { iteration_index = result + 1; }
-                }
+                    sched.increment_iterations().await;
+                    iteration_index
+                }.await;
+                iteration_index = result + 1;
 
-                if !sched.is_arrival_rate() {
+                // Skip pacing when stop/force-stop is already requested — a
+                // drained VU should exit promptly instead of sleeping out a
+                // full pacing period during graceful shutdown.
+                if !sched.is_arrival_rate()
+                    && !sched.is_stop_requested()
+                    && !sched.is_force_stop_requested()
+                {
                     apply_think_time(&think_time, Some(iter_start.elapsed())).await;
                 }
 
@@ -783,7 +807,7 @@ async fn run_driver_vus(
                 if sched.is_force_stop_requested() || sched.is_stop_requested() { break; }
                 {
                     let active = sched.active_vus().await;
-                    if sched.should_ramp_down(active).await { break; }
+                    if sched.try_claim_ramp_down(active).await { break; }
                 }
 
                 vu_sample_counter += 1;
@@ -793,74 +817,98 @@ async fn run_driver_vus(
                 }
 
                 let iter_start = Instant::now();
-                tokio::select! {
-                    _ = stop.notified() => { break; }
-                    result = async {
-                        let data_row = if data_rows.is_empty() { None }
-                            else { Some(data_rows[(iteration_index as usize + vu_id as usize) % data_rows.len()].clone()) };
 
-                        if sched.is_arrival_rate() {
-                            sched.mark_idle();
-                            loop {
-                                if sched.try_acquire_arrival_token() { sched.mark_busy(); break; }
-                                sched.arrival_notify().notified().await;
-                            }
+                // Arrival-rate mode: wait for an iteration token. The wait is
+                // ALSO woken by the stop signal so an idle VU observes the
+                // level-triggered stop flag and exits promptly instead of
+                // waiting forever for a token the ended run will never add.
+                // The idle/busy marks are balanced on every exit path.
+                if sched.is_arrival_rate() {
+                    sched.mark_idle();
+                    let arrival_notify = sched.arrival_notify();
+                    let mut got_token = false;
+                    loop {
+                        if sched.is_stop_requested() || sched.is_force_stop_requested() { break; }
+                        if sched.try_acquire_arrival_token() { got_token = true; break; }
+                        tokio::select! {
+                            _ = arrival_notify.notified() => {}
+                            _ = stop.notified() => {}
                         }
+                    }
+                    sched.mark_busy();
+                    if !got_token { break; }
+                }
 
-                        let iter_start_time = Instant::now();
-                        let mut ctx = VuContext::new(vu_id, iteration_index, sc_name_vu.clone());
-                        ctx.env = vu_env.clone();
-                        ctx.data_row = data_row;
-                        ctx.http_client = Some(http_client_handle.clone());
+                // Run ONE full iteration to completion. Deliberately no
+                // `stop.notified()` select here — gracefulStop must DRAIN
+                // in-flight iterations (let them finish), not cancel them.
+                // The level-triggered stop flag ends the VU between
+                // iterations; the scheduler's wait_for_drain enforces the
+                // grace window with a force-stop backstop.
+                let result = async {
+                    let data_row = if data_rows.is_empty() { None }
+                        else { Some(data_rows[(iteration_index as usize + vu_id as usize) % data_rows.len()].clone()) };
 
-                        let result = driver_instance.run_iteration(&mut ctx).await;
-                        let mut ctx_samples = std::mem::take(&mut ctx.samples);
-                        if !ctx_samples.is_empty() {
-                            // Merge per-scenario tags into every sample.
-                            merge_scenario_tags(&mut ctx_samples, &sc_tags);
-                            metrics.record_batch(&ctx_samples).await;
-                        }
+                    let iter_start_time = Instant::now();
+                    let mut ctx = VuContext::new(vu_id, iteration_index, sc_name_vu.clone());
+                    ctx.env = vu_env.clone();
+                    ctx.data_row = data_row;
+                    ctx.http_client = Some(http_client_handle.clone());
 
-                        if ctx.abort_requested {
-                            let msg = ctx.abort_message.unwrap_or_else(|| "Test aborted by driver".to_string());
-                            tracing::warn!("Driver '{}' requested abort: {} — stopping", driver_id, msg);
-                            sched.request_stop();
-                        }
+                    let result = driver_instance.run_iteration(&mut ctx).await;
+                    let mut ctx_samples = std::mem::take(&mut ctx.samples);
+                    if !ctx_samples.is_empty() {
+                        // Merge per-scenario tags into every sample.
+                        merge_scenario_tags(&mut ctx_samples, &sc_tags);
+                        metrics.record_batch(&ctx_samples).await;
+                    }
 
-                        if let Err(e) = result {
-                            tracing::warn!("VU {} iteration {} failed: {}", vu_id, iteration_index, e);
-                        }
+                    if ctx.abort_requested {
+                        let msg = ctx.abort_message.unwrap_or_else(|| "Test aborted by driver".to_string());
+                        tracing::warn!("Driver '{}' requested abort: {} — stopping", driver_id, msg);
+                        sched.request_stop();
+                    }
 
-                        let iter_dur = iter_start_time.elapsed();
-                        let now = std::time::SystemTime::now();
-                        let empty_tags = TagMap::new();
-                        let mut iter_samples = vec![
-                            Sample { metric: "iterations".into(), value: 1.0, tags: empty_tags.clone(), timestamp: now, sample_type: tropel_core::types::SampleType::Counter },
-                            Sample { metric: "iteration_duration".into(), value: iter_dur.as_micros() as f64, tags: empty_tags, timestamp: now, sample_type: tropel_core::types::SampleType::Trend },
-                        ];
-                        merge_scenario_tags(&mut iter_samples, &sc_tags);
-                        metrics.record_batch(&iter_samples).await;
+                    if let Err(e) = result {
+                        tracing::warn!("VU {} iteration {} failed: {}", vu_id, iteration_index, e);
+                    }
 
-                        if has_abort_thresholds {
-                            let elapsed = test_start.elapsed();
-                            if elapsed > Duration::from_secs(1) {
-                                let slot = elapsed.as_secs() / 2;
-                                let prev = (elapsed - Duration::from_millis(100)).as_secs() / 2;
-                                if slot != prev {
-                                    let results = metrics.results().await;
-                                    if check_abort_on_fail(&thresholds, &results, elapsed) {
-                                        sched.request_stop();
-                                    }
+                    let iter_dur = iter_start_time.elapsed();
+                    let now = std::time::SystemTime::now();
+                    let empty_tags = TagMap::new();
+                    let mut iter_samples = vec![
+                        Sample { metric: "iterations".into(), value: 1.0, tags: empty_tags.clone(), timestamp: now, sample_type: tropel_core::types::SampleType::Counter },
+                        Sample { metric: "iteration_duration".into(), value: iter_dur.as_micros() as f64, tags: empty_tags, timestamp: now, sample_type: tropel_core::types::SampleType::Trend },
+                    ];
+                    merge_scenario_tags(&mut iter_samples, &sc_tags);
+                    metrics.record_batch(&iter_samples).await;
+
+                    if has_abort_thresholds {
+                        let elapsed = test_start.elapsed();
+                        if elapsed > Duration::from_secs(1) {
+                            let slot = elapsed.as_secs() / 2;
+                            let prev = (elapsed - Duration::from_millis(100)).as_secs() / 2;
+                            if slot != prev {
+                                let results = metrics.results().await;
+                                if check_abort_on_fail(&thresholds, &results, elapsed) {
+                                    sched.request_stop();
                                 }
                             }
                         }
+                    }
 
-                        sched.increment_iterations().await;
-                        iteration_index
-                    } => { iteration_index = result + 1; }
-                }
+                    sched.increment_iterations().await;
+                    iteration_index
+                }.await;
+                iteration_index = result + 1;
 
-                if !sched.is_arrival_rate() {
+                // Skip pacing when stop/force-stop is already requested — a
+                // drained VU should exit promptly instead of sleeping out a
+                // full pacing period during graceful shutdown.
+                if !sched.is_arrival_rate()
+                    && !sched.is_stop_requested()
+                    && !sched.is_force_stop_requested()
+                {
                     apply_think_time(&think_time, Some(iter_start.elapsed())).await;
                 }
 

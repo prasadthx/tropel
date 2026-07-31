@@ -36,6 +36,11 @@ pub struct VUScheduler {
     /// Target VU count for ramp-down — VUs compare `active_vus > ramp_down_target`
     /// and self-select to exit when the pool is above the target.
     ramp_down_target: Arc<AtomicU32>,
+    /// Surplus slots remaining for ramp-down. Set to `current_vus - target` when
+    /// ramp-down begins; each exiting VU atomically claims one slot. This bounds
+    /// the total number of exits to exactly the delta, eliminating the overshoot
+    /// race where every VU reads the same active count and all exit.
+    ramp_down_remaining: Arc<AtomicU32>,
 }
 
 impl VUScheduler {
@@ -53,6 +58,7 @@ impl VUScheduler {
             arrival_dropped: Arc::new(AtomicU64::new(0)),
             idle_vus: Arc::new(AtomicU32::new(0)),
             ramp_down_target: Arc::new(AtomicU32::new(u32::MAX)),
+            ramp_down_remaining: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -90,19 +96,53 @@ impl VUScheduler {
         self.stop_signal.notify_waiters();
     }
 
-    /// Set the ramp-down target VU count.
-    /// VUs compare `active_vus > target` to decide if they should exit.
-    /// No wake is sent — VUs check the flag naturally at their next iteration
-    /// start via the `should_ramp_down` check in the VU loop.
-    pub fn set_ramp_down_target(&self, target: u32) {
+    /// Set the ramp-down target VU count and the number of surplus slots.
+    /// `current_vus` is the scheduler's tracked pool size at this moment, so
+    /// exactly `current_vus - target` VUs may exit during this ramp-down.
+    /// No wake is sent — VUs claim a slot naturally at their next iteration
+    /// start via the `try_claim_ramp_down` check in the VU loop.
+    pub fn set_ramp_down_target(&self, target: u32, current_vus: u32) {
         self.ramp_down_target.store(target, Ordering::Release);
+        self.ramp_down_remaining
+            .store(current_vus.saturating_sub(target), Ordering::Release);
     }
 
-    /// Check whether this VU should exit due to ramp-down.
-    /// A VU exits voluntarily when active_vus > ramp_down_target.
-    pub async fn should_ramp_down(&self, my_active_vus: u32) -> bool {
+    /// Reset ramp-down state back to "not ramping down".
+    /// Called after a ramp-down stage drains fully (all surplus VUs exited)
+    /// so a later stage's target/remaining can't spuriously claim. When a
+    /// ramp-down TIMES OUT with stragglers still mid-iteration, the caller
+    /// deliberately does NOT clear, so those VUs can still claim and exit.
+    pub fn clear_ramp_down(&self) {
+        self.ramp_down_target.store(u32::MAX, Ordering::Release);
+        self.ramp_down_remaining.store(0, Ordering::Release);
+    }
+
+    /// Try to atomically claim one of the surplus ramp-down slots.
+    /// Returns true if THIS VU should exit.
+    ///
+    /// The surplus counter was set to `current_vus - target` when ramp-down
+    /// began, so at most that many VUs can ever claim — this kills the
+    /// overshoot race where every VU reads the same `active_vus` snapshot
+    /// (all see `active > target`) and all exit below the target. The
+    /// `my_active <= target` guard additionally prevents over-exiting below
+    /// the target if some VUs already died for other reasons.
+    pub async fn try_claim_ramp_down(&self, my_active_vus: u32) -> bool {
         let target = self.ramp_down_target.load(Ordering::Acquire);
-        my_active_vus > target
+        if target == u32::MAX {
+            return false;
+        }
+        if my_active_vus <= target {
+            return false;
+        }
+        self.ramp_down_remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |r| {
+                if r > 0 {
+                    Some(r - 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
     }
 
     /// Try to consume one arrival-rate token. Returns true if a token was available.
@@ -353,7 +393,12 @@ impl VUScheduler {
             let step_delay = stage_duration / steps as u32;
 
             if target > current_vus {
-                // Ramp up (active count incremented by each VU task itself)
+                // Ramp up (active count incremented by each VU task itself).
+                // No clear_ramp_down() here: if the previous ramp-down timed
+                // out with grace-expired stragglers still mid-iteration, they
+                // must still be able to claim a surplus slot and exit during
+                // this ramp-up. Stale state from a fully-drained ramp-down is
+                // harmless (remaining == 0 blocks claims; see clear below).
                 for _ in 0..(target - current_vus) {
                     let vu_id = current_vus;
                     let handle = run_vu(self.shared_clone(), vu_id);
@@ -363,11 +408,11 @@ impl VUScheduler {
                 }
             } else {
                 // Ramp down: set the target so VUs self-select to exit.
-                // This is LEVEL-triggered, not EDGE-triggered — VUs check
-                // `active_vus > ramp_down_target` each iteration and exit
-                // if they're surplus. No global notify_waiters() required.
+                // This is LEVEL-triggered, not EDGE-triggered — VUs claim a
+                // surplus slot via `try_claim_ramp_down` each iteration and
+                // exit if they win one. No global notify_waiters() required.
                 let to_stop = current_vus - target;
-                self.set_ramp_down_target(target);
+                self.set_ramp_down_target(target, current_vus);
 
                 // Wait for the surplus VUs to drain within the graceful_ramp_down window
                 tracing::debug!(
@@ -376,12 +421,29 @@ impl VUScheduler {
                     grace_rd,
                     target
                 );
-                self.wait_for_drain_while(grace_rd, || async {
-                    let active = *self.active_vus.lock().await;
-                    active <= target
-                })
-                .await;
+                let drained = self
+                    .wait_for_drain_while(grace_rd, || async {
+                        let active = *self.active_vus.lock().await;
+                        active <= target
+                    })
+                    .await;
 
+                if drained {
+                    // All surplus VUs exited — clear ramp-down state so a
+                    // subsequent stage can't spuriously claim. If it timed out
+                    // (grace-expired stragglers), KEEP the state so those VUs
+                    // still exit at their next loop-top claim.
+                    self.clear_ramp_down();
+                }
+
+                // NOTE: after a timed-out drain, `current_vus` is stale
+                // (actual active_vus still includes stragglers + retained
+                // VUs). A subsequent ramp-down then computes `remaining` from
+                // this under-count, so the pool can settle above its target.
+                // Bounded: the kept claims still drain the stragglers, and
+                // once they exit, active converges to the tracked count (the
+                // next `set_ramp_down_target` recomputes from the stale
+                // current_vus, so full correction waits for that drain).
                 current_vus = target;
             }
         }
@@ -835,6 +897,7 @@ impl VUScheduler {
             arrival_dropped: self.arrival_dropped.clone(),
             idle_vus: self.idle_vus.clone(),
             ramp_down_target: self.ramp_down_target.clone(),
+            ramp_down_remaining: self.ramp_down_remaining.clone(),
         })
     }
 
@@ -870,26 +933,34 @@ impl VUScheduler {
     /// Wait up to `grace` for a condition (e.g., active_vus <= target) to become true.
     /// After the deadline, logs a warning but does NOT force-stop — the caller
     /// handles the final state.
-    pub async fn wait_for_drain_while<F, Fut>(&self, grace: Duration, condition: F)
+    ///
+    /// Returns `true` if the condition was satisfied within the grace window,
+    /// `false` if the deadline expired first (callers use this to decide
+    /// whether to keep or clear drain state).
+    pub async fn wait_for_drain_while<F, Fut>(&self, grace: Duration, condition: F) -> bool
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = bool>,
     {
         if grace == Duration::ZERO {
-            return;
+            // Zero-grace: "timed out" is the conservative answer — the caller
+            // keeps ramp-down state so surplus VUs self-exit at loop top.
+            // (Not clearing is correct: grace=0 means don't wait for in-flight
+            // iterations; the remaining surplus still needs to exit.)
+            return false;
         }
 
         let deadline = time::Instant::now() + grace;
         loop {
             if condition().await {
-                return;
+                return true;
             }
             if time::Instant::now() >= deadline {
                 tracing::warn!(
                     "Grace period ({:?}) expired while waiting for drain condition",
                     grace
                 );
-                return;
+                return false;
             }
             time::sleep(Duration::from_millis(10)).await;
         }
@@ -934,5 +1005,72 @@ fn parse_duration(s: &str) -> Result<Duration> {
             .parse()
             .map_err(|_| tropel_core::TropelError::Config(format!("Invalid duration: {}", s)))?;
         Ok(Duration::from_secs_f64(v))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Locks the ramp-down overshoot invariant: when `current_vus` VUs contend
+    /// for `current_vus - target` surplus slots, EXACTLY that many claims
+    /// succeed — no VU that reads the same `active > target` snapshot can
+    /// over-exit below the target.
+    #[tokio::test]
+    async fn try_claim_ramp_down_bounds_exits_to_surplus() {
+        let sched = VUScheduler::new(&ExecutionConfig::ConstantVus {
+            vus: 1,
+            duration: "1s".to_string(),
+            graceful_stop: None,
+            think_time: Default::default(),
+        });
+        let current_vus: u32 = 10;
+        let target: u32 = 5;
+        sched.set_ramp_down_target(target, current_vus);
+
+        // Simulate all 10 VUs observing active=10 (the old overshoot race:
+        // every VU sees active > target). Exactly 5 may claim.
+        let mut claimed = 0usize;
+        for _ in 0..current_vus {
+            if sched.try_claim_ramp_down(10).await {
+                claimed += 1;
+            }
+        }
+        assert_eq!(claimed, (current_vus - target) as usize);
+
+        // A 6th VU arriving late must not exit.
+        assert!(!sched.try_claim_ramp_down(10).await);
+    }
+
+    /// After a fully-drained ramp-down, clearing resets the target so a later
+    /// stage can't spuriously claim.
+    #[tokio::test]
+    async fn clear_ramp_down_disables_claims() {
+        let sched = VUScheduler::new(&ExecutionConfig::ConstantVus {
+            vus: 1,
+            duration: "1s".to_string(),
+            graceful_stop: None,
+            think_time: Default::default(),
+        });
+        sched.set_ramp_down_target(3, 8);
+        assert!(sched.try_claim_ramp_down(8).await);
+        sched.clear_ramp_down();
+        // Stale target reset — no claim, even though a stale snapshot says
+        // active > old target.
+        assert!(!sched.try_claim_ramp_down(8).await);
+    }
+
+    /// Ramp-down claims only apply when the pool is actually above target.
+    #[tokio::test]
+    async fn try_claim_ramp_down_noop_when_at_or_below_target() {
+        let sched = VUScheduler::new(&ExecutionConfig::ConstantVus {
+            vus: 1,
+            duration: "1s".to_string(),
+            graceful_stop: None,
+            think_time: Default::default(),
+        });
+        sched.set_ramp_down_target(5, 10);
+        assert!(!sched.try_claim_ramp_down(5).await); // at target
+        assert!(!sched.try_claim_ramp_down(4).await); // below target
     }
 }
