@@ -77,6 +77,13 @@ use wasmtime::{
 const DEFAULT_CALL_FUEL: u64 = 500_000_000;
 /// Maximum output buffer we hand to a plugin's `adapter_parse` (4 MiB).
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+/// Engine-wide maximum linear-memory size (256 pages = 16 MiB), matching the
+/// imported-memory clamp in [`clamp_memory_type`]. Enforced via
+/// `PoolingAllocationConfig::max_memory_size`, this applies to **exported**
+/// memories too: a module whose declared minimum exceeds it fails to
+/// instantiate, and any `memory.grow` beyond it fails at runtime — closing
+/// the gap where a cdylib-exported memory could previously grow toward 4 GiB.
+const MAX_MEMORY_BYTES: usize = 256 * 65536;
 /// Fallback allocation region base (page 2). Only used when the module does
 /// not export `malloc`/`free`. Input and output are bump-allocated *after*
 /// this base so they never alias.
@@ -94,12 +101,16 @@ pub fn create_wasm_engine() -> std::result::Result<Engine, anyhow::Error> {
 
     // Pooling allocator (per C3): reuse memory/table/stack slots across
     // instances. Cheap Store/Instance creation per call.
-    // (total_stacks is async-gated in wasmtime, so it stays at its default.
-    // memory_pages was removed in wasmtime 47 — the per-memory page ceiling
-    // is now governed by the engine's static/dynamic memory limits, which
-    // default well above the 256-page cap the old code enforced.)
+    // (total_stacks is async-gated in wasmtime, so it stays at its default.)
     let mut pooling = PoolingAllocationConfig::default();
     pooling.total_memories(16).total_tables(16);
+    // Cap linear memory to 16 MiB for ALL instances — imported AND exported
+    // memories alike (memory_pages was removed in wasmtime 47; max_memory_size
+    // is the modern engine-level ceiling and it covers exported memories). A
+    // module declaring a min above the cap fails to instantiate; memory.grow
+    // beyond the cap fails at runtime. This closes the exported-memory DoS
+    // gap that the 256-page clamp on imports alone could not.
+    pooling.max_memory_size(MAX_MEMORY_BYTES);
     config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling));
 
     // `wasmtime::Result` is not `anyhow::Result`; convert explicitly so the
@@ -164,9 +175,11 @@ fn build_link_strategy(engine: &Engine, module: &Module) -> anyhow::Result<LinkS
 /// must not produce an invalid `min > max` MemoryType.
 ///
 /// Note: modules that *export* their own memory (the typical `wasm32`
-/// cdylib) are not clamped here — their declared type governs, subject to
-/// wasmtime's engine-level memory limits. Plugin authors should declare a
-/// bounded maximum for exported memories as well.
+/// cdylib) are not clamped *here* — but they are still bounded at runtime by
+/// the engine-level `MAX_MEMORY_BYTES` ceiling (see [`create_wasm_engine`]):
+/// a declared minimum above the cap fails to instantiate and any
+/// `memory.grow` past it fails. So exported memories are capped engine-wide;
+/// this clamp only normalizes the host-supplied memory type for imports.
 fn clamp_memory_type(mem_ty: MemoryType) -> MemoryType {
     let max = mem_ty.maximum().map(|m| m.min(256) as u32).unwrap_or(256);
     let min = (mem_ty.minimum() as u32).min(max);
@@ -987,6 +1000,18 @@ mod tests {
         assert!(plugin2.detect(&[0x7f]));
     }
 
+    const OVER_MIN_MEMORY_WAT: &str = r#"
+(module
+  (memory (export "memory") 300 512)
+  (data (i32.const 0) "over-memory-plugin\00")
+  (func (export "adapter_id") (result i32) (i32.const 0))
+  (func (export "adapter_detect") (param $p i32) (param $n i32) (result i32)
+    (i32.const 0))
+  (func (export "adapter_parse") (param $in i32) (param $in_len i32) (param $out i32) (param $out_len i32) (result i32)
+    (i32.const 0))
+)
+"#;
+
     const HOSTILE_LENGTH_WAT: &str = r#"
 (module
   (memory (export "memory") 64 256)
@@ -1000,6 +1025,20 @@ mod tests {
     (i32.const 2147483647))
 )
 "#;
+
+    #[test]
+    fn test_exported_memory_capped() {
+        // A module that *exports* its own memory with a declared minimum above
+        // the engine-level MAX_MEMORY_BYTES cap (300 pages = ~19 MiB > 16 MiB)
+        // must fail to load — wasmtime's pooling max_memory_size applies to
+        // exported memories too, closing the cdylib memory-DoS gap.
+        let result = WasmPlugin::load(OVER_MIN_MEMORY_WAT.as_bytes());
+        assert!(
+            result.is_err(),
+            "module with exported memory above the cap must fail to load, got {:?}",
+            result.map(|_| ())
+        );
+    }
 
     #[test]
     fn test_hostile_written_length_clamped() {
