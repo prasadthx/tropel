@@ -155,7 +155,8 @@ impl Driver for K6Driver {
 }
 
 // Register K6Driver for compile-time discovery.
-inventory::submit!(DriverRegistration::new("k6", || Box::new(K6Driver)));
+inventory::submit!(DriverRegistration::new("k6", || Box::new(K6Driver))
+.with_priority(10));
 
 // ══════════════════════════════════════════════════════════════════
 // K6DriverInstance — per-iteration execution
@@ -250,8 +251,7 @@ impl K6DriverInstance {
                           body: String,
                           _timeout_ms: f64|
                           -> String {
-                        let headers: HashMap<String, String> =
-                            serde_json::from_str(&headers_json).unwrap_or_default();
+                        let headers = parse_headers_tolerant(&headers_json);
                         let req_body = if body.is_empty() {
                             None
                         } else {
@@ -326,8 +326,7 @@ impl K6DriverInstance {
                             .get("headers_json")
                             .and_then(|v| v.as_str())
                             .unwrap_or("{}");
-                        let headers: HashMap<String, String> =
-                            serde_json::from_str(headers_json).unwrap_or_default();
+                        let headers = parse_headers_tolerant(headers_json);
                         let body = entry
                             .get("body")
                             .and_then(|v| v.as_str())
@@ -741,6 +740,37 @@ if (typeof sleep === 'undefined') {
   }
 }
 "#;
+
+/// Parse a headers JSON string into a `HashMap`, accepting both the plain
+/// object form (`{"k":"v"}`) and the Postman/array form
+/// (`[{"key":"k","value":"v"}]`). The old code used
+/// `serde_json::from_str(...).unwrap_or_default()`, which silently dropped
+/// ALL headers whenever the payload wasn't a plain object — a silent
+/// correctness divergence (P3 · k6 header-parse divergence).
+fn parse_headers_tolerant(json: &str) -> HashMap<String, String> {
+    if json.is_empty() || json == "{}" || json == "[]" {
+        return HashMap::new();
+    }
+    if json.trim_start().starts_with('{') {
+        if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(json) {
+            return map;
+        }
+    }
+    if json.trim_start().starts_with('[') {
+        if let Ok(arr) = serde_json::from_str::<Vec<HashMap<String, serde_json::Value>>>(json) {
+            let mut headers = HashMap::new();
+            for entry in arr {
+                let key = entry.get("key").and_then(|v| v.as_str()).unwrap_or("");
+                let value = entry.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                if !key.is_empty() {
+                    headers.insert(key.to_string(), value.to_string());
+                }
+            }
+            return headers;
+        }
+    }
+    HashMap::new()
+}
 
 // ══════════════════════════════════════════════════════════════════
 // Tests

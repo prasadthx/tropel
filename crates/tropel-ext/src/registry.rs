@@ -5,11 +5,12 @@ use std::sync::Arc;
 /// The extension registry: collects all registered extensions at startup.
 ///
 /// All maps are `IndexMap` (insertion-ordered) so content auto-detection
-/// (`resolve_input` / `resolve_driver`) is deterministic: when several
-/// adapters claim a document, the winner is the first in insertion order —
-/// not a random `HashMap` iteration winner. Built-ins register via
-/// `inventory`, whose iteration order is deterministic per build (link
-/// order); runtime factories are appended after the inventory pass.
+/// (`resolve_input` / `resolve_driver`) is deterministic: among adapters
+/// whose `detect()` claims a document, the highest-`priority` wins (ties
+/// fall back to insertion order) — not a random `HashMap` iteration winner.
+/// Built-ins register via `inventory` and declare explicit priorities with
+/// `with_priority`; runtime factories are appended after the inventory pass
+/// and act as a fallback (priority 0).
 #[derive(Clone, Default)]
 pub struct ExtensionRegistry {
     protocols: IndexMap<String, Arc<ProtocolRegistration>>,
@@ -160,6 +161,7 @@ impl ExtensionRegistry {
                 InputAdapterRegistration {
                     id: registration.id,
                     create: registration.create,
+                    priority: registration.priority,
                 },
             );
         }
@@ -176,6 +178,7 @@ impl ExtensionRegistry {
                 DriverRegistration {
                     id: registration.id,
                     create: registration.create,
+                    priority: registration.priority,
                 },
             );
         }
@@ -191,34 +194,51 @@ impl ExtensionRegistry {
     /// Also probes factory-registered adapters (e.g. WASM plugins loaded from
     /// `--plugins-dir`), so content auto-detection works for runtime plugins
     /// too, not just compile-time `inventory` registrations.
+    ///
+    /// Dispatch is **explicit-priority-first**: among all adapters whose
+    /// `detect()` claims the bytes, the one with the highest `priority` wins
+    /// (ties fall back to registration order — stable IndexMap iteration).
+    /// This removes the dependency on `inventory` link order.
     pub fn resolve_input(&self, bytes: &[u8]) -> Option<Box<dyn InputAdapter>> {
+        let mut best: Option<(u8, Box<dyn InputAdapter>)> = None;
         for registration in self.input_adapters.values() {
             let adapter = (registration.create)();
-            if adapter.detect(bytes) {
-                return Some(adapter);
+            // Strictly-greater: on equal priority the FIRST registration wins
+            // (ties → registration order), and inventory adapters beat
+            // equal-priority factory adapters (factories are probed after).
+            if adapter.detect(bytes)
+                && best.as_ref().map(|(p, _)| registration.priority > *p).unwrap_or(true)
+            {
+                best = Some((registration.priority, adapter));
             }
         }
         for factory in self.input_adapter_factories.values() {
             let adapter = (factory)();
             if adapter.detect(bytes) {
-                return Some(adapter);
+                let p = 0;
+                if best.as_ref().map(|(bp, _)| p > *bp).unwrap_or(true) {
+                    best = Some((p, adapter));
+                }
             }
         }
-        None
+        best.map(|(_, adapter)| adapter)
     }
 
     /// Resolve a driver from raw bytes using content detection.
-    /// Iterates all registered drivers and returns the first one whose
-    /// `detect()` returns `true`.
+    /// Highest-priority driver whose `detect()` returns `true` wins (ties
+    /// fall back to registration order).
     pub fn resolve_driver(&self, bytes: &[u8]) -> Option<Box<dyn Driver>> {
+        let mut best: Option<(u8, Box<dyn Driver>)> = None;
         for registration in self.drivers.values() {
             let driver = (registration.create)();
-            if driver.detect(bytes) {
-                return Some(driver);
+            // Strictly-greater: first registration wins on equal priority.
+            if driver.detect(bytes)
+                && best.as_ref().map(|(p, _)| registration.priority > *p).unwrap_or(true)
+            {
+                best = Some((registration.priority, driver));
             }
         }
-        // Also check factory adapters? No — drivers use a separate path.
-        None
+        best.map(|(_, driver)| driver)
     }
 
     /// Resolve a driver by explicit ID.

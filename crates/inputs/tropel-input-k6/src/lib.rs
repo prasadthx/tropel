@@ -117,7 +117,8 @@ fn build_scenario_from_source(js_code: &str, name: &str) -> Result<Scenario> {
 // Register K6ScriptAdapter for compile-time discovery by the engine.
 inventory::submit!(InputAdapterRegistration::new("k6", || Box::new(
     K6ScriptAdapter
-)));
+))
+.with_priority(10));
 
 #[cfg(test)]
 mod tests {

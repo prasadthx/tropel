@@ -132,7 +132,8 @@ pub struct HarInputAdapter;
 
 inventory::submit!(InputAdapterRegistration::new("har", || Box::new(
     HarInputAdapter
-)));
+))
+.with_priority(30));
 
 impl InputAdapter for HarInputAdapter {
     fn id(&self) -> &str {
@@ -296,16 +297,32 @@ fn har_entry_to_item(entry: HarEntry, index: usize) -> ScenarioItem {
     // query_params as well would make the HTTP layer re-append it
     // (→ `?x=1&x=1`). Only populate query_params for HARs whose URL lacks a
     // query entirely.
+    //
+    // If the URL has no `?` AND the queryString contains DUPLICATE keys, a
+    // HashMap cannot represent them (merge_pairs would collapse `a=1&a=2`
+    // into `a=1, 2`) — instead fold the raw query string into the URL,
+    // preserving order and duplicates, and keep query_params empty.
+    let mut url = entry.request.url.clone();
     let query_params = if url.contains('?') {
         HashMap::new()
     } else {
-        merge_pairs(
-            entry
-                .request
-                .query_string
-                .into_iter()
-                .map(|q| (q.name, q.value)),
-        )
+        let pairs: Vec<(String, String)> = entry
+            .request
+            .query_string
+            .iter()
+            .map(|q| (q.name.clone(), q.value.clone()))
+            .collect();
+        if has_duplicate_keys(&pairs) {
+            let qs: Vec<String> = pairs
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect();
+            url.push('?');
+            url.push_str(&qs.join("&"));
+            HashMap::new()
+        } else {
+            merge_pairs(pairs.into_iter())
+        }
     };
 
     let body = entry.request.post_data.map(build_body);
@@ -375,6 +392,13 @@ fn build_body(pd: HarPostData) -> Body {
 
 /// Combine duplicate keys by appending values with `, ` (RFC 9110 allows
 /// combining field lines) instead of silently dropping data.
+/// True if any query key appears more than once (order-preserving duplicate
+/// detection — used to decide whether to fold the query into the URL).
+fn has_duplicate_keys(pairs: &[(String, String)]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    pairs.iter().any(|(k, _)| !seen.insert(k.clone()))
+}
+
 fn merge_pairs<I: Iterator<Item = (String, String)>>(pairs: I) -> HashMap<String, String> {
     let mut map: HashMap<String, String> = HashMap::new();
     for (k, v) in pairs {
@@ -654,6 +678,45 @@ mod tests {
             "query_params must be empty when URL already has a query"
         );
         assert_eq!(req.url, "https://api.example.com/users?limit=10&page=2");
+    }
+
+    #[test]
+    fn test_dup_query_keys_folded_into_url() {
+        // URL has no query AND queryString has duplicate keys — a HashMap
+        // can't hold them, so the raw query string is folded into the URL
+        // preserving order and duplicates (`?tag=a&tag=b`), not collapsed.
+        let adapter = HarInputAdapter;
+        let data = br#"{
+            "log": {
+                "version": "1.2",
+                "entries": [
+                    {
+                        "request": {
+                            "method": "GET",
+                            "url": "https://api.example.com/search",
+                            "headers": [],
+                            "queryString": [
+                                {"name": "tag", "value": "a"},
+                                {"name": "tag", "value": "b"},
+                                {"name": "sort", "value": "asc"}
+                            ]
+                        },
+                        "response": {"status": 200, "statusText": "OK"}
+                    }
+                ]
+            }
+        }"#;
+        let scenario = adapter.parse(data).unwrap();
+        let req = scenario.items[0].request.as_ref().unwrap();
+        assert_eq!(
+            req.url,
+            "https://api.example.com/search?tag=a&tag=b&sort=asc",
+            "duplicate query keys must be preserved in the URL"
+        );
+        assert!(
+            req.query_params.is_empty(),
+            "query_params must stay empty when the query is folded into the URL"
+        );
     }
 
     #[test]

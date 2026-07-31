@@ -234,6 +234,12 @@ impl WasmPlugin {
         let wasm_bytes = std::fs::read(path)
             .map_err(|e| anyhow::anyhow!("failed to read '{}': {}", path.display(), e))?;
         let cache_path = path.with_extension("cwasm");
+        // Sidecar holds the SHA-256 of the SOURCE .wasm that produced the
+        // cache. A .cwasm whose sidecar hash doesn't match the current source
+        // is a foreign/tampered cache — we refuse to deserialize it (wasmtime's
+        // Module::deserialize is `unsafe` precisely because it trusts its
+        // input), and instead recompile from the trusted .wasm bytes.
+        let hash_path = path.with_extension("cwasm.sha256");
         let engine = global_engine();
 
         let cache_is_fresh = std::fs::metadata(&cache_path)
@@ -245,35 +251,50 @@ impl WasmPlugin {
                 })
             })
             .unwrap_or(false);
+        // Cache is only trusted if it exists, is fresh, AND its sidecar hash
+        // equals the SHA-256 of the source bytes we're about to load.
+        let cache_matches_source = cache_is_fresh
+            && std::fs::read_to_string(&hash_path)
+                .map(|h| h.trim() == sha256_hex(&wasm_bytes))
+                .unwrap_or(false);
 
-        let module = if cache_is_fresh {
+        let module = if cache_matches_source {
             let cached = std::fs::read(&cache_path)?;
-            // SAFETY: `cached` was produced by `Engine::precompile_module` on
-            // this same engine (same wasmtime version + config). If the cache
-            // is from an incompatible engine, deserialize fails and we fall
-            // through to recompiling below.
+            // SAFETY: `cached` was verified to be produced from the exact
+            // source bytes (sidecar hash match) by the same engine version
+            // (wasmtime 47, fixed in Cargo.toml). If the cache is from an
+            // incompatible engine, deserialize fails and we fall through to
+            // recompiling below.
             match unsafe { Module::deserialize(engine, &cached) } {
                 Ok(m) => m,
-                Err(_) => Self::aot_compile(&engine, &wasm_bytes, &cache_path)?,
+                Err(_) => Self::aot_compile(&engine, &wasm_bytes, &cache_path, &hash_path)?,
             }
         } else {
-            Self::aot_compile(&engine, &wasm_bytes, &cache_path)?
+            Self::aot_compile(&engine, &wasm_bytes, &cache_path, &hash_path)?
         };
 
         Self::from_module(module)
     }
 
-    /// Precompile wasm bytes, persist the `.cwasm` cache, and load it.
+    /// Precompile wasm bytes, persist the `.cwasm` cache + its source-hash
+    /// sidecar, and load it.
     fn aot_compile(
         engine: &Engine,
         wasm_bytes: &[u8],
         cache_path: &Path,
+        hash_path: &Path,
     ) -> std::result::Result<Module, anyhow::Error> {
         let compiled = engine.precompile_module(wasm_bytes)?;
         if let Err(e) = std::fs::write(cache_path, &compiled) {
             tracing::warn!(
                 "Failed to write WASM AOT cache '{}': {}",
                 cache_path.display(),
+                e
+            );
+        } else if let Err(e) = std::fs::write(hash_path, sha256_hex(wasm_bytes)) {
+            tracing::warn!(
+                "Failed to write WASM cache hash '{}': {}",
+                hash_path.display(),
                 e
             );
         }
@@ -446,6 +467,19 @@ impl WasmPlugin {
             Ok(read_wasm_string(&*store, &memory, id_ptr))
         })
     }
+}
+
+/// Hex-encode the SHA-256 digest of `bytes` (cache sidecar format).
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        hex.push_str(&format!("{:02x}", b));
+    }
+    hex
 }
 
 /// Read a null-terminated string from WASM memory at the given pointer.

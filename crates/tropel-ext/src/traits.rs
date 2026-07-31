@@ -274,11 +274,26 @@ impl AuthSignerRegistration {
 pub struct InputAdapterRegistration {
     pub id: &'static str,
     pub create: fn() -> Box<dyn InputAdapter>,
+    /// Explicit dispatch priority for content auto-detection. Higher wins
+    /// when several adapters' `detect()` claim the same bytes; ties fall back
+    /// to registration order. This makes dispatch deterministic and independent
+    /// of `inventory` link order.
+    pub priority: u8,
 }
 
 impl InputAdapterRegistration {
     pub const fn new(id: &'static str, create: fn() -> Box<dyn InputAdapter>) -> Self {
-        Self { id, create }
+        Self {
+            id,
+            create,
+            priority: 0,
+        }
+    }
+
+    /// Builder-style priority setter (const, for `inventory::submit!`).
+    pub const fn with_priority(mut self, priority: u8) -> Self {
+        self.priority = priority;
+        self
     }
 }
 
@@ -288,11 +303,24 @@ impl InputAdapterRegistration {
 pub struct DriverRegistration {
     pub id: &'static str,
     pub create: fn() -> Box<dyn Driver>,
+    /// Explicit dispatch priority for content auto-detection (see
+    /// [`InputAdapterRegistration::priority`]).
+    pub priority: u8,
 }
 
 impl DriverRegistration {
     pub const fn new(id: &'static str, create: fn() -> Box<dyn Driver>) -> Self {
-        Self { id, create }
+        Self {
+            id,
+            create,
+            priority: 0,
+        }
+    }
+
+    /// Builder-style priority setter (const, for `inventory::submit!`).
+    pub const fn with_priority(mut self, priority: u8) -> Self {
+        self.priority = priority;
+        self
     }
 }
 

@@ -101,12 +101,28 @@ fn valid_crate_name(name: &str) -> bool {
     if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
         return false;
     }
+    // `extern crate {name};` must be a valid *identifier*, so Rust keywords
+    // are rejected too — `--with async` would generate `extern crate async;`
+    // which fails to compile (the generated crate's build would break).
+    if RUST_KEYWORDS.contains(&name) {
+        return false;
+    }
     match name {
         "crate" | "self" | "super" | "Self" | "_" => return false,
         _ => {}
     }
     name_re().is_match(name)
 }
+
+/// Rust keywords (edition 2021). `extern crate {kw};` is a syntax error for
+/// all of these, so they must never be accepted as extension names.
+static RUST_KEYWORDS: [&str; 47] = [
+    "as", "break", "const", "continue", "dyn", "else", "enum", "extern", "false", "fn", "for",
+    "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
+    "static", "struct", "trait", "true", "type", "unsafe", "use", "where", "while", "async",
+    "await", "abstract", "become", "box", "do", "final", "macro", "override", "priv", "typeof",
+    "unsized", "virtual", "yield", "try",
+];
 
 fn name_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -678,6 +694,13 @@ mod tests {
             "self",
             "super",
             "Self",
+            // Rust keywords — `extern crate async;` is a syntax error:
+            "async",
+            "match",
+            "fn",
+            "type",
+            "impl",
+            "loop",
             "_",
             "0x-bad",
         ] {

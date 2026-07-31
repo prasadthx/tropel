@@ -295,7 +295,8 @@ pub struct OpenApiInputAdapter;
 
 inventory::submit!(InputAdapterRegistration::new("openapi", || Box::new(
     OpenApiInputAdapter
-)));
+))
+.with_priority(20));
 
 impl InputAdapter for OpenApiInputAdapter {
     fn id(&self) -> &str {

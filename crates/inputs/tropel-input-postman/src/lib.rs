@@ -16,7 +16,10 @@ pub struct PostmanInputAdapter;
 // Uses a fn pointer (captureless closure) for const-compatibility with inventory.
 inventory::submit!(InputAdapterRegistration::new("postman", || Box::new(
     PostmanInputAdapter
-)));
+))
+// Postman collections are the most specific structured format — highest
+// priority so explicit dispatch is deterministic (independent of link order).
+.with_priority(40));
 
 impl InputAdapter for PostmanInputAdapter {
     fn id(&self) -> &str {
