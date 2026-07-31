@@ -6,6 +6,12 @@ use tokio::time;
 use tropel_core::config::ExecutionConfig;
 use tropel_core::Result;
 
+/// Hard bound on the trailing VU-handle join. After `grace` expires the
+/// scheduler force-stops; if a VU still ignores that (e.g. a runaway JS
+/// eval that never trips the interrupt), we abandon it after this bound
+/// rather than hang the run forever.
+const HANDLE_JOIN_BOUND: Duration = Duration::from_secs(30);
+
 /// Controls the lifecycle of VUs during a load test.
 pub struct VUScheduler {
     config: ExecutionConfig,
@@ -300,10 +306,12 @@ impl VUScheduler {
         // Wait for active VUs to drain within the graceful stop window
         self.wait_for_drain(grace).await;
 
-        // Wait for all JoinHandles (VUs that exited should be done)
-        for handle in handles {
-            handle.await.ok();
-        }
+        // Wait for all JoinHandles (VUs that exited should be done).
+        // Bounded: a VU ignoring force_stop and never tripping the JS
+        // interrupt cannot hang the run forever (P2 · maxDuration trailing
+        // join untimed).
+        Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND)
+            .await;
 
         tracing::info!("Constant VUs finished");
     }
@@ -384,10 +392,9 @@ impl VUScheduler {
         // Wait for remaining VUs to drain within the final graceful stop window
         self.wait_for_drain(grace).await;
 
-        // Wait for all JoinHandles
-        for handle in handles {
-            handle.await.ok();
-        }
+        // Wait for all JoinHandles (bounded — see await_handles_bounded)
+        Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND)
+            .await;
 
         tracing::info!("Ramping VUs finished");
     }
@@ -457,10 +464,10 @@ impl VUScheduler {
         }
 
         // Wait for all JoinHandles (already completed if VUs drained naturally;
-        // otherwise stopped by request_stop above).
-        for handle in handles {
-            handle.await.ok();
-        }
+        // otherwise stopped by request_stop above). Bounded — a VU ignoring
+        // force_stop cannot hang the final join forever.
+        Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND)
+            .await;
 
         tracing::info!("Shared iterations finished");
     }
@@ -567,9 +574,9 @@ impl VUScheduler {
         // Wait for active VUs to drain within the graceful stop window
         self.wait_for_drain(grace).await;
 
-        for handle in handles {
-            handle.await.ok();
-        }
+        // Bounded join — a stuck VU cannot hang the run (P2 trailing join)
+        Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND)
+            .await;
 
         let dropped_total = self.arrival_dropped.load(Ordering::Relaxed);
         tracing::info!(
@@ -726,9 +733,9 @@ impl VUScheduler {
         self.request_stop();
         self.wait_for_drain(grace).await;
 
-        for handle in handles {
-            handle.await.ok();
-        }
+        // Bounded join — a stuck VU cannot hang the run (P2 trailing join)
+        Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND)
+            .await;
 
         let dropped_total = self.arrival_dropped.load(Ordering::Relaxed);
         tracing::info!("Ramping arrival rate finished (dropped: {})", dropped_total);
@@ -788,11 +795,30 @@ impl VUScheduler {
         }
 
         // Wait for all JoinHandles (already completed if VUs drained naturally).
-        for handle in handles {
-            handle.await.ok();
-        }
+        // Bounded — a VU ignoring force_stop cannot hang the final join.
+        Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND)
+            .await;
 
         tracing::info!("Per-VU iterations finished");
+    }
+
+    /// Await all VU JoinHandles, but bounded by a hard timeout so a VU that
+    /// ignores `force_stop` **and** never trips the JS interrupt cannot hang
+    /// the final join loop forever. Resolves when all handles end or `bound`
+    /// elapses (the detached tasks are abandoned, matching k6's behaviour of
+    /// hard-aborting the run after the grace window).
+    async fn await_handles_bounded(handles: &mut [tokio::task::JoinHandle<()>], bound: Duration) {
+        let all_done = futures::future::join_all(handles.iter_mut());
+        tokio::pin!(all_done);
+        match tokio::time::timeout(bound, &mut all_done).await {
+            Ok(_) => tracing::debug!("All VU handles resolved"),
+            Err(_) => {
+                tracing::warn!(
+                    "Timed out after {:?} waiting for VU handles — detaching remaining VUs",
+                    bound
+                );
+            }
+        }
     }
 
     /// Create a shared clone of this scheduler for passing to VU tasks.
