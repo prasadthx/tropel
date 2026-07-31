@@ -238,7 +238,7 @@ mod tests {
             .expect("wit/ directory must parse as a valid WIT package");
 
         let world = resolve
-            .select_world(pkg, Some("tropel-adapter-world"))
+            .select_world(&[pkg], Some("tropel-adapter-world"))
             .expect("world `tropel-adapter-world` must exist");
 
         // The world must export the `tropel-adapter` interface the engine
@@ -248,7 +248,7 @@ mod tests {
             .exports
             .values()
             .find_map(|item| match item {
-                wit_parser::WorldItem::Interface(id) => {
+                wit_parser::WorldItem::Interface { id, .. } => {
                     resolve.interfaces.get(*id)
                 }
                 _ => None,

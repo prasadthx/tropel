@@ -2,7 +2,7 @@ use crate::worker::VUWorkerPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use rand::Rng;
+use rand::RngExt;
 use tokio::sync::broadcast;
 use tropel_core::config::{ExecutionConfig, HttpConfig, JobConfig, OutputConfig, ThinkTimeConfig};
 use tropel_core::scenario::Scenario;
@@ -774,7 +774,7 @@ async fn apply_think_time(config: &ThinkTimeConfig, iter_duration: Option<Durati
         if let (Ok(min), Ok(max)) = (parse_duration_str(min_str), parse_duration_str(max_str)) {
             if max > Duration::ZERO && max > min {
                 let range_ms = (max - min).as_millis() as u64;
-                let rand_ms = rand::thread_rng().gen_range(0..=range_ms);
+                let rand_ms = rand::rng().random_range(0..=range_ms);
                 tokio::time::sleep(min + Duration::from_millis(rand_ms)).await;
             }
         }

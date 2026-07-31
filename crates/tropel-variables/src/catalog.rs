@@ -1,4 +1,4 @@
-use rand::Rng;
+use rand::RngExt;
 use regex::Regex;
 /// Dynamic variable catalog.
 /// Generates values for built-in Postman dynamic variables like {{$guid}}, {{$timestamp}}, etc.
@@ -16,7 +16,7 @@ impl DynamicCatalog {
     /// Each occurrence of a dynamic variable generates a fresh value.
     pub fn resolve(&self, s: &str) -> String {
         let mut result = s.to_string();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         // {{$guid}} — fresh UUID per occurrence
         if result.contains("{{$guid}}") {
@@ -51,13 +51,13 @@ impl DynamicCatalog {
         // {{$randomInt}} — fresh random integer per occurrence
         if result.contains("{{$randomInt}}") {
             let re = Regex::new(r"\{\{\$randomInt\}\}").unwrap();
-            result = self.replace_with_func(&result, &re, |_| rng.gen_range(0..1000u32).to_string());
+            result = self.replace_with_func(&result, &re, |_| rng.random_range(0..1000u32).to_string());
         }
 
         // {{$randomFloat}} — fresh random float per occurrence
         if result.contains("{{$randomFloat}}") {
             let re = Regex::new(r"\{\{\$randomFloat\}\}").unwrap();
-            result = self.replace_with_func(&result, &re, |_| format!("{:.6}", rng.gen::<f64>() * 1000.0));
+            result = self.replace_with_func(&result, &re, |_| format!("{:.6}", rng.random::<f64>() * 1000.0));
         }
 
         // {{$randomString[:length]}}
@@ -90,7 +90,7 @@ impl DynamicCatalog {
         // {{$randomBoolean}} — fresh random bool per occurrence
         if result.contains("{{$randomBoolean}}") {
             let re = Regex::new(r"\{\{\$randomBoolean\}\}").unwrap();
-            result = self.replace_with_func(&result, &re, |_| rng.gen_bool(0.5).to_string());
+            result = self.replace_with_func(&result, &re, |_| rng.random_bool(0.5).to_string());
         }
 
         // {{$randomHex[:length]}}
@@ -116,7 +116,7 @@ impl DynamicCatalog {
         if result.contains("{{$randomIP}}") {
             let re = Regex::new(r"\{\{\$randomIP\}\}").unwrap();
             result = self.replace_with_func(&result, &re, |_| {
-                format!("{}.{}.{}.{}", rng.gen_range(1..255u32), rng.gen_range(0..255u32), rng.gen_range(0..255u32), rng.gen_range(1..255u32))
+                format!("{}.{}.{}.{}", rng.random_range(1..255u32), rng.random_range(0..255u32), rng.random_range(0..255u32), rng.random_range(1..255u32))
             });
         }
 
@@ -215,9 +215,9 @@ impl Default for DynamicCatalog {
     }
 }
 
-fn random_string(rng: &mut impl Rng, length: usize, charset: &str) -> String {
+fn random_string(rng: &mut impl RngExt, length: usize, charset: &str) -> String {
     let chars: Vec<char> = charset.chars().collect();
-    (0..length).map(|_| chars[rng.gen_range(0..chars.len())]).collect()
+    (0..length).map(|_| chars[rng.random_range(0..chars.len())]).collect()
 }
 
 fn chrono_now_iso() -> String {

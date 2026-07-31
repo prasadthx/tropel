@@ -1,7 +1,7 @@
 use crate::NativeModule;
-use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use aes_gcm::aead::{Aead, KeyInit as _};
 use cbc::cipher::block_padding::Pkcs7;
+use cbc::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use md5::Md5;
 use rquickjs::function::Func;
 use sha2::Digest;
@@ -182,8 +182,9 @@ pub fn ripemd160(data: &[u8]) -> Vec<u8> {
 
 /// Compute HMAC-SHA256.
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    use hmac::digest::KeyInit;
     use hmac::Mac;
-    let mut mac = <hmac::Hmac::<sha2::Sha256> as Mac>::new_from_slice(key)
+    let mut mac = <hmac::Hmac::<sha2::Sha256> as KeyInit>::new_from_slice(key)
         .expect("HMAC key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
@@ -191,8 +192,9 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
 
 /// Compute HMAC-SHA1.
 pub fn hmac_sha1(key: &[u8], data: &[u8]) -> Vec<u8> {
+    use hmac::digest::KeyInit;
     use hmac::Mac;
-    let mut mac = <hmac::Hmac::<sha1::Sha1> as Mac>::new_from_slice(key)
+    let mut mac = <hmac::Hmac::<sha1::Sha1> as KeyInit>::new_from_slice(key)
         .expect("HMAC key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
@@ -200,8 +202,9 @@ pub fn hmac_sha1(key: &[u8], data: &[u8]) -> Vec<u8> {
 
 /// Compute HMAC-SHA512.
 pub fn hmac_sha512(key: &[u8], data: &[u8]) -> Vec<u8> {
+    use hmac::digest::KeyInit;
     use hmac::Mac;
-    let mut mac = <hmac::Hmac::<sha2::Sha512> as Mac>::new_from_slice(key)
+    let mut mac = <hmac::Hmac::<sha2::Sha512> as KeyInit>::new_from_slice(key)
         .expect("HMAC key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
@@ -209,8 +212,9 @@ pub fn hmac_sha512(key: &[u8], data: &[u8]) -> Vec<u8> {
 
 /// Compute HMAC-MD5.
 pub fn hmac_md5(key: &[u8], data: &[u8]) -> Vec<u8> {
+    use hmac::digest::KeyInit;
     use hmac::Mac;
-    let mut mac = <hmac::Hmac::<md5::Md5> as Mac>::new_from_slice(key)
+    let mut mac = <hmac::Hmac::<md5::Md5> as KeyInit>::new_from_slice(key)
         .expect("HMAC key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
@@ -218,9 +222,9 @@ pub fn hmac_md5(key: &[u8], data: &[u8]) -> Vec<u8> {
 
 /// Generate `n` cryptographically secure random bytes using the OS CSPRNG.
 pub fn random_bytes(n: usize) -> Vec<u8> {
-    use rand::RngCore;
+    use rand::Rng;
     let mut buf = vec![0u8; n];
-    rand::rngs::OsRng.fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     buf
 }
 
@@ -316,7 +320,7 @@ pub fn aes_gcm_decrypt(key: &[u8], nonce: &[u8], ciphertext: &[u8]) -> Result<Ve
 /// AES-256-CBC encrypt with PKCS7 padding.
 /// `key` must be 32 bytes, `iv` must be 16 bytes.
 pub fn aes_cbc_encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
-    use aes::cipher::generic_array::GenericArray;
+    use cbc::cipher::Array;
 
     if key.len() != 32 {
         return Err(tropel_core::TropelError::Crypto(
@@ -329,8 +333,8 @@ pub fn aes_cbc_encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8
         ));
     }
 
-    let key_arr = GenericArray::from_slice(key);
-    let iv_arr = GenericArray::from_slice(iv);
+    let key_arr = Array::from_slice(key);
+    let iv_arr = Array::from_slice(iv);
 
     // Buffer needs space for plaintext + one full block of padding
     let block_size = 16;
@@ -339,7 +343,7 @@ pub fn aes_cbc_encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8
 
     let cipher = Aes256CbcEnc::new(key_arr, iv_arr);
     let encrypted = cipher
-        .encrypt_padded_mut::<Pkcs7>(&mut buf, plaintext.len())
+        .encrypt_padded::<Pkcs7>(&mut buf, plaintext.len())
         .map_err(|e| tropel_core::TropelError::Crypto(format!("AES-CBC encrypt failed: {}", e)))?;
 
     Ok(encrypted.to_vec())
@@ -347,7 +351,7 @@ pub fn aes_cbc_encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8
 
 /// AES-256-CBC decrypt with PKCS7 padding.
 pub fn aes_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
-    use aes::cipher::generic_array::GenericArray;
+    use cbc::cipher::Array;
 
     if key.len() != 32 {
         return Err(tropel_core::TropelError::Crypto(
@@ -365,13 +369,13 @@ pub fn aes_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u
         ));
     }
 
-    let key_arr = GenericArray::from_slice(key);
-    let iv_arr = GenericArray::from_slice(iv);
+    let key_arr = Array::from_slice(key);
+    let iv_arr = Array::from_slice(iv);
 
     let mut buf = ciphertext.to_vec();
     let cipher = Aes256CbcDec::new(key_arr, iv_arr);
     let decrypted = cipher
-        .decrypt_padded_mut::<Pkcs7>(&mut buf)
+        .decrypt_padded::<Pkcs7>(&mut buf)
         .map_err(|e| tropel_core::TropelError::Crypto(format!("AES-CBC decrypt failed: {}", e)))?;
 
     Ok(decrypted.to_vec())

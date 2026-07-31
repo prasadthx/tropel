@@ -36,102 +36,102 @@ rust-version = "1.82"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal"] }
 
 # JS engine
 rquickjs = { version = "0.12.2", features = ["full-async"] }
 
 # HTTP client
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "gzip", "brotli", "http2", "json", "stream"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "cookies", "gzip", "brotli", "http2", "json", "stream", "query", "form"] }
 
 # Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 
 # Fast JSON parsing (≈2-4× faster than serde_json for response bodies)
-simd-json = { version = "0.14", features = ["serde_impl"] }
+simd-json = { version = "0.17.3", features = ["serde_impl"] }
 
 # Metrics
-hdrhistogram = "7"
+hdrhistogram = "7.6.0"
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4.6.4", features = ["derive"] }
 
 # Extension registration
-inventory = "0.3"
+inventory = "0.3.24"
 
 # Error handling
-thiserror = "2"
-anyhow = "1"
+thiserror = "2.0.19"
+anyhow = "1.0.104"
 
 # Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # Hashing / crypto
-sha2 = "0.10"
-sha1 = "0.10"
-sha3 = "0.10"
-md-5 = "0.10"
-ripemd = "0.1"
-hmac = "0.12"
-aes = "0.8"
-aes-gcm = "0.10"
-cbc = "0.1"
+sha2 = "0.11.0"
+sha1 = "0.11.0"
+sha3 = "0.12.0"
+md-5 = "0.11.0"
+ripemd = "0.2.0"
+hmac = "0.13.0"
+aes = "0.9.2"
+aes-gcm = "0.11.0"
+cbc = "0.2.1"
 
 # Encoding
-base64 = "0.22"
-hex = "0.4"
-percent-encoding = "2"
+base64 = "0.23.0"
+hex = "0.4.3"
+percent-encoding = "2.3.2"
 
 # UUID / random
-uuid = { version = "1", features = ["v4"] }
-rand = "0.8"
+uuid = { version = "1.24.0", features = ["v4"] }
+rand = "0.10.2"
 
 # Regex
-regex = "1"
+regex = "1.13.1"
 
 # Async helpers
-futures = "0.3"
-async-trait = "0.1"
+futures = "0.3.33"
+async-trait = "0.1.91"
 
 # Date/time
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
 
 # Allocator (default: mimalloc; feature-gate tikv-jemallocator)
-mimalloc = { version = "0.1", default-features = false }
-tikv-jemallocator = { version = "0.6", default-features = false }
+mimalloc = { version = "0.1.52", default-features = false }
+tikv-jemallocator = { version = "0.7.0", default-features = false }
 
 # Testing
-wiremock = "0.6"
-insta = "1"
+wiremock = "0.6.5"
+insta = "1.48.0"
 # WIT parsing — used by tropel-sdk's unit test to prove wit/adapter.wit
 # stays valid (regression guard for the broken-WIT history). Version
 # chosen from the local registry cache; the WIT uses standard constructs
 # that any current wit-parser accepts.
-wit-parser = "0.207"
+wit-parser = "0.255.0"
 
 # Fast hash maps for tag sets
-rustc-hash = "2"
+rustc-hash = "2.1.3"
 
 # IndexMap for preserving insertion order
-indexmap = { version = "2", features = ["serde"] }
+indexmap = { version = "2.14.0", features = ["serde"] }
 
 # Temp directory for tropel-build
-tempfile = "3"
+tempfile = "3.27.0"
 
 # URL parsing
-url = { version = "2", features = ["serde"] }
+url = { version = "2.5.8", features = ["serde"] }
 
 # Lazy initialization
-once_cell = "1"
+once_cell = "1.21.4"
 
 # MIME types
-mime = "0.3"
-mime_guess = "2"
+mime = "0.3.17"
+mime_guess = "2.0.5"
 
 # CSV parsing for data files
-csv = "1.3"
+csv = "1.4.0"
 
 
 

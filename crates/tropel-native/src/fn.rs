@@ -35,14 +35,14 @@ pub fn generate_uuid() -> String {
 
 /// Generate a random integer in [min, max).
 pub fn random_int(min: i64, max: i64) -> i64 {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    rng.gen_range(min..max)
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    rng.random_range(min..max)
 }
 
 /// Generate a random float in [0, 1).
 pub fn random_float() -> f64 {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    rng.gen::<f64>()
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    rng.random::<f64>()
 }
