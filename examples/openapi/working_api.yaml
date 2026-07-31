@@ -1,0 +1,85 @@
+openapi: 3.0.3
+info:
+  title: JSONPlaceholder Test API
+  version: 1.0.0
+  description: Working OpenAPI sample using JSONPlaceholder
+servers:
+  - url: https://jsonplaceholder.typicode.com
+paths:
+  /posts:
+    get:
+      summary: List posts
+      parameters:
+        - name: _limit
+          in: query
+          schema:
+            type: integer
+            default: 5
+          example: 5
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Post'
+    post:
+      summary: Create a post
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PostInput'
+            example:
+              title: k6 test
+              body: Hello from a load test
+              userId: 1
+      responses:
+        '201':
+          description: Post created
+  /posts/{id}:
+    get:
+      summary: Get a post
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          example: 1
+      responses:
+        '200':
+          description: Post
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Post'
+components:
+  schemas:
+    Post:
+      type: object
+      properties:
+        userId:
+          type: integer
+        id:
+          type: integer
+        title:
+          type: string
+        body:
+          type: string
+    PostInput:
+      type: object
+      required:
+        - title
+        - body
+        - userId
+      properties:
+        title:
+          type: string
+        body:
+          type: string
+        userId:
+          type: integer
