@@ -1,22 +1,29 @@
 use crate::traits::*;
-use std::collections::HashMap;
+use indexmap::IndexMap;
 use std::sync::Arc;
 
 /// The extension registry: collects all registered extensions at startup.
+///
+/// All maps are `IndexMap` (insertion-ordered) so content auto-detection
+/// (`resolve_input` / `resolve_driver`) is deterministic: when several
+/// adapters claim a document, the winner is the first in insertion order —
+/// not a random `HashMap` iteration winner. Built-ins register via
+/// `inventory`, whose iteration order is deterministic per build (link
+/// order); runtime factories are appended after the inventory pass.
 #[derive(Clone, Default)]
 pub struct ExtensionRegistry {
-    protocols: HashMap<String, Arc<ProtocolRegistration>>,
-    outputs: HashMap<String, Arc<OutputRegistration>>,
-    js_modules: HashMap<String, Arc<JsModuleRegistration>>,
-    auth_signers: HashMap<String, Arc<AuthSignerRegistration>>,
-    input_adapters: HashMap<String, Arc<InputAdapterRegistration>>,
+    protocols: IndexMap<String, Arc<ProtocolRegistration>>,
+    outputs: IndexMap<String, Arc<OutputRegistration>>,
+    js_modules: IndexMap<String, Arc<JsModuleRegistration>>,
+    auth_signers: IndexMap<String, Arc<AuthSignerRegistration>>,
+    input_adapters: IndexMap<String, Arc<InputAdapterRegistration>>,
     // Runtime-constructed adapter instances (e.g. subprocess adapters).
     // These bypass the fn-pointer restriction of InputAdapterRegistration.
     // Runtime factory functions for adapters that need configuration at startup.
     // Unlike InputAdapterRegistration (fn() pointer, for inventory::submit!),
     // these closures can capture runtime values (e.g. a subprocess command).
-    input_adapter_factories: HashMap<String, Arc<dyn Fn() -> Box<dyn InputAdapter> + Send + Sync>>,
-    drivers: HashMap<String, Arc<DriverRegistration>>,
+    input_adapter_factories: IndexMap<String, Arc<dyn Fn() -> Box<dyn InputAdapter> + Send + Sync>>,
+    drivers: IndexMap<String, Arc<DriverRegistration>>,
 }
 
 impl ExtensionRegistry {

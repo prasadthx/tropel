@@ -4,9 +4,7 @@
 //! This is a reference output extension implementing Output trait.
 
 use async_trait::async_trait;
-use tropel_core::types::Sample;
-use tropel_core::Result;
-use tropel_ext::traits::Output;
+use tropel_sdk::{Sample, Result, Output};
 
 /// Prometheus output (stub — requires prometheus-http-metrics or OTLP library).
 pub struct PrometheusOutput;

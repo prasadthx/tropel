@@ -1332,6 +1332,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "id-arena"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
+
+[[package]]
 name = "ident_case"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2901,6 +2907,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "indexmap",
  "inventory",
  "serde",
  "serde_json",
@@ -2944,8 +2951,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
- "tropel-core",
- "tropel-ext",
+ "tropel-sdk",
 ]
 
 [[package]]
@@ -2959,12 +2965,11 @@ dependencies = [
  "rquickjs",
  "serde_json",
  "tracing",
- "tropel-core",
  "tropel-es",
- "tropel-ext",
  "tropel-http",
  "tropel-js",
  "tropel-native",
+ "tropel-sdk",
 ]
 
 [[package]]
@@ -2975,8 +2980,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
- "tropel-core",
- "tropel-ext",
+ "tropel-sdk",
 ]
 
 [[package]]
@@ -2986,8 +2990,7 @@ dependencies = [
  "inventory",
  "serde_json",
  "tropel-collection",
- "tropel-core",
- "tropel-ext",
+ "tropel-sdk",
 ]
 
 [[package]]
@@ -2997,8 +3000,7 @@ dependencies = [
  "rand 0.8.7",
  "serde_json",
  "tracing",
- "tropel-core",
- "tropel-ext",
+ "tropel-sdk",
 ]
 
 [[package]]
@@ -3104,6 +3106,7 @@ dependencies = [
  "thiserror",
  "tropel-core",
  "tropel-ext",
+ "wit-parser",
 ]
 
 [[package]]
@@ -3143,8 +3146,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "serde_json",
- "tropel-core",
- "tropel-ext",
+ "tropel-sdk",
 ]
 
 [[package]]
@@ -3154,8 +3156,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "serde_json",
- "tropel-core",
- "tropel-ext",
+ "tropel-sdk",
 ]
 
 [[package]]
@@ -3165,8 +3166,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "serde_json",
- "tropel-core",
- "tropel-ext",
+ "tropel-sdk",
 ]
 
 [[package]]
@@ -3198,6 +3198,12 @@ name = "unicode-width"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
+
+[[package]]
+name = "unicode-xid"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
 name = "universal-hash"
@@ -3376,6 +3382,19 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.207.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e19bb9f8ab07616da582ef8adb24c54f1424c7ec876720b7da9db8ec0626c92c"
+dependencies = [
+ "ahash",
+ "bitflags",
+ "hashbrown 0.14.5",
+ "indexmap",
+ "semver",
 ]
 
 [[package]]
@@ -3819,6 +3838,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "wit-parser"
+version = "0.207.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78c83dab33a9618d86cfe3563cc864deffd08c17efc5db31a3b7cd1edeffe6e1"
+dependencies = [
+ "anyhow",
+ "id-arena",
+ "indexmap",
+ "log",
+ "semver",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "unicode-xid",
+ "wasmparser 0.207.0",
 ]
 
 [[package]]

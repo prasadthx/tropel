@@ -14,10 +14,9 @@
 pub mod driver;
 
 use std::path::Path;
-use tropel_core::scenario::{Scenario, ScenarioInfo, ScenarioItem};
-use tropel_core::Result;
-use tropel_core::TropelError;
-use tropel_ext::traits::{InputAdapter, InputAdapterRegistration};
+use tropel_sdk::{Scenario, ScenarioInfo, ScenarioItem};
+use tropel_sdk::{Result, TropelError};
+use tropel_sdk::{InputAdapter, InputAdapterRegistration};
 
 /// Input adapter for k6-style JS/TS test scripts.
 pub struct K6ScriptAdapter;

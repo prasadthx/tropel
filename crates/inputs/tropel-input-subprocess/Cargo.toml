@@ -8,8 +8,7 @@ rust-version.workspace = true
 description = "Subprocess/JSON input adapter — runs an external command that reads bytes on stdin and writes a JSON Scenario on stdout"
 
 [dependencies]
-tropel-core.workspace = true
-tropel-ext.workspace = true
+tropel-sdk.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
 rand.workspace = true

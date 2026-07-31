@@ -29,10 +29,10 @@
 
 use std::collections::HashMap;
 use base64::Engine;
-use tropel_core::scenario::{Scenario, ScenarioInfo, ScenarioItem};
-use tropel_core::types::{Body, Method, Request};
-use tropel_core::{Result, TropelError};
-use tropel_ext::traits::{InputAdapter, InputAdapterRegistration};
+use tropel_sdk::{Scenario, ScenarioInfo, ScenarioItem};
+use tropel_sdk::{Body, Method, Request};
+use tropel_sdk::{Result, TropelError};
+use tropel_sdk::{InputAdapter, InputAdapterRegistration};
 use serde::Deserialize;
 
 // ── HAR data model (minimal — only what we need) ────────────────

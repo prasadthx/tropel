@@ -105,6 +105,11 @@ tikv-jemallocator = { version = "0.6", default-features = false }
 # Testing
 wiremock = "0.6"
 insta = "1"
+# WIT parsing — used by tropel-sdk's unit test to prove wit/adapter.wit
+# stays valid (regression guard for the broken-WIT history). Version
+# chosen from the local registry cache; the WIT uses standard constructs
+# that any current wit-parser accepts.
+wit-parser = "0.207"
 
 # Fast hash maps for tag sets
 rustc-hash = "2"

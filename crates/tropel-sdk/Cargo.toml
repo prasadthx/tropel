@@ -39,3 +39,10 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# Used to validate `wit/adapter.wit` resolves (keeps the WIT contract honest).
+# NOTE: wasmtime 47's component toolchain actually pins wit-parser 0.252;
+# this 0.207 is from the local cache and only validates syntax, which is
+# stable across versions for the constructs used here.
+wit-parser.workspace = true

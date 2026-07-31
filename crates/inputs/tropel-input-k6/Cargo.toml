@@ -8,8 +8,7 @@ rust-version.workspace = true
 description = "Input adapter that reads k6-style JavaScript/TypeScript test scripts and produces a Scenario"
 
 [dependencies]
-tropel-core.workspace = true
-tropel-ext.workspace = true
+tropel-sdk.workspace = true
 tropel-http.workspace = true
 tropel-js.workspace = true
 tropel-native.workspace = true

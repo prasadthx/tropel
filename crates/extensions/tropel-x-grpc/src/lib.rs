@@ -4,10 +4,7 @@
 //! This is a reference protocol extension implementing Protocol trait.
 
 use async_trait::async_trait;
-use tropel_core::types::{Request, Sample};
-use tropel_core::Result;
-use tropel_core::TropelError;
-use tropel_ext::traits::Protocol;
+use tropel_sdk::{Request, Sample, Result, TropelError, Protocol};
 
 /// gRPC protocol executor (stub — requires tonic for full implementation).
 pub struct GrpcProtocol;
@@ -32,5 +29,5 @@ impl Protocol for GrpcProtocol {
 
 // Registration would use inventory:
 // inventory::submit! {
-//     tropel_ext::traits::ProtocolRegistration::new(|| Box::new(GrpcProtocol::default()))
+//     tropel_sdk::ProtocolRegistration::new(|| Box::new(GrpcProtocol::default()))
 // }

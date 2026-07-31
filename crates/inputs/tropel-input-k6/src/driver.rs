@@ -31,9 +31,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use regex::Regex;
 use rquickjs::function::Func;
-use tropel_core::{Result, TropelError};
-use tropel_core::types::{Body, Method, Request, TagMap};
-use tropel_ext::traits::{Driver, DriverInstance, DriverRegistration, VuContext};
+use tropel_sdk::{Result, TropelError};
+use tropel_sdk::{Body, Method, Request, TagMap};
+use tropel_sdk::{Driver, DriverInstance, DriverRegistration, VuContext};
 use tropel_js::JsContext;
 
 // ══════════════════════════════════════════════════════════════════

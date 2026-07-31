@@ -1,4 +1,16 @@
-// ── Tropel WASM Adapter World (single file) ──
+// ── Tropel WASM Adapter World (single canonical file) ──
+//
+// This is the Component-Model contract for a WASM input-format adapter.
+// A WASM component implementing this world can serve as a Tropel input
+// adapter: the engine instantiates it, calls `detect` / `parse` from the
+// exported `tropel-adapter` interface, and drives the returned scenario.
+//
+// NOTE: The shipped WASM plugin runtime (`tropel-wasm`) currently uses the
+// C-ABI convention (exports `adapter_id`, `adapter_detect`, `adapter_parse`
+// over linear memory) rather than this WIT component world. This file is the
+// forward-looking Component-Model contract and is kept valid and resolving
+// (verified by a `wit-parser` unit test in this crate) so the component path
+// can be built when the runtime is ready for it.
 
 package tropel:adapter;
 

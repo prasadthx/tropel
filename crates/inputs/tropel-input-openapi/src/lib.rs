@@ -29,10 +29,10 @@
 //! - Server variables (`https://{env}.example.com`) use their default value.
 
 use std::collections::HashMap;
-use tropel_core::scenario::{Scenario, ScenarioInfo, ScenarioItem};
-use tropel_core::types::{ApiKeyLocation, AuthConfig, Body, Method, Request};
-use tropel_core::{Result, TropelError};
-use tropel_ext::traits::{InputAdapter, InputAdapterRegistration};
+use tropel_sdk::{Scenario, ScenarioInfo, ScenarioItem};
+use tropel_sdk::{ApiKeyLocation, AuthConfig, Body, Method, Request};
+use tropel_sdk::{Result, TropelError};
+use tropel_sdk::{InputAdapter, InputAdapterRegistration};
 use serde::Deserialize;
 use serde_json::Value;
 

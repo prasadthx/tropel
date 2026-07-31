@@ -63,17 +63,21 @@
 //! | `InputAdapterRegistration` | ✅ Stable — const fn, `fn()` pointer |
 //! | `Request`, `Response`, `Method`, `Body` | ✅ Stable — used in scenario items |
 //! | `Result<T>` / `TropelError` | ✅ Stable — error handling |
-//! | `Protocol` trait | 🚧 Available but not yet wired into engine dispatch |
-//! | `Output` trait | 🚧 Available but not yet wired into engine dispatch |
-//! | `WASM` / `WIT` interface | ✅ Designed — see `wit/` in the crate root. `InputAdapter` mirrored as `tropel-adapter` world. Host functions (logging), Scenario IR types. Runtime integration pending Phase 4. |
-//! | `VuProgram` / `Driver` trait | 🔜 Planned for future release |
+//! | `Sample`, `SampleType`, `TagMap` | ✅ Stable — metric sample surface (tags use `Arc<str>` interning) |
+//! | `Protocol` trait | 🚧 Available but not yet wired into engine dispatch (`unstable-protocol`) |
+//! | `Output` trait | 🚧 Available but not yet wired into engine dispatch (`unstable-output`) |
+//! | `Driver` / `DriverInstance` / `VuContext` | ✅ Stable — re-exported and used by the k6 driver (`tropel-input-k6`) |
+//! | `WASM` / `WIT` interface | ✅ Validated — see `wit/adapter.wit` in the crate root (resolves via `wit-parser`; a unit test keeps it from silently breaking). WASM plugins use the C ABI in `tropel-wasm`; the Component-Model runtime path is pending. |
 
 // ═══════════════════════════════════════════════════════════════════
 // Core types — the shared Scenario IR used by all adapters
 // ═══════════════════════════════════════════════════════════════════
 
 pub use tropel_core::scenario::{Scenario, ScenarioInfo, ScenarioItem};
-pub use tropel_core::types::{AuthConfig, Body, Cookie, Method, Request, Response};
+pub use tropel_core::types::{
+    ApiKeyLocation, AuthConfig, Body, CertificateConfig, Cookie, Method, Request, Response,
+    Sample, SampleType, Timings,
+};
 
 // ═══════════════════════════════════════════════════════════════════
 // Extension traits
@@ -216,5 +220,52 @@ mod tests {
         // Verify the inventory crate path works (submit! is compile-time only).
         #[allow(unused_imports)]
         use inventory as _;
+    }
+
+    /// Verify `wit/adapter.wit` resolves as a valid WIT package.
+    ///
+    /// This is the regression guard for the broken-WIT history: the old
+    /// `world.wit` exported an interface that was never defined, and a
+    /// sibling file was C-ABI prose rather than valid WIT. If the world no
+    /// longer resolves — or the `tropel-adapter` export disappears — this
+    /// test fails.
+    #[test]
+    fn test_wit_contract_resolves() {
+        let mut resolve = wit_parser::Resolve::default();
+        let wit_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("wit");
+        let (pkg, _paths) = resolve
+            .push_dir(&wit_dir)
+            .expect("wit/ directory must parse as a valid WIT package");
+
+        let world = resolve
+            .select_world(pkg, Some("tropel-adapter-world"))
+            .expect("world `tropel-adapter-world` must exist");
+
+        // The world must export the `tropel-adapter` interface the engine
+        // drives (id / detect / parse).
+        let world = resolve.worlds.get(world).expect("world must be in arena");
+        let adapter = world
+            .exports
+            .values()
+            .find_map(|item| match item {
+                wit_parser::WorldItem::Interface(id) => {
+                    resolve.interfaces.get(*id)
+                }
+                _ => None,
+            })
+            .expect("world must export an interface (tropel-adapter)");
+        assert_eq!(
+            adapter.name.as_deref(),
+            Some("tropel-adapter"),
+            "exported interface must be named tropel-adapter"
+        );
+
+        // Sanity: the adapter interface exposes id/detect/parse.
+        for fname in ["id", "detect", "parse"] {
+            assert!(
+                adapter.functions.contains_key(fname),
+                "tropel-adapter must export function `{fname}`"
+            );
+        }
     }
 }

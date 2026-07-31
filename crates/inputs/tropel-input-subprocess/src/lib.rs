@@ -47,9 +47,9 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
-use tropel_core::scenario::{Scenario, ScenarioInfo};
-use tropel_core::{Result, TropelError};
-use tropel_ext::traits::InputAdapter;
+use tropel_sdk::{Scenario, ScenarioInfo};
+use tropel_sdk::{Result, TropelError};
+use tropel_sdk::InputAdapter;
 
 /// Default per-call timeout for the subprocess. A child that outlives this
 /// is killed (DoS guard — a hanging adapter must not hang the host).
@@ -323,7 +323,7 @@ impl InputAdapter for SubprocessAdapter {
                 },
                 items: items.iter().map(|v| {
                     serde_json::from_value(v.clone())
-                        .unwrap_or_else(|_| tropel_core::scenario::ScenarioItem {
+                        .unwrap_or_else(|_| tropel_sdk::ScenarioItem {
                             id: format!("item-{}", rand::random::<u64>()),
                             name: "Imported item".to_string(),
                             request: None,
