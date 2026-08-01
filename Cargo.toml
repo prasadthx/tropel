@@ -127,6 +127,22 @@ tempfile = "3.27.0"
 # URL parsing
 url = { version = "2.5.8", features = ["serde"] }
 
+# TypeScript transpilation (oxc toolchain — real parser, not regex).
+# NOTE: pinned to 0.128 — the newest oxc whose source compiles on rustc 1.94.
+# 0.131+ uses `&& let` guards (stabilized in rustc 1.95); 0.140+ declares
+# MSRV 1.95 outright. Verified by scanning each release's typescript/class.rs.
+oxc_allocator = "0.128.0"
+oxc_parser = "0.128.0"
+oxc_span = "0.128.0"
+oxc_ast = "0.128.0"
+oxc_semantic = "0.128.0"
+oxc_transformer = "0.128.0"
+oxc_codegen = "0.128.0"
+oxc_diagnostics = "0.128.0"
+# Pin transitive MSRV-safe versions (browserslist 3.0.10+/sourcemap 8.1+ need rustc 1.95)
+oxc-browserslist = "=3.0.9"
+oxc_sourcemap = "=8.0.2"
+
 # Lazy initialization
 once_cell = "1.21.4"
 

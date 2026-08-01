@@ -2,7 +2,8 @@
 //!
 //! TypeScript transpilation and ES module bundling for Tropel load-test scripts.
 //!
-//! Uses the SWC toolchain (Rust-native, no Node.js dependency) to:
+//! Uses the **oxc** toolchain (real Rust-native parser/transformer/codegen,
+//! no Node.js dependency) to:
 //! - Strip TypeScript type annotations from `.ts` files → plain JS
 //! - Bundle ES module `import`/`export` statements into a single script
 //!
@@ -10,8 +11,8 @@
 //!
 //! At load time, before a script reaches the QuickJS runtime:
 //!
-//! 1. **File detection** — `.ts` or `.mts` triggers TypeScript stripping.
-//! 2. **Type stripping** — SWC parses, removes type annotations, codegens JS.
+//! 1. **File detection** — `.ts`/`.mts`/`.tsx` triggers TypeScript stripping.
+//! 2. **Type stripping** — oxc parses, removes type annotations, codegens JS.
 //! 3. **Module bundling** — `import`/`export` statements are resolved relative to
 //!    the script file, each dependency is transpiled (if needed), and all are
 //!    concatenated into a single JS bundle with local-scope module wrappers.

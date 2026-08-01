@@ -15,3 +15,17 @@ once_cell.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
+
+# Real TypeScript transpilation (oxc toolchain)
+oxc_allocator.workspace = true
+oxc_parser.workspace = true
+oxc_span.workspace = true
+oxc_ast.workspace = true
+oxc_semantic.workspace = true
+oxc_transformer.workspace = true
+oxc_codegen.workspace = true
+oxc_diagnostics.workspace = true
+# Exact pins force the resolver to pick MSRV-safe transitive versions
+# (oxc-browserslist 3.0.10+ and oxc_sourcemap 8.1+ need rustc 1.95)
+oxc-browserslist.workspace = true
+oxc_sourcemap.workspace = true

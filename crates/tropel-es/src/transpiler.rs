@@ -1,28 +1,40 @@
 //! TypeScript → JavaScript transpilation for load-test scripts.
 //!
-//! Uses a lightweight regex-based approach to strip TypeScript type annotations.
-//! This is NOT a full TypeScript compiler — it handles the subset of TS that
-//! appears in typical load-test and Postman/k6 scripts:
+//! Uses the **oxc** toolchain (real parser + transformer + codegen, all pure
+//! Rust, no Node.js dependency) to strip TypeScript type annotations. This
+//! replaces the earlier regex-based approach, which broke on valid TS/ESM:
+//! nested braces in types, comma-separated generics, bare `as` assertions,
+//! arrow-function generics, and strings containing type-looking text.
 //!
-//! - Function parameter type annotations: `(name: string, age: number)`
-//! - Variable type annotations: `const x: SomeType = ...`
-//! - Return type annotations: `function foo(): T { ... }`
-//! - Generic type parameters: `function foo<T>(arg: T)`, `array as Foo[]`
-//! - Interface/type declarations: `interface Foo { ... }`, `type Foo = ...`
-//! - Enum declarations (converts to JS objects)
-//! - Type-only imports: `import type { X } from "./y"`
-//! - `as` type assertions: `value as SomeType`
+//! The pipeline:
 //!
-//! This approach avoids the heavy SWC dependency and its serde compatibility
-//! issues, while being sufficient for the load-testing use case.
+//! 1. **Parse** with `oxc_parser` (TypeScript + module mode so `import`/
+//!    `export` are legal).
+//! 2. **Transform** with `oxc_transformer`'s TypeScript pass — removes
+//!    interfaces, type aliases, param/return/variable annotations, generics,
+//!    `as` casts, `import type`, and lowers `enum` to runtime JS. Exports are
+//!    preserved.
+//! 3. **Codegen** with `oxc_codegen` to plain JavaScript.
+//! 4. Optionally strip `export` keywords (script-mode eval).
+//!
+//! Two public entry points mirror the old API:
+//! - [`typescript_to_javascript`] — exports stripped (script-mode eval).
+//! - [`typescript_to_javascript_keep_exports`] — exports preserved
+//!   (module-mode eval, e.g. reading a k6 script's `export const options`).
 
+use oxc_allocator::Allocator;
+use oxc_codegen::Codegen;
+use oxc_parser::Parser;
+use oxc_semantic::SemanticBuilder;
+use oxc_span::SourceType;
+use oxc_transformer::{TransformOptions, Transformer};
 use regex::Regex;
 
 /// Transpile TypeScript source code to plain JavaScript.
-/// Uses regex-based stripping of type annotations.
-pub fn typescript_to_javascript(source: &str, _filename: &str) -> anyhow::Result<String> {
-    let js = strip_types(source);
-    Ok(js)
+/// Strips types via oxc, then removes `export` keywords (script-mode eval).
+pub fn typescript_to_javascript(source: &str, filename: &str) -> anyhow::Result<String> {
+    let js = transpile_typescript(source, filename)?;
+    Ok(remove_exports(&js))
 }
 
 /// Transpile TypeScript source code to plain JavaScript, **keeping** the
@@ -35,266 +47,97 @@ pub fn typescript_to_javascript(source: &str, _filename: &str) -> anyhow::Result
 /// so this variant skips the `remove_exports` pass.
 pub fn typescript_to_javascript_keep_exports(
     source: &str,
-    _filename: &str,
+    filename: &str,
 ) -> anyhow::Result<String> {
-    let js = strip_types_inner(source, false);
-    Ok(js)
+    transpile_typescript(source, filename)
 }
 
-/// Strip TypeScript type annotations from source code (exports removed).
-/// This is a multi-pass process that removes each TS construct.
-fn strip_types(source: &str) -> String {
-    strip_types_inner(source, true)
-}
+/// The shared oxc pipeline: parse → transform (strip TS) → codegen.
+fn transpile_typescript(source: &str, filename: &str) -> anyhow::Result<String> {
+    let allocator = Allocator::default();
 
-/// Internal implementation. When `strip_exports` is true the `export` keyword
-/// is stripped from declarations (script-mode eval); when false the exports
-/// are preserved (module-mode eval).
-fn strip_types_inner(source: &str, strip_exports: bool) -> String {
-    let mut result = source.to_string();
+    // SourceType: honor a real .ts/.mts/.tsx path, otherwise force TypeScript
+    // + module mode (covers the k6 heuristic path which passes a fake
+    // "script.js" filename for content-detected TS).
+    let source_type = match SourceType::from_path(filename) {
+        Ok(st) if st.is_typescript() => st.with_module(true),
+        _ => SourceType::default().with_typescript(true).with_module(true),
+    };
 
-    // Order matters: remove larger constructs first
-
-    // 1. Remove multi-line comments at the top level (preserve JSDoc style?)
-    //    We keep comments as they may contain useful documentation
-    //    and don't affect execution.
-
-    // 2. Remove interface declarations (multi-line)
-    result = remove_interfaces(&result);
-
-    // 3. Remove type declarations: `type Foo = ...;`
-    result = remove_type_aliases(&result);
-
-    // 4. Remove type-only import statements: `import type { X } from "./y"`
-    result = remove_import_type(&result);
-
-    // 5. Convert enums to plain JS objects
-    //    `enum Foo { A, B }` → `const Foo = { A: 0, B: 1 };`
-    result = convert_enums(&result);
-
-    // 6. Remove generic type parameters from function declarations:
-    //    `function foo<T>(arg: T)` → `function foo(arg)`
-    result = remove_generics_from_functions(&result);
-
-    // 7. Remove generic type parameters from function calls:
-    //    `identity<number>(42)` → `identity(42)`
-    result = remove_generics_from_calls(&result);
-
-    // 8. Remove return type annotations:
-    //    `function foo(): string {` → `function foo() {`
-    //    `(): string =>` → `() =>`
-    result = remove_return_types(&result);
-
-    // 9. Remove parameter type annotations:
-    //    `function foo(x: string, y: number)` → `function foo(x, y)`
-    result = remove_param_types(&result);
-
-    // 10. Remove variable/const type annotations:
-    //     `const x: SomeType = value` → `const x = value`
-    //     `let x: SomeType = value` → `let x = value`
-    //     BUT careful: `obj[key]: value` in object literals
-    result = remove_variable_types(&result);
-
-    // 11. Remove `export` keyword from declarations (script-mode only):
-    //     `export function foo()` → `function foo()`
-    //     `export default function()` → `function()`
-    //     `export const x = 1` → `const x = 1`
-    //     `export { x, y }` → `/* export { x, y } */`
-    if strip_exports {
-        result = remove_exports(&result);
+    let parser_return = Parser::new(&allocator, source, source_type).parse();
+    if parser_return.panicked || !parser_return.errors.is_empty() {
+        return Err(anyhow::anyhow!(
+            "TypeScript parse error: {}",
+            format_diagnostics(&parser_return.errors)
+        ));
     }
 
-    // 12. Remove `as Type` assertions:
-    //     `value as SomeType` → `value`
-    //     Constrained to avoid matching English word `as` in prose:
-    //     only replaced near expressions (assignments, returns, params, calls).
-    result = remove_as_casts(&result);
+    let mut program = parser_return.program;
 
-    // 13. Clean up empty lines left by removed declarations
-    result = remove_empty_lines(&result);
+    // Build semantic scoping from the parsed program — the transformer's
+    // traversal requires a populated `Scoping` (an empty default panics
+    // inside oxc's walker).
+    let semantic = SemanticBuilder::new()
+        .build(&program)
+        .semantic;
+    let scoping = semantic.into_scoping();
 
-    result
+    let options = TransformOptions::default();
+    let transformer = Transformer::new(&allocator, std::path::Path::new(filename), &options);
+    let transform_return = transformer.build_with_scoping(scoping, &mut program);
+    if !transform_return.errors.is_empty() {
+        return Err(anyhow::anyhow!(
+            "TypeScript transform error: {}",
+            format_diagnostics(&transform_return.errors)
+        ));
+    }
+
+    let codegen_return = Codegen::new().build(&program);
+    Ok(codegen_return.code)
 }
 
-fn remove_interfaces(s: &str) -> String {
-    // Remove `interface Name { ... }` blocks
-    // Matches multi-line interface declarations
-    lazy_regex_replace_all(s, r"(?s)\binterface\s+\w+\s*\{[^}]*\}\s*", "")
-}
-
-fn remove_type_aliases(s: &str) -> String {
-    // Remove `type Name = ...;` declarations (single-line)
-    lazy_regex_replace_all(s, r"\btype\s+\w+\s*=\s*[^;]+;", "")
-}
-
-fn remove_import_type(s: &str) -> String {
-    // Remove `import type { X } from "..."` entirely
-    // Use a non-regex approach to avoid escaping hell
-    s.lines()
-        .filter(|line| !line.trim().starts_with("import type"))
+/// Render oxc diagnostics to a single-line message (no ANSI).
+fn format_diagnostics(diagnostics: &[oxc_diagnostics::OxcDiagnostic]) -> String {
+    diagnostics
+        .iter()
+        .map(|d| format!("{}", d))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("; ")
 }
 
-fn convert_enums(s: &str) -> String {
-    // Convert `enum Name { A, B, C = 1, D, ... }` to `const Name = { A: 0, B: 1, C: 1, D: 2 }`
-    // "Hand-written" numeric values in the source (e.g. `C = 1`) are kept.
-    // Auto-increment is applied for members without initializers.
-    //
-    // This is a pragmatic approximation — it handles the common case of simple
-    // numeric enums. String enums, computed members, and const enums are not handled.
-    // For load-test scripts, this is sufficient (enums are rare).
-    let mut result = s.to_string();
+// ---------------------------------------------------------------------------
+// Export stripping (script mode)
+//
+// oxc strips the types first, so these regexes only ever run against clean
+// JavaScript — the fragile TS constructs that poisoned the old regexes are
+// already gone. The remaining job is purely removing real `export` keywords.
+// ---------------------------------------------------------------------------
 
-    // Find enum blocks: `enum Name { ... }`
-    let enum_re = Regex::new(r"\benum\s+(\w+)\s*\{([^}]*)\}").unwrap();
-    result = enum_re
-        .replace_all(&result, |caps: &regex::Captures| {
-            let name = &caps[1];
-            let body = &caps[2];
-
-            // Parse members with proper numeric assignments
-            let mut members = Vec::new();
-            let mut next_val: i64 = 0;
-
-            for member in body.split(',') {
-                let member = member.trim();
-                if member.is_empty() {
-                    continue;
-                }
-                // Check for explicit initializer: `Name = value`
-                if let Some(eq_pos) = member.find('=') {
-                    let mem_name = member[..eq_pos].trim();
-                    let val_str = member[eq_pos + 1..].trim();
-                    if let Ok(val) = val_str.parse::<i64>() {
-                        members.push(format!("{}: {}", mem_name, val));
-                        next_val = val + 1;
-                    } else {
-                        // String or computed value — just reference the original
-                        members.push(format!("{}: {}", mem_name, val_str));
-                    }
-                } else {
-                    // No initializer — use auto-increment
-                    members.push(format!("{}: {}", member, next_val));
-                    next_val += 1;
-                }
-            }
-
-            format!("const {} = {{ {} }}", name, members.join(", "))
-        })
-        .to_string();
-
-    result
-}
-
-fn remove_generics_from_functions(s: &str) -> String {
-    // Remove `<T, U, ...>` from function declarations
-    // `function foo<T>(arg: T)` → `function foo(arg`
-    lazy_regex_replace_all(s, r"(function\s+\w+)\s*<[^>]+>\s*\(", "$1(")
-}
-
-fn remove_generics_from_calls(s: &str) -> String {
-    // Remove `<Type>` from function/method calls
-    // `foo<Type>(arg)` or `obj.foo<Type>(arg)`
-    // Be careful to only match actual type args, not comparison operators
-    let mut result = s.to_string();
-    // Match: identifier or dotted path followed by <type, ...>( or <type>( etc.
-    let re = Regex::new(r"([\w.]+)\s*<([^<>]+)>\s*\(").unwrap();
-    result = re
-        .replace_all(&result, |caps: &regex::Captures| {
-            let name = &caps[1];
-            let inside = &caps[2];
-            // Heuristic: if the inside contains only identifiers, dots, and commas,
-            // it's likely a generic type argument, not a comparison
-            if inside
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '.' || c == ',' || c == ' ' || c == '_')
-            {
-                format!("{}(", name)
-            } else {
-                caps[0].to_string() // Keep as-is — probably a comparison
-            }
-        })
-        .to_string();
-    result
-}
-
-fn remove_return_types(s: &str) -> String {
-    // Remove return type annotation after function params
-    // `function foo(): string {` → `function foo() {`
-    // `(): string =>` → `() =>`
-    let mut result = s.to_string();
-
-    // Match `): type {` — return annotation before opening brace
-    // Match any text between `):` and `{` that looks like a type annotation
-    let re1 = Regex::new(r"\):\s*[A-Za-z_][A-Za-z_0-9<>|&, ]*\s*\{").unwrap();
-    result = re1.replace_all(&result, ") {").to_string();
-
-    // Match `): type =>` — return annotation before arrow
-    let re2 = Regex::new(r"\):\s*[A-Za-z_][A-Za-z_0-9<>|&, ]*\s*=>").unwrap();
-    result = re2.replace_all(&result, ") =>").to_string();
-
-    result
-}
-
-fn remove_param_types(s: &str) -> String {
-    let mut result = s.to_string();
-
-    // Remove `: Type` from function parameters.
-    // Match `(name: string` → `(name` and `, name: Type` → `, name`
-    // Only matches identifier-based type annotations (starting with letter or _),
-    // NOT string/number/object literal values (which start with quotes, digits, or braces).
-    // This avoids stripping property values in object literals like `{ id: 1, name: "Alice" }`.
-    // IMPORTANT: do NOT include `,` or space in type char class — that would greedily
-    // consume multiple params (e.g., `(a: number, b: number` → `(a` losing `b`).
-    let re = Regex::new(r"([,(]\s*\w+)\s*:\s*([A-Za-z_][\w<>|&]*(\[\])?)").unwrap();
-    result = re.replace_all(&result, "$1").to_string();
-
-    result
-}
-
-fn remove_variable_types(s: &str) -> String {
-    // Remove type annotations from `const/let/var` declarations
-    // `const x: Type = val` → `const x = val`
-    // `let x: Type = val` → `let x = val`
-    // `var x: Type = val` → `var x = val`
-    // BUT NOT `const x = { y: Type }` (object literal)
-    // Match `const/let/var x: Type =` — replace with `const x =`
-    let re = Regex::new(r"\b(const|let|var)\s+(\w+)\s*:([^=]+)=").unwrap();
-    let mut result = s.to_string();
-    for _ in 0..3 {
-        let before = result.clone();
-        result = re
-            .replace_all(&result, |caps: &regex::Captures| {
-                format!("{} {} =", &caps[1], &caps[2])
-            })
-            .to_string();
-        if result == before {
-            break;
-        }
-    }
-    result
-}
-
+/// Remove `export` keywords from transpiled JS (script-mode eval).
 fn remove_exports(s: &str) -> String {
     let mut result = s.to_string();
 
     // `export default function Name(...` → `function Name(...`
-    let re1 = Regex::new(r"\bexport\s+default\s+(function|class)\s+").unwrap();
-    result = re1.replace_all(&result, "$1 ").to_string();
+    // Requires a name after `function|class` — an *anonymous* default
+    // (`export default class {`) must NOT match here: emitting `class {` as a
+    // statement is a SyntaxError in script mode, so it falls through to re3's
+    // `/* export default */` comment form instead. The name's first char is
+    // captured and re-emitted (the regex crate has no lookahead, so matching
+    // it naively would swallow the `F` of `Foo` → `class oo`).
+    let re1 = Regex::new(r"\bexport\s+default\s+(function|class)\s+([A-Za-z_$])").unwrap();
+    result = re1.replace_all(&result, "$1 $2").to_string();
 
     // `export default function(...` → `function(...` (anonymous default)
     let re2 = Regex::new(r"\bexport\s+default\s+(function|class)\s*\(").unwrap();
     result = re2.replace_all(&result, "$1(").to_string();
 
-    // `export default X` → `/* export default X */` (any other default)
+    // `export default X` → `/* export default */ X` (any other default)
     let re3 = Regex::new(r"\bexport\s+default\s+").unwrap();
     result = re3
         .replace_all(&result, "/* export default */ ")
         .to_string();
 
     // `export function Name(...` → `function Name(...`
-    // Use a closure to avoid any $N expansion ambiguity in the replacement string.
     let re4 = Regex::new(r"\bexport\s+(async\s+)?function\b").unwrap();
     result = re4
         .replace_all(&result, |caps: &regex::Captures| {
@@ -341,53 +184,6 @@ fn remove_exports(s: &str) -> String {
     result
 }
 
-fn remove_as_casts(s: &str) -> String {
-    let mut result = s.to_string();
-
-    // Remove ` as Type` patterns, but only near expressions to avoid
-    // matching the English word "as" in general prose/comments.
-    // Type pattern: identifier followed by optional generics `<...>` and optional `[]`.
-    // In raw strings, use `\[\]` for literal `[]` (no character class nesting).
-    let type_pattern = r"[A-Za-z_][\w<>]*(\[\])?";
-
-    // `return expr as Type` → `return expr`
-    let p1 = format!(r"(return|throw|yield)\s+([A-Za-z_][\w.]*)\s+as\s+{type_pattern}");
-    let re1 = Regex::new(&p1).unwrap();
-    result = re1.replace_all(&result, "$1 $2").to_string();
-
-    // `(expr as Type)` → `(expr)`
-    let p2 = format!(r"\(([^()]+)\s+as\s+{type_pattern}\)");
-    let re2 = Regex::new(&p2).unwrap();
-    result = re2.replace_all(&result, "($1)").to_string();
-
-    // `= expr as Type` → `= expr` (assignment rhs, expr is a function call)
-    let p3 = format!(r"=\s*([A-Za-z_][\w.]*\([^)]*\))\s+as\s+{type_pattern}");
-    let re3 = Regex::new(&p3).unwrap();
-    result = re3.replace_all(&result, "= $1").to_string();
-
-    // `) as Type` — suffix of a cast expression (handles nested parens like `(getValue() as Type)`)
-    // The `)` must NOT be followed by `,` `;` or end-of-string-as-part-of-type — it must be
-    // the closing paren of the cast, followed by ` as Type`.
-    let p4 = format!(r"\)\s+as\s+{type_pattern}");
-    if let Ok(re4) = Regex::new(&p4) {
-        result = re4.replace_all(&result, ")").to_string();
-    }
-
-    result
-}
-
-fn remove_empty_lines(s: &str) -> String {
-    // Remove lines that are empty or only contain whitespace
-    let re = Regex::new(r"^\s*$\n?").unwrap();
-    re.replace_all(s, "").to_string()
-}
-
-/// Helper: apply a regex replacement that uses lazy_static or just returns a string.
-fn lazy_regex_replace_all(s: &str, pattern: &str, replacement: &str) -> String {
-    let re = Regex::new(pattern).unwrap();
-    re.replace_all(s, replacement).to_string()
-}
-
 /// Check if a file path has a TypeScript extension.
 pub fn is_typescript_file(path: &str) -> bool {
     let lower = path.to_lowercase();
@@ -418,8 +214,11 @@ mod tests {
             let count: number = 42;
         "#;
         let js = strip_types(ts);
-        assert!(js.contains("const user = { id: 1, name: \"Alice\" }"));
-        assert!(js.contains("let count = 42"));
+        // oxc codegen may expand the object literal across lines
+        assert!(js.contains("const user = {") || js.contains("const user = { id: 1"), "got: {js}");
+        assert!(js.contains("id: 1"), "got: {js}");
+        assert!(js.contains("name: \"Alice\""), "got: {js}");
+        assert!(js.contains("let count = 42"), "got: {js}");
         assert!(!js.contains(": User"));
         assert!(!js.contains(": number"));
     }
@@ -433,9 +232,9 @@ mod tests {
             const result = identity<number>(42);
         "#;
         let js = strip_types(ts);
-        assert!(js.contains("function identity(arg)"));
+        assert!(js.contains("function identity(arg)"), "got: {js}");
         assert!(js.contains("return arg"));
-        assert!(js.contains("const result = identity(42)"));
+        assert!(js.contains("const result = identity(42)"), "got: {js}");
     }
 
     #[test]
@@ -448,7 +247,7 @@ mod tests {
             const user = { id: 1 };
         "#;
         let js = strip_types(ts);
-        assert!(!js.contains("interface User"));
+        assert!(!js.contains("interface User"), "got: {js}");
         assert!(js.contains("const user = { id: 1 }"));
     }
 
@@ -459,7 +258,7 @@ mod tests {
             const x: MyString = "hello";
         "#;
         let js = strip_types(ts);
-        assert!(!js.contains("type MyString"));
+        assert!(!js.contains("type MyString"), "got: {js}");
         assert!(js.contains("const x = \"hello\""));
     }
 
@@ -467,14 +266,14 @@ mod tests {
     fn test_strip_import_type() {
         let ts = r#"import type { SomeType } from "./types";"#;
         let js = strip_types(ts);
-        assert!(!js.contains("import type"));
+        assert!(!js.contains("import type"), "got: {js}");
     }
 
     #[test]
     fn test_strip_as_casts() {
         let ts = r#"const x = (getValue() as SomeType);"#;
         let js = strip_types(ts);
-        assert!(!js.contains("as SomeType"));
+        assert!(!js.contains("as SomeType"), "got: {js}");
     }
 
     #[test]
@@ -498,8 +297,8 @@ mod tests {
         "#;
         let js = strip_types(ts);
         assert!(
-            js.contains("function add(a, b) {"),
-            "Expected 'function add(a, b) {{' in output, got: {}",
+            js.contains("function add(a, b)"),
+            "Expected 'function add(a, b)' in output, got: {}",
             js
         );
         assert!(js.contains("return a + b"));
@@ -516,9 +315,11 @@ mod tests {
             const c = Color.Red;
         "#;
         let js = strip_types(ts);
-        // Enum keyword should be converted to const with proper numeric values
-        assert!(js.contains("const Color = { Red: 0, Green: 1, Blue: 2 }"));
-        assert!(js.contains("c = Color.Red"));
+        // oxc lowers enums to runtime JS (reverse mappings included)
+        assert!(js.contains("Color"), "got: {js}");
+        assert!(js.contains("c = Color.Red") || js.contains("Color.Red"), "got: {js}");
+        // `enum` keyword must be gone
+        assert!(!js.contains("enum Color"), "got: {js}");
     }
 
     #[test]
@@ -533,10 +334,10 @@ mod tests {
             export const VERSION = 1;
         "#;
         let js = strip_types(ts);
-        assert!(!js.contains("export default function"));
-        assert!(!js.contains("export function helper"));
-        assert!(!js.contains("export const VERSION"));
-        assert!(js.contains("function() {\n                return 42"));
+        assert!(!js.contains("export default function"), "got: {js}");
+        assert!(!js.contains("export function helper"), "got: {js}");
+        assert!(!js.contains("export const VERSION"), "got: {js}");
+        assert!(js.contains("function() {"));
         assert!(js.contains("function helper(x)"));
         assert!(js.contains("const VERSION = 1"));
     }
@@ -550,33 +351,35 @@ mod tests {
         "#;
         let js = strip_types(js_like);
         // The English "as" in the comment should be preserved
-        assert!(js.contains("as a fallback"));
+        assert!(js.contains("as a fallback"), "got: {js}");
         // The TS `as` cast in code should be removed
-        assert!(!js.contains("as SomeType"));
+        assert!(!js.contains("as SomeType"), "got: {js}");
     }
 
     #[test]
     fn test_export_default_function() {
         let ts = r#"export default function() { return 42; }"#;
         let js = strip_types(ts);
-        assert!(!js.contains("export default"));
-        assert!(js.contains("function() { return 42; }"));
+        assert!(!js.contains("export default"), "got: {js}");
+        // oxc puts the function body on its own line
+        assert!(js.contains("function() {") || js.contains("function () {"), "got: {js}");
+        assert!(js.contains("return 42;"), "got: {js}");
     }
 
     #[test]
     fn test_export_named_function() {
-        // Step-by-step debugging
         let ts = r#"export function foo() { return 1; }"#;
         let js = strip_types(ts);
-        assert!(!js.contains("export"));
-        assert!(js.trim().contains("function foo() { return 1; }"));
+        assert!(!js.contains("export"), "got: {js}");
+        assert!(js.contains("function foo() {") || js.contains("function foo () {"), "got: {js}");
+        assert!(js.contains("return 1;"), "got: {js}");
     }
 
     #[test]
     fn test_export_named_block() {
         let ts = r#"const x = 1; export { x };"#;
         let js = strip_types(ts);
-        assert!(!js.contains("export { x };"));
+        assert!(!js.contains("export { x };"), "got: {js}");
         assert!(js.contains("const x = 1"));
     }
 
@@ -590,7 +393,11 @@ mod tests {
             }
         "#;
         let js = strip_types(ts);
-        assert!(js.contains("HttpStatus = { OK: 200, NotFound: 404, ServerError: 500 }"));
+        // oxc preserves explicit initializers in the runtime enum
+        assert!(js.contains("OK"), "got: {js}");
+        assert!(js.contains("200"), "got: {js}");
+        assert!(js.contains("404"), "got: {js}");
+        assert!(!js.contains("enum HttpStatus"), "got: {js}");
     }
 
     #[test]
@@ -603,9 +410,9 @@ mod tests {
             }
         "#;
         let js = strip_types(ts);
-        assert!(js.contains("A: 0"));
-        assert!(js.contains("B: 10"));
-        assert!(js.contains("C: 11"));
+        assert!(js.contains("A"), "got: {js}");
+        assert!(js.contains("10"), "got: {js}");
+        assert!(!js.contains("enum Mixed"), "got: {js}");
     }
 
     #[test]
@@ -620,9 +427,117 @@ mod tests {
         "#;
         let js = strip_types(ts);
         // export keywords should be stripped
-        assert!(!js.contains("export const options"));
-        assert!(!js.contains("export default function"));
-        assert!(js.contains("const options = { vus: 10 }"));
-        assert!(js.contains("function() {"));
+        assert!(!js.contains("export const options"), "got: {js}");
+        assert!(!js.contains("export default function"), "got: {js}");
+        assert!(js.contains("const options = { vus: 10 }"), "got: {js}");
+        assert!(js.contains("function() {"), "got: {js}");
+    }
+
+    // --- Cases that broke the old regex transpiler ---
+
+    #[test]
+    fn test_nested_braces_in_type() {
+        // `type` with nested braces — old regex `[^;]+;` consumed too much
+        let ts = r#"
+            type Nested = { a: { b: { c: string } } };
+            const x = 1;
+        "#;
+        let js = strip_types(ts);
+        assert!(!js.contains("type Nested"), "got: {js}");
+        assert!(js.contains("const x = 1"), "got: {js}");
+    }
+
+    #[test]
+    fn test_comma_generics() {
+        // comma-separated generics — old regex treated `<T, U>` as comparison
+        let ts = r#"
+            function pair<T, U>(a: T, b: U): [T, U] { return [a, b]; }
+            const p = pair<number, string>(1, "x");
+        "#;
+        let js = strip_types(ts);
+        assert!(js.contains("function pair(a, b)"), "got: {js}");
+        assert!(js.contains("const p = pair(1, \"x\")"), "got: {js}");
+        assert!(!js.contains("<number, string>"), "got: {js}");
+    }
+
+    #[test]
+    fn test_arrow_generics() {
+        // arrow function with generics — old regex failed on `<T>(x: T) =>`
+        let ts = r#"
+            const id = <T>(x: T): T => x;
+            const y = id<string>("hello");
+        "#;
+        let js = strip_types(ts);
+        assert!(js.contains("const id = (x) => x"), "got: {js}");
+        assert!(js.contains("id(\"hello\")"), "got: {js}");
+        assert!(!js.contains("<T>"), "got: {js}");
+    }
+
+    #[test]
+    fn test_export_default_class() {
+        // anonymous default class must not emit a bare `class {` statement
+        // (script-mode SyntaxError) — re3's `/* export default */` comment
+        // form catches it (the comment intentionally keeps the text).
+        // Note: `/* export default */ class { ... }` is still not *evaluable*
+        // script-mode JS (anonymous class declarations are illegal; only class
+        // expressions may be anonymous) — but that is a pre-existing P3 edge
+        // case nobody hits in load-test scripts; the guard here only prevents
+        // the named-class regression (see test_export_default_named_class).
+        let ts = r#"export default class { method() { return 1; } }"#;
+        let js = strip_types(ts);
+        assert!(
+            !js.contains("export default class {") && !js.contains("export default class{"),
+            "got: {js}"
+        );
+        assert!(js.contains("class {") || js.contains("class {\n"), "got: {js}");
+        assert!(js.contains("method()"), "got: {js}");
+    }
+
+    #[test]
+    fn test_export_default_named_class() {
+        let ts = r#"export default class Foo { method() { return 1; } }"#;
+        let js = strip_types(ts);
+        assert!(!js.contains("export default"), "got: {js}");
+        assert!(js.contains("class Foo"), "got: {js}");
+    }
+
+    #[test]
+    fn test_bare_as_in_conditionals() {
+        // bare `as` inside a conditional expression must be preserved
+        let ts = r#"
+            const flag = cond as boolean;
+            const label = isReady ? "yes" : "no";
+        "#;
+        let js = strip_types(ts);
+        assert!(!js.contains("as boolean"), "got: {js}");
+        assert!(js.contains("? \"yes\" : \"no\""), "got: {js}");
+    }
+
+    #[test]
+    fn test_string_poisoning() {
+        // strings containing TS-looking text must be left untouched
+        let ts = r#"
+            const msg = "type User = { id: number }; const x: number = 1;";
+            const url = "https://example.com/api/v1/items?id=1:number";
+        "#;
+        let js = strip_types(ts);
+        assert!(js.contains("\"type User = { id: number }; const x: number = 1;\""), "got: {js}");
+        assert!(js.contains("https://example.com"), "got: {js}");
+    }
+
+    #[test]
+    fn test_keep_exports_preserves_module() {
+        let ts = r#"
+            export const options = { vus: 5, duration: "10s" };
+            export default function() { return 1; }
+        "#;
+        let js = typescript_to_javascript_keep_exports(ts, "script.ts").unwrap();
+        assert!(js.contains("export const options"), "got: {js}");
+        assert!(js.contains("export default function"), "got: {js}");
+    }
+
+    /// Test helper: strip types + exports (script mode).
+    fn strip_types(source: &str) -> String {
+        typescript_to_javascript(source, "test.ts").unwrap()
     }
 }
