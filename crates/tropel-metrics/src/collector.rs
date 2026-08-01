@@ -206,6 +206,14 @@ enum MetricsEvent {
         metric: String,
         tx: tokio::sync::oneshot::Sender<f64>,
     },
+    /// Configure summary presentation before results are snapshotted.
+    SetSummaryConfig {
+        summary_trend_stats: Vec<String>,
+        effective_thresholds: std::collections::HashMap<
+            String,
+            tropel_core::config::ThresholdConfig,
+        >,
+    },
 }
 
 /// The top-level metrics collector.
@@ -255,6 +263,26 @@ impl MetricsCollector {
             tx,
             sample_sink: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Configure summary presentation (trend stats + effective thresholds)
+    /// before the end-of-run snapshot. Best-effort: if the aggregator has
+    /// already shut down the config is dropped.
+    pub async fn set_summary_config(
+        &self,
+        summary_trend_stats: Vec<String>,
+        effective_thresholds: std::collections::HashMap<
+            String,
+            tropel_core::config::ThresholdConfig,
+        >,
+    ) {
+        let _ = self
+            .tx
+            .send(MetricsEvent::SetSummaryConfig {
+                summary_trend_stats,
+                effective_thresholds,
+            })
+            .await;
     }
 
     /// Set a broadcast sender for forwarding samples to streaming outputs.
@@ -369,6 +397,13 @@ struct Aggregator {
     data: IndexMap<MetricKey, MetricSet>,
     /// Total counters by metric name.
     totals: HashMap<String, f64>,
+    /// Trend stats to surface in the summary (k6 `summaryTrendStats`).
+    summary_trend_stats: Vec<String>,
+    /// Effective threshold set (job + script-declared) for reporting.
+    effective_thresholds: std::collections::HashMap<
+        String,
+        tropel_core::config::ThresholdConfig,
+    >,
 }
 
 impl Aggregator {
@@ -376,6 +411,8 @@ impl Aggregator {
         Self {
             data: IndexMap::new(),
             totals: HashMap::new(),
+            summary_trend_stats: k6_default_trend_stats(),
+            effective_thresholds: std::collections::HashMap::new(),
         }
     }
 
@@ -397,6 +434,13 @@ impl Aggregator {
                 MetricsEvent::GetTotal { metric, tx } => {
                     let total = agg.totals.get(&metric).copied().unwrap_or(0.0);
                     let _ = tx.send(total);
+                }
+                MetricsEvent::SetSummaryConfig {
+                    summary_trend_stats,
+                    effective_thresholds,
+                } => {
+                    agg.summary_trend_stats = summary_trend_stats;
+                    agg.effective_thresholds = effective_thresholds;
                 }
             }
         }
@@ -425,7 +469,7 @@ impl Aggregator {
         *total += sample.value;
     }
 
-    fn build_results(&self) -> MetricsResult {
+    fn build_results(&mut self) -> MetricsResult {
         let mut metrics = Vec::new();
         let mut http_reqs: u64 = 0;
         let mut http_req_duration: Option<MetricSummary> = None;
@@ -663,6 +707,8 @@ impl Aggregator {
             },
             iterations,
             vus_max,
+            summary_trend_stats: std::mem::take(&mut self.summary_trend_stats),
+            effective_thresholds: std::mem::take(&mut self.effective_thresholds),
         }
     }
 }
@@ -719,6 +765,16 @@ pub struct MetricsResult {
     pub iterations: u64,
     /// Maximum concurrent VUs observed.
     pub vus_max: u64,
+    /// Trend statistics to show in the summary, k6 `summaryTrendStats`
+    /// semantics (e.g. `["avg","min","med","max","p(90)","p(95)","p(99)"]`).
+    /// Defaults to the k6 set. Reporters must honor this list.
+    pub summary_trend_stats: Vec<String>,
+    /// The thresholds actually applied to the run (job + script-declared).
+    /// Reporters evaluate and display pass/fail against this set.
+    pub effective_thresholds: std::collections::HashMap<
+        String,
+        tropel_core::config::ThresholdConfig,
+    >,
 }
 
 impl Default for MetricsResult {
@@ -738,9 +794,47 @@ impl Default for MetricsResult {
             http_req_failed: 0.0,
             iterations: 0,
             vus_max: 0,
+            summary_trend_stats: k6_default_trend_stats(),
+            effective_thresholds: std::collections::HashMap::new(),
         }
     }
 }
+
+/// The k6 default `summaryTrendStats` list.
+pub fn k6_default_trend_stats() -> Vec<String> {
+    ["avg", "min", "med", "max", "p(90)", "p(95)", "p(99)"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Map a k6 `summaryTrendStats` entry onto the `MetricSummary` field it
+/// refers to. Returns `None` for unknown entries (caller should skip).
+pub fn trend_stat_value(stat: &str, m: &MetricSummary) -> Option<f64> {
+    match stat.trim() {
+        "avg" | "mean" => Some(m.mean),
+        "min" => Some(m.min as f64),
+        "med" | "median" => Some(m.p50 as f64),
+        "max" => Some(m.max as f64),
+        "count" => Some(m.count as f64),
+        "sum" => Some(m.sum),
+        "rate" => Some(m.rate),
+        s if s.starts_with("p(") && s.ends_with(')') => {
+            let pct: f64 = s[2..s.len() - 1].trim().parse().ok()?;
+            // k6 allows arbitrary percentiles; MetricsResult only tracks
+            // p50/p90/p95/p99 — map to the nearest tracked bucket.
+            let bucket = match pct {
+                x if x <= 50.0 => m.p50 as f64,
+                x if x <= 90.0 => m.p90 as f64,
+                x if x <= 95.0 => m.p95 as f64,
+                _ => m.p99 as f64,
+            };
+            Some(bucket)
+        }
+        _ => None,
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

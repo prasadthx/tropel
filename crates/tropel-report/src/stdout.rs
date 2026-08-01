@@ -1,10 +1,36 @@
 use crate::Reporter;
 use async_trait::async_trait;
 use tropel_core::Result;
-use tropel_metrics::collector::MetricsResult;
+use tropel_metrics::collector::{trend_stat_value, MetricSummary, MetricsResult};
+use tropel_metrics::thresholds::evaluate_thresholds;
 
 /// Prints a summary report to stdout.
 pub struct StdoutReporter;
+
+impl StdoutReporter {
+    /// Render a Trend metric using the configured `summaryTrendStats` list.
+    fn render_trend(line: &str, m: &MetricSummary, stats: &[String]) {
+        let mut parts: Vec<String> = Vec::new();
+        for stat in stats {
+            if let Some(v) = trend_stat_value(stat, m) {
+                match stat.trim() {
+                    s if s.starts_with("p(") => {
+                        parts.push(format!("{}={:.0}ms", stat.trim(), v / 1000.0));
+                    }
+                    "avg" | "mean" => parts.push(format!("avg={:.2}ms", v / 1000.0)),
+                    "min" => parts.push(format!("min={:.0}ms", v / 1000.0)),
+                    "max" => parts.push(format!("max={:.0}ms", v / 1000.0)),
+                    "count" => parts.push(format!("count={:.0}", v)),
+                    "sum" => parts.push(format!("sum={:.2}ms", v / 1000.0)),
+                    "rate" => parts.push(format!("rate={:.4}", v)),
+                    "med" | "median" => parts.push(format!("med={:.0}ms", v / 1000.0)),
+                    _ => parts.push(format!("{}={:.2}", stat.trim(), v)),
+                }
+            }
+        }
+        println!("    {}{}", line, parts.join("  "));
+    }
+}
 
 #[async_trait]
 impl Reporter for StdoutReporter {
@@ -13,6 +39,20 @@ impl Reporter for StdoutReporter {
     }
 
     async fn report(&self, result: &MetricsResult) -> Result<()> {
+        let stats = if result.summary_trend_stats.is_empty() {
+            vec![
+                "avg".to_string(),
+                "min".to_string(),
+                "med".to_string(),
+                "max".to_string(),
+                "p(90)".to_string(),
+                "p(95)".to_string(),
+                "p(99)".to_string(),
+            ]
+        } else {
+            result.summary_trend_stats.clone()
+        };
+
         println!("\n╔══════════════════════════════════════════════════╗");
         println!("║          Tropel Load Test Summary               ║");
         println!("╚══════════════════════════════════════════════════╝\n");
@@ -42,21 +82,13 @@ impl Reporter for StdoutReporter {
 
         if let Some(duration) = &result.http_req_duration {
             println!("\n  HTTP request duration:");
-            println!("    avg:    {:.2}ms", duration.mean / 1000.0);
-            println!("    min:    {}μs", duration.min);
-            println!("    max:    {}ms", duration.max / 1000);
-            println!("    p50:    {}ms", duration.p50 / 1000);
-            println!("    p90:    {}ms", duration.p90 / 1000);
-            println!("    p95:    {}ms", duration.p95 / 1000);
-            println!("    p99:    {}ms", duration.p99 / 1000);
+            Self::render_trend("", duration, &stats);
         }
 
         // Iteration duration
         if let Some(dur) = &result.iteration_duration {
             println!("\n  Iteration duration:");
-            println!("    avg:    {:.2}ms", dur.mean / 1000.0);
-            println!("    min:    {}μs", dur.min);
-            println!("    max:    {}ms", dur.max / 1000);
+            Self::render_trend("", dur, &stats);
         }
 
         // Checks/assertions
@@ -104,10 +136,29 @@ impl Reporter for StdoutReporter {
                         );
                     }
                     tropel_metrics::collector::MetricType::Trend => {
-                        println!("[Trend]  count: {}  avg: {:.2}  min: {}  max: {}  p50: {}  p90: {}  p95: {}  p99: {}",
-                            metric.count, metric.mean, metric.min, metric.max,
-                            metric.p50, metric.p90, metric.p95, metric.p99);
+                        println!("[Trend]");
+                        Self::render_trend("", metric, &stats);
                     }
+                }
+            }
+        }
+
+        // Thresholds — pass/fail against the effective threshold set.
+        if !result.effective_thresholds.is_empty() {
+            println!("\n  Thresholds:");
+            let threshold_results = evaluate_thresholds(&result.effective_thresholds, result);
+            for tr in &threshold_results {
+                let op = tr.expression.split_whitespace().nth(1).unwrap_or("<?>");
+                if tr.passed {
+                    println!(
+                        "    ✓ {}: {:.2} {} {:.2} (PASS)",
+                        tr.name, tr.actual, op, tr.threshold
+                    );
+                } else {
+                    println!(
+                        "    ✗ {}: {:.2} {} {:.2} (FAIL)",
+                        tr.name, tr.actual, op, tr.threshold
+                    );
                 }
             }
         }

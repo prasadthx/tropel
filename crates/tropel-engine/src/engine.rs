@@ -62,6 +62,7 @@ impl Engine {
         // being silently ignored.
         let mut declared_scenarios: Option<HashMap<String, ScenarioConfig>> = None;
         let mut declared_execution: Option<ExecutionConfig> = None;
+        let mut declared_trend_stats: Option<Vec<String>> = None;
         if !config.execution_explicit && config.scenarios.is_empty() {
             let input_path = std::path::Path::new(&config.input);
             let bytes = std::fs::read(&config.input).ok();
@@ -87,6 +88,17 @@ impl Engine {
                             "Script-declared discardResponseBodies={} applied to HTTP client",
                             discard
                         );
+                    }
+                    // Script-declared summary trend stats (k6
+                    // `options.summaryTrendStats`) configure the summary.
+                    if let Some(stats) = decl.summary_trend_stats {
+                        if !stats.is_empty() {
+                            tracing::info!(
+                                "Script-declared summaryTrendStats applied: {:?}",
+                                stats
+                            );
+                            declared_trend_stats = Some(stats);
+                        }
                     }
                     // Merge script-declared thresholds (CLI/config keys win on
                     // collision — CLI keys are "threshold_N", so no clash).
@@ -308,6 +320,14 @@ impl Engine {
         for handle in output_handles {
             let _ = handle.await;
         }
+
+        // Apply summary presentation config (trend stats + effective
+        // thresholds) to the collector so reporters see them.
+        let summary_trend_stats = declared_trend_stats
+            .unwrap_or_else(|| tropel_metrics::collector::k6_default_trend_stats());
+        metrics
+            .set_summary_config(summary_trend_stats, thresholds.clone())
+            .await;
 
         let results = metrics.results().await;
         let reporters = self.create_reporters(&config.output);

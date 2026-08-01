@@ -206,6 +206,9 @@ pub struct DriverDeclaredOptions {
     /// when `Some(true)`, the engine sets the HTTP client to discard all
     /// response bodies. `None` leaves the job's HttpConfig untouched.
     pub discard_response_bodies: Option<bool>,
+    /// Which trend statistics the summary shows (k6 `options.summaryTrendStats`).
+    /// `None` uses the k6 default set.
+    pub summary_trend_stats: Option<Vec<String>>,
 }
 
 /// A driver instance ready to run iterations.

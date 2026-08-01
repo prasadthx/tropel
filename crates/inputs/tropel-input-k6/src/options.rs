@@ -44,6 +44,11 @@ pub struct K6Options {
     /// `responseType` defaults; pairs with the lazy-body work.
     #[serde(alias = "discardResponseBodies")]
     pub discard_response_bodies: Option<bool>,
+    /// Which trend statistics the summary shows (k6 `options.summaryTrendStats`,
+    /// e.g. `["avg","min","med","max","p(90)","p(95)","p(99)"]`). When
+    /// absent, the k6 default set is used.
+    #[serde(alias = "summaryTrendStats")]
+    pub summary_trend_stats: Option<Vec<String>>,
 }
 
 /// A ramping stage. `target` is `f64` so a single struct serves both
@@ -160,6 +165,7 @@ impl K6Options {
                         scenarios: Some(map),
                         thresholds,
                         discard_response_bodies: self.discard_response_bodies,
+                        summary_trend_stats: self.summary_trend_stats.clone(),
                     });
                 }
             }
@@ -171,6 +177,7 @@ impl K6Options {
             scenarios: None,
             thresholds,
             discard_response_bodies: self.discard_response_bodies,
+            summary_trend_stats: self.summary_trend_stats.clone(),
         })
     }
 
