@@ -158,45 +158,41 @@ impl Response {
 /// Request sub-timings, matching k6's http_req_* breakdown.
 ///
 /// All durations are wall-clock microseconds measured from the start of the
-/// HTTP request (`execute()`). Fields that cannot be measured from reqwest's
-/// public API (blocked, connecting, tls_handshaking, sending) are set to
-/// `Duration::ZERO` and documented as "requires connector instrumentation".
+/// HTTP request (`execute()`). `blocked`, `dns`, and `connecting` are filled
+/// from real connector instrumentation (reqwest's `dns_resolver` and
+/// `connector_layer` hooks — see `tropel-http::subtimings`); they are ZERO
+/// when a pooled keep-alive connection is reused (no connection work).
 ///
 /// The measurable phases:
-/// - **waiting** (TTFB): request sent until response headers received
+/// - **blocked**: request start until connection attempt begins (pool wait)
+/// - **dns**: real DNS resolution time
+/// - **connecting**: TCP connect (plus TLS for https, folded into the
+///   connector call by reqwest)
+/// - **waiting** (TTFB): response headers received
 /// - **receiving**: response headers received until full body received
 /// - **total**: full request lifecycle (start until body fully received)
 ///
 /// Phases not yet measurable from reqwest alone:
-/// - **blocked**: time spent before connection starts (queue, proxy, etc.)
-/// - **connecting**: TCP handshake
-/// - **tls_handshaking**: TLS handshake
+/// - **tls_handshaking**: TLS handshake (included in `connecting` for https)
 /// - **sending**: time to transmit the request body
 ///
-/// Note: `total >= waiting + receiving`. The difference is the time spent
-/// in blocked/connecting/tls_handshaking/sending phases (plus any overhead).
-/// When connector instrumentation is added, those phases can be filled from
-/// DNS/TCP/TLS timestamps.
+/// These two are set to `Duration::ZERO`; a hyper-based custom connector
+/// would be required to split them out.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Timings {
-    /// Time blocked before connection starts (queue, DNS, proxy negotiation).
-    /// Requires connector-level instrumentation to measure accurately.
+    /// Time blocked before connection starts (pool wait / queueing).
     #[serde(default)]
     pub blocked: Duration,
     /// DNS resolution time.
-    /// Requires connector-level instrumentation to measure accurately.
     #[serde(default)]
     pub dns: Duration,
-    /// TCP connect time.
-    /// Requires connector-level instrumentation to measure accurately.
+    /// TCP connect time (TLS included for https).
     #[serde(default)]
     pub connecting: Duration,
-    /// TLS handshake time.
-    /// Requires connector-level instrumentation to measure accurately.
+    /// TLS handshake time. Always ZERO — folded into `connecting` by reqwest.
     #[serde(default)]
     pub tls_handshaking: Duration,
-    /// Time to send the request body.
-    /// Requires connector-level instrumentation to measure accurately.
+    /// Time to send the request body. Always ZERO — not exposed by reqwest.
     #[serde(default)]
     pub sending: Duration,
     /// Time to first byte (TTFB) — from request start to response head received.
@@ -211,8 +207,7 @@ pub struct Timings {
 
 impl Timings {
     /// Create a new Timings from measured phases.
-    /// blocked/dns/connecting/tls_handshaking/sending default to ZERO
-    /// (requires connector-level instrumentation).
+    /// blocked/dns/connecting/tls_handshaking/sending default to ZERO.
     pub fn from_measured(waiting: Duration, receiving: Duration, total: Duration) -> Self {
         Self {
             blocked: Duration::ZERO,

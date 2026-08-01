@@ -43,6 +43,7 @@ rquickjs = { version = "0.12.2", features = ["full-async"] }
 
 # HTTP client
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "cookies", "gzip", "brotli", "http2", "json", "stream", "query", "form"] }
+tower = { version = "0.5.3", default-features = false }
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }

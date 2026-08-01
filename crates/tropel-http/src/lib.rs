@@ -7,6 +7,7 @@ pub mod auth;
 pub mod blocking;
 pub mod client;
 pub mod protocol;
+pub mod subtimings;
 
 pub use auth::*;
 pub use client::*;

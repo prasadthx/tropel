@@ -47,6 +47,17 @@ impl HttpClient {
             }
         }
 
+        // Real sub-timing hooks:
+        // - `dns_resolver` times actual DNS lookups (replaces the default
+        //   GaiResolver with an equivalent getaddrinfo-based resolver).
+        // - `connector_layer` times each connection attempt (DNS + TCP + TLS)
+        //   via generic tower middleware that never names reqwest's sealed
+        //   `Unnameable`/`Conn` types.
+        // Results are recorded on the VU thread and consumed by `execute()`.
+        builder = builder
+            .dns_resolver(crate::subtimings::TimingDnsResolver)
+            .connector_layer(crate::subtimings::TimingConnectorLayer);
+
         let inner = builder
             .build()
             .map_err(|e| TropelError::Http(format!("Failed to create HTTP client: {}", e)))?;
@@ -59,15 +70,24 @@ impl HttpClient {
 
     /// Execute an HTTP request with sub-timing instrumentation.
     ///
-    /// Measures three phases of the request lifecycle:
-    /// - **waiting** (TTFB): from `execute()` start to response headers received.
-    ///   Includes DNS, TCP, TLS, sending, and server processing time.
-    /// - **receiving**: from response headers to full body bytes received.
-    /// - **total**: entire `execute()` duration.
+    /// Measures the full request lifecycle with real phase data captured via
+    /// reqwest's `dns_resolver` and `connector_layer` hooks (see
+    /// [`crate::subtimings`]):
+    /// - **blocked**: request start → connector `call()` begins (pool wait /
+    ///   queueing; zero when a pooled keep-alive connection is reused)
+    /// - **dns**: real DNS resolution time
+    /// - **connecting**: connector call minus DNS (pure TCP for http; for
+    ///   https reqwest folds the TLS handshake into the connector call, so it
+    ///   is included here)
+/// - **waiting** (TTFB): from just before the request is sent to response
+///   headers received. For fresh connections this includes the connect phases
+///   (blocked + dns + connecting); k6's `http_req_waiting` excludes them
+    /// - **receiving**: from response headers to full body bytes received
+    /// - **total**: entire `execute()` duration
     ///
-    /// Blocked, connecting, tls_handshaking, and sending phases are set to
-    /// `Duration::ZERO` — they require connector-level instrumentation that
-    /// reqwest's stable API does not expose.
+    /// `tls_handshaking` and `sending` remain `Duration::ZERO` — reqwest
+    /// seals those phases inside the connector / request future. A
+    /// hyper-based custom connector would be required to split them out.
     ///
     /// Returns the response along with the number of bytes sent in the request body.
     pub async fn execute(
@@ -76,6 +96,7 @@ impl HttpClient {
         signer: Option<&dyn AuthSigner>,
     ) -> Result<HttpResponse> {
         let total_start = std::time::Instant::now();
+        crate::subtimings::begin_request(total_start);
 
         // Calculate request body size for data_sent tracking
         let request_body_size: u64 = request
@@ -212,10 +233,28 @@ impl HttpClient {
 
         let total_duration = total_start.elapsed();
 
-        // Build sub-timings.
-        // blocked/dns/connecting/tls_handshaking/sending are ZERO because
-        // reqwest's stable API does not expose connection-level phases.
-        let timings = Timings::from_measured(waiting_duration, receiving_duration, total_duration);
+        // Build sub-timings from the real phases recorded by the
+        // `dns_resolver` and `connector_layer` hooks (thread-local slot).
+        // When the request reused a pooled keep-alive connection no connector
+        // call happened, so the connect phases are ZERO — matching k6, which
+        // also reports ~0 blocked/connecting for pooled connections.
+        //
+        // Note: `dns` is optional on purpose — for IP-literal hosts (e.g.
+        // "127.0.0.1") reqwest's HttpConnector skips DNS resolution entirely,
+        // so only the connect phases exist.
+        let phases = crate::subtimings::take_slot();
+        let mut timings = Timings::from_measured(waiting_duration, receiving_duration, total_duration);
+        if let (Some(request_start), Some(connect_start), Some(connect_elapsed)) = (
+            phases.request_start,
+            phases.connect_start,
+            phases.connect_elapsed,
+        ) {
+            timings.blocked = connect_start.saturating_duration_since(request_start);
+            timings.dns = phases.dns_elapsed.unwrap_or_default();
+            // connect_elapsed spans DNS + TCP (+ TLS for https); subtract the
+            // separately-measured DNS to leave the transport phases.
+            timings.connecting = connect_elapsed.saturating_sub(timings.dns);
+        }
 
         let response = HttpResponse {
             status_code,

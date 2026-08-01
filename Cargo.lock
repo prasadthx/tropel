@@ -3199,6 +3199,7 @@ dependencies = [
  "simd-json",
  "thiserror",
  "tokio",
+ "tower",
  "tracing",
  "tropel-core",
  "tropel-ext",

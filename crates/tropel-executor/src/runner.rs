@@ -315,13 +315,19 @@ impl VURunner {
                             // HTTP sub-timing metrics (Trend, all in μs)
                             // ═══════════════════════════════════════════════
                             // These match k6's http_req_* sub-timing metrics.
-                            // blocked/connecting/tls_handshaking/sending are
-                            // ZERO until connector-level instrumentation is
-                            // added to reqwest. waiting (TTFB) and receiving
-                            // are always measured.
+                            // http_req_dns is a Tropel extra (k6 folds DNS into
+                            // http_req_blocked). blocked/dns/connecting are
+                            // REAL (from reqwest's dns_resolver +
+                            // connector_layer hooks);
+                            // tls_handshaking/sending are always ZERO (folded
+                            // into connecting / waiting by reqwest). waiting
+                            // (TTFB) and receiving are always measured.
+                            // Note: on a pooled keep-alive reuse no connector
+                            // call happens, so blocked/dns/connecting are 0.
                             if let Some(timings) = &http_response.timings {
                                 let sub_timing_metrics = [
                                     ("http_req_blocked", timings.blocked),
+                                    ("http_req_dns", timings.dns),
                                     ("http_req_connecting", timings.connecting),
                                     ("http_req_tls_handshaking", timings.tls_handshaking),
                                     ("http_req_sending", timings.sending),
