@@ -38,6 +38,10 @@ impl Engine {
         let format_hint = config.input_type.clone();
         let metrics = Arc::new(MetricsCollector::new());
 
+        // Latency histogram ceiling (None = auto-resize, no clipping). Applied
+        // before any samples are recorded so every MetricSet uses it.
+        metrics.set_histogram_max(config.http.histogram_max_micros).await;
+
         let num_workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);

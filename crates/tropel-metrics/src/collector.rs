@@ -121,10 +121,10 @@ pub struct MetricSet {
 }
 
 impl MetricSet {
-    fn new(metric_type: MetricType) -> Self {
+    fn new(metric_type: MetricType, histogram_max_micros: Option<u64>) -> Self {
         Self {
             metric_type,
-            histogram: LatencyHistogram::new(),
+            histogram: LatencyHistogram::with_max(histogram_max_micros),
             count: 0.0,
             sum: 0.0,
             min: f64::MAX,
@@ -214,6 +214,9 @@ enum MetricsEvent {
             tropel_core::config::ThresholdConfig,
         >,
     },
+    /// Set the latency histogram ceiling (microseconds) before any samples
+    /// are recorded. `None` = auto-resize (no ceiling).
+    SetHistogramMax(Option<u64>),
 }
 
 /// The top-level metrics collector.
@@ -263,6 +266,12 @@ impl MetricsCollector {
             tx,
             sample_sink: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Set the latency histogram ceiling (microseconds) before samples are
+    /// recorded. `None` selects auto-resize (no ceiling). Best-effort.
+    pub async fn set_histogram_max(&self, max_micros: Option<u64>) {
+        let _ = self.tx.send(MetricsEvent::SetHistogramMax(max_micros)).await;
     }
 
     /// Configure summary presentation (trend stats + effective thresholds)
@@ -404,6 +413,8 @@ struct Aggregator {
         String,
         tropel_core::config::ThresholdConfig,
     >,
+    /// Latency histogram ceiling in microseconds (None = auto-resize).
+    histogram_max_micros: Option<u64>,
 }
 
 impl Aggregator {
@@ -413,6 +424,7 @@ impl Aggregator {
             totals: HashMap::new(),
             summary_trend_stats: k6_default_trend_stats(),
             effective_thresholds: std::collections::HashMap::new(),
+            histogram_max_micros: None,
         }
     }
 
@@ -442,6 +454,9 @@ impl Aggregator {
                     agg.summary_trend_stats = summary_trend_stats;
                     agg.effective_thresholds = effective_thresholds;
                 }
+                MetricsEvent::SetHistogramMax(max) => {
+                    agg.histogram_max_micros = max;
+                }
             }
         }
     }
@@ -458,10 +473,9 @@ impl Aggregator {
         };
 
         // Use the type from the first sample for this key
-        let metric_set = self
-            .data
-            .entry(key)
-            .or_insert_with(|| MetricSet::new(metric_type));
+        let metric_set = self.data.entry(key).or_insert_with(|| {
+            MetricSet::new(metric_type, self.histogram_max_micros)
+        });
         metric_set.record(sample.value, &sample.sample_type);
 
         // Update totals

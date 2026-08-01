@@ -406,6 +406,12 @@ pub struct HttpConfig {
     pub discard_response_bodies: bool,
     /// Max redirects to follow.
     pub max_redirects: u32,
+    /// Optional fixed ceiling for the latency histogram, in MICROseconds.
+    /// `None` (default) uses hdrhistogram auto-resize — no ceiling, so very
+    /// slow requests are recorded exactly instead of being clipped at 60 s.
+    /// Set this to bound memory for runs with pathological outliers.
+    #[serde(default, alias = "histogramMaxMicros")]
+    pub histogram_max_micros: Option<u64>,
 }
 
 fn default_expected_statuses() -> Vec<ExpectedStatus> {
@@ -431,6 +437,7 @@ impl Default for HttpConfig {
             decompress: true,
             max_redirects: 10,
             discard_response_bodies: false,
+            histogram_max_micros: None,
         }
     }
 }

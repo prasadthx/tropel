@@ -9,15 +9,40 @@ pub struct LatencyHistogram {
 }
 
 impl LatencyHistogram {
-    /// Create a new histogram with default bounds (1 μs to 1 min).
+    /// Create a new auto-resizing histogram (1 μs low bound, unbounded high).
+    ///
+    /// hdrhistogram's `Histogram::new(sigfig)` enables auto-resize: values
+    /// above the initial ceiling grow the histogram instead of being silently
+    /// dropped. The old fixed 60 s ceiling clipped very slow requests, which
+    /// skewed p99/max and under-counted latency.
     pub fn new() -> Self {
-        Self::with_bounds(1, 60_000_000) // 1 μs to 60 seconds (in μs)
+        let inner = Histogram::new(3).expect("Failed to create auto-resizing histogram");
+        Self { inner }
     }
 
-    /// Create a new histogram with custom bounds.
+    /// Create a new histogram with custom bounds (fixed ceiling — values above
+    /// `high` are silently clamped/dropped, matching k6's bounded histogram
+    /// behavior). Prefer [`Self::new`] (auto-resize) unless a bounded ceiling
+    /// is explicitly required.
     pub fn with_bounds(low: u64, high: u64) -> Self {
         let inner = Histogram::new_with_bounds(low, high, 3).expect("Failed to create histogram");
         Self { inner }
+    }
+
+    /// Create a new histogram with a custom high bound in microseconds
+    /// (1 μs low bound). `None` (or an unusable ceiling) selects the
+    /// auto-resizing variant — a garbage ceiling must not panic inside the
+    /// aggregator task on the first recorded sample.
+    ///
+    /// hdrhistogram requires `high >= 2 * low` (with `low = 1` that means
+    /// `high >= 2`), so ceilings of 0 or 1 fall back to auto-resize. Very
+    /// large `high` values are safe: with low=1 the internal magnitude sum
+    /// is always < 63, so the constructor never rejects them.
+    pub fn with_max(max_micros: Option<u64>) -> Self {
+        match max_micros {
+            Some(high) if high >= 2 => Self::with_bounds(1, high),
+            _ => Self::new(),
+        }
     }
 
     /// Record a duration value.
