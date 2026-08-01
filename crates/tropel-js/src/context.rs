@@ -1,6 +1,6 @@
 use crate::error::*;
 use rquickjs::function::Func;
-use rquickjs::{Context, Function, Persistent, Promise, Runtime};
+use rquickjs::{Context, Coerced, FromJs, Function, Persistent, Promise, Runtime};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -54,9 +54,10 @@ impl CachedScript {
     }
 
     /// Restore the function and invoke it with no arguments.
-    /// On error, adjusts line numbers by subtracting the wrapper offset
-    /// and includes the original source in the diagnostic.
-    pub fn invoke<'js>(&self, ctx: &rquickjs::Ctx<'js>) -> Result<()> {
+    /// Returns the raw return value (so async scripts can be awaited by
+    /// the caller). On error, adjusts line numbers by subtracting the
+    /// wrapper offset and includes the original source in the diagnostic.
+    pub fn invoke<'js>(&self, ctx: &rquickjs::Ctx<'js>) -> Result<rquickjs::Value<'js>> {
         let func = self
             .func
             .clone()
@@ -84,8 +85,7 @@ impl CachedScript {
                 "Script error ({}): {}\n--- source ---\n{}\n--------------",
                 label, adjusted, source_preview
             ))
-        })?;
-        Ok(())
+        })
     }
 }
 
@@ -343,6 +343,115 @@ impl JsContext {
         Ok(pump_count)
     }
 
+    /// Drive a JS Promise to completion, returning its resolved value.
+    ///
+    /// Uses `rquickjs::Promise::finish` which loops over the QuickJS job
+    /// queue until the promise is resolved or rejected:
+    /// - **resolved** → returns the resolved value
+    /// - **rejected** → the rejection reason is converted into a `JsError`
+    ///   (no more swallowed rejections)
+    /// - **WouldBlock** → the job queue drained without the promise settling
+    ///   (e.g. it is pending on an operation the synchronous runtime cannot
+    ///   drive, like a real timer) — reported as a clear error instead of
+    ///   hanging or silently dropping the promise
+    ///
+    /// Must be called inside `ctx.with()`. `Ctx::execute_pending_job` used
+    /// internally is lock-free, so this does not deadlock against the
+    /// runtime lock held by `with`.
+    fn finish_promise<'js>(
+        ctx: &rquickjs::Ctx<'js>,
+        promise: &rquickjs::Promise<'js>,
+    ) -> Result<rquickjs::Value<'js>> {
+        promise.finish::<rquickjs::Value>().map_err(|e| match e {
+            rquickjs::Error::Exception => {
+                // The promise rejected — retrieve the thrown value.
+                // Because the cached wrapper is an async function, runtime
+                // errors in user source arrive here as rejections, so this is
+                // the primary error surface. Prefer the stack trace (it
+                // carries QuickJS line info) over the bare message, falling
+                // back to JS `String(err)` coercion.
+                let caught = ctx.catch();
+                let reason = Self::rejection_to_string(ctx, &caught)
+                    .unwrap_or_else(|| "<non-string rejection reason>".to_string());
+                JsError::Eval(format!("Async script rejected: {}", reason))
+            }
+            rquickjs::Error::WouldBlock => {
+                // An infinite microtask loop trips the per-eval interrupt
+                // (deadline), which `Ctx::execute_pending_job`'s `res != 0`
+                // collapses into WouldBlock. If an exception is pending,
+                // report it as the interrupt rather than a misleading
+                // "blocked" message.
+                if ctx.has_exception() {
+                    let caught = ctx.catch();
+                    let reason = Self::rejection_to_string(ctx, &caught)
+                        .unwrap_or_else(|| "<non-string rejection reason>".to_string());
+                    JsError::Eval(format!("Async script interrupted: {}", reason))
+                } else {
+                    JsError::Eval(
+                        "Async script: promise never resolved (blocked on an operation the runtime cannot drive, e.g. a real timer)"
+                            .into(),
+                    )
+                }
+            }
+            other => JsError::Eval(format!("Async script error: {}", other)),
+        })
+    }
+
+    /// Convert a promise rejection reason to a readable string.
+    ///
+    /// Tries, in order:
+    /// 1. A JS helper that prefers `e.stack` (line info) over `e`.
+    /// 2. `Coerced<String>` (JS `String(value)` coercion — "Error: msg").
+    /// 3. `value_to_string` fallback.
+    fn rejection_to_string<'js>(
+        ctx: &rquickjs::Ctx<'js>,
+        caught: &rquickjs::Value<'js>,
+    ) -> Option<String> {
+        // Stack-first coercion via a tiny JS helper. QuickJS's `e.stack`
+        // omits the "Error: <message>" header, so we prepend `e.message`
+        // when it isn't already part of the stack.
+        if let Ok(stack_fn) = ctx.eval::<rquickjs::Function, _>(
+            "(function(e){ var s = e && e.stack ? String(e.stack) : String(e); \
+             var m = e && e.message && typeof e.message === 'string' ? e.message : ''; \
+             return (m && s.indexOf(m) === -1) ? (m + '\\n' + s) : s; })",
+        ) {
+            if let Ok(s) = stack_fn.call::<_, std::string::String>((caught.clone(),)) {
+                if !s.is_empty() && s != "undefined" && s != "null" {
+                    return Some(s);
+                }
+            }
+        }
+        // Fall back to JS String() coercion.
+        if let Ok(s) = Coerced::<std::string::String>::from_js(ctx, caught.clone()) {
+            let s = s.to_string();
+            if !s.is_empty() && s != "undefined" && s != "null" {
+                return Some(s);
+            }
+        }
+        // Last resort: our own stringifier.
+        value_to_string(caught, ctx).ok().filter(|s| !s.is_empty())
+    }
+
+    /// Convert a resolved JS value to a useful string: JSON for
+    /// objects/arrays, plain string for scalars.
+    fn resolved_value_to_string<'js>(
+        value: &rquickjs::Value<'js>,
+        ctx: &rquickjs::Ctx<'js>,
+    ) -> Result<String> {
+        if value.is_object() || value.is_array() {
+            let globals = ctx.globals();
+            let json_fn: rquickjs::Function = globals
+                .get("JSON")
+                .and_then(|json: rquickjs::Object| json.get("stringify"))
+                .map_err(|e| JsError::Conversion(format!("JSON.stringify lookup failed: {}", e)))?;
+            json_fn
+                .call::<_, String>((value.clone(),))
+                .map_err(|e| JsError::Conversion(format!("JSON.stringify failed: {}", e)))
+        } else {
+            value_to_string(value, ctx)
+        }
+    }
+
     /// Evaluate JavaScript code and return the result as a string.
     /// After evaluation, pumps the promise job queue to resolve any
     /// pending microtasks (Promise callbacks, async/await continuations).
@@ -368,23 +477,32 @@ impl JsContext {
     /// The script should return a Promise (e.g., an async function invocation).
     /// This method:
     /// 1. Evaluates the code
-    /// 2. Pumps the job queue to resolve any pending microtasks
-    /// 3. Returns the result as a string
+    /// 2. Drives the returned Promise to completion (resolved *value* is
+    ///    returned, not a type-name placeholder)
+    /// 3. Surfaces rejections as errors instead of swallowing them
     ///
     /// If the script does NOT return a Promise, it behaves like `eval()`.
     pub async fn eval_async(&self, code: &str) -> Result<String> {
         self.reset_interrupt();
         let code = code.to_string();
 
-        // Evaluate the code
+        // Evaluate the code and resolve any returned promise inside the
+        // context lock (Promise::finish drives the job queue itself).
         let result = self.ctx.with(move |ctx| {
             let value: rquickjs::Value = ctx
                 .eval(code)
                 .map_err(|e| JsError::Eval(format!("JS eval_async error: {}", e)))?;
-            value_to_string(&value, &ctx)
+
+            if let Some(promise) = value.as_promise() {
+                let resolved = Self::finish_promise(&ctx, &promise)?;
+                Self::resolved_value_to_string(&resolved, &ctx)
+            } else {
+                value_to_string(&value, &ctx)
+            }
         })?;
 
-        // Pump the job queue to resolve any pending promises
+        // Pump the job queue to resolve any remaining pending microtasks
+        // (promises created as side effects, not returned).
         let pump_count = self.pump_promise_queue()?;
         if pump_count > 0 {
             tracing::trace!("Resolved async script (pumped {} times)", pump_count);
@@ -456,8 +574,13 @@ impl JsContext {
     /// async function.
     ///
     /// Wraps the source in `(async function(){...})()` so `await` is valid,
-    /// evaluates it (getting a Promise), then pumps the job queue to resolve
-    /// the Promise to completion.
+    /// evaluates it (getting a Promise), drives it to completion via
+    /// `Promise::finish` — surfacing rejections as errors — then pumps any
+    /// remaining microtasks.
+    ///
+    /// Note: kept as public API; in-tree callers (runner.rs) now use
+    /// `run_script_cached` exclusively (its wrapper is async too), so this
+    /// method has no internal callers but remains available for embedders.
     pub async fn run_script_async(&self, source: &str) -> Result<bool> {
         self.reset_interrupt();
         let source = source.to_string();
@@ -466,13 +589,14 @@ impl JsContext {
         let wrapped = format!("(async function __tropel_script(){{{source}}})()");
 
         self.ctx.with(move |ctx| {
-            let _promise: Promise = ctx
+            let promise: Promise = ctx
                 .eval(wrapped)
                 .map_err(|e| JsError::Eval(format!("Async script compile error: {}", e)))?;
+            Self::finish_promise(&ctx, &promise)?;
             Ok::<_, JsError>(())
         })?;
 
-        // Pump the promise queue to resolve the async function
+        // Pump the promise queue to resolve any remaining microtasks
         self.pump_promise_queue()?;
 
         Ok(true)
@@ -482,7 +606,7 @@ impl JsContext {
     ///
     /// On first call, the source is wrapped in:
     /// ```text
-    /// (function __tropel_script(){
+    /// (async function __tropel_script(){
     /// //# sourceURL=<source_url>
     /// <source>
     /// })
@@ -490,6 +614,12 @@ impl JsContext {
     /// compiled via `ctx.eval()`, and persisted via `Persistent<Function>`.
     /// Subsequent calls restore the persisted function from the cache and
     /// invoke it directly — avoiding re-parsing the source on every iteration.
+    ///
+    /// The wrapper is an **async** function so top-level `await` / `Promise`
+    /// in user scripts is always valid — no fragile substring sniffing to
+    /// pick a sync/async path. The returned Promise is driven to completion
+    /// via [`JsContext::finish_promise`], so rejections surface as errors and
+    /// `await`-dependent code runs to completion.
     ///
     /// The wrapped source puts user code on its own lines so QuickJS error
     /// line numbers are shifted by a known offset (2 lines). When reporting
@@ -519,7 +649,7 @@ impl JsContext {
         };
 
         // Wrapper format — 2 lines before user source:
-        //   Line 1: (function __tropel_script(){
+        //   Line 1: (async function __tropel_script(){
         //   Line 2: //# sourceURL=...
         //   Line 3+: user source...
         //   Last:   })
@@ -532,10 +662,19 @@ impl JsContext {
             cache.get(&hash).cloned()
         };
 
+        // Behavior note: a script whose *returned* promise never settles
+        // (e.g. `return new Promise(() => {})`) now errors with
+        // "promise never resolved" instead of silently pumping the job queue
+        // and moving on — a deliberate improvement (clear error > silent
+        // hang), but a semantic change from the old sync wrapper.
         if let Some(script) = cached {
-            // Fast path: restore and invoke the persisted function
+            // Fast path: restore and invoke the persisted function, then
+            // drive any returned promise to completion.
             let result = self.ctx.with(|ctx| {
-                script.invoke(&ctx)?;
+                let value = script.invoke(&ctx)?;
+                if let Some(promise) = value.as_promise() {
+                    Self::finish_promise(&ctx, &promise)?;
+                }
                 Ok::<_, JsError>(true)
             });
             // Pump promise queue after cached script execution
@@ -546,7 +685,7 @@ impl JsContext {
         // Slow path: compile, persist, cache, invoke
         let script = self.ctx.with(move |ctx| {
             let wrapped = format!(
-                "(function __tropel_script(){{\n//# sourceURL={}\n{source}\n}})",
+                "(async function __tropel_script(){{\n//# sourceURL={}\n{source}\n}})",
                 source_url_str
             );
             let func: Function = ctx.eval(wrapped.as_str()).map_err(|e| {
@@ -566,8 +705,11 @@ impl JsContext {
                 WRAPPER_OFFSET,
             );
 
-            // Execute now before caching
-            script.invoke(&ctx)?;
+            // Execute now before caching; drive any returned promise.
+            let value = script.invoke(&ctx)?;
+            if let Some(promise) = value.as_promise() {
+                Self::finish_promise(&ctx, &promise)?;
+            }
 
             Ok::<_, JsError>(script)
         })?;
@@ -627,5 +769,102 @@ fn value_to_string(value: &rquickjs::Value, _ctx: &rquickjs::Ctx) -> Result<Stri
         Ok(format!("{:?}", value.type_of()))
     } else {
         Ok(String::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn new_ctx() -> JsContext {
+        JsContext::new(None, Some(Duration::from_secs(5)))
+            .await
+            .expect("context creation should succeed")
+    }
+
+    #[tokio::test]
+    async fn eval_async_returns_resolved_value() {
+        let ctx = new_ctx().await;
+        // A script that returns a Promise must return the *resolved value*,
+        // not a type-name placeholder.
+        let r = ctx.eval_async("Promise.resolve(42)").await.unwrap();
+        assert_eq!(r, "42");
+
+        let r = ctx.eval_async("Promise.resolve('hello')").await.unwrap();
+        assert_eq!(r, "hello");
+    }
+
+    #[tokio::test]
+    async fn eval_async_returns_json_for_objects() {
+        let ctx = new_ctx().await;
+        let r = ctx
+            .eval_async("Promise.resolve({a: 1, b: [2, 3]})")
+            .await
+            .unwrap();
+        assert!(r.contains("\"a\":1") || r.contains("\"a\": 1"), "got: {}", r);
+        assert!(r.contains("\"b\""));
+    }
+
+    #[tokio::test]
+    async fn eval_async_surfaces_rejections() {
+        let ctx = new_ctx().await;
+        let err = ctx.eval_async("Promise.reject(new Error('boom'))").await;
+        let msg = format!("{:?}", err.err());
+        assert!(msg.contains("rejected"), "got: {}", msg);
+        assert!(msg.contains("boom"), "got: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn eval_async_awaits_internal_awaits() {
+        let ctx = new_ctx().await;
+        // The awaited value must be computed after internal awaits, not the
+        // pre-resolution placeholder.
+        let r = ctx
+            .eval_async("(async () => { await Promise.resolve(1); return 99; })()")
+            .await
+            .unwrap();
+        assert_eq!(r, "99");
+    }
+
+    #[tokio::test]
+    async fn run_script_cached_handles_top_level_await() {
+        let ctx = new_ctx().await;
+        // Top-level `await` must be valid inside the cached wrapper.
+        let ok = ctx
+            .run_script_cached(
+                "globalThis.__tropel_flag = 0; await Promise.resolve(); globalThis.__tropel_flag = 1;",
+                Some("async-test.js".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(ok);
+        let flag = ctx.get_global("__tropel_flag").await.unwrap();
+        assert_eq!(flag.as_deref(), Some("1"), "post-await code must run");
+    }
+
+    #[tokio::test]
+    async fn run_script_cached_surfaces_rejected_promise() {
+        let ctx = new_ctx().await;
+        // A cached script whose returned promise rejects must surface the
+        // error instead of silently swallowing it.
+        let err = ctx
+            .run_script_cached("return Promise.reject(new Error('kaboom'))", Some("reject.js".to_string()))
+            .await
+            .err();
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("rejected"), "got: {}", msg);
+        assert!(msg.contains("kaboom"), "got: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn run_script_cached_sync_script_still_works() {
+        let ctx = new_ctx().await;
+        let ok = ctx
+            .run_script_cached("globalThis.__tropel_x = 7;", Some("sync.js".to_string()))
+            .await
+            .unwrap();
+        assert!(ok);
+        let x = ctx.get_global("__tropel_x").await.unwrap();
+        assert_eq!(x.as_deref(), Some("7"));
     }
 }

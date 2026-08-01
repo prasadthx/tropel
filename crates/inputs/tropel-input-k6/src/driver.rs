@@ -199,11 +199,20 @@ impl DriverInstance for K6DriverInstance {
         // Uses the cached `Persistent<Function>` fast path: the invocation
         // expression is compiled once (first iteration) and re-invoked from
         // the script cache on every subsequent iteration — no re-parsing.
+        //
+        // `return` is required: the cached wrapper is `(async function(){...})`
+        // and only an explicit `return` makes the wrapper adopt the inner
+        // promise. Without it, an async default export's promise would be
+        // discarded (side effects still run via the job pump, but its
+        // rejections would be swallowed).
         let iter_start = Instant::now();
 
         match self
             .js_ctx
-            .run_script_cached("__tropel_iteration()", Some("k6-iteration.js".to_string()))
+            .run_script_cached(
+                "return __tropel_iteration()",
+                Some("k6-iteration.js".to_string()),
+            )
             .await
         {
             Ok(_) => {}
