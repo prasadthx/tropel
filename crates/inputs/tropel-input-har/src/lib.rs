@@ -340,6 +340,7 @@ fn har_entry_to_item(entry: HarEntry, index: usize) -> ScenarioItem {
             certificate: None,
             follow_redirects: true,
             timeout: None,
+            response_type: tropel_sdk::ResponseType::Text,
         }),
         prerequest: None,
         test: None,

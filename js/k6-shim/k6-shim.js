@@ -14,8 +14,8 @@
 // ══════════════════════════════════════════════════════════════════
 
 // ── Globals set by native host (K6DriverInstance) ──
-// __tropel_k6_http_request(method, url, headers_json, body, timeout_ms) -> JSON string
-// __tropel_pm_send_request(method, url, headers_json, body, timeout_ms) -> JSON string
+// __tropel_k6_http_request(method, url, headers_json, body, timeout_ms, response_type) -> JSON string
+// __tropel_pm_send_request(method, url, headers_json, body, timeout_ms, response_type) -> JSON string
 // __tropel_vu_id, __tropel_iteration_num, __tropel_scenario
 
 // ══════════════════════════════════════════════════════════════════
@@ -27,36 +27,30 @@ function k6HTTPRequest(method, url, body, params) {
     var headersJson = JSON.stringify(canonical.headers);
     var resultJson = null;
 
-    // Try the k6-native HTTP bridge first (lazy-registered by K6DriverInstance)
+    // Try the k6-native HTTP bridge first (lazy-registered by K6DriverInstance).
+    // Both bridges accept the k6 responseType ("text"/"binary"/"none") as
+    // their 6th argument. NOTE: previously this function had a duplicated
+    // leftover block calling with undefined `bodyStr`/`timeoutMs` that threw
+    // ReferenceError on EVERY request — removed.
     if (typeof __tropel_k6_http_request === 'function') {
         resultJson = __tropel_k6_http_request(
             canonical.method,
             canonical.url,
             headersJson,
             canonical.body,
-            canonical.timeoutMs
+            canonical.timeoutMs,
+            canonical.responseType
         );
-    }
-    // Fall back to the PM bridge (if installed)
-    else if (typeof __tropel_pm_send_request === 'function') {
+    } else if (typeof __tropel_pm_send_request === 'function') {
         resultJson = __tropel_pm_send_request(
             canonical.method,
             canonical.url,
             headersJson,
             canonical.body,
-            canonical.timeoutMs
+            canonical.timeoutMs,
+            canonical.responseType
         );
-    }
-
-    // Try the k6-native HTTP bridge first (lazy-registered by K6DriverInstance)
-    if (typeof __tropel_k6_http_request === 'function') {
-        resultJson = __tropel_k6_http_request(method, url, headersJson, bodyStr, timeoutMs);
-    }
-    // Fall back to the PM bridge (if installed)
-    else if (typeof __tropel_pm_send_request === 'function') {
-        resultJson = __tropel_pm_send_request(method, url, headersJson, bodyStr, timeoutMs);
-    }
-    else {
+    } else {
         throw new Error(
             'k6 http.* requires a native HTTP bridge — neither __tropel_k6_http_request ' +
             'nor __tropel_pm_send_request is available. Check that the K6Driver or PM bridge ' +
@@ -112,6 +106,8 @@ function normalizeK6Request(method, url, body, params) {
 
     var headers = params.headers || {};
     var timeout = params.timeout || '30s';
+    // k6 params.responseType: "text" (default) | "binary" | "none"
+    var responseType = params.responseType || 'text';
 
     var timeoutMs = 30000;
     if (typeof timeout === 'string') {
@@ -134,6 +130,7 @@ function normalizeK6Request(method, url, body, params) {
         headers: serialized.headers,
         body: serialized.body,
         timeoutMs: timeoutMs,
+        responseType: responseType,
     };
 }
 
@@ -281,6 +278,7 @@ http.batch = function (requests) {
                 headers_json: JSON.stringify(canonical.headers),
                 body: canonical.body,
                 timeout_ms: canonical.timeoutMs,
+                response_type: canonical.responseType,
             });
         }
 
@@ -316,15 +314,18 @@ function normalizeBatchEntry(req, defaultKey) {
         };
     }
     if (typeof req === 'object') {
+        // Preserve the object-form entry's responseType (k6: params.responseType)
+        var entryParams = req.params || {};
         return {
             key: req.name != null ? req.name : defaultKey,
             method: req.method || 'GET',
             url: req.url || '',
             body: req.body || null,
             params: {
-                headers: req.headers || {},
-                tags: req.tags || {},
-                timeout: req.timeout || '30s'
+                headers: req.headers || entryParams.headers || {},
+                tags: req.tags || entryParams.tags || {},
+                timeout: req.timeout || entryParams.timeout || '30s',
+                responseType: entryParams.responseType || req.responseType || 'text'
             }
         };
     }

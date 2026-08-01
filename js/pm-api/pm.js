@@ -368,7 +368,10 @@ pm.sendRequest = function (options, callback) {
             url,
             JSON.stringify(headers),
             typeof body === 'string' ? body : JSON.stringify(body),
-            timeout
+            timeout,
+            // k6-style responseType — Postman sendRequest has no such field,
+            // default to "text" (bridge requires the 6th arg)
+            (options && options.responseType) || 'text'
         );
 
         // Fire callback with the response

@@ -48,7 +48,7 @@ impl Engine {
             num_workers
         );
 
-        let http_config = config.http.clone();
+        let mut http_config = config.http.clone();
         let tls_config = config.tls.clone();
         let mut thresholds = config.thresholds.clone();
         let data_rows = config.iteration_data.clone();
@@ -78,6 +78,16 @@ impl Engine {
                     .declared_options(&bytes, Some(input_path), &config.env)
                     .await
                 {
+                    // Script-declared global body handling (k6
+                    // `options.discardResponseBodies`) applies to the HTTP
+                    // client when the job didn't set one explicitly.
+                    if let Some(discard) = decl.discard_response_bodies {
+                        http_config.discard_response_bodies = discard;
+                        tracing::info!(
+                            "Script-declared discardResponseBodies={} applied to HTTP client",
+                            discard
+                        );
+                    }
                     // Merge script-declared thresholds (CLI/config keys win on
                     // collision — CLI keys are "threshold_N", so no clash).
                     for (k, v) in &decl.thresholds {

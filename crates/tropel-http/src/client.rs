@@ -308,8 +308,13 @@ impl HttpClient {
         // ═══════════════════════════════════════════════════════
         // Phase 2: Receive response body
         // ═══════════════════════════════════════════════════════
+        // The body is skipped when the GLOBAL discard_response_bodies flag is
+        // set OR the per-request k6 `responseType: "none"` is requested — both
+        // save bandwidth/memory; scripts just see an empty body.
         let receiving_start = std::time::Instant::now();
-        let body_vec = if self.discard_bodies {
+        let discard = self.discard_bodies
+            || request.response_type == tropel_core::types::ResponseType::None;
+        let body_vec = if discard {
             Vec::new()
         } else {
             response

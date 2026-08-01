@@ -39,6 +39,11 @@ pub struct K6Options {
     pub graceful_ramp_down: Option<String>,
     #[serde(alias = "maxDuration")]
     pub max_duration: Option<String>,
+    /// Global body-handling: when true, response bodies are discarded for ALL
+    /// requests (k6 `options.discardResponseBodies`). Overrides per-request
+    /// `responseType` defaults; pairs with the lazy-body work.
+    #[serde(alias = "discardResponseBodies")]
+    pub discard_response_bodies: Option<bool>,
 }
 
 /// A ramping stage. `target` is `f64` so a single struct serves both
@@ -154,6 +159,7 @@ impl K6Options {
                         execution: None,
                         scenarios: Some(map),
                         thresholds,
+                        discard_response_bodies: self.discard_response_bodies,
                     });
                 }
             }
@@ -164,6 +170,7 @@ impl K6Options {
             execution: Some(execution),
             scenarios: None,
             thresholds,
+            discard_response_bodies: self.discard_response_bodies,
         })
     }
 

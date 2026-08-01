@@ -261,7 +261,8 @@ impl K6DriverInstance {
                           url: String,
                           headers_json: String,
                           body: String,
-                          _timeout_ms: f64|
+                          _timeout_ms: f64,
+                          response_type: String|
                           -> String {
                         let headers = parse_headers_tolerant(&headers_json);
                         let req_body = if body.is_empty() {
@@ -279,6 +280,7 @@ impl K6DriverInstance {
                             certificate: None,
                             follow_redirects: true,
                             timeout: None,
+                            response_type: tropel_sdk::ResponseType::from_k6(&response_type),
                         };
                         // Execute on the dedicated I/O runtime via the shared
                         // blocking helper — safe from inside ctx.with on a
@@ -358,6 +360,10 @@ impl K6DriverInstance {
                         } else {
                             None
                         };
+                        let response_type = entry
+                            .get("response_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("text");
                         let req = Request {
                             url,
                             method: Method::from_str(&method).unwrap_or(Method::GET),
@@ -368,6 +374,7 @@ impl K6DriverInstance {
                             certificate: None,
                             follow_redirects: true,
                             timeout,
+                            response_type: tropel_sdk::ResponseType::from_k6(response_type),
                         };
                         let http_client = http_for_io.clone();
                         async move {

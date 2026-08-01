@@ -704,6 +704,7 @@ fn convert_request(wr: &WasmRequest) -> Request {
         certificate: None,
         follow_redirects: wr.follow_redirects,
         timeout: wr.timeout_ms.map(std::time::Duration::from_millis),
+        response_type: tropel_core::types::ResponseType::Text,
     }
 }
 

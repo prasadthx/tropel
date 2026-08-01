@@ -237,6 +237,7 @@ impl VURunner {
                         certificate: request.certificate.clone(),
                         follow_redirects: request.follow_redirects,
                         timeout: request.timeout,
+                        response_type: request.response_type,
                     };
 
                     // Build auth signer from request auth config, or use the scenario-level auth

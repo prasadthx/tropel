@@ -202,6 +202,10 @@ pub struct DriverDeclaredOptions {
     /// Thresholds declared by the script (k6 `options.thresholds`),
     /// merged into the job's thresholds.
     pub thresholds: HashMap<String, ThresholdConfig>,
+    /// Global response-body handling (k6 `options.discardResponseBodies`):
+    /// when `Some(true)`, the engine sets the HTTP client to discard all
+    /// response bodies. `None` leaves the job's HttpConfig untouched.
+    pub discard_response_bodies: Option<bool>,
 }
 
 /// A driver instance ready to run iterations.

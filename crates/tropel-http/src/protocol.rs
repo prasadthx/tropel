@@ -39,6 +39,7 @@ impl HttpProtocol {
             certificate: request.certificate.clone(),
             follow_redirects: request.follow_redirects,
             timeout: request.timeout,
+            response_type: request.response_type,
         };
 
         self.execute_item_with_request(&resolved_req, auth_signer)

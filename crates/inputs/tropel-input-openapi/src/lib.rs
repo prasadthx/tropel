@@ -451,6 +451,7 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
                     certificate: None,
                     follow_redirects: true,
                     timeout: None,
+                    response_type: tropel_sdk::ResponseType::Text,
                 }),
                 prerequest: None,
                 test: None,

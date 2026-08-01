@@ -53,6 +53,36 @@ impl Method {
     }
 }
 
+/// How the response body should be handled for a request.
+///
+/// Mirrors k6's per-request `params.responseType`:
+/// - `Text` (default): body kept as raw bytes; decoded to text lazily on
+///   access (`body_text()` / `body_json()`).
+/// - `Binary`: body kept as raw bytes, surfaced as-is to scripts that want
+///   binary payloads (base64 etc.).
+/// - `None`: body is discarded entirely — `execute()` skips reading it
+///   (saves bandwidth/memory, pairs with the global `discardResponseBodies`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ResponseType {
+    #[default]
+    Text,
+    Binary,
+    None,
+}
+
+impl ResponseType {
+    /// Parse from a k6-style string (`"text"`, `"binary"`, `"none"`).
+    /// Unrecognized/empty values fall back to `Text` (k6's default).
+    pub fn from_k6(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "binary" => ResponseType::Binary,
+            "none" => ResponseType::None,
+            _ => ResponseType::Text,
+        }
+    }
+}
+
 /// A single HTTP request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
@@ -76,6 +106,9 @@ pub struct Request {
     pub follow_redirects: bool,
     /// Connection/read timeout.
     pub timeout: Option<Duration>,
+    /// How to handle the response body (k6 `params.responseType`).
+    #[serde(default)]
+    pub response_type: ResponseType,
 }
 
 fn default_true() -> bool {
@@ -94,6 +127,7 @@ impl Default for Request {
             certificate: None,
             follow_redirects: true,
             timeout: None,
+            response_type: ResponseType::Text,
         }
     }
 }

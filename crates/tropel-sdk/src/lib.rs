@@ -78,8 +78,8 @@ pub use tropel_core::config::{
     ArrivalRateStage, ExecutionConfig, ScenarioConfig, Stage, ThinkTimeConfig, ThresholdConfig,
 };
 pub use tropel_core::types::{
-    ApiKeyLocation, AuthConfig, Body, CertificateConfig, Cookie, Method, Request, Response, Sample,
-    SampleType, Timings,
+    ApiKeyLocation, AuthConfig, Body, CertificateConfig, Cookie, Method, Request, Response,
+    ResponseType, Sample, SampleType, Timings,
 };
 
 // ═══════════════════════════════════════════════════════════════════
@@ -175,6 +175,7 @@ mod tests {
                     certificate: None,
                     follow_redirects: true,
                     timeout: None,
+                    response_type: ResponseType::Text,
                 }),
                 prerequest: None,
                 test: None,

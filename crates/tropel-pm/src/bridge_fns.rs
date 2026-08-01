@@ -644,6 +644,8 @@ impl PmBridge {
             //   headers_json: JSON string of headers (supports both object and array formats)
             //   body: Request body string (empty string = no body)
             //   timeout_ms: Request timeout in milliseconds (0 = no timeout, default 30000)
+            //   response_type: k6 responseType ("text"/"binary"/"none") — "none"
+            //     skips reading the response body (saves bandwidth/memory)
             // Returns: JSON-encoded response with code, statusText, body, headers, responseTime
             let http = self.http_client.clone();
             let state_for_send = self.state.clone();
@@ -654,7 +656,8 @@ impl PmBridge {
                           url: String,
                           headers_json: String,
                           body: String,
-                          timeout_ms: f64|
+                          timeout_ms: f64,
+                          response_type: String|
                           -> String {
                         // Resolve {{variables}} in the URL using current PM state
                         let resolved_url = {
@@ -688,6 +691,7 @@ impl PmBridge {
                             certificate: None,
                             follow_redirects: true,
                             timeout,
+                            response_type: tropel_core::types::ResponseType::from_k6(&response_type),
                         };
 
                         // Execute on the dedicated I/O runtime via the shared
