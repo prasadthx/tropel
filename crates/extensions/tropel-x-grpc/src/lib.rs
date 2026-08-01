@@ -1,13 +1,140 @@
 //! # tropel-x-grpc
 //!
-//! gRPC protocol extension for Tropel.
-//! This is a reference protocol extension implementing Protocol trait.
+//! Real gRPC protocol extension for Tropel: loads `.proto` files at runtime
+//! (protox + prost-reflect), executes unary and server-streaming calls via
+//! tonic with a fully dynamic codec (no codegen), and emits the
+//! `grpc_req_duration` metric.
+//!
+//! ## Request contract
+//!
+//! The URL encodes the gRPC method: `grpc://host:port/package.Service/Method`
+//! (or `grpcs://` for TLS). The request body is the input message as JSON.
+//!
+//! The proto source is resolved from (first match wins):
+//! 1. `config["proto"]` — a `.proto` file path or inline proto source text,
+//!    with optional `config["proto_dir"]` for imports.
+//! 2. The `x-grpc-proto` request header (path or inline source), with
+//!    optional `x-grpc-proto-dir`.
+//! 3. The `TROPEL_GRPC_PROTO` env var (path), with `TROPEL_GRPC_PROTO_DIR`.
+//!
+//! The response is stored in `pm.response`: status 200 on OK (or a mapped
+//! HTTP status on gRPC error), body = response message(s) as JSON (an array
+//! for server-streaming).
 
 use async_trait::async_trait;
-use tropel_sdk::{Protocol, Request, Result, Sample, TropelError};
+use bytes::{Buf, BufMut};
+use prost::Message as _;
+use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
+use serde::de::DeserializeSeed;
+use std::collections::HashMap;
+use std::time::Instant;
+use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use tonic::{Code as GrpcCode, Request as TonicRequest, Status};
+use tropel_sdk::{
+    Body, Protocol, ProtocolOutcome, ProtocolRegistration, Request, Response, Result, Sample,
+    SampleType, TagMap, TropelError,
+};
 
-/// gRPC protocol executor (stub — requires tonic for full implementation).
+/// Default gRPC port when the URL omits it.
+const DEFAULT_PORT: u16 = 50051;
+/// Max proto source size accepted as inline text (1 MiB).
+const MAX_INLINE_PROTO: usize = 1024 * 1024;
+
+/// gRPC protocol executor.
+#[derive(Default)]
 pub struct GrpcProtocol;
+
+/// A tonic `Codec` that encodes/decodes prost-reflect `DynamicMessage`s.
+///
+/// tonic's `Codec` trait is unsealed, so a fully dynamic codec (no generated
+/// code) is possible: the input/output `MessageDescriptor`s come from a
+/// runtime-compiled `DescriptorPool`.
+///
+/// `input` is the message type the **encoder** produces (on a client: the
+/// request message; on a server: the response message). `output` is the
+/// message type the **decoder** yields (on a client: the response message;
+/// on a server: the request message). For a server-side codec pass
+/// `(method.output(), method.input())`.
+pub struct DynamicCodec {
+    /// Descriptor for the message type the **decoder** yields (on a client:
+    /// the response message; on a server: the request message).
+    output: MessageDescriptor,
+}
+
+impl DynamicCodec {
+    /// Create a codec from an encoder message descriptor and a decoder
+    /// message descriptor. See the struct docs for the client/server swap.
+    ///
+    /// Only `output` is stored: `DynamicEncoder` is a unit struct because a
+    /// [`DynamicMessage`] self-describes and needs no external descriptor to
+    /// encode. The `_input` parameter is kept so call sites can express the
+    /// orientation (`(method.input(), method.output())` client-side,
+    /// swapped server-side).
+    pub fn new(_input: MessageDescriptor, output: MessageDescriptor) -> Self {
+        Self { output }
+    }
+}
+
+impl Codec for DynamicCodec {
+    type Encode = DynamicMessage;
+    type Decode = DynamicMessage;
+    type Encoder = DynamicEncoder;
+    type Decoder = DynamicDecoder;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        DynamicEncoder
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        DynamicDecoder {
+            desc: self.output.clone(),
+        }
+    }
+}
+
+/// Encoder half of [`DynamicCodec`] — delegates to prost's binary encoding.
+pub struct DynamicEncoder;
+
+impl Encoder for DynamicEncoder {
+    type Item = DynamicMessage;
+    type Error = Status;
+
+    fn encode(
+        &mut self,
+        item: Self::Item,
+        dst: &mut EncodeBuf<'_>,
+    ) -> std::result::Result<(), Self::Error> {
+        let bytes = item.encode_to_vec();
+        dst.put_slice(&bytes);
+        Ok(())
+    }
+}
+
+/// Decoder half of [`DynamicCodec`] — delegates to prost-reflect's binary
+/// decoding against the message descriptor.
+pub struct DynamicDecoder {
+    desc: MessageDescriptor,
+}
+
+impl Decoder for DynamicDecoder {
+    type Item = DynamicMessage;
+    type Error = Status;
+
+    fn decode(
+        &mut self,
+        src: &mut DecodeBuf<'_>,
+    ) -> std::result::Result<Option<Self::Item>, Self::Error> {
+        if src.remaining() == 0 {
+            return Ok(None);
+        }
+        let bytes = src.copy_to_bytes(src.remaining());
+        let msg = DynamicMessage::decode(self.desc.clone(), bytes)
+            .map_err(|e| Status::internal(format!("decode {}: {e}", self.desc.full_name())))?;
+        Ok(Some(msg))
+    }
+}
 
 #[async_trait]
 impl Protocol for GrpcProtocol {
@@ -15,20 +142,388 @@ impl Protocol for GrpcProtocol {
         "grpc"
     }
 
-    async fn execute(&self, _req: &Request, _config: Option<&serde_json::Value>) -> Result<Sample> {
-        let _start = std::time::Instant::now();
+    async fn execute(&self, req: &Request, config: Option<&serde_json::Value>) -> Result<ProtocolOutcome> {
+        let start = Instant::now();
 
-        // gRPC execution is not yet implemented
-        // This would use tonic to execute gRPC calls
+        // ── Parse the URL: grpc://host:port/package.Service/Method ──
+        let url = url::Url::parse(&req.url)
+            .map_err(|e| TropelError::Config(format!("invalid gRPC URL '{}': {}", req.url, e)))?;
+        let is_tls = url.scheme() == "grpcs";
+        if !matches!(url.scheme(), "grpc" | "grpcs") {
+            return Err(TropelError::Config(format!(
+                "not a gRPC URL: '{}'",
+                req.url
+            )));
+        }
+        let host = url
+            .host_str()
+            .ok_or_else(|| TropelError::Config(format!("gRPC URL has no host: '{}'", req.url)))?
+            .to_string();
+        let port = url.port().unwrap_or(DEFAULT_PORT);
+        let path = url.path().trim_start_matches('/');
+        let mut segments = path.split('/');
+        let service_full = segments.next().unwrap_or("").trim();
+        let method_name = segments.next().unwrap_or("").trim();
+        if service_full.is_empty() || method_name.is_empty() {
+            return Err(TropelError::Config(format!(
+                "gRPC URL must be grpc(s)://host:port/package.Service/Method, got '{}'",
+                req.url
+            )));
+        }
 
-        Err(TropelError::Extension(
-            "gRPC protocol not yet implemented — add tonic dependency and implement the executor"
-                .into(),
-        ))
+        // ── Resolve the proto source (config → header → env) ──
+        let (proto_src, proto_dir) = resolve_proto(req, config)?;
+
+        // ── Compile the proto + build the descriptor pool ──
+        let pool = compile_proto(&proto_src, proto_dir.as_deref())?;
+        let service = pool
+            .get_service_by_name(service_full)
+            .ok_or_else(|| {
+                TropelError::Config(format!(
+                    "service '{}' not found in proto (have: {})",
+                    service_full,
+                    list_services(&pool)
+                ))
+            })?;
+        let method = service
+            .methods()
+            .find(|m| m.name() == method_name)
+            .ok_or_else(|| {
+                TropelError::Config(format!(
+                    "method '{}' not found on service '{}'",
+                    method_name, service_full
+                ))
+            })?;
+
+        // ── Build the input message from the JSON body ──
+        // prost-reflect's canonical JSON support is the serde path:
+        // `MessageDescriptor: DeserializeSeed` (JSON → DynamicMessage) and
+        // `DynamicMessage: Serialize` (DynamicMessage → JSON). The
+        // `transcode_from`/`transcode_to` helpers take concrete `prost::Message`
+        // impls, which a dynamic protocol does not have.
+        let input_desc = method.input();
+        let mut input_msg = DynamicMessage::new(input_desc.clone());
+        if let Some(json) = body_to_json(req) {
+            let json_str = serde_json::to_string(&json)
+                .map_err(|e| TropelError::Parse(format!("request body JSON: {e}")))?;
+            let mut de = serde_json::Deserializer::from_str(&json_str);
+            input_msg = input_desc.clone().deserialize(&mut de).map_err(|e| {
+                TropelError::Parse(format!(
+                    "request body is not a valid {}: {}",
+                    input_desc.full_name(),
+                    e
+                ))
+            })?;
+        }
+
+        // ── Connect ──
+        let scheme = if is_tls { "https" } else { "http" };
+        let uri = format!("{scheme}://{host}:{port}");
+        let mut endpoint = Endpoint::from_shared(uri)
+            .map_err(|e| TropelError::Extension(format!("bad gRPC endpoint: {e}")))?;
+        if is_tls {
+            endpoint = endpoint
+                .tls_config(ClientTlsConfig::new().domain_name(&host))
+                .map_err(|e| TropelError::Extension(format!("gRPC TLS config: {e}")))?;
+        }
+        let channel: Channel = endpoint
+            .connect()
+            .await
+            .map_err(|e| TropelError::Extension(format!("gRPC connect to {host}:{port}: {e}")))?;
+
+        // ── Build the request with metadata from request headers ──
+        let mut tonic_req = TonicRequest::new(input_msg);
+        for (k, v) in &req.headers {
+            let lower = k.to_ascii_lowercase();
+            if lower.starts_with(':') {
+                continue;
+            }
+            if let (Ok(mv), Ok(key)) = (
+                v.parse::<AsciiMetadataValue>(),
+                AsciiMetadataKey::from_bytes(lower.as_bytes()),
+            ) {
+                tonic_req.metadata_mut().insert(key, mv);
+            }
+        }
+
+        let path_str = format!("/{service_full}/{method_name}");
+        let path = parse_path(&path_str)?;
+        let codec = DynamicCodec::new(method.input(), method.output());
+        let deadline = req.timeout;
+        let mut client = tonic::client::Grpc::new(channel);
+        // Reserve the channel before the call: the transport `Channel` is
+        // backed by a tower `Buffer`, whose `call` panics if `poll_ready`
+        // was never polled (`send_item called without first calling
+        // poll_reserve`). Generated tonic clients do this too.
+        client
+            .ready()
+            .await
+            .map_err(|e| TropelError::Extension(format!("gRPC channel not ready: {e}")))?;
+
+        // ── Execute (unary or server-streaming) with optional timeout ──
+        let mut status_override: Option<GrpcCode> = None;
+        let response_value: serde_json::Value = if method.is_server_streaming() {
+            let fut = client.server_streaming(tonic_req, path, codec);
+            let result = if let Some(t) = deadline {
+                match tokio::time::timeout(t, fut).await {
+                    Ok(r) => r,
+                    Err(_) => Err(Status::deadline_exceeded("gRPC call timed out")),
+                }
+            } else {
+                fut.await
+            };
+            match result {
+                Ok(stream) => {
+                    let mut msgs = Vec::new();
+                    let mut stream = stream.into_inner();
+                    loop {
+                        match stream.message().await {
+                            Ok(Some(msg)) => {
+                                if let Ok(v) = serde_json::to_value(&msg) {
+                                    msgs.push(v);
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(e) => {
+                                status_override = Some(e.code());
+                                break;
+                            }
+                        }
+                    }
+                    serde_json::Value::Array(msgs)
+                }
+                Err(e) => {
+                    status_override = Some(e.code());
+                    serde_json::Value::Null
+                }
+            }
+        } else {
+            let fut = client.unary(tonic_req, path, codec);
+            let result = if let Some(t) = deadline {
+                match tokio::time::timeout(t, fut).await {
+                    Ok(r) => r,
+                    Err(_) => Err(Status::deadline_exceeded("gRPC call timed out")),
+                }
+            } else {
+                fut.await
+            };
+            match result {
+                Ok(resp) => serde_json::to_value(&resp.into_inner())
+                    .unwrap_or(serde_json::Value::Null),
+                Err(e) => {
+                    status_override = Some(e.code());
+                    serde_json::Value::Null
+                }
+            }
+        };
+
+        let duration = start.elapsed();
+        let (http_status, ok) = match status_override {
+            None => (200u16, true),
+            Some(code) => (grpc_code_to_http(code), false),
+        };
+
+        // ── Build the outcome: response + samples ──
+        let body_bytes = serde_json::to_vec(&response_value).unwrap_or_default();
+        let response = Response {
+            status_code: http_status,
+            status_text: if ok { "OK".into() } else { "ERROR".into() },
+            headers: HashMap::new(),
+            body: body_bytes.clone(),
+            response_time: duration,
+            timings: None,
+            cookies: vec![],
+            size: body_bytes.len() as u64,
+        };
+
+        let now = std::time::SystemTime::now();
+        let mut tags = TagMap::with_capacity(5);
+        tags.insert("url", req.url.clone());
+        tags.insert("method", format!("{service_full}/{method_name}"));
+        tags.insert("status", http_status.to_string());
+        tags.insert("name", format!("{service_full}/{method_name}"));
+        tags.insert("group", "grpc");
+
+        let sent = body_to_json(req)
+            .map(|v| serde_json::to_vec(&v).map(|b| b.len() as f64).unwrap_or(0.0))
+            .unwrap_or(0.0);
+        let samples = vec![
+            Sample {
+                metric: "grpc_req_duration".into(),
+                value: duration.as_micros() as f64,
+                tags: tags.clone(),
+                timestamp: now,
+                sample_type: SampleType::Trend,
+            },
+            Sample {
+                metric: "grpc_reqs".into(),
+                value: 1.0,
+                tags: tags.clone(),
+                timestamp: now,
+                sample_type: SampleType::Counter,
+            },
+            Sample {
+                metric: "grpc_req_failed".into(),
+                value: if ok { 0.0 } else { 1.0 },
+                tags: tags.clone(),
+                timestamp: now,
+                sample_type: SampleType::Rate,
+            },
+            Sample {
+                metric: "data_sent".into(),
+                value: sent,
+                tags: tags.clone(),
+                timestamp: now,
+                sample_type: SampleType::Counter,
+            },
+            Sample {
+                metric: "data_received".into(),
+                value: body_bytes.len() as f64,
+                tags,
+                timestamp: now,
+                sample_type: SampleType::Counter,
+            },
+        ];
+
+        Ok(ProtocolOutcome {
+            samples,
+            response: Some(response),
+        })
     }
 }
 
-// Registration would use inventory:
-// inventory::submit! {
-//     tropel_sdk::ProtocolRegistration::new(|| Box::new(GrpcProtocol::default()))
-// }
+/// Parse a `/package.Service/Method` path into a `PathAndQuery`.
+fn parse_path(path: &str) -> Result<http::uri::PathAndQuery> {
+    http::uri::PathAndQuery::try_from(path)
+        .map_err(|e| TropelError::Config(format!("invalid gRPC path '{path}': {e}")))
+}
+
+/// Convert a gRPC status code to an approximate HTTP status.
+fn grpc_code_to_http(code: GrpcCode) -> u16 {
+    match code {
+        GrpcCode::Ok => 200,
+        GrpcCode::Cancelled => 499,
+        GrpcCode::Unknown => 500,
+        GrpcCode::InvalidArgument => 400,
+        GrpcCode::DeadlineExceeded => 504,
+        GrpcCode::NotFound => 404,
+        GrpcCode::AlreadyExists => 409,
+        GrpcCode::PermissionDenied => 403,
+        GrpcCode::ResourceExhausted => 429,
+        GrpcCode::FailedPrecondition => 400,
+        GrpcCode::Aborted => 409,
+        GrpcCode::OutOfRange => 400,
+        GrpcCode::Unimplemented => 501,
+        GrpcCode::Internal => 500,
+        GrpcCode::Unavailable => 503,
+        GrpcCode::DataLoss => 500,
+        GrpcCode::Unauthenticated => 401,
+    }
+}
+
+/// Extract a JSON value from the request body, if any.
+fn body_to_json(req: &Request) -> Option<serde_json::Value> {
+    match req.body.as_ref()? {
+        Body::Raw(s) => serde_json::from_str(s).ok(),
+        Body::Json(v) => Some(v.clone()),
+        _ => None,
+    }
+}
+
+/// Resolve the proto source from config → headers → env.
+/// Returns `(source_or_path, include_dir)`.
+fn resolve_proto(
+    req: &Request,
+    config: Option<&serde_json::Value>,
+) -> Result<(String, Option<String>)> {
+    // 1. config
+    if let Some(cfg) = config {
+        if let Some(p) = cfg.get("proto").and_then(|v| v.as_str()) {
+            let dir = cfg
+                .get("proto_dir")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            return Ok((p.to_string(), dir));
+        }
+    }
+    // 2. request headers
+    if let Some(p) = req.headers.get("x-grpc-proto") {
+        let dir = req.headers.get("x-grpc-proto-dir").cloned();
+        return Ok((p.clone(), dir));
+    }
+    // 3. env
+    if let Ok(p) = std::env::var("TROPEL_GRPC_PROTO") {
+        let dir = std::env::var("TROPEL_GRPC_PROTO_DIR").ok();
+        return Ok((p, dir));
+    }
+    Err(TropelError::Config(
+        "no proto source: pass config {\"proto\": ...} / {\"proto_dir\": ...}, \
+         the x-grpc-proto request header, or set TROPEL_GRPC_PROTO"
+            .into(),
+    ))
+}
+
+/// Compile proto source (path or inline text) into a `DescriptorPool`.
+///
+/// Public so extensions/tests can compile the same pool used at runtime.
+/// Inline source is detected by the presence of a `syntax` directive or a
+/// newline; file paths pass through unchanged.
+pub fn compile_proto(source: &str, include_dir: Option<&str>) -> Result<DescriptorPool> {
+    let tmp;
+    let proto_path = if source.contains('\n') || source.contains("syntax") || source.trim().is_empty()
+    {
+        // Inline source → write to a temp file.
+        if source.len() > MAX_INLINE_PROTO {
+            return Err(TropelError::Config(format!(
+                "inline proto source exceeds {} bytes",
+                MAX_INLINE_PROTO
+            )));
+        }
+        tmp = tempfile::Builder::new()
+            .prefix("tropel-grpc-")
+            .suffix(".proto")
+            .tempfile()
+            .map_err(|e| TropelError::Extension(format!("temp proto file: {e}")))?;
+        std::fs::write(tmp.path(), source)
+            .map_err(|e| TropelError::Extension(format!("write temp proto: {e}")))?;
+        tmp.path().to_path_buf()
+    } else {
+        std::path::PathBuf::from(source)
+    };
+
+    let mut includes: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(dir) = include_dir {
+        includes.push(std::path::PathBuf::from(dir));
+    }
+    if let Some(parent) = proto_path.parent() {
+        if !includes.iter().any(|i| i == parent) {
+            includes.push(parent.to_path_buf());
+        }
+    }
+
+    let fds = protox::compile([proto_path.as_path()], includes)
+        .map_err(|e| TropelError::Extension(format!("proto compile: {e}")))?;
+    // Decode from bytes rather than passing the FileDescriptorSet by value —
+    // sidesteps prost-types version unification between protox and
+    // prost-reflect (both use prost-types 0.14, but the bytes round-trip is
+    // immune to any future drift). `Vec<u8>` does not impl `bytes::Buf`, so
+    // hand out a slice.
+    let bytes = prost::Message::encode_to_vec(&fds);
+    let pool = DescriptorPool::decode(bytes.as_slice())
+        .map_err(|e| TropelError::Extension(format!("proto pool: {e}")))?;
+    Ok(pool)
+}
+
+fn list_services(pool: &DescriptorPool) -> String {
+    pool.services()
+        .map(|s| s.name().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Inventory factory — must be a `fn` pointer for `inventory::submit!`.
+fn grpc_factory() -> Box<dyn Protocol> {
+    Box::new(GrpcProtocol::default())
+}
+
+inventory::submit!(ProtocolRegistration::new("grpc", grpc_factory));

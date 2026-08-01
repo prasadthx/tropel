@@ -102,7 +102,7 @@ pub use tropel_ext::traits::{
 
 /// Unstable protocol extension trait (requires `unstable-protocol` feature).
 #[cfg(feature = "unstable-protocol")]
-pub use tropel_ext::traits::{Protocol, ProtocolRegistration};
+pub use tropel_ext::traits::{Protocol, ProtocolOutcome, ProtocolRegistration};
 
 /// Unstable output extension trait (requires `unstable-output` feature).
 #[cfg(feature = "unstable-output")]

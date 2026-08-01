@@ -8,10 +8,23 @@ use tropel_core::types::{Request, Response, Sample};
 use tropel_core::Result;
 
 /// A new protocol/request executor (beyond HTTP): gRPC, WebSocket, MQTT, ...
+///
+/// `execute()` returns the metric samples to record plus the response to
+/// surface to scripts (`pm.response`). See [`ProtocolOutcome`].
 #[async_trait]
 pub trait Protocol: Send + Sync {
     fn scheme(&self) -> &str;
-    async fn execute(&self, req: &Request, config: Option<&Value>) -> Result<Sample>;
+    async fn execute(&self, req: &Request, config: Option<&Value>) -> Result<ProtocolOutcome>;
+}
+
+/// Result of executing a request through a [`Protocol`].
+///
+/// The runner records `samples` into the metrics pipeline and exposes
+/// `response` to scripts via the PM bridge (`pm.response`), mirroring the
+/// HTTP path where the runner builds both from the HTTP response.
+pub struct ProtocolOutcome {
+    pub samples: Vec<Sample>,
+    pub response: Option<Response>,
 }
 
 /// A new JS module callable from scripts, e.g. `import x from "tropel/x/grpc"`.
@@ -252,15 +265,35 @@ pub trait DriverInstance: Send + Sync {
 // ── Registration types for inventory ──
 
 /// Registration wrapper for protocols.
+/// `scheme` is the URL scheme this protocol handles (e.g. `"grpc"`), stored
+/// separately from the factory so `collect_inventory()` can read it without
+/// instantiating the protocol.
+///
+/// Uses a `fn` pointer (not `Arc<dyn Fn>`) because `inventory::submit!`
+/// requires the expression to be usable in a `const` context — the same
+/// pattern as `InputAdapterRegistration`. Protocol factories are simple
+/// captureless constructors, so a function pointer is sufficient.
 pub struct ProtocolRegistration {
-    pub factory: Arc<dyn Fn() -> Box<dyn Protocol> + Send + Sync>,
+    pub scheme: &'static str,
+    pub create: fn() -> Box<dyn Protocol>,
+    /// Reserved for dispatch priority (informational; protocols are
+    /// scheme-keyed).
+    pub priority: u8,
 }
 
 impl ProtocolRegistration {
-    pub fn new(factory: impl Fn() -> Box<dyn Protocol> + Send + Sync + 'static) -> Self {
+    pub const fn new(scheme: &'static str, create: fn() -> Box<dyn Protocol>) -> Self {
         Self {
-            factory: Arc::new(factory),
+            scheme,
+            create,
+            priority: 0,
         }
+    }
+
+    /// Builder-style priority setter (const, for `inventory::submit!`).
+    pub const fn with_priority(mut self, priority: u8) -> Self {
+        self.priority = priority;
+        self
     }
 }
 
@@ -388,3 +421,4 @@ impl DriverRegistration {
 inventory::collect!(InputAdapterRegistration);
 inventory::collect!(DriverRegistration);
 inventory::collect!(OutputRegistration);
+inventory::collect!(ProtocolRegistration);

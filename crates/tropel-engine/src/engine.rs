@@ -14,7 +14,7 @@ use tropel_core::{Result, TropelError};
 use tropel_executor::runner::VURunner;
 use tropel_executor::scheduler::VUScheduler;
 use tropel_ext::registry::ExtensionRegistry;
-use tropel_ext::traits::{Driver, DriverHttpClient, Output, VuContext};
+use tropel_ext::traits::{Driver, DriverHttpClient, Output, Protocol, VuContext};
 use tropel_http::client::HttpClient;
 use tropel_http::AuthSigner;
 use tropel_metrics::collector::MetricsCollector;
@@ -351,6 +351,12 @@ impl Engine {
                 };
 
                 let sc_name_log = sc_name.clone();
+                // Resolve the registered gRPC protocol once per scenario and
+                // share it across VUs so `grpc://` / `grpcs://` URLs dispatch
+                // to it (the runner's scheme check).
+                let grpc_protocol: Option<Arc<dyn Protocol>> = registry_sc
+                    .get_protocol("grpc")
+                    .map(Arc::from);
                 match resolved {
                     ResolvedInput::Scenario(scenario) => {
                         run_scenario_vus(
@@ -368,6 +374,7 @@ impl Engine {
                             thresholds,
                             data_rows,
                             test_start,
+                            grpc_protocol,
                         )
                         .await;
                     }
@@ -825,6 +832,7 @@ async fn run_scenario_vus(
     thresholds: HashMap<String, tropel_core::config::ThresholdConfig>,
     data_rows: Vec<HashMap<String, serde_json::Value>>,
     test_start: Instant,
+    grpc_protocol: Option<Arc<dyn Protocol>>,
 ) {
     if start_delay > Duration::ZERO {
         tokio::time::sleep(start_delay).await;
@@ -881,6 +889,7 @@ async fn run_scenario_vus(
         let is_per_vu_iterations = is_per_vu_iterations;
         let sc_tags = sc_tags_c.clone();
         let executor_name = executor_name.clone();
+        let grpc_protocol_vu = grpc_protocol.clone();
 
         let (_, handle) = pool.spawn(async move {
             sched.add_active_vu(1).await;
@@ -897,6 +906,7 @@ async fn run_scenario_vus(
             let bridge_client = Arc::new(client.clone());
             let mut runner = VURunner::new(scenario, client, vu_id, sc_name_vu.clone())
                 .with_expected_statuses(http_cfg.expected_statuses.clone())
+                .with_grpc_protocol(grpc_protocol_vu.clone())
                 .with_exec_context(
                     executor_name,
                     sched.active_vus_handle(),

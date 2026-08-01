@@ -8,6 +8,29 @@ rust-version.workspace = true
 
 [dependencies]
 tropel-sdk = { workspace = true, features = ["unstable-protocol"] }
+tropel-core.workspace = true
 async-trait.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+inventory.workspace = true
+
+# gRPC runtime
+protox.workspace = true
+prost.workspace = true
+prost-reflect.workspace = true
+tonic.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+bytes.workspace = true
+http.workspace = true
+url.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+# Codegen-free tonic test server (manual tower Service + http-body-util body).
+tower.workspace = true
+http-body-util = "0.1"
+tokio.workspace = true
+serde_json.workspace = true

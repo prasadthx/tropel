@@ -15,6 +15,7 @@ tropel-metrics.workspace = true
 tropel-variables.workspace = true
 tropel-native.workspace = true
 tropel-collection.workspace = true
+tropel-ext.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

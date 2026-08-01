@@ -36,9 +36,9 @@ impl ExtensionRegistry {
     }
 
     /// Register a protocol.
-    pub fn register_protocol(&mut self, scheme: &str, registration: ProtocolRegistration) {
+    pub fn register_protocol(&mut self, registration: ProtocolRegistration) {
         self.protocols
-            .insert(scheme.to_string(), Arc::new(registration));
+            .insert(registration.scheme.to_string(), Arc::new(registration));
     }
 
     /// Register an output.
@@ -72,7 +72,7 @@ impl ExtensionRegistry {
 
     /// Get a protocol by scheme.
     pub fn get_protocol(&self, scheme: &str) -> Option<Box<dyn Protocol>> {
-        self.protocols.get(scheme).map(|r| (r.factory)())
+        self.protocols.get(scheme).map(|r| (r.create)())
     }
 
     /// Get an output by name.
@@ -198,6 +198,17 @@ impl ExtensionRegistry {
         }
         let output_count = self.outputs.len();
         tracing::debug!("Collected {} output(s) from inventory", output_count);
+
+        tracing::debug!("Collecting inventory-registered protocols");
+        for registration in inventory::iter::<ProtocolRegistration> {
+            self.register_protocol(ProtocolRegistration {
+                scheme: registration.scheme,
+                create: registration.create,
+                priority: registration.priority,
+            });
+        }
+        let protocol_count = self.protocols.len();
+        tracing::debug!("Collected {} protocol(s) from inventory", protocol_count);
     }
 
     /// Resolve an input adapter from raw bytes using content detection.

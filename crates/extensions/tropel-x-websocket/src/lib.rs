@@ -4,7 +4,7 @@
 //! This is a reference protocol extension implementing Protocol trait.
 
 use async_trait::async_trait;
-use tropel_sdk::{Protocol, Request, Result, Sample, TropelError};
+use tropel_sdk::{Protocol, ProtocolOutcome, Request, Result, TropelError};
 
 /// WebSocket protocol executor (stub).
 pub struct WebSocketProtocol;
@@ -15,7 +15,11 @@ impl Protocol for WebSocketProtocol {
         "ws"
     }
 
-    async fn execute(&self, _req: &Request, _config: Option<&serde_json::Value>) -> Result<Sample> {
+    async fn execute(
+        &self,
+        _req: &Request,
+        _config: Option<&serde_json::Value>,
+    ) -> Result<ProtocolOutcome> {
         Err(TropelError::Extension(
             "WebSocket protocol not yet implemented".into(),
         ))

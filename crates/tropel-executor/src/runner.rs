@@ -8,6 +8,7 @@ use tropel_core::config::ExpectedStatus;
 use tropel_core::scenario::Scenario;
 use tropel_core::types::{AuthConfig, Sample, SampleType, TagMap};
 use tropel_core::Result;
+use tropel_ext::traits::Protocol;
 use tropel_http::client::HttpClient;
 use tropel_js::JsContext;
 use tropel_pm::bridge::{PmState, SharedPmState};
@@ -46,6 +47,9 @@ pub struct VURunner {
     client: HttpClient,
     config: RunnerConfig,
     js_ctx: Option<Box<JsContext>>,
+    /// Registered protocol for `grpc://` / `grpcs://` URLs, if the binary
+    /// links a gRPC extension (e.g. `tropel-x-grpc`).
+    grpc_protocol: Option<Arc<dyn Protocol>>,
     /// Expected status codes/ranges that determine request success.
     /// Controls http_req_failed metric: 1.0 when status is NOT expected.
     expected_statuses: Vec<ExpectedStatus>,
@@ -83,6 +87,7 @@ impl VURunner {
             client,
             config: RunnerConfig::default(),
             js_ctx: None,
+            grpc_protocol: None,
             // Default: 2xx-3xx = success (matches k6 behavior)
             expected_statuses: vec![ExpectedStatus::Range("200-399".to_string())],
             vu_id,
@@ -93,6 +98,13 @@ impl VURunner {
     /// Attach a JS context for script execution.
     pub fn with_js_context(mut self, js_ctx: Box<JsContext>) -> Self {
         self.js_ctx = Some(js_ctx);
+        self
+    }
+
+    /// Attach the registered gRPC protocol so `grpc://` / `grpcs://` URLs
+    /// dispatch to it instead of the HTTP client.
+    pub fn with_grpc_protocol(mut self, protocol: Option<Arc<dyn Protocol>>) -> Self {
+        self.grpc_protocol = protocol;
         self
     }
 
@@ -240,6 +252,62 @@ impl VURunner {
                         response_type: request.response_type,
                     };
 
+                    // ── gRPC protocol dispatch (grpc:// or grpcs://) ──
+                    // When the URL uses the gRPC scheme, dispatch to the
+                    // registered protocol instead of the HTTP client. The
+                    // protocol resolves its proto source from request
+                    // headers / config / env and returns both the metric
+                    // samples and a Response for pm.response.
+                    let is_grpc = resolved_url.starts_with("grpc://")
+                        || resolved_url.starts_with("grpcs://");
+                    if is_grpc {
+                        if let Some(proto) = &self.grpc_protocol {
+                            let exec_start = Instant::now();
+                            match proto.execute(&resolved_req, None).await {
+                                Ok(outcome) => {
+                                    let duration = exec_start.elapsed();
+                                    tracing::trace!(
+                                        "VU runner: gRPC call to {} completed in {:?}",
+                                        resolved_req.url,
+                                        duration
+                                    );
+                                    if let Some(resp) = outcome.response {
+                                        let mut state = self.pm_state.lock().unwrap();
+                                        state.response = Some(resp);
+                                    }
+                                    result.samples.extend(outcome.samples);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "VU {} gRPC request '{}' failed: {}",
+                                        iteration_index,
+                                        item.name,
+                                        e
+                                    );
+                                    let err_tags = TagMap::from_pairs([
+                                        ("url", resolved_url.clone()),
+                                        ("method", request.method.to_string()),
+                                        ("name", item.name.clone()),
+                                        ("error", e.to_string()),
+                                    ]);
+                                    let now = std::time::SystemTime::now();
+                                    result.samples.push(tropel_core::types::Sample {
+                                        metric: "errors".to_string(),
+                                        value: 1.0,
+                                        tags: err_tags,
+                                        timestamp: now,
+                                        sample_type: SampleType::Counter,
+                                    });
+                                }
+                            }
+                        } else {
+                            tracing::warn!(
+                                "VU {}: grpc:// URL '{}' but no gRPC protocol registered — skipping",
+                                iteration_index,
+                                resolved_url
+                            );
+                        }
+                    } else {
                     // Build auth signer from request auth config, or use the scenario-level auth
                     let auth_signer = resolved_req
                         .auth
@@ -396,6 +464,7 @@ impl VURunner {
                                 sample_type: SampleType::Rate,
                             });
                         }
+                    }
                     }
                 }
 

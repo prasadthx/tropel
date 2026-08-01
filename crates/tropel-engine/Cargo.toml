@@ -26,6 +26,7 @@ tropel-input-har.workspace = true
 tropel-input-openapi.workspace = true
 tropel-input-subprocess.workspace = true
 tropel-wasm.workspace = true
+tropel-x-grpc.workspace = true
 rquickjs.workspace = true
 tokio.workspace = true
 thiserror.workspace = true

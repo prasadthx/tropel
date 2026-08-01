@@ -15,7 +15,7 @@
 //! `register_builtins()` is invoked from the CLI at startup, before the
 //! `ExtensionRegistry` performs its `collect_inventory()` pass.
 
-use tropel_ext::traits::{Driver, InputAdapter};
+use tropel_ext::traits::{Driver, InputAdapter, Protocol};
 
 /// Force-link every built-in input adapter and driver by constructing it.
 /// Returns the total number of built-ins so the call is observable.
@@ -27,7 +27,11 @@ pub fn link_builtins() -> usize {
         Box::new(tropel_input_k6::K6ScriptAdapter),
     ];
     let drivers: Vec<Box<dyn Driver>> = vec![Box::new(tropel_input_k6::driver::K6Driver)];
-    adapters.len() + drivers.len()
+    // Force-link the gRPC protocol so its `inventory::submit!` registration
+    // survives dead-stripping — this is what makes `grpc://` / `grpcs://`
+    // URLs reachable through the VU runner's scheme dispatch.
+    let protocols: Vec<Box<dyn Protocol>> = vec![Box::new(tropel_x_grpc::GrpcProtocol)];
+    adapters.len() + drivers.len() + protocols.len()
 }
 
 /// Call from the CLI before registry collection so the linker keeps the
