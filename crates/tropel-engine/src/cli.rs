@@ -101,6 +101,18 @@ pub enum Commands {
         #[arg(long = "influxdb-addr")]
         influxdb_addr: Option<String>,
 
+        /// Deterministic workload partition for this node, as "from:to"
+        /// (e.g. "0:1/3") — k6 `executionSegment`. Combined with
+        /// --execution-segment-sequence this node runs only its fraction of
+        /// the workload (VUs/iterations/rate), scaled deterministically.
+        #[arg(long = "execution-segment")]
+        execution_segment: Option<String>,
+
+        /// Full sequence of segment boundaries shared by all cooperating
+        /// nodes, e.g. "0,1/3,2/3,1" — k6 `executionSegmentSequence`.
+        #[arg(long = "execution-segment-sequence")]
+        execution_segment_sequence: Option<String>,
+
         /// Threshold expression (can be specified multiple times)
         #[arg(short = 't', long = "threshold")]
         threshold: Vec<String>,
@@ -256,6 +268,8 @@ async fn run_command(cli: Cli) -> Result<()> {
         json_stream,
         statsd_addr,
         influxdb_addr,
+        execution_segment,
+        execution_segment_sequence,
         subprocess_adapter,
         plugins_dir,
         ..
@@ -279,6 +293,8 @@ async fn run_command(cli: Cli) -> Result<()> {
     let json_stream = json_stream.clone();
     let statsd_addr = statsd_addr.clone();
     let influxdb_addr = influxdb_addr.clone();
+    let execution_segment = execution_segment.clone();
+    let execution_segment_sequence = execution_segment_sequence.clone();
     let thresholds = threshold.clone();
     let insecure = *insecure;
     // `mode` is now optional so we can tell whether the user explicitly chose
@@ -430,6 +446,8 @@ async fn run_command(cli: Cli) -> Result<()> {
         input_type: format.clone(),
         execution,
         execution_explicit: load_profile_explicit,
+        execution_segment,
+        execution_segment_sequence,
         env: env_map,
         iteration_data,
         output: OutputConfig {
@@ -577,6 +595,14 @@ fn apply_overlay(
             config.execution_explicit = true;
         }
     }
+    // Execution segments: CLI flags win; overlay fills gaps. Applied later
+    // by the engine to scale each scenario's workload deterministically.
+    if config.execution_segment.is_none() {
+        config.execution_segment = overlay.execution_segment.clone();
+    }
+    if config.execution_segment_sequence.is_none() {
+        config.execution_segment_sequence = overlay.execution_segment_sequence.clone();
+    }
     // Env: overlay vars fill in, CLI -e already present wins (insert only
     // keys the overlay has that the CLI env doesn't).
     for (k, v) in &overlay.env {
@@ -700,6 +726,10 @@ fn merge_partial(base: PartialConfig, file: PartialConfig) -> PartialConfig {
         http: file.http.or(base.http),
         tls: file.tls.or(base.tls),
         extensions: base.extensions.into_iter().chain(file.extensions).collect(),
+        execution_segment: file.execution_segment.or(base.execution_segment),
+        execution_segment_sequence: file
+            .execution_segment_sequence
+            .or(base.execution_segment_sequence),
     }
 }
 

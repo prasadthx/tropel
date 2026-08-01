@@ -34,6 +34,12 @@ pub struct PartialConfig {
     pub http: Option<HttpConfig>,
     pub tls: Option<TlsConfig>,
     pub extensions: HashMap<String, serde_json::Value>,
+    /// k6 `executionSegment` — "from:to" workload partition for this node.
+    #[serde(default, alias = "executionSegment")]
+    pub execution_segment: Option<String>,
+    /// k6 `executionSegmentSequence` — full sequence of boundaries.
+    #[serde(default, alias = "executionSegmentSequence")]
+    pub execution_segment_sequence: Option<String>,
 }
 
 impl PartialConfig {
@@ -146,6 +152,8 @@ impl PartialConfig {
             out.otlp_endpoint = Some(v);
             cfg.output = Some(out);
         }
+        cfg.execution_segment = env_str("K6_EXECUTION_SEGMENT");
+        cfg.execution_segment_sequence = env_str("K6_EXECUTION_SEGMENT_SEQUENCE");
         if let Some(v) = env_str("K6_DISCARD_RESPONSE_BODIES") {
             if let Ok(b) = v.parse::<bool>() {
                 let mut http = cfg.http.take().unwrap_or_default();

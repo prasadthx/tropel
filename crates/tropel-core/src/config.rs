@@ -118,6 +118,17 @@ pub struct JobConfig {
     /// scripts drive their own runs unless the user opts out via flags.
     #[serde(default)]
     pub execution_explicit: bool,
+    /// Deterministic workload partitioning: which fraction `[from, to)` of
+    /// this run this node executes, as `"from:to"` (e.g. `"0:1/3"`).
+    /// Combine with `execution_segment_sequence` for cross-node validation.
+    /// k6-compatible: `executionSegment` / `executionSegmentSequence`.
+    #[serde(default, alias = "executionSegment")]
+    pub execution_segment: Option<String>,
+    /// The full sequence of segment boundaries shared by all cooperating
+    /// nodes, e.g. `"0,1/3,2/3,1"`. Optional but recommended: validates
+    /// that `execution_segment` is a consecutive pair of this sequence.
+    #[serde(default, alias = "executionSegmentSequence")]
+    pub execution_segment_sequence: Option<String>,
 }
 
 /// How to execute the load test.
@@ -516,6 +527,8 @@ impl Default for JobConfig {
             tls: TlsConfig::default(),
             extensions: HashMap::new(),
             execution_explicit: false,
+            execution_segment: None,
+            execution_segment_sequence: None,
         }
     }
 }

@@ -261,6 +261,48 @@ impl Engine {
             ]
         };
 
+        // Apply the execution segment (k6 executionSegment /
+        // executionSegmentSequence): each scenario's workload is scaled
+        // deterministically to this node's share [from, to). An invalid
+        // segment spec is a hard config error — better to fail before any
+        // VU starts than to run the full workload on every node.
+        let segment = match &config.execution_segment {
+            Some(spec) => match tropel_core::segment::ExecutionSegment::parse(
+                spec,
+                config.execution_segment_sequence.as_deref(),
+            ) {
+                Ok(seg) => {
+                    tracing::info!(
+                        "Execution segment [{:.3}, {:.3}) — running {:.1}% of the workload",
+                        seg.from(),
+                        seg.to(),
+                        seg.fraction() * 100.0
+                    );
+                    Some(seg)
+                }
+                Err(e) => return Err(e),
+            },
+            None => None,
+        };
+        let scenario_configs: Vec<(
+            String,
+            ExecutionConfig,
+            HashMap<String, String>,
+            HashMap<String, String>,
+            Duration,
+            String,
+            Option<String>,
+        )> = scenario_configs
+            .into_iter()
+            .map(|(name, exec, env, tags, delay, input, exec_fn)| {
+                let exec = match &segment {
+                    Some(seg) => seg.apply(&exec),
+                    None => exec,
+                };
+                (name, exec, env, tags, delay, input, exec_fn)
+            })
+            .collect();
+
         tracing::info!(
             "Starting Tropel load test: {} scenario(s)",
             scenario_configs.len()
