@@ -1,5 +1,6 @@
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tropel_core::types::{Request, Response, Sample, TagMap};
@@ -45,6 +46,17 @@ pub struct PmState {
     pub vu_id: u32,
     /// Name of the currently running scenario.
     pub scenario_name: String,
+    /// k6-style executor type name (e.g. "constant-vus") — set once per VU
+    /// from the scenario's ExecutionConfig. Backs `exec.scenario.executor()`.
+    pub executor_name: String,
+    /// Shared handle to the scheduler's ACTIVE-VU counter, when one has been
+    /// attached. Backs `exec.instance.vusActive`. Atomic so the sync bridge
+    /// closure can read it without awaiting an async mutex.
+    pub active_vus: Option<Arc<AtomicU32>>,
+    /// Shared handle to the scheduler's GLOBAL total-iteration counter, when
+    /// one has been attached. Backs `exec.instance.iterationsCompleted` — a
+    /// total across ALL VUs, not just this one.
+    pub global_iterations: Option<Arc<AtomicU64>>,
     /// Current iteration index (0-based) within this scenario.
     pub iteration_index: u64,
     /// Name of the currently executing request/item.
@@ -85,6 +97,9 @@ impl PmState {
             current_group: None,
             vu_id: 0,
             scenario_name: String::new(),
+            executor_name: String::new(),
+            active_vus: None,
+            global_iterations: None,
             iteration_index: 0,
             current_request_name: String::new(),
             abort_requested: false,
@@ -118,6 +133,21 @@ impl PmState {
     /// Set the iteration data for the current iteration.
     pub fn set_iteration_data(&mut self, data: Option<HashMap<String, Value>>) {
         self.iteration_data = data;
+    }
+
+    /// Attach the shared execution-context handles from the scheduler.
+    /// Called once per VU at startup — the executor name is immutable and the
+    /// two atomic handles are shared with the scheduler's live counters, so
+    /// later reads (from sync JS bridge closures) see up-to-date values.
+    pub fn attach_exec_context(
+        &mut self,
+        executor_name: String,
+        active_vus: Arc<AtomicU32>,
+        global_iterations: Arc<AtomicU64>,
+    ) {
+        self.executor_name = executor_name;
+        self.active_vus = Some(active_vus);
+        self.global_iterations = Some(global_iterations);
     }
 }
 

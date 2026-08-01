@@ -562,13 +562,16 @@ impl PmBridge {
                 Func::from(move || -> String { state_clone.lock().unwrap().scenario_name.clone() }),
             );
 
-            // Known limitation: exec.scenario.executor — executor type string
-            // (e.g., "constant-vus", "ramping-vus") is not yet piped through to
-            // PmState. The ExecutionConfig enum variant is available when the
-            // VURunner is created but not stored. Always returns "".
+            // exec.scenario.executor — executor type string (e.g.,
+            // "constant-vus", "ramping-vus"). Piped into PmState by the engine
+            // via VURunner::with_exec_context. Falls back to "" when the
+            // engine hasn't attached it (e.g. script-only test harnesses).
+            let state_clone = state.clone();
             let _ = globals.set(
                 "__tropel_exec_scenario_executor",
-                Func::from(|| -> String { String::new() }),
+                Func::from(move || -> String {
+                    state_clone.lock().unwrap().executor_name.clone()
+                }),
             );
 
             // exec.vu.iterationInScenario — current iteration index
@@ -578,24 +581,36 @@ impl PmBridge {
                 Func::from(move || -> u64 { state_clone.lock().unwrap().iteration_index }),
             );
 
-            // Known limitation: exec.instance.iterationsCompleted — returns the
-            // per-VU iteration count, NOT a global total across all VUs (which is
-            // what k6 provides). Requires a shared atomic counter across VUs in
-            // the scheduler to be piped into PmState.
+            // exec.instance.iterationsCompleted — GLOBAL total across all VUs.
+            // The engine attaches the scheduler's shared atomic counter to
+            // PmState; the closure reads it live (lock-free). Falls back to the
+            // per-VU iteration index when no handle is attached.
             let state_clone = state.clone();
             let _ = globals.set(
                 "__tropel_exec_iterations_completed",
                 Func::from(move || -> u64 {
                     let st = state_clone.lock().unwrap();
-                    st.iteration_index
+                    st.global_iterations
+                        .as_ref()
+                        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                        .unwrap_or(st.iteration_index)
                 }),
             );
 
-            // Known limitation: exec.instance.vusActive — currently active VUs.
-            // Requires the scheduler's active_vus count to be passed to PmState
-            // each iteration. k6 provides this via the instance object, but the
-            // connection from VU runner to scheduler is indirect. Always returns 0.
-            let _ = globals.set("__tropel_exec_vus_active", Func::from(|| -> u32 { 0 }));
+            // exec.instance.vusActive — currently active VUs, read live from
+            // the scheduler's shared atomic counter (lock-free). Falls back to
+            // 0 when no handle is attached.
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_exec_vus_active",
+                Func::from(move || -> u32 {
+                    let st = state_clone.lock().unwrap();
+                    st.active_vus
+                        .as_ref()
+                        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                        .unwrap_or(0)
+                }),
+            );
 
             // test.abort(message) — requests engine to abort the test
             let state_clone = state.clone();

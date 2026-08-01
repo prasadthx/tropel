@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -104,6 +105,24 @@ impl VURunner {
     /// Set expected status codes/ranges for http_req_failed evaluation.
     pub fn with_expected_statuses(mut self, expected: Vec<ExpectedStatus>) -> Self {
         self.expected_statuses = expected;
+        self
+    }
+
+    /// Attach the execution-context info from the scheduler: the executor
+    /// type name and shared handles to the scheduler's ACTIVE-VU and GLOBAL
+    /// iteration counters. These back `exec.scenario.executor()`,
+    /// `exec.instance.vusActive()`, and `exec.instance.iterationsCompleted()`
+    /// (a total across ALL VUs, not just this one).
+    pub fn with_exec_context(
+        mut self,
+        executor_name: String,
+        active_vus: Arc<AtomicU32>,
+        global_iterations: Arc<AtomicU64>,
+    ) -> Self {
+        {
+            let mut state = self.pm_state.lock().unwrap();
+            state.attach_exec_context(executor_name, active_vus, global_iterations);
+        }
         self
     }
 

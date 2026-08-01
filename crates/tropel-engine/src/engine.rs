@@ -473,6 +473,8 @@ async fn run_scenario_vus(
     let has_abort_thresholds = thresholds.values().any(|t| t.abort_on_fail);
     let is_per_vu_iterations = matches!(exec_cfg, ExecutionConfig::PerVUIterations { .. });
     let think_time_cfg = extract_think_time(&exec_cfg);
+    // k6-style executor name (e.g. "constant-vus") — backs exec.scenario.executor().
+    let executor_name = exec_cfg.executor_name().to_string();
     let metrics_c = metrics.clone();
     let scenario_c = scenario.clone();
     let stop_c = stop_signal.clone();
@@ -499,6 +501,7 @@ async fn run_scenario_vus(
         let sc_name_vu = sc_name_c.clone();
         let is_per_vu_iterations = is_per_vu_iterations;
         let sc_tags = sc_tags_c.clone();
+        let executor_name = executor_name.clone();
 
         let (_, handle) = pool.spawn(async move {
             sched.add_active_vu(1).await;
@@ -514,7 +517,12 @@ async fn run_scenario_vus(
 
             let bridge_client = Arc::new(client.clone());
             let mut runner = VURunner::new(scenario, client, vu_id, sc_name_vu.clone())
-                .with_expected_statuses(http_cfg.expected_statuses.clone());
+                .with_expected_statuses(http_cfg.expected_statuses.clone())
+                .with_exec_context(
+                    executor_name,
+                    sched.active_vus_handle(),
+                    sched.total_iterations_handle(),
+                );
             let pm_state = runner.state_handle();
 
             let js_ctx = create_vu_js_context(vu_id, &pm_state, &bridge_client).await;

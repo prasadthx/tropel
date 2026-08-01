@@ -227,6 +227,21 @@ pub enum ExecutionConfig {
     },
 }
 
+impl ExecutionConfig {
+    /// k6-style executor type name (matches the serde tag used for this
+    /// variant). Exposed to scripts via `exec.scenario.executor()`.
+    pub fn executor_name(&self) -> &'static str {
+        match self {
+            ExecutionConfig::ConstantVus { .. } => "constant-vus",
+            ExecutionConfig::RampingVus { .. } => "ramping-vus",
+            ExecutionConfig::ConstantArrivalRate { .. } => "constant-arrival-rate",
+            ExecutionConfig::SharedIterations { .. } => "shared-iterations",
+            ExecutionConfig::RampingArrivalRate { .. } => "ramping-arrival-rate",
+            ExecutionConfig::PerVUIterations { .. } => "per-vu-iterations",
+        }
+    }
+}
+
 /// A ramping stage (for VU count — used by RampingVus).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stage {

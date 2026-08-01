@@ -1,7 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 use tokio::time;
 use tropel_core::config::ExecutionConfig;
 use tropel_core::Result;
@@ -15,8 +14,13 @@ const HANDLE_JOIN_BOUND: Duration = Duration::from_secs(30);
 /// Controls the lifecycle of VUs during a load test.
 pub struct VUScheduler {
     config: ExecutionConfig,
-    active_vus: Arc<Mutex<u32>>,
-    total_iterations: Arc<Mutex<u64>>,
+    /// Lock-free active-VU counter. Atomic so sync JS bridge closures
+    /// (inside ctx.with) can read `exec.instance.vusActive` without awaiting
+    /// an async mutex — the tokio Mutex made that impossible.
+    active_vus: Arc<AtomicU32>,
+    /// Lock-free total-iteration counter, shared the same way for
+    /// `exec.instance.iterationsCompleted` (a GLOBAL total across all VUs).
+    total_iterations: Arc<AtomicU64>,
     stop_signal: Arc<tokio::sync::Notify>,
     /// Level-triggered stop flag — VUs check this between iterations and exit
     /// gracefully (finish current iteration first).
@@ -48,8 +52,8 @@ impl VUScheduler {
     pub fn new(config: &ExecutionConfig) -> Self {
         Self {
             config: config.clone(),
-            active_vus: Arc::new(Mutex::new(0)),
-            total_iterations: Arc::new(Mutex::new(0)),
+            active_vus: Arc::new(AtomicU32::new(0)),
+            total_iterations: Arc::new(AtomicU64::new(0)),
             stop_signal: Arc::new(tokio::sync::Notify::new()),
             stop_requested: Arc::new(AtomicBool::new(false)),
             force_stop_requested: Arc::new(AtomicBool::new(false)),
@@ -188,30 +192,44 @@ impl VUScheduler {
 
     /// Get active VU count.
     pub async fn active_vus(&self) -> u32 {
-        *self.active_vus.lock().await
+        self.active_vus.load(Ordering::Acquire)
     }
 
     /// Increment active VU count.
     pub async fn add_active_vu(&self, delta: u32) {
-        let mut vus = self.active_vus.lock().await;
-        *vus += delta;
+        self.active_vus.fetch_add(delta, Ordering::AcqRel);
     }
 
     /// Decrement active VU count.
     pub async fn remove_active_vu(&self, delta: u32) {
-        let mut vus = self.active_vus.lock().await;
-        *vus = vus.saturating_sub(delta);
+        self.active_vus
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                Some(v.saturating_sub(delta))
+            })
+            .ok();
     }
 
     /// Get total iterations completed.
     pub async fn total_iterations(&self) -> u64 {
-        *self.total_iterations.lock().await
+        self.total_iterations.load(Ordering::Acquire)
     }
 
     /// Increment iteration count.
     pub async fn increment_iterations(&self) {
-        let mut iters = self.total_iterations.lock().await;
-        *iters += 1;
+        self.total_iterations.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Shared handle to the active-VU counter — handed to a VU's PmState so
+    /// the sync `exec.instance.vusActive` bridge can read it live.
+    pub fn active_vus_handle(&self) -> Arc<AtomicU32> {
+        self.active_vus.clone()
+    }
+
+    /// Shared handle to the GLOBAL total-iteration counter — handed to a VU's
+    /// PmState so `exec.instance.iterationsCompleted` reflects all VUs, not
+    /// just this one.
+    pub fn total_iterations_handle(&self) -> Arc<AtomicU64> {
+        self.total_iterations.clone()
     }
 
     /// Start executing VUs according to the execution config.
@@ -423,7 +441,7 @@ impl VUScheduler {
                 );
                 let drained = self
                     .wait_for_drain_while(grace_rd, || async {
-                        let active = *self.active_vus.lock().await;
+                        let active = self.active_vus.load(Ordering::Acquire);
                         active <= target
                     })
                     .await;
@@ -912,7 +930,7 @@ impl VUScheduler {
 
         let deadline = time::Instant::now() + grace;
         loop {
-            let active = *self.active_vus.lock().await;
+            let active = self.active_vus.load(Ordering::Acquire);
             if active == 0 {
                 tracing::debug!("All VUs drained within grace period");
                 return;
