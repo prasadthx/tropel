@@ -682,6 +682,14 @@ fn call_module_handle_summary(
     let data: rquickjs::Value = parse.call((data_json,))?;
     let result: rquickjs::Value = func.call((data,))?;
 
+    // k6 allows `export async function handleSummary(data)`. If the call
+    // returned a Promise, finish it (pumps the job queue until settled).
+    let result: rquickjs::Value = if let Some(promise) = result.as_promise() {
+        promise.finish()?
+    } else {
+        result
+    };
+
     if result.is_undefined() || result.is_null() {
         return Ok(None);
     }
@@ -1119,6 +1127,71 @@ mod tests {
                 "missing exec export must error"
             );
         });
+    }
+
+    #[test]
+    fn test_module_eval_handle_summary_returns_map() {
+        // `export function handleSummary(data)` must be callable with the
+        // summary data and return a filename → content map (stdout prints).
+        let source = r#"
+            export function handleSummary(data) {
+                return {
+                    "stdout": "custom stdout: " + data.state.iterations,
+                    "summary.html": "<html>" + data.metrics.http_reqs.type + "</html>",
+                };
+            }
+            export default function() {}
+        "#;
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        let map: Option<HashMap<String, String>> = ctx.with(|ctx| {
+            call_module_handle_summary(
+                &ctx,
+                source,
+                r#"{"metrics":{"http_reqs":{"type":"counter"}},"state":{"iterations":7}}"#,
+            )
+            .unwrap()
+        });
+        let map = map.expect("handleSummary must produce output");
+        assert_eq!(map.get("stdout").map(|s| s.as_str()), Some("custom stdout: 7"));
+        assert_eq!(
+            map.get("summary.html").map(|s| s.as_str()),
+            Some("<html>counter</html>")
+        );
+    }
+
+    #[test]
+    fn test_module_eval_handle_summary_absent_is_none() {
+        let source = "export default function() {}\n";
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        let result: Option<HashMap<String, String>> = ctx.with(|ctx| {
+            call_module_handle_summary(&ctx, source, "{}").unwrap()
+        });
+        assert!(result.is_none(), "no handleSummary export → None");
+    }
+
+    #[test]
+    fn test_module_eval_handle_summary_async() {
+        // k6 permits async handleSummary — the Promise must be finished.
+        let source = r#"
+            export async function handleSummary(data) {
+                return { "stdout": "async " + data.state.vusMax };
+            }
+            export default function() {}
+        "#;
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        let result: Option<HashMap<String, String>> = ctx.with(|ctx| {
+            call_module_handle_summary(
+                &ctx,
+                source,
+                r#"{"state":{"vusMax":3}}"#,
+            )
+            .unwrap()
+        });
+        let map = result.expect("async handleSummary must produce output");
+        assert_eq!(map.get("stdout").map(|s| s.as_str()), Some("async 3"));
     }
 
     #[test]

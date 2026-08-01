@@ -4,17 +4,23 @@
 //! Streaming outputs consuming individual samples during the run.
 
 pub mod csv_reporter;
+pub mod influxdb;
 pub mod json_reporter;
+pub mod json_stream;
 pub mod otlp;
 pub mod output;
 pub mod prometheus;
+pub mod statsd;
 pub mod stdout;
 
 pub use csv_reporter::*;
+pub use influxdb::*;
 pub use json_reporter::*;
+pub use json_stream::*;
 pub use otlp::*;
 pub use output::*;
 pub use prometheus::*;
+pub use statsd::*;
 pub use stdout::*;
 
 use async_trait::async_trait;

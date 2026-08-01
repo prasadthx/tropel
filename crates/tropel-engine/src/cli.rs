@@ -86,6 +86,21 @@ pub enum Commands {
         #[arg(long = "summary-export")]
         summary_export: Option<PathBuf>,
 
+        /// NDJSON streaming output file (k6 `--out json=file` equivalent):
+        /// every sample is appended as one JSON line during the run
+        #[arg(long = "json-stream")]
+        json_stream: Option<PathBuf>,
+
+        /// StatsD / Datadog agent address (host:port, e.g. localhost:8125)
+        /// for streaming datagram output
+        #[arg(long = "statsd-addr")]
+        statsd_addr: Option<String>,
+
+        /// InfluxDB line-protocol UDP address (host:port, e.g. localhost:8089)
+        /// for streaming line-protocol datagrams
+        #[arg(long = "influxdb-addr")]
+        influxdb_addr: Option<String>,
+
         /// Threshold expression (can be specified multiple times)
         #[arg(short = 't', long = "threshold")]
         threshold: Vec<String>,
@@ -238,6 +253,9 @@ async fn run_command(cli: Cli) -> Result<()> {
         prometheus_url,
         otlp_endpoint,
         summary_export,
+        json_stream,
+        statsd_addr,
+        influxdb_addr,
         subprocess_adapter,
         plugins_dir,
         ..
@@ -258,6 +276,9 @@ async fn run_command(cli: Cli) -> Result<()> {
     let prometheus_url = prometheus_url.clone();
     let otlp_endpoint = otlp_endpoint.clone();
     let summary_export = summary_export.clone();
+    let json_stream = json_stream.clone();
+    let statsd_addr = statsd_addr.clone();
+    let influxdb_addr = influxdb_addr.clone();
     let thresholds = threshold.clone();
     let insecure = *insecure;
     // `mode` is now optional so we can tell whether the user explicitly chose
@@ -417,6 +438,9 @@ async fn run_command(cli: Cli) -> Result<()> {
             prometheus_remote_write_url: prometheus_url,
             otlp_endpoint,
             summary_export: summary_export.map(|p| p.to_string_lossy().to_string()),
+            json_stream: json_stream.map(|p| p.to_string_lossy().to_string()),
+            statsd_addr,
+            influxdb_addr,
             ..Default::default()
         },
         thresholds: threshold_map,
@@ -582,6 +606,15 @@ fn apply_overlay(
         }
         if config.output.summary_export.is_none() {
             config.output.summary_export = out.summary_export.clone();
+        }
+        if config.output.json_stream.is_none() {
+            config.output.json_stream = out.json_stream.clone();
+        }
+        if config.output.statsd_addr.is_none() {
+            config.output.statsd_addr = out.statsd_addr.clone();
+        }
+        if config.output.influxdb_addr.is_none() {
+            config.output.influxdb_addr = out.influxdb_addr.clone();
         }
         // The CLI never sets summary/trends (both default false), so the
         // overlay's explicit values apply directly.

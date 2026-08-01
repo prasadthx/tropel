@@ -312,6 +312,18 @@ pub struct OutputConfig {
     /// data object is written here as JSON.
     #[serde(default)]
     pub summary_export: Option<String>,
+    /// NDJSON streaming output file: every sample is appended as one JSON
+    /// line while the run is in progress (k6 `--out json=file` equivalent).
+    #[serde(default)]
+    pub json_stream: Option<String>,
+    /// StatsD / Datadog agent address (`host:port`, e.g. `localhost:8125`)
+    /// for streaming datagram output with Datadog-style tags.
+    #[serde(default)]
+    pub statsd_addr: Option<String>,
+    /// InfluxDB line-protocol UDP address (`host:port`, e.g. `localhost:8089`)
+    /// for streaming line-protocol datagrams.
+    #[serde(default)]
+    pub influxdb_addr: Option<String>,
 }
 
 impl Default for OutputConfig {
@@ -324,6 +336,9 @@ impl Default for OutputConfig {
             prometheus_remote_write_url: None,
             otlp_endpoint: None,
             summary_export: None,
+            json_stream: None,
+            statsd_addr: None,
+            influxdb_addr: None,
         }
     }
 }
