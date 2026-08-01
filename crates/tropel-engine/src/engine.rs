@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tropel_core::config::{
-    ExecutionConfig, HttpConfig, JobConfig, OutputConfig, ScenarioConfig, ThinkTimeConfig,
+    ExecutionConfig, HttpConfig, JobConfig, OutputConfig, ScenarioConfig, ThinkTimeConfig, TlsConfig,
 };
 use tropel_core::scenario::Scenario;
 use tropel_core::types::{Request, Response, Sample, TagMap};
@@ -49,6 +49,7 @@ impl Engine {
         );
 
         let http_config = config.http.clone();
+        let tls_config = config.tls.clone();
         let mut thresholds = config.thresholds.clone();
         let data_rows = config.iteration_data.clone();
         let test_start = Instant::now();
@@ -202,6 +203,7 @@ impl Engine {
             let metrics = metrics.clone();
             let pool = pool.clone();
             let http_cfg = http_config.clone();
+            let tls_cfg = tls_config.clone();
             let thresholds = thresholds.clone();
             let data_rows = data_rows.clone();
             let base_env = config.env.clone();
@@ -243,6 +245,7 @@ impl Engine {
                             metrics,
                             pool,
                             http_cfg,
+                            tls_cfg,
                             thresholds,
                             data_rows,
                             test_start,
@@ -262,6 +265,7 @@ impl Engine {
                             metrics,
                             pool,
                             http_cfg,
+                            tls_cfg,
                             thresholds,
                             data_rows,
                             test_start,
@@ -445,6 +449,7 @@ async fn run_scenario_vus(
     metrics: Arc<MetricsCollector>,
     pool: Arc<VUWorkerPool>,
     http_cfg: HttpConfig,
+    tls_cfg: TlsConfig,
     thresholds: HashMap<String, tropel_core::config::ThresholdConfig>,
     data_rows: Vec<HashMap<String, serde_json::Value>>,
     test_start: Instant,
@@ -481,6 +486,7 @@ async fn run_scenario_vus(
     let data_rows_c = data_rows.clone();
     let pool_c = pool.clone();
     let http_cfg_c = http_cfg.clone();
+    let tls_cfg_c = tls_cfg.clone();
     let thresholds_c = thresholds.clone();
     let vu_env_c = vu_env.clone();
     let sc_name_c = sc_name.clone();
@@ -494,6 +500,7 @@ async fn run_scenario_vus(
         let vu_env = vu_env_c.clone();
         let data_rows = data_rows_c.clone();
         let http_cfg = http_cfg_c.clone();
+        let tls_cfg = tls_cfg_c.clone();
         let thresholds = thresholds_c.clone();
         let has_abort_thresholds = has_abort_thresholds;
         let pool = pool_c.clone();
@@ -506,7 +513,7 @@ async fn run_scenario_vus(
         let (_, handle) = pool.spawn(async move {
             sched.add_active_vu(1).await;
 
-            let client = match HttpClient::new(&http_cfg) {
+            let client = match HttpClient::with_tls(&http_cfg, &tls_cfg) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!("VU {}: Failed to create HTTP client: {}", vu_id, e);
@@ -703,6 +710,7 @@ async fn run_driver_vus(
     metrics: Arc<MetricsCollector>,
     pool: Arc<VUWorkerPool>,
     http_cfg: HttpConfig,
+    tls_cfg: TlsConfig,
     thresholds: HashMap<String, tropel_core::config::ThresholdConfig>,
     data_rows: Vec<HashMap<String, serde_json::Value>>,
     test_start: Instant,
@@ -748,6 +756,7 @@ async fn run_driver_vus(
     let data_rows_c = data_rows.clone();
     let pool_c = pool.clone();
     let http_cfg_c = http_cfg.clone();
+    let tls_cfg_c = tls_cfg.clone();
     let thresholds_c = thresholds.clone();
     let vu_env_c = vu_env.clone();
     let sc_name_c = sc_name.clone();
@@ -765,6 +774,7 @@ async fn run_driver_vus(
         let vu_env = vu_env_c.clone();
         let data_rows = data_rows_c.clone();
         let http_cfg = http_cfg_c.clone();
+        let tls_cfg = tls_cfg_c.clone();
         let thresholds = thresholds_c.clone();
         let has_abort_thresholds = has_abort_thresholds;
         let pool = pool_c.clone();
@@ -809,7 +819,7 @@ async fn run_driver_vus(
                 }
             };
 
-            let client = match HttpClient::new(&http_cfg) {
+            let client = match HttpClient::with_tls(&http_cfg, &tls_cfg) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!("VU {}: Failed to create HTTP client: {}", vu_id, e);

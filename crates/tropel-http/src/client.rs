@@ -1,7 +1,7 @@
 use crate::auth::AuthSigner;
 use std::collections::HashMap;
 use std::time::Duration;
-use tropel_core::config::HttpConfig;
+use tropel_core::config::{HttpConfig, TlsConfig};
 use tropel_core::types::*;
 use tropel_core::Result;
 use tropel_core::TropelError;
@@ -19,13 +19,103 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
-    /// Create a new HTTP client from config.
+    /// Create a new HTTP client from config (default TLS settings).
     pub fn new(config: &HttpConfig) -> Result<Self> {
+        Self::with_tls(config, &TlsConfig::default())
+    }
+
+    /// Create a new HTTP client from config, applying the TLS settings:
+    /// - `insecure_skip_verify`: disable certificate verification
+    ///   (`danger_accept_invalid_certs`)
+    /// - `min_version` / `max_version`: TLS protocol version bounds
+    /// - `client_cert` + `client_key`: mTLS client identity — an unencrypted
+    ///   PEM cert + key pair, concatenated into one buffer for
+    ///   `Identity::from_pem` (accepts PKCS#8, PKCS#1 and SEC1 keys).
+    ///
+    /// `client_passphrase` and `allowed_ciphers` are deliberately not applied:
+    /// PKCS#12/encrypted-key support requires the native-tls backend, and
+    /// per-client cipher selection is not exposed through reqwest's
+    /// `ClientBuilder` (custom cipher suites would need
+    /// `use_preconfigured_tls(rustls::ClientConfig)`). This build uses
+    /// rustls, which negotiates a safe default cipher set; a supplied
+    /// passphrase logs a warning (its value is never logged).
+    pub fn with_tls(config: &HttpConfig, tls: &TlsConfig) -> Result<Self> {
         let mut builder = reqwest::Client::builder()
             .cookie_store(true)
             .user_agent(&config.user_agent)
             .pool_max_idle_per_host(config.max_idle_connections)
             .timeout(DEFAULT_REQUEST_TIMEOUT);
+
+        // ── TLS: insecure_skip_verify ──
+        if tls.insecure_skip_verify {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+
+        // ── TLS: min/max protocol version ──
+        if let Some(version) = parse_tls_version(&tls.min_version) {
+            builder = builder.min_tls_version(version);
+        }
+        if let Some(version) = parse_tls_version(&tls.max_version) {
+            builder = builder.max_tls_version(version);
+        }
+
+        // ── TLS: mTLS client identity ──
+        if let Some(cert_path) = &tls.client_cert {
+            let cert_bytes = std::fs::read(cert_path).map_err(|e| {
+                TropelError::Config(format!("Failed to read client cert '{}': {}", cert_path, e))
+            })?;
+
+            // PEM cert + key pair — client_key is REQUIRED here: an identity
+            // without key material is meaningless, so fail fast with a clear
+            // message instead of a confusing parse error.
+            let key_path = tls.client_key.as_deref().ok_or_else(|| {
+                TropelError::Config(format!(
+                    "TLS client_cert '{}' set but no client_key: a client \
+                     identity requires both a certificate and its private key",
+                    cert_path
+                ))
+            })?;
+            let key_bytes = std::fs::read(key_path).map_err(|e| {
+                TropelError::Config(format!("Failed to read client key '{}': {}", key_path, e))
+            })?;
+
+            // PKCS#12 bundles and encrypted PEM keys require the native-tls
+            // backend, which this build does not enable (rustls only). Warn
+            // when a passphrase was supplied so users aren't surprised that
+            // it's ignored; the key must be unencrypted PEM. The passphrase
+            // VALUE is never logged (it is a secret).
+            if tls.client_passphrase.is_some() {
+                tracing::warn!(
+                    "client_passphrase is only honored with the native-tls backend; \
+                     this rustls build uses unencrypted PEM keys, so the supplied \
+                     passphrase will be ignored"
+                );
+            }
+
+            // Concatenate cert + key into ONE PEM buffer and use
+            // `Identity::from_pem` (the only identity constructor available
+            // under the rustls feature). It parses mixed PEM sections and
+            // accepts PKCS#8 (`BEGIN PRIVATE KEY`), PKCS#1
+            // (`BEGIN RSA PRIVATE KEY`) and SEC1 (`BEGIN EC PRIVATE KEY`)
+            // keys. `from_pkcs8_pem`/`from_pkcs12_der` exist but are gated
+            // behind native-tls.
+            let mut combined = cert_bytes;
+            combined.extend_from_slice(b"\n");
+            combined.extend_from_slice(&key_bytes);
+            let identity = reqwest::Identity::from_pem(&combined).map_err(|e| {
+                TropelError::Config(format!(
+                    "Failed to load PEM client identity (cert '{}', key '{}'): {}",
+                    cert_path, key_path, e
+                ))
+            })?;
+            builder = builder.identity(identity);
+        } else if tls.client_key.is_some() {
+            // Asymmetry guard: a key without a cert is meaningless and would
+            // otherwise be silently ignored (the block above is cert-gated).
+            tracing::warn!(
+                "client_key is set without client_cert — the key will be ignored"
+            );
+        }
 
         if !config.decompress {
             builder = builder.no_deflate();
@@ -334,6 +424,19 @@ impl HttpResponse {
         }
         let mut body_bytes = self.body.clone();
         simd_json::serde::from_slice(&mut body_bytes).ok()
+    }
+}
+
+/// Parse a TLS version string ("1.2", "tls1.2", "1.3", ...) into a reqwest
+/// TLS version. Returns None for unrecognized/empty values (builder defaults).
+fn parse_tls_version(s: &Option<String>) -> Option<reqwest::tls::Version> {
+    let v = s.as_deref()?.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "1.0" | "tls1.0" | "tlsv1.0" | "tls1" => Some(reqwest::tls::Version::TLS_1_0),
+        "1.1" | "tls1.1" | "tlsv1.1" => Some(reqwest::tls::Version::TLS_1_1),
+        "1.2" | "tls1.2" | "tlsv1.2" | "tls12" => Some(reqwest::tls::Version::TLS_1_2),
+        "1.3" | "tls1.3" | "tlsv1.3" | "tls13" => Some(reqwest::tls::Version::TLS_1_3),
+        _ => None,
     }
 }
 
