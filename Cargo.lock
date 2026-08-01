@@ -3656,6 +3656,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "tropel-distributed"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tropel-core",
+ "tropel-engine",
+ "tropel-ext",
+ "tropel-metrics",
+ "tropel-report",
+]
+
+[[package]]
 name = "tropel-engine"
 version = "0.1.0"
 dependencies = [
@@ -3858,6 +3875,7 @@ name = "tropel-metrics"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.23.0",
  "chrono",
  "hdrhistogram",
  "indexmap",

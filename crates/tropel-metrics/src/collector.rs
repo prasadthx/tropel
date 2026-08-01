@@ -1,5 +1,7 @@
 use crate::histogram::LatencyHistogram;
+use base64::Engine as _;
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -9,7 +11,7 @@ use tropel_core::types::{Sample, SampleType};
 
 /// Information about the type of a metric — stored alongside MetricSet so the
 /// aggregator can report type-appropriate summary statistics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetricType {
     /// Counter — monotonically increasing total (e.g. http_reqs, data_received).
     /// Aggregation: sum only.
@@ -201,6 +203,9 @@ enum MetricsEvent {
     Samples(Vec<Sample>),
     /// Request a results snapshot.
     GetResults(tokio::sync::oneshot::Sender<MetricsResult>),
+    /// Request a raw, serializable snapshot (histogram V2 bytes included) for
+    /// shipping to a distributed controller.
+    GetSnapshot(tokio::sync::oneshot::Sender<MetricsSnapshot>),
     /// Request a total count for a specific metric.
     GetTotal {
         metric: String,
@@ -375,6 +380,23 @@ impl MetricsCollector {
         resp_rx.await.unwrap_or_default()
     }
 
+    /// Get a raw, serializable snapshot of the aggregated series (with
+    /// hdr-histogram V2 bytes for Trend metrics). Used by `tropel-agent` to
+    /// ship its metrics to a `tropel-controller`, which merges histograms
+    /// losslessly via [`merge_snapshots`].
+    pub async fn snapshot(&self) -> MetricsSnapshot {
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        if self
+            .tx
+            .send(MetricsEvent::GetSnapshot(resp_tx))
+            .await
+            .is_err()
+        {
+            return MetricsSnapshot::default();
+        }
+        resp_rx.await.unwrap_or_default()
+    }
+
     /// Get total count for a metric — sends a request and waits.
     pub async fn total_count(&self, metric: &str) -> f64 {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
@@ -442,6 +464,10 @@ impl Aggregator {
                 MetricsEvent::GetResults(tx) => {
                     let results = agg.build_results();
                     let _ = tx.send(results);
+                }
+                MetricsEvent::GetSnapshot(tx) => {
+                    let snap = agg.build_snapshot();
+                    let _ = tx.send(snap);
                 }
                 MetricsEvent::GetTotal { metric, tx } => {
                     let total = agg.totals.get(&metric).copied().unwrap_or(0.0);
@@ -788,6 +814,148 @@ impl Aggregator {
             effective_thresholds: std::mem::take(&mut self.effective_thresholds),
         }
     }
+
+    /// Build a serializable snapshot of the raw aggregated series. Trend
+    /// metrics carry their hdr-histogram as base64 V2 bytes so a controller
+    /// can deserialize and merge them losslessly.
+    fn build_snapshot(&self) -> MetricsSnapshot {
+        let mut series = Vec::with_capacity(self.data.len());
+        for (key, set) in &self.data {
+            series.push(SeriesSnapshot {
+                metric: key.metric.to_string(),
+                tags: key
+                    .tags
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                metric_type: set.metric_type,
+                histogram: if set.metric_type == MetricType::Trend
+                    && set.histogram.count() > 0
+                {
+                    Some(
+                        base64::engine::general_purpose::STANDARD
+                            .encode(set.histogram.to_bytes()),
+                    )
+                } else {
+                    None
+                },
+                count: set.count,
+                sum: set.sum,
+                min: set.min,
+                max: set.max,
+                last: set.last,
+            });
+        }
+        MetricsSnapshot {
+            series,
+            totals: self.totals.clone(),
+            summary_trend_stats: self.summary_trend_stats.clone(),
+        }
+    }
+
+    /// Absorb a serialized snapshot from a worker: rebuild each MetricSet
+    /// (deserializing Trend histograms) and merge into this aggregator.
+    /// Histograms merge losslessly — the controller's total is exactly the
+    /// sum of the workers' buckets.
+    fn absorb_snapshot(&mut self, snap: &MetricsSnapshot) {
+        for s in &snap.series {
+            let mut tags = tropel_core::types::TagMap::new();
+            for (k, v) in &s.tags {
+                tags.insert(k.clone(), v.clone());
+            }
+            let key = MetricKey::new(&s.metric, &tags);
+
+            let histogram = match &s.histogram {
+                Some(b64) => base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .ok()
+                    .and_then(|bytes| LatencyHistogram::from_bytes(&bytes))
+                    .unwrap_or_default(),
+                None => LatencyHistogram::default(),
+            };
+
+            match self.data.entry(key) {
+                indexmap::map::Entry::Occupied(mut e) => {
+                    let existing = e.get_mut();
+                    if existing.metric_type == MetricType::Trend {
+                        existing.histogram.merge(&histogram);
+                    }
+                    existing.count += s.count;
+                    existing.sum += s.sum;
+                    if s.min < existing.min {
+                        existing.min = s.min;
+                    }
+                    if s.max > existing.max {
+                        existing.max = s.max;
+                    }
+                    existing.last = s.last;
+                }
+                indexmap::map::Entry::Vacant(v) => {
+                    v.insert(MetricSet {
+                        metric_type: s.metric_type,
+                        histogram,
+                        count: s.count,
+                        sum: s.sum,
+                        min: s.min,
+                        max: s.max,
+                        last: s.last,
+                    });
+                }
+            }
+        }
+        for (k, v) in &snap.totals {
+            let entry = self.totals.entry(k.clone()).or_insert(0.0);
+            *entry += v;
+        }
+        if self.summary_trend_stats.is_empty() && !snap.summary_trend_stats.is_empty() {
+            self.summary_trend_stats = snap.summary_trend_stats.clone();
+        }
+    }
+}
+
+/// A serializable snapshot of one aggregated series. Trend metrics carry
+/// their hdr-histogram as base64-encoded V2 bytes so a controller can
+/// deserialize and merge them losslessly (no percentile estimation, no
+/// sampling) over a compact JSON wire format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeriesSnapshot {
+    pub metric: String,
+    pub tags: Vec<(String, String)>,
+    pub metric_type: MetricType,
+    /// base64(hdr-histogram V2 bytes) — Trend metrics with samples only.
+    pub histogram: Option<String>,
+    pub count: f64,
+    pub sum: f64,
+    pub min: f64,
+    pub max: f64,
+    pub last: f64,
+}
+
+/// A serializable snapshot of a worker's aggregated metrics — the wire type
+/// `tropel-agent` ships to `tropel-controller` for central lossless merging.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MetricsSnapshot {
+    pub series: Vec<SeriesSnapshot>,
+    pub totals: HashMap<String, f64>,
+    pub summary_trend_stats: Vec<String>,
+}
+
+/// Merge worker snapshots into a single `MetricsResult` (🦀 Rust-opt: the
+/// hdr-histogram V2 merge is lossless — the controller's buckets are exactly
+/// the sum of the workers', so percentiles/means are exact, not estimated).
+///
+/// The effective threshold set is taken from the `thresholds` argument (the
+/// controller's job config); trend stats are inherited from the workers.
+pub fn merge_snapshots(
+    snapshots: Vec<MetricsSnapshot>,
+    thresholds: std::collections::HashMap<String, tropel_core::config::ThresholdConfig>,
+) -> MetricsResult {
+    let mut agg = Aggregator::new();
+    agg.effective_thresholds = thresholds;
+    for snap in &snapshots {
+        agg.absorb_snapshot(snap);
+    }
+    agg.build_results()
 }
 
 /// Summary of a single metric, with type-aware statistics.

@@ -128,4 +128,36 @@ mod tests {
         assert_eq!(scenario.items.len(), 1);
         assert_eq!(scenario.items[0].name, "GET Users");
     }
+
+    #[test]
+    fn test_parse_string_form_url() {
+        // Regression: real Postman exports may serialize a request URL as a
+        // plain string ("https://…") instead of the object form
+        // {"raw": …}. Before the custom UrlDetail Deserialize, the string
+        // failed to parse and the untagged CollectionItem silently fell
+        // through to FolderItem with request: None — the request was
+        // dropped, so runs executed zero http requests.
+        let adapter = PostmanInputAdapter;
+        let data = br#"{
+            "info": {
+                "name": "String-URL Collection",
+                "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+            },
+            "item": [
+                {
+                    "name": "r1",
+                    "request": {
+                        "method": "GET",
+                        "url": "https://api.example.com/"
+                    },
+                    "response": []
+                }
+            ]
+        }"#;
+
+        let scenario = adapter.parse(data).unwrap();
+        assert_eq!(scenario.items.len(), 1, "request item must not fall through to a folder");
+        let req = scenario.items[0].request.as_ref().expect("request must be present");
+        assert_eq!(req.url, "https://api.example.com/");
+    }
 }

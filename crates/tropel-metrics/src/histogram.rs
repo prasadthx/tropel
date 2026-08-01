@@ -107,6 +107,36 @@ impl LatencyHistogram {
         self.inner.add(&other.inner).ok();
     }
 
+    /// Serialize this histogram to the hdr-histogram V2 binary format.
+    ///
+    /// Hdr-histogram V2 is a lossless, portable encoding — two histograms
+    /// serialized on different machines merge exactly. This is what makes
+    /// the distributed `tropel-agent` → `tropel-controller` merge exact:
+    /// agents ship bytes, the controller deserializes and `add()`s them
+    /// with no precision loss (🦀 Rust-opt: no percentile estimation, no
+    /// sampling — real buckets).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        use hdrhistogram::serialization::{Serializer, V2Serializer};
+        let mut serializer = V2Serializer::new();
+        let mut buf = Vec::new();
+        // Serialization into an in-memory Vec cannot fail in practice.
+        let _ = serializer.serialize(&self.inner, &mut buf);
+        buf
+    }
+
+    /// Deserialize a histogram from hdr-histogram V2 binary bytes.
+    /// Returns `None` for corrupted/foreign data (callers treat it as an
+    /// empty histogram rather than failing the merge).
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        use hdrhistogram::serialization::Deserializer;
+        let mut deserializer = Deserializer::new();
+        let mut cursor = std::io::Cursor::new(bytes);
+        deserializer
+            .deserialize::<u64, _>(&mut cursor)
+            .ok()
+            .map(|inner| Self { inner })
+    }
+
     /// Export histogram statistics.
     pub fn stats(&self) -> HistogramStats {
         HistogramStats {
@@ -126,9 +156,7 @@ impl Default for LatencyHistogram {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Snapshot of histogram statistics.
+}/// Snapshot of histogram statistics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistogramStats {
     pub count: u64,
@@ -139,4 +167,63 @@ pub struct HistogramStats {
     pub p90: u64,
     pub p95: u64,
     pub p99: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v2_roundtrip_preserves_exact_statistics() {
+        let mut h = LatencyHistogram::new();
+        for ms in [1u64, 2, 3, 4, 5, 50, 100, 250] {
+            h.record_micros(ms * 1000);
+        }
+        let bytes = h.to_bytes();
+        assert!(!bytes.is_empty());
+
+        let h2 = LatencyHistogram::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(h.count(), h2.count());
+        assert_eq!(h.min(), h2.min());
+        assert_eq!(h.max(), h2.max());
+        assert!((h.mean() - h2.mean()).abs() < 1e-9);
+        assert_eq!(h.p50(), h2.p50());
+        assert_eq!(h.p90(), h2.p90());
+        assert_eq!(h.p95(), h2.p95());
+        assert_eq!(h.p99(), h2.p99());
+    }
+
+    #[test]
+    fn v2_corrupt_bytes_return_none() {
+        assert!(LatencyHistogram::from_bytes(b"garbage").is_none());
+        assert!(LatencyHistogram::from_bytes(&[]).is_none());
+    }
+
+    #[test]
+    fn merge_is_exact_sum_of_buckets() {
+        let mut a = LatencyHistogram::new();
+        let mut b = LatencyHistogram::new();
+        a.record_micros(1_000);
+        a.record_micros(2_000);
+        b.record_micros(50_000);
+        b.record_micros(100_000);
+
+        // Serialize, deserialize, merge — must equal recording all four.
+        let a2 = LatencyHistogram::from_bytes(&a.to_bytes()).unwrap();
+        let b2 = LatencyHistogram::from_bytes(&b.to_bytes()).unwrap();
+        let mut merged = a2;
+        merged.merge(&b2);
+
+        let mut direct = LatencyHistogram::new();
+        direct.record_micros(1_000);
+        direct.record_micros(2_000);
+        direct.record_micros(50_000);
+        direct.record_micros(100_000);
+
+        assert_eq!(merged.count(), 4);
+        assert_eq!(merged.count(), direct.count());
+        assert_eq!(merged.max(), direct.max());
+        assert_eq!(merged.p95(), direct.p95());
+        assert_eq!(merged.p99(), direct.p99());
+    }
 }

@@ -520,6 +520,15 @@ impl VUScheduler {
         // active_vus, which is still 0 at this point because VUs increment it
         // asynchronously inside their spawned tasks (the startup race that made
         // the old select! resolve immediately and drop the timeout branch).
+        //
+        // NOTE: each JoinHandle must be polled EXACTLY ONCE — tokio panics
+        // with "JoinHandle polled after completion" if a completed handle is
+        // re-polled. The old code joined here and then joined AGAIN in
+        // `await_handles_bounded`, which panicked the scenario task on every
+        // shared-iterations run. After this block the handles are dropped:
+        // drained VUs are already done, and in the max_duration branch the
+        // level-triggered stop flag plus the engine's active_vus drain loop
+        // let any stragglers exit on their own.
         if let Some(max_dur) = max_duration {
             let all_done = futures::future::join_all(handles.iter_mut());
             tokio::pin!(all_done);
@@ -541,13 +550,10 @@ impl VUScheduler {
                     self.wait_for_drain(grace).await;
                 }
             }
+        } else {
+            // No cap — join all VU handles directly (single join, no re-poll).
+            futures::future::join_all(handles.iter_mut()).await;
         }
-
-        // Wait for all JoinHandles (already completed if VUs drained naturally;
-        // otherwise stopped by request_stop above). Bounded — a VU ignoring
-        // force_stop cannot hang the final join forever.
-        Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND)
-            .await;
 
         tracing::info!("Shared iterations finished");
     }
@@ -850,7 +856,8 @@ impl VUScheduler {
 
         // max_duration is a CAP, not a mandatory wait.
         // Race the JOIN of all VU handles against the timeout (same startup-race
-        // fix as run_shared_iterations — see there).
+        // fix as run_shared_iterations — see there). Each JoinHandle is polled
+        // exactly once (re-polling a completed handle panics tokio).
         if let Some(max_dur) = max_duration {
             let all_done = futures::future::join_all(handles.iter_mut());
             tokio::pin!(all_done);
@@ -872,12 +879,10 @@ impl VUScheduler {
                     self.wait_for_drain(grace).await;
                 }
             }
+        } else {
+            // No cap — join all VU handles directly (single join, no re-poll).
+            futures::future::join_all(handles.iter_mut()).await;
         }
-
-        // Wait for all JoinHandles (already completed if VUs drained naturally).
-        // Bounded — a VU ignoring force_stop cannot hang the final join.
-        Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND)
-            .await;
 
         tracing::info!("Per-VU iterations finished");
     }

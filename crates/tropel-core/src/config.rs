@@ -129,6 +129,12 @@ pub struct JobConfig {
     /// that `execution_segment` is a consecutive pair of this sequence.
     #[serde(default, alias = "executionSegmentSequence")]
     pub execution_segment_sequence: Option<String>,
+    /// Set by `tropel-agent` when running as a distributed worker: the
+    /// controller owns the end-of-run summary (reporters, handleSummary,
+    /// summary-export), so the agent skips them and just ships its raw
+    /// snapshot back for central merging.
+    #[serde(default, alias = "distributedWorker")]
+    pub distributed_worker: bool,
 }
 
 /// How to execute the load test.
@@ -529,6 +535,7 @@ impl Default for JobConfig {
             execution_explicit: false,
             execution_segment: None,
             execution_segment_sequence: None,
+            distributed_worker: false,
         }
     }
 }

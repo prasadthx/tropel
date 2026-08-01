@@ -76,20 +76,77 @@ pub struct RequestDetail {
 }
 
 /// URL detail.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Postman may export a request URL as either the structured object form
+/// (`{"raw": "https://…", "host": […], …}`) or as a plain string
+/// (`"https://…"`). The custom `Deserialize` accepts both — without it,
+/// string-form URLs fail to parse, the untagged `CollectionItem` silently
+/// falls through to `FolderItem`, and the request is dropped entirely.
+#[derive(Debug, Clone, Serialize)]
 pub struct UrlDetail {
     pub raw: Option<String>,
     pub protocol: Option<String>,
-    #[serde(default)]
     pub host: Vec<String>,
     pub port: Option<String>,
-    #[serde(default)]
     pub path: Vec<String>,
-    #[serde(default)]
     pub query: Vec<QueryParam>,
-    #[serde(default)]
     pub variable: Vec<UrlVariable>,
     pub hash: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for UrlDetail {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Match either the structured object or a bare URL string.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum UrlForm {
+            Raw(String),
+            Object(UrlDetailFields),
+        }
+
+        #[derive(Deserialize)]
+        struct UrlDetailFields {
+            raw: Option<String>,
+            protocol: Option<String>,
+            #[serde(default)]
+            host: Vec<String>,
+            port: Option<String>,
+            #[serde(default)]
+            path: Vec<String>,
+            #[serde(default)]
+            query: Vec<QueryParam>,
+            #[serde(default)]
+            variable: Vec<UrlVariable>,
+            hash: Option<String>,
+        }
+
+        let form = UrlForm::deserialize(deserializer)?;
+        Ok(match form {
+            UrlForm::Raw(raw) => UrlDetail {
+                raw: Some(raw),
+                protocol: None,
+                host: Vec::new(),
+                port: None,
+                path: Vec::new(),
+                query: Vec::new(),
+                variable: Vec::new(),
+                hash: None,
+            },
+            UrlForm::Object(fields) => UrlDetail {
+                raw: fields.raw,
+                protocol: fields.protocol,
+                host: fields.host,
+                port: fields.port,
+                path: fields.path,
+                query: fields.query,
+                variable: fields.variable,
+                hash: fields.hash,
+            },
+        })
+    }
 }
 
 /// URL query parameter.

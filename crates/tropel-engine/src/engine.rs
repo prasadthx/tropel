@@ -426,21 +426,37 @@ impl Engine {
             .set_summary_config(summary_trend_stats, thresholds.clone())
             .await;
 
+        // Raw snapshot FIRST (build_results mem::takes the summary config,
+        // so the snapshot must be captured before results() drains it).
+        // Distributed agents ship this to a controller for lossless merge;
+        // single-node runs never consume it, so skip the serialize cost.
+        let snapshot = if config.distributed_worker {
+            metrics.snapshot().await
+        } else {
+            tropel_metrics::collector::MetricsSnapshot::default()
+        };
         let results = metrics.results().await;
-        let reporters = self.create_reporters(&config.output);
-        for reporter in &reporters {
-            reporter.report(&results).await?;
-        }
 
-        // k6 `handleSummary(data)`: let the script emit custom summaries
-        // (JSON/HTML/JUnit). Runs after the run with the aggregated data;
-        // returned files are written (`stdout` prints). Falls back to
-        // `--summary-export` when the script declares no handleSummary.
-        self.emit_handle_summary(config, &registry, &results, &thresholds, test_start)
-            .await;
+        // Distributed workers (`tropel-agent`) skip ALL end-of-run output —
+        // the controller owns the summary, handleSummary, and reporters —
+        // and only ship their raw snapshot back for central merging.
+        if !config.distributed_worker {
+            let reporters = self.create_reporters(&config.output);
+            for reporter in &reporters {
+                reporter.report(&results).await?;
+            }
+
+            // k6 `handleSummary(data)`: let the script emit custom summaries
+            // (JSON/HTML/JUnit). Runs after the run with the aggregated data;
+            // returned files are written (`stdout` prints). Falls back to
+            // `--summary-export` when the script declares no handleSummary.
+            self.emit_handle_summary(config, &registry, &results, &thresholds, test_start)
+                .await;
+        }
 
         Ok(EngineResult {
             metrics: results,
+            snapshot,
             // The effective threshold set — CLI/config thresholds merged with
             // any script-declared (k6 options) thresholds. The CLI reports
             // against THIS set so k6 SLOs appear in the end-of-run summary,
@@ -702,6 +718,10 @@ fn spawn_extension_output(
 #[derive(Debug)]
 pub struct EngineResult {
     pub metrics: tropel_metrics::collector::MetricsResult,
+    /// Raw serializable snapshot of the aggregated series (hdr-histogram V2
+    /// bytes for Trend metrics). Distributed agents ship this to a
+    /// controller; single-node runs can ignore it.
+    pub snapshot: tropel_metrics::collector::MetricsSnapshot,
     /// The thresholds actually applied to the run: the job's own thresholds
     /// merged with any script-declared thresholds (e.g. from a k6
     /// `export const options`). Consumers should report/evaluate against this

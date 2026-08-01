@@ -1,0 +1,28 @@
+[package]
+name = "tropel-distributed"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "tropel-controller"
+path = "src/bin/controller.rs"
+
+[[bin]]
+name = "tropel-agent"
+path = "src/bin/agent.rs"
+
+[dependencies]
+tropel-core.workspace = true
+tropel-engine.workspace = true
+tropel-ext.workspace = true
+tropel-metrics.workspace = true
+tropel-report.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
