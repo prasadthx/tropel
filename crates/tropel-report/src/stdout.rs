@@ -143,6 +143,62 @@ impl Reporter for StdoutReporter {
             }
         }
 
+        // Per-URL breakdown — the collector merges all http_req_duration
+        // series per distinct `url` tag into exact per-URL summaries stored
+        // in the dedicated `result.per_url` field (kept out of `metrics` so
+        // threshold evaluation can't double-count). One row per URL with true
+        // merged percentiles.
+        if result.per_url.len() > 1 {
+            println!("\n  Per-URL (http_req_duration):");
+            for m in &result.per_url {
+                let url = m.tags.iter().find(|(k, _)| k == "url").map(|(_, v)| v.as_str());
+                let url = url.unwrap_or(&m.key);
+                println!("    {}  (reqs: {})", url, m.count);
+                Self::render_trend("  ", m, &stats);
+            }
+        }
+
+        // Per-group breakdown — series carrying a `group` tag. The runner
+        // tags every request `group=http` by default, so exclude that
+        // constant (the headline already covers overall HTTP); named groups
+        // from `group()`/`pm.group` produce the meaningful rows.
+        let grouped_series: Vec<&MetricSummary> = result
+            .metrics
+            .iter()
+            .filter(|m| m.tags.iter().any(|(k, v)| k == "group" && v != "http"))
+            .collect();
+        if !grouped_series.is_empty() {
+            println!("\n  Per-group breakdown:");
+            for m in &grouped_series {
+                let group = m
+                    .tags
+                    .iter()
+                    .find(|(k, _)| k == "group")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or("");
+                let metric = m.key.split('{').next().unwrap_or("");
+                print!("    {}", metric);
+                match m.metric_type {
+                    tropel_metrics::collector::MetricType::Rate => {
+                        println!("  [group={}]  rate: {:.4}", group, m.rate);
+                    }
+                    tropel_metrics::collector::MetricType::Counter => {
+                        println!("  [group={}]  total: {:.0}", group, m.sum);
+                    }
+                    tropel_metrics::collector::MetricType::Gauge => {
+                        println!(
+                            "  [group={}]  last: {:.0}  min: {}  max: {}",
+                            group, m.last, m.min, m.max
+                        );
+                    }
+                    tropel_metrics::collector::MetricType::Trend => {
+                        println!("  [group={}]", group);
+                        Self::render_trend("      ", m, &stats);
+                    }
+                }
+            }
+        }
+
         // Thresholds — pass/fail against the effective threshold set.
         if !result.effective_thresholds.is_empty() {
             println!("\n  Thresholds:");

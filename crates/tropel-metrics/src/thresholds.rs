@@ -392,6 +392,7 @@ mod tests {
             checks_failed: 5,
             http_req_duration: Some(MetricSummary {
                 key: "http_req_duration".into(),
+                tags: vec![],
                 metric_type: MetricType::Trend,
                 count: 100,
                 sum: 50000.0,
@@ -457,6 +458,7 @@ mod tests {
         let mut metrics = MetricsResult::default();
         metrics.metrics.push(MetricSummary {
             key: "http_req_duration{status=200}".into(),
+            tags: vec![("status".into(), "200".into())],
             metric_type: MetricType::Trend,
             count: 80,
             sum: 32000.0,
@@ -472,6 +474,7 @@ mod tests {
         });
         metrics.metrics.push(MetricSummary {
             key: "http_req_duration{status=500}".into(),
+            tags: vec![("status".into(), "500".into())],
             metric_type: MetricType::Trend,
             count: 10,
             sum: 15000.0,

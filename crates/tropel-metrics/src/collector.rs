@@ -484,6 +484,8 @@ impl Aggregator {
     }
 
     fn build_results(&mut self) -> MetricsResult {
+        use std::collections::btree_map::Entry;
+
         let mut metrics = Vec::new();
         let mut http_reqs: u64 = 0;
         let mut http_req_duration: Option<MetricSummary> = None;
@@ -502,14 +504,25 @@ impl Aggregator {
 
         // Merge all http_req_duration* histograms into one for the headline value
         let mut merged_http_dur: Option<MetricSet> = None;
+        // Exact per-URL merge: one MetricSet per distinct `url` (or `name`)
+        // tag, so reporters can show true per-URL percentiles instead of
+        // approximating from a single series.
+        let mut merged_per_url: std::collections::BTreeMap<String, MetricSet> =
+            std::collections::BTreeMap::new();
 
         for (key, set) in self.data.iter() {
             let key_str = key.to_key_string();
+            let summary_tags: Vec<(String, String)> = key
+                .tags
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
 
             // Build type-appropriate summary
             let summary = match set.metric_type {
                 MetricType::Counter => MetricSummary {
                     key: key_str,
+                    tags: summary_tags.clone(),
                     metric_type: MetricType::Counter,
                     count: set.count as u64,
                     sum: set.sum,
@@ -525,6 +538,7 @@ impl Aggregator {
                 },
                 MetricType::Rate => MetricSummary {
                     key: key_str,
+                    tags: summary_tags.clone(),
                     metric_type: MetricType::Rate,
                     count: set.count as u64,
                     sum: set.sum,
@@ -540,6 +554,7 @@ impl Aggregator {
                 },
                 MetricType::Gauge => MetricSummary {
                     key: key_str,
+                    tags: summary_tags.clone(),
                     metric_type: MetricType::Gauge,
                     count: set.count as u64,
                     sum: set.sum,
@@ -565,6 +580,7 @@ impl Aggregator {
                     let stats = set.histogram.stats();
                     MetricSummary {
                         key: key_str,
+                        tags: summary_tags,
                         metric_type: MetricType::Trend,
                         count: set.count as u64,
                         sum: set.sum,
@@ -591,6 +607,25 @@ impl Aggregator {
                     }
                     None => {
                         merged_http_dur = Some(set.clone());
+                    }
+                }
+                // Exact per-URL merge (url tag, falling back to name).
+                if let Some(url) = key
+                    .tags
+                    .iter()
+                    .find(|(k, _)| k.as_ref() == "url" || k.as_ref() == "name")
+                    .map(|(_, v)| v.as_ref())
+                {
+                    match merged_per_url.entry(url.to_string()) {
+                        Entry::Occupied(mut e) => {
+                            let merged = e.get_mut();
+                            merged.histogram.merge(&set.histogram);
+                            merged.count += set.count;
+                            merged.sum += set.sum;
+                        }
+                        Entry::Vacant(v) => {
+                            v.insert(set.clone());
+                        }
                     }
                 }
             } else if key.metric.starts_with("http_reqs") {
@@ -644,11 +679,37 @@ impl Aggregator {
             metrics.push(summary);
         }
 
+        // Build exact per-URL http_req_duration summaries (merged histograms)
+        // so reporters can show a true per-URL breakdown. Kept in the
+        // dedicated `per_url` field (NOT `metrics`) so threshold evaluation
+        // never double-counts samples that also exist as raw series.
+        let mut per_url = Vec::with_capacity(merged_per_url.len());
+        for (url, merged) in merged_per_url {
+            let stats = merged.histogram.stats();
+            per_url.push(MetricSummary {
+                key: format!("http_req_duration{{url={}}}", url),
+                tags: vec![("url".to_string(), url)],
+                metric_type: MetricType::Trend,
+                count: merged.count as u64,
+                sum: merged.sum,
+                mean: merged.mean(),
+                min: stats.min,
+                max: stats.max,
+                p50: stats.p50,
+                p90: stats.p90,
+                p95: stats.p95,
+                p99: stats.p99,
+                last: 0.0,
+                rate: 0.0,
+            });
+        }
+
         // Build headline iteration_duration from merged histogram
         if let Some(ref merged) = merged_iter_dur {
             let stats = merged.histogram.stats();
             iteration_duration = Some(MetricSummary {
                 key: "iteration_duration".to_string(),
+                tags: vec![],
                 metric_type: MetricType::Trend,
                 count: merged.count as u64,
                 sum: merged.sum,
@@ -669,6 +730,7 @@ impl Aggregator {
             let stats = merged.histogram.stats();
             http_req_duration = Some(MetricSummary {
                 key: "http_req_duration".to_string(),
+                tags: vec![],
                 metric_type: MetricType::Trend,
                 count: merged.count as u64,
                 sum: merged.sum,
@@ -700,6 +762,7 @@ impl Aggregator {
 
         MetricsResult {
             metrics,
+            per_url,
             checks_total,
             checks_passed,
             checks_failed,
@@ -732,6 +795,11 @@ impl Aggregator {
 #[derive(Debug, Clone)]
 pub struct MetricSummary {
     pub key: String,
+    /// The (key, value) tag pairs that distinguish this series (e.g.
+    /// `url`, `status`, `group`, `name`). Populated from the MetricKey so
+    /// reporters can build per-URL / per-group breakdowns without parsing
+    /// the key string.
+    pub tags: Vec<(String, String)>,
     /// The type of this metric — determines which fields are meaningful.
     pub metric_type: MetricType,
     /// Sample count (Counter: events added; Rate: events; Trend: samples; Gauge: samples).
@@ -762,6 +830,12 @@ pub struct MetricSummary {
 #[derive(Debug, Clone)]
 pub struct MetricsResult {
     pub metrics: Vec<MetricSummary>,
+    /// Exact per-URL http_req_duration summaries (histograms merged per
+    /// distinct `url` tag). Kept OUT of `metrics` so threshold evaluation
+    /// (which iterates `metrics`) can't double-count the same samples that
+    /// already exist as raw per-(url,method,status) series. Reporters render
+    /// these for the per-URL breakdown.
+    pub per_url: Vec<MetricSummary>,
     pub checks_total: u64,
     pub checks_passed: u64,
     pub checks_failed: u64,
@@ -795,6 +869,7 @@ impl Default for MetricsResult {
     fn default() -> Self {
         Self {
             metrics: vec![],
+            per_url: vec![],
             checks_total: 0,
             checks_passed: 0,
             checks_failed: 0,
