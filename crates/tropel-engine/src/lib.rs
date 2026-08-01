@@ -4,6 +4,7 @@
 
 pub mod builtins;
 pub mod cli;
+pub mod config_file;
 pub mod engine;
 pub mod worker;
 pub use engine::*;
