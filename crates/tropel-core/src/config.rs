@@ -304,6 +304,14 @@ pub struct OutputConfig {
     /// When set, samples are exported to the collector as OTLP metrics.
     #[serde(default)]
     pub otlp_endpoint: Option<String>,
+    /// Path for the `--summary-export` JSON export (k6 semantics).
+    ///
+    /// When the script declares a `handleSummary(data)` function (k6), the
+    /// script's returned file map governs output and this is ignored unless
+    /// the script also prints to `stdout`; otherwise the aggregated summary
+    /// data object is written here as JSON.
+    #[serde(default)]
+    pub summary_export: Option<String>,
 }
 
 impl Default for OutputConfig {
@@ -315,6 +323,7 @@ impl Default for OutputConfig {
             trends: true,
             prometheus_remote_write_url: None,
             otlp_endpoint: None,
+            summary_export: None,
         }
     }
 }

@@ -191,6 +191,27 @@ pub trait Driver: Send + Sync {
     ) -> Option<DriverDeclaredOptions> {
         None
     }
+
+    /// Invoke the script's `handleSummary(data)` function (k6) after the run,
+    /// if the script declares one.
+    ///
+    /// `summary_data_json` is the k6-style summary data object (metrics,
+    /// thresholds, state) serialized as JSON. Returns a map of output
+    /// filename → content with k6 semantics: the `stdout` key prints to
+    /// stdout, every other key is written as a file. `None` means the script
+    /// has no `handleSummary` export (or the driver doesn't support it) — the
+    /// engine falls back to its default summary / `--summary-export`.
+    ///
+    /// The default implementation returns `None`.
+    async fn handle_summary(
+        &self,
+        _bytes: &[u8],
+        _source_path: Option<&std::path::Path>,
+        _summary_data_json: &str,
+        _env: &HashMap<String, String>,
+    ) -> Option<HashMap<String, String>> {
+        None
+    }
 }
 
 /// Load-profile options declared by a script itself (e.g. k6's

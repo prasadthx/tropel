@@ -155,6 +155,25 @@ impl Driver for K6Driver {
         };
         options.to_declared()
     }
+
+    async fn handle_summary(
+        &self,
+        bytes: &[u8],
+        source_path: Option<&Path>,
+        summary_data_json: &str,
+        env: &HashMap<String, String>,
+    ) -> Option<HashMap<String, String>> {
+        // Run the script's `export function handleSummary(data)` (k6) with
+        // the post-run summary data object. Returns a map of filename →
+        // content (the `stdout` key prints to stdout). Any failure (not a
+        // function, eval error, …) yields None → engine falls back to its
+        // default summary / --summary-export.
+        let original = std::str::from_utf8(bytes).ok()?;
+        let module_source = prepare_module_source(original, source_path).ok()?;
+        eval_module_handle_summary(&module_source, summary_data_json, env)
+            .await
+            .ok()?
+    }
 }
 
 // Register K6Driver for compile-time discovery.
@@ -605,6 +624,84 @@ async fn eval_module_export_json(
             Ok(None)
         }
     }
+}
+
+/// Evaluate an ES module, call its `handleSummary(data)` export with the
+/// given summary-data JSON, and return the script's output map
+/// (filename → content; `stdout` prints to stdout). Returns `Ok(None)` when
+/// the script declares no `handleSummary` export.
+async fn eval_module_handle_summary(
+    source: &str,
+    data_json: &str,
+    env: &HashMap<String, String>,
+) -> Result<Option<HashMap<String, String>>> {
+    let js_ctx = JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
+        .await
+        .map_err(|e| TropelError::Other(format!("JS context creation failed: {}", e)))?;
+
+    // Minimal globals a k6 script may reference while building its summary.
+    let _ = js_ctx.set_global_str("__VU", "0").await;
+    let _ = js_ctx.set_global_str("__ITER", "0").await;
+    let env_json = serde_json::to_value(env).unwrap_or_else(|_| serde_json::json!({}));
+    let _ = js_ctx.set_global_json("__ENV", &env_json).await;
+    let _ = js_ctx.set_global_json("__tropel_env", &env_json).await;
+
+    js_ctx.reset_interrupt();
+    match js_ctx.with_ctx(|ctx| call_module_handle_summary(ctx, source, data_json)) {
+        Ok(Some(map)) => Ok(Some(map)),
+        Ok(None) => Ok(None),
+        Err(e) => {
+            tracing::warn!("Failed to run k6 handleSummary: {}", e);
+            Ok(None)
+        }
+    }
+}
+
+/// Call `handleSummary(data)` inside the given context. The data object is
+/// parsed via the global `JSON.parse` so no lifetime-bound JS value escapes
+/// the `with_ctx` closure; the returned map is stringified and parsed here.
+fn call_module_handle_summary(
+    ctx: &rquickjs::Ctx,
+    source: &str,
+    data_json: &str,
+) -> std::result::Result<Option<HashMap<String, String>>, rquickjs::Error> {
+    let module = rquickjs::Module::declare(ctx.clone(), "k6-script", source)?;
+    let (module, promise) = module.eval()?;
+    promise.finish::<()>()?;
+
+    // Use the established `module.get::<_, Function>` pattern (see
+    // install_iteration_global): a missing export OR a non-function export
+    // both yield None, matching read_module_export_string's handling.
+    let func: rquickjs::Function = match module.get::<_, rquickjs::Function>("handleSummary") {
+        Ok(f) => f,
+        Err(_) => return Ok(None), // absent or not a function
+    };
+
+    let json_obj: rquickjs::Object = ctx.globals().get("JSON")?;
+    let parse: rquickjs::Function = json_obj.get("parse")?;
+    let data: rquickjs::Value = parse.call((data_json,))?;
+    let result: rquickjs::Value = func.call((data,))?;
+
+    if result.is_undefined() || result.is_null() {
+        return Ok(None);
+    }
+
+    let stringify: rquickjs::Function = json_obj.get("stringify")?;
+    let s: String = stringify.call((result,))?;
+    let parsed: serde_json::Value = serde_json::from_str(&s).unwrap_or_default();
+
+    // k6 allows handleSummary to return a single string (→ stdout) or an
+    // object map of filename → content.
+    if let Some(text) = parsed.as_str() {
+        return Ok(Some(HashMap::from([("stdout".to_string(), text.to_string())])));
+    }
+    let mut map = HashMap::new();
+    if let Some(obj) = parsed.as_object() {
+        for (k, v) in obj {
+            map.insert(k.clone(), v.as_str().unwrap_or_default().to_string());
+        }
+    }
+    Ok(Some(map))
 }
 
 /// Evaluate an ES module in the given context and JSON.stringify() the named

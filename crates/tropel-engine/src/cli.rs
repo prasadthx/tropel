@@ -81,6 +81,11 @@ pub enum Commands {
         #[arg(long = "otlp-endpoint")]
         otlp_endpoint: Option<String>,
 
+        /// k6-style summary export path: writes the aggregated summary data
+        /// object as JSON (when no script handleSummary overrides output)
+        #[arg(long = "summary-export")]
+        summary_export: Option<PathBuf>,
+
         /// Threshold expression (can be specified multiple times)
         #[arg(short = 't', long = "threshold")]
         threshold: Vec<String>,
@@ -232,6 +237,7 @@ async fn run_command(cli: Cli) -> Result<()> {
         iterations,
         prometheus_url,
         otlp_endpoint,
+        summary_export,
         subprocess_adapter,
         plugins_dir,
         ..
@@ -251,6 +257,7 @@ async fn run_command(cli: Cli) -> Result<()> {
     let output = output.clone();
     let prometheus_url = prometheus_url.clone();
     let otlp_endpoint = otlp_endpoint.clone();
+    let summary_export = summary_export.clone();
     let thresholds = threshold.clone();
     let insecure = *insecure;
     // `mode` is now optional so we can tell whether the user explicitly chose
@@ -409,6 +416,7 @@ async fn run_command(cli: Cli) -> Result<()> {
             output_file: output.map(|p| p.to_string_lossy().to_string()),
             prometheus_remote_write_url: prometheus_url,
             otlp_endpoint,
+            summary_export: summary_export.map(|p| p.to_string_lossy().to_string()),
             ..Default::default()
         },
         thresholds: threshold_map,
@@ -571,6 +579,9 @@ fn apply_overlay(
         }
         if config.output.otlp_endpoint.is_none() {
             config.output.otlp_endpoint = out.otlp_endpoint.clone();
+        }
+        if config.output.summary_export.is_none() {
+            config.output.summary_export = out.summary_export.clone();
         }
         // The CLI never sets summary/trends (both default false), so the
         // overlay's explicit values apply directly.

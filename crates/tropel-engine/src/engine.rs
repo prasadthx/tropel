@@ -19,7 +19,7 @@ use tropel_http::client::HttpClient;
 use tropel_http::AuthSigner;
 use tropel_metrics::collector::MetricsCollector;
 use tropel_metrics::thresholds::check_abort_on_fail;
-use tropel_report::{create_reporter, OtlpOutput, PrometheusRemoteWriteOutput, Reporter, StreamingStdoutOutput};
+use tropel_report::{create_reporter, InfluxdbOutput, JsonStreamOutput, OtlpOutput, PrometheusRemoteWriteOutput, Reporter, StatsdOutput, StreamingStdoutOutput};
 
 /// The engine orchestrates a complete load test job.
 pub struct Engine {
@@ -162,6 +162,24 @@ impl Engine {
         if let Some(endpoint) = &config.output.otlp_endpoint {
             let rx = sample_tx.subscribe();
             let handle = OtlpOutput::spawn(rx, endpoint.clone());
+            output_handles.push(handle);
+        }
+        // JSON-stream (NDJSON file) output.
+        if let Some(path) = &config.output.json_stream {
+            let rx = sample_tx.subscribe();
+            let handle = JsonStreamOutput::spawn(rx, path.clone());
+            output_handles.push(handle);
+        }
+        // StatsD / Datadog output (UDP datagrams).
+        if let Some(addr) = &config.output.statsd_addr {
+            let rx = sample_tx.subscribe();
+            let handle = StatsdOutput::spawn(rx, addr.clone());
+            output_handles.push(handle);
+        }
+        // InfluxDB output (line protocol over UDP).
+        if let Some(addr) = &config.output.influxdb_addr {
+            let rx = sample_tx.subscribe();
+            let handle = InfluxdbOutput::spawn(rx, addr.clone());
             output_handles.push(handle);
         }
         // Registered extension outputs: any configured reporter name that
@@ -372,6 +390,13 @@ impl Engine {
             reporter.report(&results).await?;
         }
 
+        // k6 `handleSummary(data)`: let the script emit custom summaries
+        // (JSON/HTML/JUnit). Runs after the run with the aggregated data;
+        // returned files are written (`stdout` prints). Falls back to
+        // `--summary-export` when the script declares no handleSummary.
+        self.emit_handle_summary(config, &registry, &results, &thresholds, test_start)
+            .await;
+
         Ok(EngineResult {
             metrics: results,
             // The effective threshold set — CLI/config thresholds merged with
@@ -416,6 +441,154 @@ impl Default for Engine {
     fn default() -> Self {
         Self::new(ExtensionRegistry::new())
     }
+}
+
+// ══════════════════════════════════════════════════════════════════
+// handleSummary(data) — script-emitted custom summaries
+// ══════════════════════════════════════════════════════════════════
+
+impl Engine {
+    /// Invoke the script's `handleSummary(data)` (k6) after the run and
+    /// write the returned files (`stdout` key prints to stdout). When the
+    /// script declares no handleSummary, honor `--summary-export` by
+    /// writing the default summary data object as JSON. Best-effort — a
+    /// failing script summary never fails the run.
+    async fn emit_handle_summary(
+        &self,
+        config: &JobConfig,
+        registry: &ExtensionRegistry,
+        results: &tropel_metrics::collector::MetricsResult,
+        thresholds: &HashMap<String, tropel_core::config::ThresholdConfig>,
+        test_start: Instant,
+    ) {
+        let summary_value = build_summary_data(results, thresholds, test_start);
+        let summary_json = serde_json::to_string(&summary_value).unwrap_or_default();
+
+        // Resolve a driver for the input (k6 scripts declare handleSummary).
+        // If no driver resolves (e.g. a Postman/HAR declarative collection),
+        // there is no script to call — fall through to --summary-export.
+        let input_path = std::path::Path::new(&config.input);
+        let bytes = std::fs::read(&config.input).ok();
+        let driver = bytes.as_ref().and_then(|b| {
+            if let Some(fmt) = &config.input_type {
+                registry.resolve_driver_by_id(fmt)
+            } else {
+                registry.resolve_driver(b)
+            }
+        });
+
+        let mut handled = false;
+        if let (Some(driver), Some(bytes)) = (driver, bytes.as_deref()) {
+            if let Some(files) = driver
+                .handle_summary(bytes, Some(input_path), &summary_json, &config.env)
+                .await
+            {
+                // k6 semantics: a script-defined handleSummary REPLACES the
+                // default summary entirely — even a stdout-only map suppresses
+                // the --summary-export fallback.
+                handled = true;
+                for (name, content) in files {
+                    if name == "stdout" {
+                        println!("{content}");
+                    } else if let Err(e) = std::fs::write(&name, content) {
+                        tracing::warn!("handleSummary failed to write '{name}': {e}");
+                    } else {
+                        tracing::info!("handleSummary wrote '{name}'");
+                    }
+                }
+            }
+        }
+
+        // Fallback: --summary-export writes the default JSON summary when no
+        // script handleSummary produced any output.
+        if !handled {
+            if let Some(path) = &config.output.summary_export {
+                let pretty = serde_json::to_string_pretty(&summary_value).unwrap_or_default();
+                if let Err(e) = std::fs::write(path, pretty) {
+                    tracing::warn!("Failed to write summary export to '{:?}': {}", path, e);
+                } else {
+                    tracing::info!("Summary exported to '{:?}'", path);
+                }
+            }
+        }
+    }
+}
+
+/// Build the k6-style summary data object (`handleSummary(data)` argument)
+/// from the aggregated results: per-metric values typed like k6 plus a
+/// top-level `thresholds` map (expression → pass/fail) and run state.
+fn build_summary_data(
+    results: &tropel_metrics::collector::MetricsResult,
+    thresholds: &HashMap<String, tropel_core::config::ThresholdConfig>,
+    test_start: Instant,
+) -> serde_json::Value {
+    use serde_json::{json, Map};
+    use tropel_metrics::collector::MetricType;
+    use tropel_metrics::thresholds::evaluate_thresholds;
+
+    let mut metrics = Map::new();
+    for m in &results.metrics {
+        let (typ, contains, values) = match m.metric_type {
+            MetricType::Counter => (
+                "counter",
+                "default",
+                json!({ "count": m.count }),
+            ),
+            MetricType::Gauge => (
+                "gauge",
+                "default",
+                json!({ "value": m.last, "min": m.min, "max": m.max, "avg": m.mean }),
+            ),
+            MetricType::Rate => (
+                "rate",
+                "default",
+                json!({ "rate": m.rate, "count": m.count }),
+            ),
+            MetricType::Trend => (
+                "trend",
+                "time",
+                json!({
+                    "avg": m.mean,
+                    "min": m.min,
+                    "med": m.p50,
+                    "max": m.max,
+                    "p(90)": m.p90,
+                    "p(95)": m.p95,
+                    "p(99)": m.p99,
+                    "count": m.count,
+                }),
+            ),
+        };
+        metrics.insert(
+            m.key.clone(),
+            json!({
+                "type": typ,
+                "contains": contains,
+                "values": values,
+            }),
+        );
+    }
+
+    let mut thresholds_map = Map::new();
+    for t in evaluate_thresholds(thresholds, results) {
+        thresholds_map.insert(t.expression.clone(), json!(t.passed));
+    }
+
+    json!({
+        "metrics": metrics,
+        "root_group": { "name": "", "path": "", "id": "", "groups": [], "checks": [] },
+        "options": {},
+        "thresholds": thresholds_map,
+        "state": {
+            "testRunDurationMs": test_start.elapsed().as_millis() as u64,
+            "iterations": results.iterations,
+            "vusMax": results.vus_max,
+            "http_reqs": results.http_reqs,
+            "checksTotal": results.checks_total,
+            "checksPassed": results.checks_passed,
+            "checksFailed": results.checks_failed,
+        },
+    })
 }
 
 // ══════════════════════════════════════════════════════════════════
