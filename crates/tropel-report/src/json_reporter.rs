@@ -16,15 +16,10 @@ impl JsonReporter {
             output_path: output_path.map(PathBuf::from),
         }
     }
-}
 
-#[async_trait]
-impl Reporter for JsonReporter {
-    fn name(&self) -> &str {
-        "json"
-    }
-
-    async fn report(&self, result: &MetricsResult) -> Result<()> {
+    /// Render the full report as a pretty-printed JSON string (no I/O).
+    /// Exposed for tests and programmatic consumers; `report()` writes it.
+    pub fn render(&self, result: &MetricsResult) -> Result<String> {
         let mut metrics_map = serde_json::Map::new();
 
         for metric in &result.metrics {
@@ -57,9 +52,20 @@ impl Reporter for JsonReporter {
             "data_sent": result.data_sent,
         });
 
-        let json_str = serde_json::to_string_pretty(&output).map_err(|e| {
+        serde_json::to_string_pretty(&output).map_err(|e| {
             tropel_core::TropelError::Report(format!("JSON serialization error: {}", e))
-        })?;
+        })
+    }
+}
+
+#[async_trait]
+impl Reporter for JsonReporter {
+    fn name(&self) -> &str {
+        "json"
+    }
+
+    async fn report(&self, result: &MetricsResult) -> Result<()> {
+        let json_str = self.render(result)?;
 
         if let Some(path) = &self.output_path {
             tokio::fs::write(path, &json_str)

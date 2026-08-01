@@ -507,4 +507,108 @@ mod tests {
         assert!(scenario.items[0].test.is_some());
         assert!(scenario.items[0].test.as_ref().unwrap().contains("pm.test"));
     }
+
+    #[test]
+    fn test_parse_folder_nesting() {
+        // A folder containing a request: the request must surface as a
+        // nested ScenarioItem, not be flattened or dropped.
+        let json = r#"{
+            "info": {"name": "Nested", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "item": [{
+                "name": "Folder",
+                "item": [{
+                    "name": "Inner Req",
+                    "request": {"method": "GET", "url": {"raw": "https://api.example.com/inner"}}
+                }]
+            }]
+        }"#;
+
+        let collection = parse_collection_str(json).unwrap();
+        let scenario = collection_to_scenario(collection, HashMap::new());
+        assert_eq!(scenario.items.len(), 1);
+        assert_eq!(scenario.items[0].name, "Folder");
+        assert_eq!(scenario.items[0].items.len(), 1);
+        let inner = &scenario.items[0].items[0];
+        assert_eq!(inner.name, "Inner Req");
+        let req = inner.request.as_ref().expect("inner request parsed");
+        assert_eq!(req.url, "https://api.example.com/inner");
+    }
+
+    #[test]
+    fn test_parse_query_params_and_raw_body() {
+        // Structured URL with query params + a raw JSON body + string-form
+        // URL variant must all survive the round-trip.
+        let json = r#"{
+            "info": {"name": "Full", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "item": [{
+                "name": "Create",
+                "request": {
+                    "method": "POST",
+                    "url": {
+                        "raw": "https://api.example.com/items",
+                        "host": ["api", "example", "com"],
+                        "path": ["items"],
+                        "query": [
+                            {"key": "page", "value": "2"},
+                            {"key": "per_page", "value": "50"}
+                        ]
+                    },
+                    "body": {
+                        "mode": "raw",
+                        "raw": "{\"name\":\"x\"}"
+                    }
+                }
+            }, {
+                "name": "StringUrl",
+                "request": {"method": "GET", "url": "https://api.example.com/str"}
+            }]
+        }"#;
+
+        let collection = parse_collection_str(json).unwrap();
+        let scenario = collection_to_scenario(collection, HashMap::new());
+        assert_eq!(scenario.items.len(), 2);
+
+        let create = scenario.items[0].request.as_ref().unwrap();
+        assert_eq!(create.url, "https://api.example.com/items");
+        assert_eq!(create.query_params.get("page").map(String::as_str), Some("2"));
+        assert_eq!(create.query_params.get("per_page").map(String::as_str), Some("50"));
+        assert!(matches!(create.body, Some(Body::Raw(ref s)) if s == "{\"name\":\"x\"}"));
+
+        // String-form URL: the custom UrlDetail deserializer handles it.
+        let str_req = scenario.items[1].request.as_ref().unwrap();
+        assert_eq!(str_req.url, "https://api.example.com/str");
+    }
+
+    #[test]
+    fn test_parse_urlencoded_body() {
+        let json = r#"{
+            "info": {"name": "Form", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "item": [{
+                "name": "Login",
+                "request": {
+                    "method": "POST",
+                    "url": {"raw": "https://api.example.com/login"},
+                    "body": {
+                        "mode": "urlencoded",
+                        "urlencoded": [
+                            {"key": "user", "value": "alice"},
+                            {"key": "pass", "value": "secret", "disabled": true}
+                        ]
+                    }
+                }
+            }]
+        }"#;
+
+        let collection = parse_collection_str(json).unwrap();
+        let scenario = collection_to_scenario(collection, HashMap::new());
+        let req = scenario.items[0].request.as_ref().unwrap();
+        match &req.body {
+            Some(Body::UrlEncoded(params)) => {
+                assert_eq!(params.len(), 1, "disabled param dropped");
+                assert_eq!(params.get("user").map(String::as_str), Some("alice"));
+                assert!(params.get("pass").is_none());
+            }
+            other => panic!("expected UrlEncoded body, got {:?}", other),
+        }
+    }
 }

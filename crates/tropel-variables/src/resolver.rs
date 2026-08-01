@@ -213,4 +213,75 @@ mod tests {
         let result = resolver.resolve_deep("https://{{host}}/v1", &scope, 5);
         assert_eq!(result, "https://api.example.com/v1");
     }
+
+    #[test]
+    fn test_collection_then_globals_priority() {
+        let resolver = VariableResolver::new();
+        let scope = VariableScope {
+            collection: HashMap::from([(
+                "key".into(),
+                serde_json::Value::String("col-value".into()),
+            )]),
+            globals: HashMap::from([(
+                "key".into(),
+                serde_json::Value::String("global-value".into()),
+            )]),
+            ..Default::default()
+        };
+
+        // env > data > collection > globals; with env absent, collection wins.
+        assert_eq!(resolver.resolve("{{key}}", &scope), "col-value");
+
+        // Collection value type is preserved through the value form.
+        let scope_num = VariableScope {
+            collection: HashMap::from([("n".into(), serde_json::json!(42))]),
+            ..Default::default()
+        };
+        assert_eq!(resolver.resolve("n={{n}}", &scope_num), "n=42");
+    }
+
+    #[test]
+    fn test_dynamic_guid_fresh_per_occurrence() {
+        // Regression: {{$guid}}-{{$guid}} once produced the SAME value both
+        // times (str::replace of a single resolved string). Each occurrence
+        // must be independently fresh.
+        let resolver = VariableResolver::new();
+        let scope = VariableScope::default();
+        // Delimiter is a comma — NOT a hyphen, because UUIDs themselves are
+        // hyphenated, so splitting on '-' would split inside the first UUID.
+        let result = resolver.resolve("{{$guid}},{{$guid}}", &scope);
+
+        let (first, second) = result.split_once(',').expect("comma separator present");
+        assert_eq!(first.len(), 36, "first is a UUID: {first}");
+        assert_eq!(second.len(), 36, "second is a UUID: {second}");
+        assert_ne!(first, second, "each occurrence is fresh");
+    }
+
+    #[test]
+    fn test_dynamic_timestamp_and_random_int() {
+        let resolver = VariableResolver::new();
+        let scope = VariableScope::default();
+
+        // {{$timestamp}} — 10-digit Unix seconds.
+        let ts = resolver.resolve("ts={{$timestamp}}", &scope);
+        let ts_val = ts.strip_prefix("ts=").unwrap();
+        assert_eq!(ts_val.len(), 10, "timestamp is 10 digits: {ts}");
+        let secs: u64 = ts_val.parse().unwrap();
+        assert!(secs > 1_700_000_000, "timestamp is recent: {ts}");
+
+        // {{$randomInt}} — fresh integer in [0, 1000) per occurrence.
+        for _ in 0..20 {
+            let ri = resolver.resolve("{{$randomInt}}", &scope);
+            let n: i64 = ri.parse().unwrap_or_else(|_| panic!("randomInt is numeric: {ri}"));
+            assert!((0..1000).contains(&n), "randomInt in range: {ri}");
+        }
+    }
+
+    #[test]
+    fn test_unresolved_variable_left_literal_in_deep() {
+        let resolver = VariableResolver::new();
+        let scope = VariableScope::default();
+        let result = resolver.resolve_deep("/api/{{missing}}/v1", &scope, 5);
+        assert_eq!(result, "/api/{{missing}}/v1");
+    }
 }

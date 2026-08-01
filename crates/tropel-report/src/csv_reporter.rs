@@ -15,15 +15,10 @@ impl CsvReporter {
             output_path: output_path.map(PathBuf::from),
         }
     }
-}
 
-#[async_trait]
-impl Reporter for CsvReporter {
-    fn name(&self) -> &str {
-        "csv"
-    }
-
-    async fn report(&self, result: &MetricsResult) -> Result<()> {
+    /// Render the full report as CSV text (no I/O). Exposed for tests and
+    /// programmatic consumers; `report()` writes it.
+    pub fn render(&self, result: &MetricsResult) -> String {
         let mut csv_output = String::from("key,count,sum,mean,min,max,p50,p90,p95,p99\n");
 
         for metric in &result.metrics {
@@ -41,6 +36,19 @@ impl Reporter for CsvReporter {
                 metric.p99
             ));
         }
+
+        csv_output
+    }
+}
+
+#[async_trait]
+impl Reporter for CsvReporter {
+    fn name(&self) -> &str {
+        "csv"
+    }
+
+    async fn report(&self, result: &MetricsResult) -> Result<()> {
+        let csv_output = self.render(result);
 
         if let Some(path) = &self.output_path {
             tokio::fs::write(path, &csv_output)
