@@ -22,6 +22,9 @@ tropel-core.workspace = true
 tropel-engine.workspace = true
 tropel-ext.workspace = true
 tropel-metrics.workspace = true
+# Reference extension: links its inventory-registered outputs (e.g.
+# "prometheus") into the binary so ExtensionRegistry can find them.
+tropel-x-prometheus.workspace = true
 clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true

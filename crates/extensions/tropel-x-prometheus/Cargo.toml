@@ -8,6 +8,10 @@ rust-version.workspace = true
 
 [dependencies]
 tropel-sdk = { workspace = true, features = ["unstable-output"] }
+tropel-report.workspace = true
 async-trait.workspace = true
-serde_json.workspace = true
-anyhow.workspace = true
+inventory.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

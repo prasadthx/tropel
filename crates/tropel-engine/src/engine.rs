@@ -14,7 +14,7 @@ use tropel_core::{Result, TropelError};
 use tropel_executor::runner::VURunner;
 use tropel_executor::scheduler::VUScheduler;
 use tropel_ext::registry::ExtensionRegistry;
-use tropel_ext::traits::{Driver, DriverHttpClient, VuContext};
+use tropel_ext::traits::{Driver, DriverHttpClient, Output, VuContext};
 use tropel_http::client::HttpClient;
 use tropel_http::AuthSigner;
 use tropel_metrics::collector::MetricsCollector;
@@ -137,15 +137,48 @@ impl Engine {
             output_handles.push(handle);
         }
         // Prometheus remote-write and OTLP outputs (streaming, best-effort).
+        // When the user drives prometheus through the extension output
+        // (`--reporter prometheus`), the extension handles it — skip the
+        // built-in path so samples are not pushed twice. Only skip when the
+        // extension output is actually registered: a custom binary built
+        // without tropel-x-prometheus must not silently lose its stream.
+        let prometheus_via_extension = config
+            .output
+            .reporters
+            .iter()
+            .any(|r| r == "prometheus")
+            && self
+                .extension_registry
+                .list_outputs()
+                .iter()
+                .any(|o| o == "prometheus");
         if let Some(url) = &config.output.prometheus_remote_write_url {
-            let rx = sample_tx.subscribe();
-            let handle = PrometheusRemoteWriteOutput::spawn(rx, url.clone());
-            output_handles.push(handle);
+            if !prometheus_via_extension {
+                let rx = sample_tx.subscribe();
+                let handle = PrometheusRemoteWriteOutput::spawn(rx, url.clone());
+                output_handles.push(handle);
+            }
         }
         if let Some(endpoint) = &config.output.otlp_endpoint {
             let rx = sample_tx.subscribe();
             let handle = OtlpOutput::spawn(rx, endpoint.clone());
             output_handles.push(handle);
+        }
+        // Registered extension outputs: any configured reporter name that
+        // resolves to an extension output (e.g. the `prometheus` reference
+        // extension) is driven from the sample stream — emit() per batch,
+        // flush() when the stream closes. This replaces the old
+        // "extension reporter not supported" dead end.
+        for name in &config.output.reporters {
+            if create_reporter(name).is_some() {
+                continue; // built-in reporters handled above / at the end
+            }
+            if let Some(mut ext) = self.extension_registry.get_output(name) {
+                ext.configure(&config.output);
+                let rx = sample_tx.subscribe();
+                let handle = spawn_extension_output(rx, ext);
+                output_handles.push(handle);
+            }
         }
         if output_handles.is_empty() {
             metrics.set_sample_sink(None);
@@ -354,9 +387,17 @@ impl Engine {
         for name in &config.reporters {
             if let Some(reporter) = create_reporter(name) {
                 reporters.push(reporter);
-            } else if let Some(_ext) = self.extension_registry.get_output(name) {
-                tracing::warn!(
-                    "Extension reporter '{}' not yet supported in engine runner",
+            } else if self
+                .extension_registry
+                .list_outputs()
+                .iter()
+                .any(|o| o == name)
+            {
+                // Extension outputs are driven from the sample stream during
+                // the run (see Engine::run) — they are not end-of-run
+                // reporters, so there is nothing to create here.
+                tracing::debug!(
+                    "Extension output '{}' driven as a streaming output",
                     name
                 );
             } else {
@@ -375,6 +416,68 @@ impl Default for Engine {
     fn default() -> Self {
         Self::new(ExtensionRegistry::new())
     }
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Extension output driver
+// ══════════════════════════════════════════════════════════════════
+
+/// Drive a registered extension output from the sample stream.
+///
+/// Subscribes to the metrics broadcast channel, batches samples, and calls
+/// the output's `emit()` every `FLUSH_INTERVAL` (or when the batch exceeds
+/// `MAX_BATCH`), then `flush()` once when the stream closes (test end).
+/// Best-effort: `emit`/`flush` failures are logged, never fatal.
+fn spawn_extension_output(
+    mut rx: broadcast::Receiver<Sample>,
+    output: Box<dyn Output>,
+) -> tokio::task::JoinHandle<()> {
+    const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+    const MAX_BATCH: usize = 10_000;
+
+    tokio::spawn(async move {
+        let mut batch: Vec<Sample> = Vec::with_capacity(1024);
+        let mut tick = tokio::time::interval(FLUSH_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                res = rx.recv() => match res {
+                    Ok(sample) => {
+                        batch.push(sample);
+                        if batch.len() >= MAX_BATCH {
+                            let b = std::mem::take(&mut batch);
+                            if let Err(e) = output.emit(&b).await {
+                                tracing::warn!("extension output '{}' emit failed: {e}", output.name());
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::trace!("extension output dropped {n} samples (consumer lag)");
+                    }
+                },
+                _ = tick.tick() => {
+                    if !batch.is_empty() {
+                        let b = std::mem::take(&mut batch);
+                        if let Err(e) = output.emit(&b).await {
+                            tracing::warn!("extension output '{}' emit failed: {e}", output.name());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Final flush on stream close.
+        if !batch.is_empty() {
+            if let Err(e) = output.emit(&batch).await {
+                tracing::warn!("extension output '{}' final emit failed: {e}", output.name());
+            }
+        }
+        if let Err(e) = output.flush().await {
+            tracing::warn!("extension output '{}' flush failed: {e}", output.name());
+        }
+    })
 }
 
 // ══════════════════════════════════════════════════════════════════

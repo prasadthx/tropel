@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tropel_core::config::{ExecutionConfig, ScenarioConfig, ThresholdConfig};
+use tropel_core::config::{ExecutionConfig, OutputConfig, ScenarioConfig, ThresholdConfig};
 use tropel_core::scenario::Scenario;
 use tropel_core::types::{Request, Response, Sample};
 use tropel_core::Result;
@@ -26,6 +26,13 @@ pub trait Output: Send + Sync {
     fn name(&self) -> &str;
     async fn emit(&self, batch: &[Sample]) -> Result<()>;
     async fn flush(&self) -> Result<()>;
+
+    /// Optional configuration pass before streaming begins.
+    ///
+    /// The engine calls this once after constructing the output, passing the
+    /// job's `OutputConfig` so outputs can pick up endpoints / credentials
+    /// (e.g. a Prometheus remote-write URL). Default is a no-op.
+    fn configure(&mut self, _config: &OutputConfig) {}
 }
 
 /// A new auth signer usable by protocols.
@@ -237,15 +244,29 @@ impl ProtocolRegistration {
 }
 
 /// Registration wrapper for outputs.
+/// Follows the same `fn` pointer pattern as `InputAdapterRegistration`
+/// for `const`-compatibility with `inventory::submit!`.
 pub struct OutputRegistration {
-    pub factory: Arc<dyn Fn() -> Box<dyn Output> + Send + Sync>,
+    pub id: &'static str,
+    pub create: fn() -> Box<dyn Output>,
+    /// Reserved for future dispatch priority; outputs are name-keyed so
+    /// this is currently informational.
+    pub priority: u8,
 }
 
 impl OutputRegistration {
-    pub fn new(factory: impl Fn() -> Box<dyn Output> + Send + Sync + 'static) -> Self {
+    pub const fn new(id: &'static str, create: fn() -> Box<dyn Output>) -> Self {
         Self {
-            factory: Arc::new(factory),
+            id,
+            create,
+            priority: 0,
         }
+    }
+
+    /// Builder-style priority setter (const, for `inventory::submit!`).
+    pub const fn with_priority(mut self, priority: u8) -> Self {
+        self.priority = priority;
+        self
     }
 }
 
@@ -345,3 +366,4 @@ impl DriverRegistration {
 // This must be in the crate that defines the type (`tropel-ext`).
 inventory::collect!(InputAdapterRegistration);
 inventory::collect!(DriverRegistration);
+inventory::collect!(OutputRegistration);

@@ -65,7 +65,7 @@
 //! | `Result<T>` / `TropelError` | ✅ Stable — error handling |
 //! | `Sample`, `SampleType`, `TagMap` | ✅ Stable — metric sample surface (tags use `Arc<str>` interning) |
 //! | `Protocol` trait | 🚧 Available but not yet wired into engine dispatch (`unstable-protocol`) |
-//! | `Output` trait | 🚧 Available but not yet wired into engine dispatch (`unstable-output`) |
+//! | `Output` trait | ✅ Wired — engine drives registered outputs from the sample stream (emit per batch, flush on close); see the `prometheus` reference extension (`unstable-output`) |
 //! | `Driver` / `DriverInstance` / `VuContext` | ✅ Stable — re-exported and used by the k6 driver (`tropel-input-k6`) |
 //! | `WASM` / `WIT` interface | ✅ Validated — see `wit/adapter.wit` in the crate root (resolves via `wit-parser`; a unit test keeps it from silently breaking). WASM plugins use the C ABI in `tropel-wasm`; the Component-Model runtime path is pending. |
 
@@ -75,7 +75,8 @@
 
 pub use tropel_core::scenario::{Scenario, ScenarioInfo, ScenarioItem};
 pub use tropel_core::config::{
-    ArrivalRateStage, ExecutionConfig, ScenarioConfig, Stage, ThinkTimeConfig, ThresholdConfig,
+    ArrivalRateStage, ExecutionConfig, HttpConfig, OutputConfig, ScenarioConfig, Stage,
+    ThinkTimeConfig, ThresholdConfig, TlsConfig,
 };
 pub use tropel_core::types::{
     ApiKeyLocation, AuthConfig, Body, CertificateConfig, Cookie, Method, Request, Response,

@@ -3611,6 +3611,7 @@ dependencies = [
  "tropel-engine",
  "tropel-ext",
  "tropel-metrics",
+ "tropel-x-prometheus",
 ]
 
 [[package]]
@@ -3992,9 +3993,11 @@ dependencies = [
 name = "tropel-x-prometheus"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
- "serde_json",
+ "inventory",
+ "tokio",
+ "tracing",
+ "tropel-report",
  "tropel-sdk",
 ]
 

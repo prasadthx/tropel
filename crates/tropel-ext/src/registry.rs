@@ -77,7 +77,7 @@ impl ExtensionRegistry {
 
     /// Get an output by name.
     pub fn get_output(&self, name: &str) -> Option<Box<dyn Output>> {
-        self.outputs.get(name).map(|r| (r.factory)())
+        self.outputs.get(name).map(|r| (r.create)())
     }
 
     /// Get a JS module by specifier.
@@ -184,6 +184,20 @@ impl ExtensionRegistry {
         }
         let driver_count = self.drivers.len();
         tracing::debug!("Collected {} driver(s) from inventory", driver_count);
+
+        tracing::debug!("Collecting inventory-registered outputs");
+        for registration in inventory::iter::<OutputRegistration> {
+            self.register_output(
+                registration.id,
+                OutputRegistration {
+                    id: registration.id,
+                    create: registration.create,
+                    priority: registration.priority,
+                },
+            );
+        }
+        let output_count = self.outputs.len();
+        tracing::debug!("Collected {} output(s) from inventory", output_count);
     }
 
     /// Resolve an input adapter from raw bytes using content detection.
