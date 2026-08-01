@@ -112,6 +112,9 @@ insta = "1.48.0"
 # that any current wit-parser accepts.
 wit-parser = "0.255.0"
 
+# Snappy compression (Prometheus remote-write)
+snap = "1.1.2"
+
 # Fast hash maps for tag sets
 rustc-hash = "2.1.3"
 

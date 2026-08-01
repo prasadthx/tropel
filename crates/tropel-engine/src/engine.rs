@@ -19,7 +19,7 @@ use tropel_http::client::HttpClient;
 use tropel_http::AuthSigner;
 use tropel_metrics::collector::MetricsCollector;
 use tropel_metrics::thresholds::check_abort_on_fail;
-use tropel_report::{create_reporter, Reporter, StreamingStdoutOutput};
+use tropel_report::{create_reporter, OtlpOutput, PrometheusRemoteWriteOutput, Reporter, StreamingStdoutOutput};
 
 /// The engine orchestrates a complete load test job.
 pub struct Engine {
@@ -107,6 +107,17 @@ impl Engine {
         if has_stdout {
             let rx = sample_tx.subscribe();
             let handle = StreamingStdoutOutput::spawn(rx);
+            output_handles.push(handle);
+        }
+        // Prometheus remote-write and OTLP outputs (streaming, best-effort).
+        if let Some(url) = &config.output.prometheus_remote_write_url {
+            let rx = sample_tx.subscribe();
+            let handle = PrometheusRemoteWriteOutput::spawn(rx, url.clone());
+            output_handles.push(handle);
+        }
+        if let Some(endpoint) = &config.output.otlp_endpoint {
+            let rx = sample_tx.subscribe();
+            let handle = OtlpOutput::spawn(rx, endpoint.clone());
             output_handles.push(handle);
         }
         if output_handles.is_empty() {

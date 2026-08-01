@@ -1,0 +1,574 @@
+//! # Prometheus remote-write streaming output
+//!
+//! Pushes samples to a Prometheus remote-write endpoint
+//! (e.g. `http://localhost:9090/api/v1/write`) as snappy-compressed
+//! protobuf `WriteRequest` batches during the load test.
+//!
+//! Samples are buffered per time series (metric name + sorted labels, with
+//! `__name__` carrying the metric name) and flushed every `FLUSH_INTERVAL`
+//! or when the buffer exceeds `MAX_BUFFERED_SAMPLES`. A final flush happens
+//! when the sample stream closes (test end).
+//!
+//! The wire format is the standard Prometheus remote-write protocol:
+//! `Content-Encoding: snappy` + `Content-Type: application/x-protobuf` with
+//! `X-Prometheus-Remote-Write-Version: 0.1.0`. The protobuf encoding for the
+//! three small messages (`WriteRequest`, `TimeSeries`, `Label`, `Sample`) is
+//! hand-rolled (no `prost`/`protobuf` dependency needed for such a tiny,
+//! stable schema) and covered by round-trip decode tests.
+
+use async_trait::async_trait;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, UNIX_EPOCH};
+use tokio::sync::broadcast;
+use tropel_core::types::Sample;
+use tropel_core::{Result, TropelError};
+
+use crate::Output;
+
+/// How often buffered samples are flushed to the endpoint.
+const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+/// Max buffered samples before a forced flush.
+const MAX_BUFFERED_SAMPLES: usize = 10_000;
+/// Remote-write URL path appended when the user gives only a base URL.
+const REMOTE_WRITE_PATH: &str = "/api/v1/write";
+
+/// Prometheus remote-write output.
+///
+/// Create one with [`PrometheusRemoteWriteOutput::new`] and either drive it
+/// through the [`Output`] trait or spawn the engine-facing consumer task
+/// with [`PrometheusRemoteWriteOutput::spawn`] (the pattern used by
+/// [`crate::StreamingStdoutOutput`]).
+pub struct PrometheusRemoteWriteOutput {
+    url: String,
+    client: reqwest::Client,
+    /// Buffered samples keyed by time series (metric + sorted labels).
+    series: Mutex<HashMap<SeriesKey, Vec<(f64, i64)>>>,
+    /// Total buffered sample count (fast read without taking the lock).
+    total_buffered: AtomicUsize,
+}
+
+/// A single time series identity: metric name plus sorted (name, value) labels.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SeriesKey {
+    metric: String,
+    /// Sorted label pairs (including `__name__` = metric as the first entry).
+    labels: Vec<(String, String)>,
+}
+
+impl SeriesKey {
+    fn from_sample(sample: &Sample) -> Self {
+        let mut labels: Vec<(String, String)> = sample
+            .tags
+            .iter()
+            .filter(|(k, _)| k != &"__name__") // avoid duplicate __name__ label
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        labels.sort();
+        labels.insert(0, ("__name__".to_string(), sample.metric.clone()));
+        Self {
+            metric: sample.metric.clone(),
+            labels,
+        }
+    }
+}
+
+impl PrometheusRemoteWriteOutput {
+    /// Create a new remote-write output pushing to `url`.
+    ///
+    /// The URL may be a full endpoint (`http://host:9090/api/v1/write`) or a
+    /// bare base — `/api/v1/write` is appended when missing.
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: normalize_remote_write_url(&url.into()),
+            client: reqwest::Client::new(),
+            series: Mutex::new(HashMap::new()),
+            total_buffered: AtomicUsize::new(0),
+        }
+    }
+
+    /// Spawn a consumer task that pushes samples to the endpoint.
+    ///
+    /// Subscribes to the metrics collector's broadcast stream, buffers
+    /// samples, flushes every `FLUSH_INTERVAL` (and when the buffer exceeds
+    /// `MAX_BUFFERED_SAMPLES`), and performs a final flush when the channel
+    /// closes (test end). Returns a `JoinHandle` that completes when the
+    /// sender is dropped.
+    pub fn spawn(mut rx: broadcast::Receiver<Sample>, url: String) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let output = PrometheusRemoteWriteOutput::new(url);
+            let mut tick = tokio::time::interval(FLUSH_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    res = rx.recv() => match res {
+                        Ok(sample) => {
+                            output.buffer(&sample);
+                            if output.total_buffered.load(Ordering::Relaxed) >= MAX_BUFFERED_SAMPLES {
+                                if let Err(e) = output.flush().await {
+                                    tracing::warn!("prometheus remote-write flush failed: {e}");
+                                }
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::trace!("prometheus output dropped {n} samples (consumer lag)");
+                        }
+                    },
+                    _ = tick.tick() => {
+                        if output.total_buffered.load(Ordering::Relaxed) > 0 {
+                            if let Err(e) = output.flush().await {
+                                tracing::warn!("prometheus remote-write flush failed: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Final flush on stream close.
+            if let Err(e) = output.flush().await {
+                tracing::warn!("prometheus remote-write final flush failed: {e}");
+            }
+        })
+    }
+
+    /// Buffer a sample into its time series.
+    fn buffer(&self, sample: &Sample) {
+        let mut series = self.series.lock().unwrap();
+        let key = SeriesKey::from_sample(sample);
+        let ts_ms = sample
+            .timestamp
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        series.entry(key).or_default().push((sample.value, ts_ms));
+        self.total_buffered.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Drain the buffer, encode a snappy-compressed `WriteRequest`, and POST
+    /// it to the remote-write endpoint. Non-2xx responses are logged, not
+    /// fatal (the run must not fail because a dashboard is down).
+    async fn flush(&self) -> Result<()> {
+        let series = {
+            let mut guard = self.series.lock().unwrap();
+            let taken = std::mem::take(&mut *guard);
+            // Reset the counter inside the lock so a concurrent `buffer()`
+            // cannot push a sample after `mem::take` but before the reset,
+            // leaving the map non-empty with the counter at 0 (the 5s tick's
+            // `> 0` check would then skip a flush until the next sample).
+            self.total_buffered.store(0, Ordering::Relaxed);
+            taken
+        };
+        if series.is_empty() {
+            return Ok(());
+        }
+
+        let payload = encode_write_request(&series);
+        let compressed = snap::raw::Encoder::new()
+            .compress_vec(&payload)
+            .map_err(|e| TropelError::Report(format!("snappy compress failed: {e}")))?;
+
+        let resp = self
+            .client
+            .post(&self.url)
+            .header("Content-Encoding", "snappy")
+            .header("Content-Type", "application/x-protobuf")
+            .header("X-Prometheus-Remote-Write-Version", "0.1.0")
+            .body(compressed)
+            .send()
+            .await
+            .map_err(|e| TropelError::Http(format!("remote-write POST failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!("remote-write rejected ({status}): {body}");
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Output for PrometheusRemoteWriteOutput {
+    fn name(&self) -> &str {
+        "prometheus-remote-write"
+    }
+
+    async fn sample(&self, samples: &[Sample]) -> Result<()> {
+        for sample in samples {
+            self.buffer(sample);
+        }
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<()> {
+        self.flush().await
+    }
+}
+
+/// Append `/api/v1/write` to a bare base URL.
+fn normalize_remote_write_url(url: &str) -> String {
+    let trimmed = url.trim_end_matches('/');
+    if trimmed.ends_with(REMOTE_WRITE_PATH) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}{REMOTE_WRITE_PATH}")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hand-rolled protobuf encoding (remote-write wire format)
+// ---------------------------------------------------------------------------
+
+/// Encode a `WriteRequest` message from buffered series.
+///
+/// Schema:
+/// ```protobuf
+/// message WriteRequest { repeated TimeSeries timeseries = 1; }
+/// message TimeSeries  { repeated Label labels = 1; repeated Sample samples = 2; }
+/// message Label       { string name = 1; string value = 2; }
+/// message Sample      { double value = 1; int64 timestamp = 2; } // ms
+/// ```
+fn encode_write_request(series: &HashMap<SeriesKey, Vec<(f64, i64)>>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (key, samples) in series {
+        let mut ts = Vec::new();
+        for (name, value) in &key.labels {
+            let mut label = Vec::new();
+            write_string_field(&mut label, 1, name);
+            write_string_field(&mut label, 2, value);
+            write_bytes_field(&mut ts, 1, &label);
+        }
+        for (value, ts_ms) in samples {
+            let mut sample = Vec::new();
+            write_double_field(&mut sample, 1, *value);
+            write_varint_field(&mut sample, 2, *ts_ms as u64);
+            write_bytes_field(&mut ts, 2, &sample);
+        }
+        write_bytes_field(&mut out, 1, &ts);
+    }
+    out
+}
+
+/// Write a base-128 varint.
+fn write_varint(buf: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        buf.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    buf.push(v as u8);
+}
+
+/// Write a field key: `(field_number << 3) | wire_type`.
+fn write_key(buf: &mut Vec<u8>, field: u32, wire_type: u8) {
+    write_varint(buf, ((field as u64) << 3) | wire_type as u64);
+}
+
+/// Write a length-delimited (wire type 2) field.
+fn write_bytes_field(buf: &mut Vec<u8>, field: u32, data: &[u8]) {
+    write_key(buf, field, 2);
+    write_varint(buf, data.len() as u64);
+    buf.extend_from_slice(data);
+}
+
+/// Write a string (length-delimited) field.
+fn write_string_field(buf: &mut Vec<u8>, field: u32, s: &str) {
+    write_bytes_field(buf, field, s.as_bytes());
+}
+
+/// Write a fixed64 (wire type 1) field — used for `double`.
+fn write_double_field(buf: &mut Vec<u8>, field: u32, v: f64) {
+    write_key(buf, field, 1);
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+/// Write a varint (wire type 0) field — used for `int64`.
+fn write_varint_field(buf: &mut Vec<u8>, field: u32, v: u64) {
+    write_key(buf, field, 0);
+    write_varint(buf, v);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+    use tropel_core::types::{Sample, SampleType, TagMap};
+
+    fn sample(metric: &str, value: f64, tags: TagMap) -> Sample {
+        Sample {
+            metric: metric.to_string(),
+            value,
+            tags,
+            timestamp: SystemTime::now(),
+            sample_type: SampleType::Point,
+        }
+    }
+
+    /// A minimal protobuf reader used only to validate the encoder output
+    /// (round-trip). Handles the three remote-write messages.
+    mod decode {
+        use super::*;
+        use std::collections::HashMap;
+
+        pub fn read_varint(buf: &[u8], pos: &mut usize) -> u64 {
+            let mut result = 0u64;
+            let mut shift = 0u32;
+            loop {
+                let byte = buf[*pos];
+                *pos += 1;
+                result |= ((byte & 0x7f) as u64) << shift;
+                if byte & 0x80 == 0 {
+                    return result;
+                }
+                shift += 7;
+            }
+        }
+
+        pub fn read_bytes(buf: &[u8], pos: &mut usize) -> Vec<u8> {
+            let len = read_varint(buf, pos) as usize;
+            let start = *pos;
+            *pos += len;
+            buf[start..start + len].to_vec()
+        }
+
+        #[derive(Debug, PartialEq)]
+        pub struct Label {
+            pub name: String,
+            pub value: String,
+        }
+
+        #[derive(Debug, PartialEq)]
+        pub struct DecodedSeries {
+            pub labels: Vec<Label>,
+            pub samples: Vec<(f64, i64)>,
+        }
+
+        fn parse_label(buf: &[u8]) -> Label {
+            let mut pos = 0usize;
+            let mut name = String::new();
+            let mut value = String::new();
+            while pos < buf.len() {
+                let key = read_varint(buf, &mut pos);
+                let field = key >> 3;
+                let wire = key & 0x7;
+                match (field, wire) {
+                    (1, 2) => name = String::from_utf8(read_bytes(buf, &mut pos)).unwrap(),
+                    (2, 2) => value = String::from_utf8(read_bytes(buf, &mut pos)).unwrap(),
+                    _ => panic!("unexpected label field {field}/{wire}"),
+                }
+            }
+            Label { name, value }
+        }
+
+        fn parse_sample(buf: &[u8]) -> (f64, i64) {
+            let mut pos = 0usize;
+            let mut value = 0.0f64;
+            let mut ts = 0i64;
+            while pos < buf.len() {
+                let key = read_varint(buf, &mut pos);
+                let field = key >> 3;
+                let wire = key & 0x7;
+                match (field, wire) {
+                    (1, 1) => {
+                        let start = pos;
+                        pos += 8;
+                        let mut arr = [0u8; 8];
+                        arr.copy_from_slice(&buf[start..start + 8]);
+                        value = f64::from_le_bytes(arr);
+                    }
+                    (2, 0) => ts = read_varint(buf, &mut pos) as i64,
+                    _ => panic!("unexpected sample field {field}/{wire}"),
+                }
+            }
+            (value, ts)
+        }
+
+        pub fn decode(buf: &[u8]) -> HashMap<Vec<(String, String)>, Vec<(f64, i64)>> {
+            let mut out = HashMap::new();
+            let mut pos = 0usize;
+            while pos < buf.len() {
+                let key = read_varint(buf, &mut pos);
+                assert_eq!(key >> 3, 1, "expected timeseries field");
+                assert_eq!(key & 0x7, 2, "expected length-delimited");
+                let ts_bytes = read_bytes(buf, &mut pos);
+                let mut tpos = 0usize;
+                let mut labels = Vec::new();
+                let mut samples = Vec::new();
+                while tpos < ts_bytes.len() {
+                    let tkey = read_varint(&ts_bytes, &mut tpos);
+                    let field = tkey >> 3;
+                    let wire = tkey & 0x7;
+                    match (field, wire) {
+                        (1, 2) => {
+                            let lb = parse_label(&read_bytes(&ts_bytes, &mut tpos));
+                            labels.push((lb.name, lb.value));
+                        }
+                        (2, 2) => samples.push(parse_sample(&read_bytes(&ts_bytes, &mut tpos))),
+                        _ => panic!("unexpected timeseries field {field}/{wire}"),
+                    }
+                }
+                out.insert(labels, samples);
+            }
+            out
+        }
+    }
+
+    #[test]
+    fn remote_write_roundtrip() {
+        let mut tags = TagMap::new();
+        tags.insert("status", "200");
+        tags.insert("method", "GET");
+
+        let s1 = sample("http_req_duration", 123.5, tags.clone());
+        let s2 = sample("http_req_duration", 200.0, tags.clone());
+        let s3 = sample("http_reqs", 1.0, TagMap::new());
+
+        let mut series: HashMap<SeriesKey, Vec<(f64, i64)>> = HashMap::new();
+        for s in [&s1, &s2, &s3] {
+            let key = SeriesKey::from_sample(s);
+            let ts = s.timestamp.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+            series.entry(key).or_default().push((s.value, ts));
+        }
+
+        let encoded = encode_write_request(&series);
+        let decoded = decode::decode(&encoded);
+
+        assert_eq!(decoded.len(), 2, "two distinct series expected");
+
+        // Verify the http_req_duration series (labels sorted, __name__ first).
+        let mut found_dur = None;
+        for (labels, samples) in &decoded {
+            let map: HashMap<&str, &str> = labels
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            if map.get("__name__") == Some(&"http_req_duration") {
+                assert_eq!(map.get("status"), Some(&"200"));
+                assert_eq!(map.get("method"), Some(&"GET"));
+                assert_eq!(samples.len(), 2);
+                // values preserved exactly
+                let mut vals: Vec<f64> = samples.iter().map(|(v, _)| *v).collect();
+                vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                assert_eq!(vals, vec![123.5, 200.0]);
+                found_dur = Some(());
+            }
+        }
+        assert!(found_dur.is_some(), "http_req_duration series missing");
+
+        // Verify http_reqs has just __name__.
+        for (labels, samples) in &decoded {
+            if labels.iter().any(|(k, _)| k == "http_reqs") {
+                assert_eq!(labels.len(), 1);
+                assert_eq!(samples.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn snappy_roundtrip() {
+        let mut tags = TagMap::new();
+        tags.insert("status", "200");
+        let s = sample("http_req_duration", 42.0, tags);
+        let mut series = HashMap::new();
+        let key = SeriesKey::from_sample(&s);
+        series.insert(key, vec![(42.0, 1000)]);
+
+        let encoded = encode_write_request(&series);
+        let compressed = snap::raw::Encoder::new().compress_vec(&encoded).unwrap();
+        let decompressed = snap::raw::Decoder::new().decompress_vec(&compressed).unwrap();
+        assert_eq!(encoded, decompressed);
+    }
+
+    #[test]
+    fn url_normalization() {
+        assert_eq!(
+            normalize_remote_write_url("http://localhost:9090"),
+            "http://localhost:9090/api/v1/write"
+        );
+        assert_eq!(
+            normalize_remote_write_url("http://localhost:9090/"),
+            "http://localhost:9090/api/v1/write"
+        );
+        assert_eq!(
+            normalize_remote_write_url("http://host:9090/api/v1/write"),
+            "http://host:9090/api/v1/write"
+        );
+    }
+
+    /// End-to-end: buffer samples, flush to a live TCP server, and decode the
+    /// received snappy+protobuf payload.
+    #[tokio::test]
+    async fn flush_posts_to_endpoint() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Read the HTTP request head.
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = sock.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            // Extract Content-Length and read the body.
+            let head_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+            let content_length: usize = head
+                .lines()
+                .find_map(|l| {
+                    let l = l.trim();
+                    let lower = l.to_lowercase();
+                    lower.strip_prefix("content-length:").and_then(|v| v.trim().parse().ok())
+                })
+                .unwrap_or(0);
+            while buf.len() < head_end + content_length {
+                let n = sock.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let body = &buf[head_end..head_end + content_length];
+
+            // Echo the raw body back for the test to decode.
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/x-protobuf\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.write_all(body).await.unwrap();
+            sock.flush().await.unwrap();
+            body.to_vec()
+        });
+
+        let output = PrometheusRemoteWriteOutput::new(format!("http://{addr}"));
+        let s = sample("http_reqs", 1.0, TagMap::new());
+        output.sample(&[s]).await.unwrap();
+        output.stop().await.unwrap();
+
+        let received = server.await.unwrap();
+        assert!(!received.is_empty(), "server received nothing");
+        let decompressed = snap::raw::Decoder::new().decompress_vec(&received).unwrap();
+        let decoded = decode::decode(&decompressed);
+        assert!(!decoded.is_empty());
+        let series = decoded.values().next().unwrap();
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].0, 1.0);
+    }
+}

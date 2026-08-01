@@ -67,6 +67,14 @@ pub enum Commands {
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
 
+        /// Prometheus remote-write endpoint (e.g. http://localhost:9090)
+        #[arg(long = "prometheus-url")]
+        prometheus_url: Option<String>,
+
+        /// OTLP/HTTP collector endpoint (e.g. http://localhost:4318)
+        #[arg(long = "otlp-endpoint")]
+        otlp_endpoint: Option<String>,
+
         /// Threshold expression (can be specified multiple times)
         #[arg(short = 't', long = "threshold")]
         threshold: Vec<String>,
@@ -215,6 +223,8 @@ async fn run_command(cli: Cli) -> Result<()> {
         mode,
         stages,
         iterations,
+        prometheus_url,
+        otlp_endpoint,
         subprocess_adapter,
         plugins_dir,
         ..
@@ -232,6 +242,8 @@ async fn run_command(cli: Cli) -> Result<()> {
     let data_file = data_file.clone();
     let reporters = reporter.clone();
     let output = output.clone();
+    let prometheus_url = prometheus_url.clone();
+    let otlp_endpoint = otlp_endpoint.clone();
     let thresholds = threshold.clone();
     let insecure = *insecure;
     // `mode` is now optional so we can tell whether the user explicitly chose
@@ -380,6 +392,8 @@ async fn run_command(cli: Cli) -> Result<()> {
         output: OutputConfig {
             reporters: reporters.clone(),
             output_file: output.map(|p| p.to_string_lossy().to_string()),
+            prometheus_remote_write_url: prometheus_url,
+            otlp_endpoint,
             ..Default::default()
         },
         thresholds: threshold_map,

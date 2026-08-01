@@ -5,12 +5,16 @@
 
 pub mod csv_reporter;
 pub mod json_reporter;
+pub mod otlp;
 pub mod output;
+pub mod prometheus;
 pub mod stdout;
 
 pub use csv_reporter::*;
 pub use json_reporter::*;
+pub use otlp::*;
 pub use output::*;
+pub use prometheus::*;
 pub use stdout::*;
 
 use async_trait::async_trait;

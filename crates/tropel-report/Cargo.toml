@@ -16,3 +16,5 @@ tracing.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 chrono.workspace = true
+reqwest.workspace = true
+snap.workspace = true

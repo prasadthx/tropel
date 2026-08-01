@@ -281,6 +281,14 @@ pub struct OutputConfig {
     pub summary: bool,
     /// Whether to show trend statistics.
     pub trends: bool,
+    /// Prometheus remote-write endpoint (e.g. `http://localhost:9090`).
+    /// When set, samples are streamed to Prometheus via the remote-write API.
+    #[serde(default)]
+    pub prometheus_remote_write_url: Option<String>,
+    /// OTLP/HTTP collector endpoint (e.g. `http://localhost:4318`).
+    /// When set, samples are exported to the collector as OTLP metrics.
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
 }
 
 impl Default for OutputConfig {
@@ -290,6 +298,8 @@ impl Default for OutputConfig {
             output_file: None,
             summary: true,
             trends: true,
+            prometheus_remote_write_url: None,
+            otlp_endpoint: None,
         }
     }
 }
