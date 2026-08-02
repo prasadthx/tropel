@@ -151,6 +151,32 @@ pub enum Body {
     },
 }
 
+impl Body {
+    /// Number of bytes the encoded request body will occupy on the wire
+    /// (for the `data_sent` metric). UrlEncoded/FormData are counted as
+    /// `k=v&k=v` concatenation; JSON as its serialized length.
+    pub fn encoded_len(&self) -> usize {
+        match self {
+            Body::Raw(s) => s.len(),
+            Body::Json(v) => serde_json::to_string(v).map(|s| s.len()).unwrap_or(0),
+            Body::UrlEncoded(m) | Body::FormData(m) => {
+                let mut s = String::new();
+                for (k, v) in m {
+                    if !s.is_empty() {
+                        s.push('&');
+                    }
+                    s.push_str(k);
+                    s.push('=');
+                    s.push_str(v);
+                }
+                s.len()
+            }
+            Body::Binary(v) => v.len(),
+            Body::GraphQL { query, .. } => query.len(),
+        }
+    }
+}
+
 /// HTTP response with lazy body decoding.
 ///
 /// The body is stored as raw `Vec<u8>`. `body_text()` and `body_json()`

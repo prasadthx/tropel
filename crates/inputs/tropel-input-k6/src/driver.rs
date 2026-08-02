@@ -40,10 +40,10 @@ use regex::Regex;
 use rquickjs::function::Func;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 use tropel_js::JsContext;
-use tropel_sdk::{Body, Method, Request, TagMap};
+use tropel_sdk::{Body, Method, Request, Sample, SampleType, TagMap};
 use tropel_sdk::{Driver, DriverDeclaredOptions, DriverInstance, DriverRegistration, VuContext};
 use tropel_sdk::{Result, TropelError};
 
@@ -126,6 +126,7 @@ impl Driver for K6Driver {
             js_ctx,
             _source_path: source_path.map(|p| p.to_path_buf()),
             http_bridge_registered: false,
+            sample_sink: Arc::new(Mutex::new(Vec::new())),
         }))
     }
 
@@ -311,12 +312,108 @@ pub struct K6DriverInstance {
     /// registered. Registration happens on the first run_iteration() call
     /// because the HttpClient isn't available until init() completes.
     http_bridge_registered: bool,
+    /// Shared sink for samples recorded by the native HTTP bridge closures
+    /// (__tropel_k6_http_request / __tropel_k6_http_batch). The closures are
+    /// 'static and can't reach the VuContext, so they push into this buffer
+    /// and run_iteration() drains it into ctx.samples after each iteration.
+    sample_sink: Arc<Mutex<Vec<Sample>>>,
 }
 
 // Safety: each DriverInstance runs on its own VU thread (thread-per-core).
 // JsContext already has unsafe impl Send + Sync in tropel_js.
 unsafe impl Send for K6DriverInstance {}
 unsafe impl Sync for K6DriverInstance {}
+
+/// Build the standard http_req_* tag set (url/method/status/name/group).
+fn http_tags(req: &Request, status: &str) -> TagMap {
+    let mut tags = TagMap::with_capacity(5);
+    tags.insert("url", req.url.clone());
+    tags.insert("method", req.method.to_string());
+    tags.insert("status", status.to_string());
+    tags.insert("name", req.url.clone());
+    tags.insert("group", "http");
+    tags
+}
+
+/// Record the standard `http_req_*` samples for a completed request.
+///
+/// Mirrors the declarative runner's tag set and k6's default success
+/// semantics: a request is failed unless its status is in 2xx–3xx. `sent`
+/// is the request-body byte count (for `data_sent`).
+fn push_http_samples(
+    sink: &Mutex<Vec<Sample>>,
+    req: &Request,
+    status_code: u16,
+    duration: Duration,
+    size: u64,
+    sent: usize,
+) {
+    let now = SystemTime::now();
+    let tags = http_tags(req, &status_code.to_string());
+
+    let is_failed = !(200..400).contains(&status_code);
+    let mut v = sink.lock().unwrap();
+    v.push(Sample {
+        metric: "http_req_duration".into(),
+        value: duration.as_micros() as f64,
+        tags: tags.clone(),
+        timestamp: now,
+        sample_type: SampleType::Trend,
+    });
+    v.push(Sample {
+        metric: "http_reqs".into(),
+        value: 1.0,
+        tags: tags.clone(),
+        timestamp: now,
+        sample_type: SampleType::Counter,
+    });
+    v.push(Sample {
+        metric: "http_req_failed".into(),
+        value: if is_failed { 1.0 } else { 0.0 },
+        tags: tags.clone(),
+        timestamp: now,
+        sample_type: SampleType::Rate,
+    });
+    v.push(Sample {
+        metric: "data_received".into(),
+        value: size as f64,
+        tags: tags.clone(),
+        timestamp: now,
+        sample_type: SampleType::Counter,
+    });
+    v.push(Sample {
+        metric: "data_sent".into(),
+        value: sent as f64,
+        tags,
+        timestamp: now,
+        sample_type: SampleType::Counter,
+    });
+}
+
+/// Record samples for a request that failed at the transport level (timeout,
+/// connection refused, …). Failed requests must still appear in the summary:
+/// `http_reqs` increments and `http_req_failed` (Rate) becomes 1.0 — matching
+/// the declarative runner's error branch and k6 semantics.
+fn push_http_failure(sink: &Mutex<Vec<Sample>>, req: &Request) {
+    let now = SystemTime::now();
+    let tags = http_tags(req, "0");
+
+    let mut v = sink.lock().unwrap();
+    v.push(Sample {
+        metric: "http_reqs".into(),
+        value: 1.0,
+        tags: tags.clone(),
+        timestamp: now,
+        sample_type: SampleType::Counter,
+    });
+    v.push(Sample {
+        metric: "http_req_failed".into(),
+        value: 1.0,
+        tags,
+        timestamp: now,
+        sample_type: SampleType::Rate,
+    });
+}
 
 #[async_trait]
 impl DriverInstance for K6DriverInstance {
@@ -363,6 +460,12 @@ impl DriverInstance for K6DriverInstance {
 
         let iter_dur = iter_start.elapsed();
 
+        // Drain samples recorded by the native HTTP bridge closures during
+        // this iteration (http_req_* etc.) into the VuContext for the
+        // engine's metrics pipeline.
+        let bridge_samples = std::mem::take(&mut *self.sample_sink.lock().unwrap());
+        ctx.samples.extend(bridge_samples);
+
         // Emit iteration_duration sample
         ctx.emit_sample(
             "iteration_duration",
@@ -393,6 +496,7 @@ impl K6DriverInstance {
         self.js_ctx.with_ctx(|rq_ctx| {
             let globals = rq_ctx.globals();
             let http_client_request = http_client.clone();
+            let sink = self.sample_sink.clone();
             let _ = globals.set(
                 "__tropel_k6_http_request",
                 Func::from(
@@ -425,12 +529,33 @@ impl K6DriverInstance {
                         // blocking helper — safe from inside ctx.with on a
                         // current-thread VU runtime. No block_on here: that
                         // deadlocks the VU's own reactor.
+                        // Clone the request into the 'static I/O future; the
+                        // original stays alive for sample-tag construction.
+                        let req_for_io = req.clone();
                         let http_for_io = http_client_request.clone();
                         let result = tropel_http::blocking::execute_blocking(async move {
-                            http_for_io.execute(&req).await
+                            http_for_io.execute(&req_for_io).await
                         });
                         match result {
                             Ok(resp) => {
+                                // Record the standard http_req_* samples so
+                                // the summary/thresholds see this request
+                                // (mirrors the declarative runner + WASM
+                                // driver). The req body is counted for
+                                // data_sent; k6 semantics: 2xx-3xx success.
+                                let sent = req
+                                    .body
+                                    .as_ref()
+                                    .map(Body::encoded_len)
+                                    .unwrap_or(0);
+                                push_http_samples(
+                                    &sink,
+                                    &req,
+                                    resp.status_code,
+                                    resp.response_time,
+                                    resp.size,
+                                    sent,
+                                );
                                 let body_text = String::from_utf8(resp.body).unwrap_or_default();
                                 serde_json::json!({
                                     "code": resp.status_code,
@@ -442,20 +567,25 @@ impl K6DriverInstance {
                                 })
                                 .to_string()
                             }
-                            Err(e) => serde_json::json!({
-                                "code": 0,
-                                "status": 0,
-                                "status_text": format!("HTTP error: {}", e),
-                                "body": "",
-                                "headers": {},
-                                "response_time": 0,
-                            })
-                            .to_string(),
+                            Err(e) => {
+                                tracing::debug!("k6 http request failed: {}", e);
+                                push_http_failure(&sink, &req);
+                                serde_json::json!({
+                                    "code": 0,
+                                    "status": 0,
+                                    "status_text": format!("HTTP error: {}", e),
+                                    "body": "",
+                                    "headers": {},
+                                    "response_time": 0,
+                                })
+                                .to_string()
+                            }
                         }
                     },
                 ),
             );
 
+            let batch_sink = self.sample_sink.clone();
             let _ = globals.set(
                 "__tropel_k6_http_batch",
                 Func::from(move |requests_json: String| -> String {
@@ -518,7 +648,7 @@ impl K6DriverInstance {
                         let http_client = http_for_io.clone();
                         async move {
                             let resp = http_client.execute(&req).await;
-                            (key, resp)
+                            (key, req, resp)
                         }
                     });
 
@@ -529,7 +659,7 @@ impl K6DriverInstance {
 
                     let mut response_map = serde_json::Map::new();
                     if let Ok(results) = responses {
-                        for (key, result) in results {
+                        for (key, req, result) in results {
                             let key_str = match key {
                                 serde_json::Value::String(s) => s,
                                 serde_json::Value::Number(n) => n.to_string(),
@@ -538,6 +668,22 @@ impl K6DriverInstance {
                             };
                             let entry_resp = match result {
                                 Ok(resp) => {
+                                    // Record the standard http_req_* samples
+                                    // for each batch request (mirrors the
+                                    // single-request bridge).
+                                    let sent = req
+                                        .body
+                                        .as_ref()
+                                        .map(Body::encoded_len)
+                                        .unwrap_or(0);
+                                    push_http_samples(
+                                        &batch_sink,
+                                        &req,
+                                        resp.status_code,
+                                        resp.response_time,
+                                        resp.size,
+                                        sent,
+                                    );
                                     let body_text = String::from_utf8(resp.body).unwrap_or_default();
                                     serde_json::json!({
                                         "code": resp.status_code,
@@ -548,14 +694,18 @@ impl K6DriverInstance {
                                         "response_time": resp.response_time.as_secs_f64() * 1000.0,
                                     })
                                 }
-                                Err(e) => serde_json::json!({
-                                    "code": 0,
-                                    "status": 0,
-                                    "status_text": format!("HTTP error: {}", e),
-                                    "body": "",
-                                    "headers": {},
-                                    "response_time": 0,
-                                }),
+                                Err(e) => {
+                                    tracing::debug!("k6 batch request failed: {}", e);
+                                    push_http_failure(&batch_sink, &req);
+                                    serde_json::json!({
+                                        "code": 0,
+                                        "status": 0,
+                                        "status_text": format!("HTTP error: {}", e),
+                                        "body": "",
+                                        "headers": {},
+                                        "response_time": 0,
+                                    })
+                                }
                             };
                             response_map.insert(key_str, entry_resp);
                         }

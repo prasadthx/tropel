@@ -76,6 +76,12 @@ impl VURunner {
             state.set_request_names(names);
             state.vu_id = vu_id;
             state.scenario_name = scenario_name.clone();
+            // Seed collection variables from the scenario (the Postman
+            // collection's top-level `variable` section lands in
+            // scenario.variables) so `{{var}}` references in URLs, headers,
+            // and bodies resolve. CLI env vars were already merged into
+            // scenario.variables by the engine before this point.
+            state.collection_vars.extend(scenario.variables.clone());
         }
         Self {
             scenario,

@@ -411,25 +411,7 @@ fn http_request_host(
         let data_sent = req
             .body
             .as_ref()
-            .map(|b| match b {
-                Body::Raw(s) => s.len(),
-                Body::Json(v) => serde_json::to_string(v).map(|s| s.len()).unwrap_or(0),
-                Body::UrlEncoded(m) | Body::FormData(m) => {
-                    // Count actual encoded bytes, not map entries.
-                    let mut s = String::new();
-                    for (k, v) in m {
-                        if !s.is_empty() {
-                            s.push('&');
-                        }
-                        s.push_str(k);
-                        s.push('=');
-                        s.push_str(v);
-                    }
-                    s.len()
-                }
-                Body::Binary(v) => v.len(),
-                Body::GraphQL { query, .. } => query.len(),
-            })
+            .map(Body::encoded_len)
             .unwrap_or(0) as f64;
 
         let samples = &mut caller.data_mut().samples;
