@@ -9,8 +9,6 @@ use std::path::PathBuf;
 use tokio::net::TcpListener;
 use tropel_core::config::JobConfig;
 use tropel_core::{Result, TropelError};
-use tropel_metrics::thresholds::evaluate_thresholds;
-use tropel_report::create_reporter;
 
 #[derive(Parser)]
 #[command(name = "tropel-controller", about = "Distributed load-test controller")]
@@ -43,33 +41,7 @@ async fn main() -> Result<()> {
 
     let result = tropel_distributed::run_controller(listener, &config, args.agents).await?;
 
-    // Report the merged result through the configured reporters.
-    let mut reporters = Vec::new();
-    for name in &config.output.reporters {
-        if let Some(r) = create_reporter(name) {
-            reporters.push(r);
-        } else {
-            tracing::warn!("Unknown reporter: {name}");
-        }
-    }
-    for reporter in &reporters {
-        reporter.report(&result).await?;
-    }
-
-    // Thresholds → exit code (mirrors the single-node CLI tail).
-    let threshold_results = evaluate_thresholds(&result.effective_thresholds, &result);
-    let mut any_failed = false;
-    for tr in &threshold_results {
-        if tr.passed {
-            tracing::info!("  ✓ Threshold '{}': {:.2} (PASS)", tr.name, tr.actual);
-        } else {
-            tracing::error!("  ✗ Threshold '{}': {:.2} (FAIL)", tr.name, tr.actual);
-            any_failed = true;
-        }
-    }
-    if any_failed {
-        Err(TropelError::Other("One or more thresholds failed".into()))
-    } else {
-        Ok(())
-    }
+    // Report through the configured reporters + evaluate thresholds
+    // (exit-code contract shared with `tropel-cloud-run`).
+    tropel_distributed::report_and_thresholds(&config, &result).await
 }
