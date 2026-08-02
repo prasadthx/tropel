@@ -74,11 +74,19 @@ impl HttpClient {
         } else {
             config.max_idle_connections
         };
+        // Global request timeout: configurable via `HttpConfig.request_timeout`
+        // (k6 `timeout`); falls back to the 10s engine default. A per-request
+        // `timeout` (Request.timeout) can still override it shorter.
+        let request_timeout = config
+            .request_timeout
+            .as_deref()
+            .and_then(|s| parse_duration(s).ok())
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT);
         let mut builder = reqwest::Client::builder()
             .cookie_store(true)
             .user_agent(&config.user_agent)
             .pool_max_idle_per_host(max_idle)
-            .timeout(DEFAULT_REQUEST_TIMEOUT);
+            .timeout(request_timeout);
 
         // ── TLS: insecure_skip_verify ──
         if tls.insecure_skip_verify {

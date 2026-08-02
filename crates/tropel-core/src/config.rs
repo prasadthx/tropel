@@ -454,6 +454,13 @@ pub struct HttpConfig {
     pub keep_alive: Option<String>,
     /// Timeout for idle connections.
     pub idle_connection_timeout: Option<String>,
+    /// Global per-request timeout (k6 `timeout`), e.g. `"30s"`. Applied as
+    /// the client-level ceiling for every request; a per-request `timeout`
+    /// overrides it with a shorter value. `None` (default) uses the engine
+    /// default of 10 seconds. Bounds how long a hung server can stall a VU
+    /// (which in turn bounds the engine's VU-drain loop).
+    #[serde(default, alias = "requestTimeout")]
+    pub request_timeout: Option<String>,
     /// Whether to enable HTTP/2.
     pub http2: bool,
     /// User-agent header value.
@@ -538,6 +545,7 @@ impl Default for HttpConfig {
             keep_alive: Some("30s".to_string()),
             // How long an idle connection is kept before being closed.
             idle_connection_timeout: Some("30s".to_string()),
+            request_timeout: None,
             http2: true,
             user_agent: "Tropel/0.1.0".to_string(),
             decompress: true,

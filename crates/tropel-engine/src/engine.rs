@@ -24,7 +24,7 @@ use tropel_core::scenario::Scenario;
 use tropel_core::types::{Request, Response, Sample, TagMap};
 use tropel_core::{Result, TropelError};
 use tropel_executor::runner::VURunner;
-use tropel_executor::scheduler::VUScheduler;
+use tropel_executor::scheduler::{VUScheduler, VuLease};
 use tropel_ext::registry::ExtensionRegistry;
 use tropel_ext::traits::{Driver, DriverHttpClient, Output, Protocol, VuContext};
 use tropel_http::client::HttpClient;
@@ -968,13 +968,15 @@ async fn run_scenario_vus(
         // blocking script `sleep()` (std::thread::sleep) never freezes a
         // co-located VU — there is no co-located VU.
         let handle = pool.spawn_vu(vu_id, async move {
-            sched.add_active_vu(1).await;
+            // Panic-safe lease: increments `active_vus` now and decrements on
+            // drop — even if the task panics mid-flight, the counter can't
+            // leak and the engine's drain loop can't hang forever.
+            let _lease = VuLease::acquire(&sched);
 
             let client = match HttpClient::with_tls_and_rps(&http_cfg, &tls_cfg, rps_vu) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!("VU {}: Failed to create HTTP client: {}", vu_id, e);
-                    sched.remove_active_vu(1).await;
                     return;
                 }
             };
@@ -1105,8 +1107,6 @@ async fn run_scenario_vus(
                     }
                 }
             }
-
-            sched.remove_active_vu(1).await;
         });
         handle
     }).await.ok();
@@ -1132,9 +1132,22 @@ async fn run_scenario_vus(
         }
     }
 
+    // Bound the drain: a panicked VU (leaked `active_vus`) or timeout-less I/O
+    // must not hang the run forever. Wait up to 30s for stragglers, then warn
+    // and proceed to shutdown. The panic-safe VuLease guard plus the global
+    // request timeout (HttpConfig.request_timeout) make the 30s bound a
+    // backstop rather than the expected path.
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let active = executor.active_vus().await;
         if active == 0 {
+            break;
+        }
+        if tokio::time::Instant::now() >= drain_deadline {
+            tracing::warn!(
+                "VU drain timed out after 30s ({} VU(s) still active) — proceeding to shutdown",
+                active
+            );
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1275,14 +1288,16 @@ async fn run_driver_vus(
         // run_scenario_vus for the rationale — blocking sleep() must never
         // freeze a co-located VU).
         let handle = pool.spawn_vu(vu_id, async move {
-            sched.add_active_vu(1).await;
+            // Panic-safe lease: increments `active_vus` now and decrements on
+            // drop — even if the task panics mid-flight, the counter can't
+            // leak and the engine's drain loop can't hang forever.
+            let _lease = VuLease::acquire(&sched);
 
             // Re-resolve driver from registry so each VU gets a fresh instance
             let driver = match registry.resolve_driver_by_id(&driver_id) {
                 Some(d) => d,
                 None => {
                     tracing::error!("VU {}: Driver '{}' not found in registry", vu_id, driver_id);
-                    sched.remove_active_vu(1).await;
                     return;
                 }
             };
@@ -1300,7 +1315,6 @@ async fn run_driver_vus(
                         driver_id,
                         e
                     );
-                    sched.remove_active_vu(1).await;
                     return;
                 }
             };
@@ -1309,7 +1323,6 @@ async fn run_driver_vus(
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!("VU {}: Failed to create HTTP client: {}", vu_id, e);
-                    sched.remove_active_vu(1).await;
                     return;
                 }
             };
@@ -1442,8 +1455,6 @@ async fn run_driver_vus(
                     }
                 }
             }
-
-            sched.remove_active_vu(1).await;
         });
         handle
     }).await.ok();
@@ -1469,9 +1480,22 @@ async fn run_driver_vus(
         }
     }
 
+    // Bound the drain: a panicked VU (leaked `active_vus`) or timeout-less I/O
+    // must not hang the run forever. Wait up to 30s for stragglers, then warn
+    // and proceed to shutdown. The panic-safe VuLease guard plus the global
+    // request timeout (HttpConfig.request_timeout) make the 30s bound a
+    // backstop rather than the expected path.
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let active = executor.active_vus().await;
         if active == 0 {
+            break;
+        }
+        if tokio::time::Instant::now() >= drain_deadline {
+            tracing::warn!(
+                "VU drain timed out after 30s ({} VU(s) still active) — proceeding to shutdown",
+                active
+            );
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

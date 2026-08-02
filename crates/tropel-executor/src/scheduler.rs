@@ -11,6 +11,38 @@ use tropel_core::Result;
 /// rather than hang the run forever.
 const HANDLE_JOIN_BOUND: Duration = Duration::from_secs(30);
 
+/// RAII lease that tracks a VU in the scheduler's `active_vus` counter.
+///
+/// Increments on `acquire` and decrements on drop — including when the VU
+/// task panics, which a bare `remove_active_vu().await` at the tail of the
+/// task (dropped mid-panic) cannot guarantee. Without this, a panicked VU
+/// leaks the counter and the engine's drain loop would spin forever.
+///
+/// The counter is a plain `Arc<AtomicU32>` so `Drop` is sync and
+/// lock-free — no `.await` allowed in `Drop`, and no panic can occur here.
+pub struct VuLease {
+    active_vus: Arc<AtomicU32>,
+}
+
+impl VuLease {
+    /// Create a lease, incrementing the active-VU counter.
+    pub fn acquire(sched: &VUScheduler) -> Self {
+        let active_vus = sched.active_vus_handle();
+        active_vus.fetch_add(1, Ordering::AcqRel);
+        Self { active_vus }
+    }
+}
+
+impl Drop for VuLease {
+    fn drop(&mut self) {
+        self.active_vus
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                Some(v.saturating_sub(1))
+            })
+            .ok();
+    }
+}
+
 /// Controls the lifecycle of VUs during a load test.
 pub struct VUScheduler {
     config: ExecutionConfig,
@@ -228,20 +260,6 @@ impl VUScheduler {
     /// Get active VU count.
     pub async fn active_vus(&self) -> u32 {
         self.active_vus.load(Ordering::Acquire)
-    }
-
-    /// Increment active VU count.
-    pub async fn add_active_vu(&self, delta: u32) {
-        self.active_vus.fetch_add(delta, Ordering::AcqRel);
-    }
-
-    /// Decrement active VU count.
-    pub async fn remove_active_vu(&self, delta: u32) {
-        self.active_vus
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                Some(v.saturating_sub(delta))
-            })
-            .ok();
     }
 
     /// Get total iterations completed.
