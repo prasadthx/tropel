@@ -4434,14 +4434,18 @@ name = "tropel-wasm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "inventory",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "thiserror",
+ "tokio",
  "tracing",
  "tropel-core",
  "tropel-ext",
+ "tropel-http",
  "wasmtime",
 ]
 

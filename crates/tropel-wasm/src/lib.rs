@@ -55,6 +55,16 @@
 //! - **Distinct I/O regions**: input and output buffers never alias (regression:
 //!   both used to land at the same fixed offset).
 
+//! ## Imperative driver
+//!
+//! Modules that export `adapter_run_iteration` (plus a `memory` export) can
+//! also be run as an imperative **driver** — the engine calls the export once
+//! per VU iteration with a JSON iteration context, and the module drives HTTP
+//! / sleep / custom metrics through host imports (`env.http_request`,
+//! `env.sleep`, `env.metric_add`). See [`driver`] for the ABI.
+
+pub mod driver;
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -72,22 +82,22 @@ use wasmtime::{
 // ══════════════════════════════════════════════════════════════════
 
 /// Default per-call WASM instruction budget (fuel units, 1 unit ≈ 1
-/// instruction). Generous enough for any real parse; an infinite loop burns
-/// through it in well under a second.
-const DEFAULT_CALL_FUEL: u64 = 500_000_000;
+/// instruction). Generous enough for any real parse/iteration; an infinite
+/// loop burns through it in well under a second.
+pub(crate) const DEFAULT_CALL_FUEL: u64 = 500_000_000;
 /// Maximum output buffer we hand to a plugin's `adapter_parse` (4 MiB).
-const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 /// Engine-wide maximum linear-memory size (256 pages = 16 MiB), matching the
 /// imported-memory clamp in [`clamp_memory_type`]. Enforced via
 /// `PoolingAllocationConfig::max_memory_size`, this applies to **exported**
 /// memories too: a module whose declared minimum exceeds it fails to
 /// instantiate, and any `memory.grow` beyond it fails at runtime — closing
 /// the gap where a cdylib-exported memory could previously grow toward 4 GiB.
-const MAX_MEMORY_BYTES: usize = 256 * 65536;
+pub(crate) const MAX_MEMORY_BYTES: usize = 256 * 65536;
 /// Fallback allocation region base (page 2). Only used when the module does
 /// not export `malloc`/`free`. Input and output are bump-allocated *after*
 /// this base so they never alias.
-const FALLBACK_BASE: usize = 131072;
+pub(crate) const FALLBACK_BASE: usize = 131072;
 
 pub fn create_wasm_engine() -> std::result::Result<Engine, anyhow::Error> {
     let mut config = Config::new();
@@ -122,6 +132,11 @@ static ENGINE: std::sync::OnceLock<Engine> = std::sync::OnceLock::new();
 
 fn global_engine() -> &'static Engine {
     ENGINE.get_or_init(|| create_wasm_engine().expect("Failed to create wasmtime engine"))
+}
+
+/// Shared wasmtime engine accessor for sibling modules (driver.rs).
+pub(crate) fn wasm_engine() -> &'static Engine {
+    global_engine()
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -180,7 +195,7 @@ fn build_link_strategy(engine: &Engine, module: &Module) -> anyhow::Result<LinkS
 /// a declared minimum above the cap fails to instantiate and any
 /// `memory.grow` past it fails. So exported memories are capped engine-wide;
 /// this clamp only normalizes the host-supplied memory type for imports.
-fn clamp_memory_type(mem_ty: MemoryType) -> MemoryType {
+pub(crate) fn clamp_memory_type(mem_ty: MemoryType) -> MemoryType {
     let max = mem_ty.maximum().map(|m| m.min(256) as u32).unwrap_or(256);
     let min = (mem_ty.minimum() as u32).min(max);
     MemoryType::new(min, Some(max))
@@ -231,76 +246,8 @@ impl WasmPlugin {
     /// The cache is reused on subsequent loads (no JIT) and is invalidated
     /// when the source `.wasm` is newer than the cache (mtime check).
     pub fn from_file(path: &Path) -> std::result::Result<Self, anyhow::Error> {
-        let wasm_bytes = std::fs::read(path)
-            .map_err(|e| anyhow::anyhow!("failed to read '{}': {}", path.display(), e))?;
-        let cache_path = path.with_extension("cwasm");
-        // Sidecar holds the SHA-256 of the SOURCE .wasm that produced the
-        // cache. A .cwasm whose sidecar hash doesn't match the current source
-        // is a foreign/tampered cache — we refuse to deserialize it (wasmtime's
-        // Module::deserialize is `unsafe` precisely because it trusts its
-        // input), and instead recompile from the trusted .wasm bytes.
-        let hash_path = path.with_extension("cwasm.sha256");
-        let engine = global_engine();
-
-        let cache_is_fresh = std::fs::metadata(&cache_path)
-            .and_then(|cache_md| {
-                std::fs::metadata(path).map(|src_md| {
-                    cache_md
-                        .modified()
-                        .is_ok_and(|cache_t| src_md.modified().is_ok_and(|src_t| cache_t >= src_t))
-                })
-            })
-            .unwrap_or(false);
-        // Cache is only trusted if it exists, is fresh, AND its sidecar hash
-        // equals the SHA-256 of the source bytes we're about to load.
-        let cache_matches_source = cache_is_fresh
-            && std::fs::read_to_string(&hash_path)
-                .map(|h| h.trim() == sha256_hex(&wasm_bytes))
-                .unwrap_or(false);
-
-        let module = if cache_matches_source {
-            let cached = std::fs::read(&cache_path)?;
-            // SAFETY: `cached` was verified to be produced from the exact
-            // source bytes (sidecar hash match) by the same engine version
-            // (wasmtime 47, fixed in Cargo.toml). If the cache is from an
-            // incompatible engine, deserialize fails and we fall through to
-            // recompiling below.
-            match unsafe { Module::deserialize(engine, &cached) } {
-                Ok(m) => m,
-                Err(_) => Self::aot_compile(engine, &wasm_bytes, &cache_path, &hash_path)?,
-            }
-        } else {
-            Self::aot_compile(engine, &wasm_bytes, &cache_path, &hash_path)?
-        };
-
+        let module = load_module_aot(path)?;
         Self::from_module(module)
-    }
-
-    /// Precompile wasm bytes, persist the `.cwasm` cache + its source-hash
-    /// sidecar, and load it.
-    fn aot_compile(
-        engine: &Engine,
-        wasm_bytes: &[u8],
-        cache_path: &Path,
-        hash_path: &Path,
-    ) -> std::result::Result<Module, anyhow::Error> {
-        let compiled = engine.precompile_module(wasm_bytes)?;
-        if let Err(e) = std::fs::write(cache_path, &compiled) {
-            tracing::warn!(
-                "Failed to write WASM AOT cache '{}': {}",
-                cache_path.display(),
-                e
-            );
-        } else if let Err(e) = std::fs::write(hash_path, sha256_hex(wasm_bytes)) {
-            tracing::warn!(
-                "Failed to write WASM cache hash '{}': {}",
-                hash_path.display(),
-                e
-            );
-        }
-        // SAFETY: `compiled` was just produced by `Engine::precompile_module`
-        // on this same engine.
-        Ok(unsafe { Module::deserialize(engine, &compiled) }?)
     }
 
     /// Create a store + instance, run a closure, return the result.
@@ -469,8 +416,84 @@ impl WasmPlugin {
     }
 }
 
+/// Load a `.wasm` module with the AOT `.cwasm` cache (see
+/// [`WasmPlugin::from_file`] for the cache-freshness + sidecar-hash rules).
+///
+/// Shared by the declarative adapters (`WasmPlugin::from_file`) and the
+/// imperative driver (`driver.rs`), so both get JIT-free reloads.
+pub(crate) fn load_module_aot(path: &Path) -> std::result::Result<Module, anyhow::Error> {
+    let wasm_bytes = std::fs::read(path)
+        .map_err(|e| anyhow::anyhow!("failed to read '{}': {}", path.display(), e))?;
+    let cache_path = path.with_extension("cwasm");
+    // Sidecar holds the SHA-256 of the SOURCE .wasm that produced the
+    // cache. A .cwasm whose sidecar hash doesn't match the current source
+    // is a foreign/tampered cache — we refuse to deserialize it (wasmtime's
+    // Module::deserialize is `unsafe` precisely because it trusts its
+    // input), and instead recompile from the trusted .wasm bytes.
+    let hash_path = path.with_extension("cwasm.sha256");
+    let engine = global_engine();
+
+    let cache_is_fresh = std::fs::metadata(&cache_path)
+        .and_then(|cache_md| {
+            std::fs::metadata(path).map(|src_md| {
+                cache_md
+                    .modified()
+                    .is_ok_and(|cache_t| src_md.modified().is_ok_and(|src_t| cache_t >= src_t))
+            })
+        })
+        .unwrap_or(false);
+    // Cache is only trusted if it exists, is fresh, AND its sidecar hash
+    // equals the SHA-256 of the source bytes we're about to load.
+    let cache_matches_source = cache_is_fresh
+        && std::fs::read_to_string(&hash_path)
+            .map(|h| h.trim() == sha256_hex(&wasm_bytes))
+            .unwrap_or(false);
+
+    if cache_matches_source {
+        let cached = std::fs::read(&cache_path)?;
+        // SAFETY: `cached` was verified to be produced from the exact
+        // source bytes (sidecar hash match) by the same engine version
+        // (wasmtime 47, fixed in Cargo.toml). If the cache is from an
+        // incompatible engine, deserialize fails and we fall through to
+        // recompiling below.
+        match unsafe { Module::deserialize(engine, &cached) } {
+            Ok(m) => Ok(m),
+            Err(_) => aot_compile(engine, &wasm_bytes, &cache_path, &hash_path),
+        }
+    } else {
+        aot_compile(engine, &wasm_bytes, &cache_path, &hash_path)
+    }
+}
+
+/// Precompile wasm bytes, persist the `.cwasm` cache + its source-hash
+/// sidecar, and load it (shared by adapters and the driver).
+pub(crate) fn aot_compile(
+    engine: &Engine,
+    wasm_bytes: &[u8],
+    cache_path: &Path,
+    hash_path: &Path,
+) -> std::result::Result<Module, anyhow::Error> {
+    let compiled = engine.precompile_module(wasm_bytes)?;
+    if let Err(e) = std::fs::write(cache_path, &compiled) {
+        tracing::warn!(
+            "Failed to write WASM AOT cache '{}': {}",
+            cache_path.display(),
+            e
+        );
+    } else if let Err(e) = std::fs::write(hash_path, sha256_hex(wasm_bytes)) {
+        tracing::warn!(
+            "Failed to write WASM cache hash '{}': {}",
+            hash_path.display(),
+            e
+        );
+    }
+    // SAFETY: `compiled` was just produced by `Engine::precompile_module`
+    // on this same engine.
+    Ok(unsafe { Module::deserialize(engine, &compiled) }?)
+}
+
 /// Hex-encode the SHA-256 digest of `bytes` (cache sidecar format).
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -486,7 +509,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 ///
 /// Scans the live memory region directly (no fixed-size buffer), so a long
 /// plugin id is never silently truncated.
-fn read_wasm_string(store: &Store<()>, memory: &Memory, ptr: i32) -> String {
+pub(crate) fn read_wasm_string(store: &Store<()>, memory: &Memory, ptr: i32) -> String {
     if ptr < 0 {
         return String::new();
     }
@@ -498,7 +521,7 @@ fn read_wasm_string(store: &Store<()>, memory: &Memory, ptr: i32) -> String {
 }
 
 /// Read a buffer from WASM memory.
-fn read_wasm_buffer(store: &Store<()>, memory: &Memory, ptr: usize, len: u32) -> String {
+pub(crate) fn read_wasm_buffer(store: &Store<()>, memory: &Memory, ptr: usize, len: u32) -> String {
     if len == 0 {
         return String::new();
     }

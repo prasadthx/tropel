@@ -10,6 +10,10 @@ description = "WASM plugin runtime for Tropel — loads and runs WebAssembly plu
 [dependencies]
 tropel-core.workspace = true
 tropel-ext.workspace = true
+tropel-http.workspace = true
+async-trait.workspace = true
+inventory.workspace = true
+tokio.workspace = true
 # wasmtime 47 (latest). We build only what the plugin runtime needs:
 # cranelift (JIT + precompile_module), wat (WAT text in tests),
 # pooling-allocator (PoolingAllocationConfig), runtime + std (core

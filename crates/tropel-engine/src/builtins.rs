@@ -26,7 +26,14 @@ pub fn link_builtins() -> usize {
         Box::new(tropel_input_openapi::OpenApiInputAdapter),
         Box::new(tropel_input_k6::K6ScriptAdapter),
     ];
-    let drivers: Vec<Box<dyn Driver>> = vec![Box::new(tropel_input_k6::driver::K6Driver)];
+    let drivers: Vec<Box<dyn Driver>> = vec![
+        Box::new(tropel_input_k6::driver::K6Driver),
+        // Force-link the imperative WASM driver so its inventory registration
+        // survives dead-stripping (tropel-wasm is also linked for
+        // discover_plugins, but the DriverRegistration static must be pulled
+        // into the binary for `tropel run plugin.wasm` to resolve).
+        Box::new(tropel_wasm::driver::WasmDriver),
+    ];
     // Force-link the protocol extensions so their `inventory::submit!`
     // registrations survive dead-stripping — this is what makes `grpc://` /
     // `grpcs://` and `ws://` / `wss://` URLs reachable through the VU
