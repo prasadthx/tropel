@@ -272,6 +272,19 @@ impl ExecutionSegment {
                 graceful_stop: graceful_stop.clone(),
                 think_time: think_time.clone(),
             },
+            ExecutionConfig::ExternallyControlled {
+                vus,
+                max_vus,
+                duration,
+                graceful_stop,
+                think_time,
+            } => ExecutionConfig::ExternallyControlled {
+                vus: self.scale_vus(*vus),
+                max_vus: self.scale_vus(*max_vus),
+                duration: duration.clone(),
+                graceful_stop: graceful_stop.clone(),
+                think_time: think_time.clone(),
+            },
         }
     }
 }

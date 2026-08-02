@@ -254,15 +254,11 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut buf = [0u8; 4096];
-            loop {
-                // Tolerate Err: when the client is dropped the pooled socket
-                // may close with RST (abortive close is common on Windows)
-                // instead of a clean FIN, so read() can error rather than
-                // return Ok(0). Either way the server task should just exit.
-                let n = match sock.read(&mut buf).await {
-                    Ok(n) => n,
-                    Err(_) => break,
-                };
+            // Tolerate Err: when the client is dropped the pooled socket may
+            // close with RST (abortive close is common on Windows) instead of
+            // a clean FIN, so read() can error rather than return Ok(0).
+            // Either way the server task should just exit.
+            while let Ok(n) = sock.read(&mut buf).await {
                 if n == 0 {
                     break;
                 }

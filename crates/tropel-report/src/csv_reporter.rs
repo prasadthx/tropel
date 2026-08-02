@@ -53,7 +53,7 @@ impl Reporter for CsvReporter {
         if let Some(path) = &self.output_path {
             tokio::fs::write(path, &csv_output)
                 .await
-                .map_err(|e| tropel_core::TropelError::Io(e))?;
+                .map_err(tropel_core::TropelError::Io)?;
         } else {
             // Print to stdout
             println!("{}", csv_output);

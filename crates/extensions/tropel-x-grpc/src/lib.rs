@@ -308,7 +308,7 @@ impl Protocol for GrpcProtocol {
                 fut.await
             };
             match result {
-                Ok(resp) => serde_json::to_value(&resp.into_inner())
+                Ok(resp) => serde_json::to_value(resp.into_inner())
                     .unwrap_or(serde_json::Value::Null),
                 Err(e) => {
                     status_override = Some(e.code());
@@ -523,7 +523,7 @@ fn list_services(pool: &DescriptorPool) -> String {
 
 /// Inventory factory — must be a `fn` pointer for `inventory::submit!`.
 fn grpc_factory() -> Box<dyn Protocol> {
-    Box::new(GrpcProtocol::default())
+    Box::new(GrpcProtocol)
 }
 
 inventory::submit!(ProtocolRegistration::new("grpc", grpc_factory));

@@ -188,7 +188,7 @@ async fn unary_roundtrip() {
     let pool = tropel_x_grpc::compile_proto(TEST_PROTO, None).unwrap();
     let addr = spawn_server(pool).await;
 
-    let proto = tropel_x_grpc::GrpcProtocol::default();
+    let proto = tropel_x_grpc::GrpcProtocol;
     let outcome = proto
         .execute(
             &make_req(format!("grpc://{addr}/test.Greeter/SayHello")),
@@ -219,7 +219,7 @@ async fn server_streaming_roundtrip() {
     let pool = tropel_x_grpc::compile_proto(TEST_PROTO, None).unwrap();
     let addr = spawn_server(pool).await;
 
-    let proto = tropel_x_grpc::GrpcProtocol::default();
+    let proto = tropel_x_grpc::GrpcProtocol;
     let outcome = proto
         .execute(
             &make_req(format!("grpc://{addr}/test.Greeter/StreamHello")),
@@ -247,7 +247,7 @@ async fn unknown_method_returns_error_status() {
     let pool = tropel_x_grpc::compile_proto(TEST_PROTO, None).unwrap();
     let addr = spawn_server(pool).await;
 
-    let proto = tropel_x_grpc::GrpcProtocol::default();
+    let proto = tropel_x_grpc::GrpcProtocol;
     // A method that does not exist in the proto → config error, no network call.
     let err = proto
         .execute(

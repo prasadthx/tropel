@@ -37,7 +37,11 @@ impl std::fmt::Display for Method {
 
 impl Method {
     /// Parse a method from a string (case-insensitive).
-    pub fn from_str(s: &str) -> Option<Self> {
+    ///
+    /// Named `parse` (not `from_str`) to avoid colliding with the standard
+    /// `FromStr::from_str` — this variant returns `Option`, not `Result`,
+    /// so it is deliberately NOT the trait impl.
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
             "GET" => Some(Method::GET),
             "HEAD" => Some(Method::HEAD),
@@ -456,15 +460,12 @@ pub struct Sample {
 
 /// Type of metric sample.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Default)]
 pub enum SampleType {
+    #[default]
     Point,
     Counter,
     Trend,
     Rate,
 }
 
-impl Default for SampleType {
-    fn default() -> Self {
-        Self::Point
-    }
-}

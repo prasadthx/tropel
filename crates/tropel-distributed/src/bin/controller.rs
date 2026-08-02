@@ -32,13 +32,13 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     let raw = std::fs::read_to_string(&args.config)
-        .map_err(|e| TropelError::Io(e))?;
+        .map_err(TropelError::Io)?;
     let config: JobConfig = serde_json::from_str(&raw)
         .map_err(|e| TropelError::Parse(format!("invalid job config: {e}")))?;
 
     let listener = TcpListener::bind(&args.listen)
         .await
-        .map_err(|e| TropelError::Io(e))?;
+        .map_err(TropelError::Io)?;
     tracing::info!("Controller listening on {}. Waiting for {} agent(s)...", args.listen, args.agents);
 
     let result = tropel_distributed::run_controller(listener, &config, args.agents).await?;

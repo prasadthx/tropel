@@ -267,10 +267,10 @@ impl WasmPlugin {
             // recompiling below.
             match unsafe { Module::deserialize(engine, &cached) } {
                 Ok(m) => m,
-                Err(_) => Self::aot_compile(&engine, &wasm_bytes, &cache_path, &hash_path)?,
+                Err(_) => Self::aot_compile(engine, &wasm_bytes, &cache_path, &hash_path)?,
             }
         } else {
-            Self::aot_compile(&engine, &wasm_bytes, &cache_path, &hash_path)?
+            Self::aot_compile(engine, &wasm_bytes, &cache_path, &hash_path)?
         };
 
         Self::from_module(module)
@@ -330,7 +330,7 @@ impl WasmPlugin {
             } => {
                 let memory = Memory::new(&mut store, mem_type.clone())?;
                 let mut linker = Linker::new(engine);
-                linker.define(&store, module, name, memory.clone())?;
+                linker.define(&store, module, name, memory)?;
                 linker.define_unknown_imports_as_traps(&self.module)?;
                 let instance = linker.instantiate(&mut store, &self.module)?;
                 (instance, memory)
@@ -602,7 +602,7 @@ fn convert_scenario(ws: WasmScenario) -> Result<Scenario> {
         },
         items,
         variables,
-        auth: ws.auth.as_ref().and_then(|a| convert_auth(a)),
+        auth: ws.auth.as_ref().and_then(convert_auth),
     })
 }
 
@@ -700,7 +700,7 @@ fn convert_request(wr: &WasmRequest) -> Request {
         headers: wr.headers.clone(),
         query_params: wr.query_params.clone(),
         body,
-        auth: wr.auth.as_ref().and_then(|a| convert_auth(a)),
+        auth: wr.auth.as_ref().and_then(convert_auth),
         certificate: None,
         follow_redirects: wr.follow_redirects,
         timeout: wr.timeout_ms.map(std::time::Duration::from_millis),

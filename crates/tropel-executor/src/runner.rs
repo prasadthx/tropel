@@ -22,19 +22,12 @@ pub struct IterationResult {
 
 /// Configuration for a VU runner.
 #[derive(Clone)]
+#[derive(Default)]
 pub struct RunnerConfig {
     pub max_iterations: Option<u64>,
     pub max_duration: Option<Duration>,
 }
 
-impl Default for RunnerConfig {
-    fn default() -> Self {
-        Self {
-            max_iterations: None,
-            max_duration: None,
-        }
-    }
-}
 
 /// Per-VU iteration runner with full HTTP/JS/PM integration.
 ///
@@ -137,7 +130,7 @@ impl VURunner {
     /// `exec.instance.vusActive()`, and `exec.instance.iterationsCompleted()`
     /// (a total across ALL VUs, not just this one).
     pub fn with_exec_context(
-        mut self,
+        self,
         executor_name: String,
         active_vus: Arc<AtomicU32>,
         global_iterations: Arc<AtomicU64>,

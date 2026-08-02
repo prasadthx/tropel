@@ -354,9 +354,7 @@ mod tests {
             }
             let head_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
             let body = buf[head_end..].to_vec();
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
-            );
+            let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK".to_string();
             sock.write_all(resp.as_bytes()).await.unwrap();
             sock.flush().await.unwrap();
             body

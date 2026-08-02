@@ -104,7 +104,28 @@ impl LatencyHistogram {
     /// Merge another histogram into this one.
     /// All recorded values from `other` are added to this histogram.
     pub fn merge(&mut self, other: &LatencyHistogram) {
-        self.inner.add(&other.inner).ok();
+        // Fast path: exact bucket add. Fails when `other` has a wider range
+        // than `self` and `self` cannot auto-resize (e.g. both sides came
+        // from a V2 serialization round-trip, which fixes the bounds).
+        if self.inner.add(&other.inner).is_ok() {
+            return;
+        }
+        // Fallback: rebuild a fresh auto-resizing histogram from the recorded
+        // bins of both sides. Lossless — HdrHistogram bin iteration yields the
+        // exact value and count at every populated bucket.
+        let mut merged = Histogram::<u64>::new(3)
+            .expect("Failed to create auto-resizing histogram");
+        for v in self.inner.iter_recorded() {
+            merged
+                .record_n(v.value_iterated_to(), v.count_at_value())
+                .ok();
+        }
+        for v in other.inner.iter_recorded() {
+            merged
+                .record_n(v.value_iterated_to(), v.count_at_value())
+                .ok();
+        }
+        self.inner = merged;
     }
 
     /// Serialize this histogram to the hdr-histogram V2 binary format.

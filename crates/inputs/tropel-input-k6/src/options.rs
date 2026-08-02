@@ -319,6 +319,13 @@ impl K6Scenario {
                 graceful_stop: self.graceful_stop.clone(),
                 think_time,
             }),
+            "externally-controlled" => Some(ExecutionConfig::ExternallyControlled {
+                vus: self.vus.unwrap_or(1),
+                max_vus: self.max_vus.unwrap_or(10),
+                duration: self.duration.clone(),
+                graceful_stop: self.graceful_stop.clone(),
+                think_time,
+            }),
             other => {
                 tracing::warn!("k6 scenario executor '{other}' is not supported — skipping");
                 None

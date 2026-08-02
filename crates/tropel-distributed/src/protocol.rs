@@ -79,7 +79,7 @@ pub async fn read_frame<R: tokio::io::AsyncRead + Unpin, T: serde::de::Deseriali
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
     /// Split a duplex stream into a writer and a reader half for the
     /// framing tests (TcpStream has no `pair()`; duplex is transport-less
@@ -111,7 +111,7 @@ mod tests {
     #[tokio::test]
     async fn frame_rejects_oversized() {
         // A frame declaring 600 MB must be rejected before allocating.
-        let (mut a, mut b) = split_duplex(1024 * 1024);
+        let (mut a, b) = split_duplex(1024 * 1024);
         let len = (600u32 * 1024 * 1024).to_be_bytes();
         a.write_all(&len).await.unwrap();
         let mut rx = b;

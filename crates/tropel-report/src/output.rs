@@ -51,6 +51,12 @@ pub trait Output: Send + Sync {
 /// ANSI clear-line, producing a live-updating status bar.
 pub struct StreamingStdoutOutput;
 
+impl Default for StreamingStdoutOutput {
+    fn default() -> Self {
+        Self
+    }
+}
+
 impl StreamingStdoutOutput {
     /// Create a new streaming stdout output instance.
     pub fn new() -> Self {
@@ -195,11 +201,10 @@ impl LiveState {
         };
 
         print!(
-            "\r\x1b[K  running ({:02}m{:02}.{:01}s), {} VUs, {} reqs ({} rps), {:.1} MB recv, p95={:.0}ms, max={:.0}ms, {:.1}% fail",
+            "\r\x1b[K  running ({:02}m{:02}.{:01}s), ? VUs, {} reqs ({} rps), {:.1} MB recv, p95={:.0}ms, max={:.0}ms, {:.1}% fail",
             mins,
             secs_remainder,
             (elapsed.subsec_millis() / 100),
-            "?",
             self.total_reqs,
             rolling_rps,
             self.total_data_received / 1_000_000.0,

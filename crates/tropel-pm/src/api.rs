@@ -194,7 +194,7 @@ impl PmApi {
 
     pub fn expect_body_contains(&self, name: &str, substring: &str) -> bool {
         let body = self.response_body();
-        let passed = body.map_or(false, |b| b.contains(substring));
+        let passed = body.is_some_and(|b| b.contains(substring));
         self.test(name, passed);
         passed
     }

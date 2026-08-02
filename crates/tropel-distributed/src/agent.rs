@@ -11,7 +11,7 @@ use tropel_ext::registry::ExtensionRegistry;
 pub async fn run_agent(controller_addr: &str) -> Result<()> {
     let mut stream = TcpStream::connect(controller_addr)
         .await
-        .map_err(|e| TropelError::Io(e))?;
+        .map_err(TropelError::Io)?;
     tracing::info!("Agent: connected to controller {controller_addr}");
 
     let assign: AssignMsg = read_frame(&mut stream).await?;

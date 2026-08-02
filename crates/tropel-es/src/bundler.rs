@@ -183,7 +183,7 @@ fn resolve_import(spec: &str, base_dir: &Path) -> Result<(PathBuf, String)> {
             let candidate = base_dir.join(format!("{}{}", spec, ext));
             if candidate.exists() {
                 let source = std::fs::read_to_string(&candidate)
-                    .map_err(|e| tropel_core::TropelError::Io(e))?;
+                    .map_err(tropel_core::TropelError::Io)?;
 
                 // Transpile if it's TypeScript
                 let js_source =
@@ -237,7 +237,7 @@ fn resolve_import(spec: &str, base_dir: &Path) -> Result<(PathBuf, String)> {
         let shim_path = project_root.join(shim_path);
         if shim_path.exists() {
             let source =
-                std::fs::read_to_string(&shim_path).map_err(|e| tropel_core::TropelError::Io(e))?;
+                std::fs::read_to_string(&shim_path).map_err(tropel_core::TropelError::Io)?;
             return Ok((shim_path, source));
         }
     }
@@ -248,7 +248,7 @@ fn resolve_import(spec: &str, base_dir: &Path) -> Result<(PathBuf, String)> {
     let index_candidate = node_modules_path.join("index.js");
     if index_candidate.exists() {
         let source = std::fs::read_to_string(&index_candidate)
-            .map_err(|e| tropel_core::TropelError::Io(e))?;
+            .map_err(tropel_core::TropelError::Io)?;
         return Ok((index_candidate, source));
     }
 
@@ -276,14 +276,14 @@ fn extract_string_literal(s: &str) -> std::result::Result<String, ()> {
 fn sanitize_module_name(path: &Path) -> String {
     path.file_stem()
         .and_then(|s| s.to_str())
-        .map(|s| s.replace('-', "_").replace('.', "_"))
+        .map(|s| s.replace(['-', '.'], "_"))
         .unwrap_or_else(|| "module".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    
 
     #[test]
     fn test_extract_imports_named() {

@@ -1,4 +1,16 @@
 use crate::worker::VUWorkerPool;
+
+/// One entry of the per-scenario config list threaded into `run_scenario_vus`.
+/// (name, execution, env, tags, start_delay, input_path, exec_name)
+type ScenarioConfigTuple = (
+    String,
+    ExecutionConfig,
+    HashMap<String, String>,
+    HashMap<String, String>,
+    Duration,
+    String,
+    Option<String>,
+);
 use async_trait::async_trait;
 use rand::RngExt;
 use std::collections::HashMap;
@@ -204,15 +216,7 @@ impl Engine {
         // k6 `export const options`) take precedence over the default profile
         // but not over explicit user config (execution_explicit check above).
         // Tuple: (name, execution, env, tags, start_delay, input_path).
-        let scenario_configs: Vec<(
-            String,
-            ExecutionConfig,
-            HashMap<String, String>,
-            HashMap<String, String>,
-            Duration,
-            String,
-            Option<String>,
-        )> = if let Some(scs) = declared_scenarios {
+        let scenario_configs: Vec<ScenarioConfigTuple> = if let Some(scs) = declared_scenarios {
             scs.iter()
                 .map(|(name, sc)| {
                     let start_delay = parse_duration_str(&sc.start_time).unwrap_or(Duration::ZERO);
@@ -284,15 +288,7 @@ impl Engine {
             },
             None => None,
         };
-        let scenario_configs: Vec<(
-            String,
-            ExecutionConfig,
-            HashMap<String, String>,
-            HashMap<String, String>,
-            Duration,
-            String,
-            Option<String>,
-        )> = scenario_configs
+        let scenario_configs: Vec<ScenarioConfigTuple> = scenario_configs
             .into_iter()
             .map(|(name, exec, env, tags, delay, input, exec_fn)| {
                 let exec = match &segment {
@@ -326,9 +322,9 @@ impl Engine {
             let thresholds = thresholds.clone();
             let data_rows = data_rows.clone();
             let base_env = config.env.clone();
-            let test_start = test_start;
             let registry_sc = registry.clone();
             let fmt_hint = format_hint.clone();
+            let control_port = config.control_port;
 
             let handle = tokio::spawn(async move {
                 let resolved = resolve_input_or_driver(
@@ -380,6 +376,7 @@ impl Engine {
                             test_start,
                             grpc_protocol,
                             ws_protocol,
+                            control_port,
                         )
                         .await;
                     }
@@ -402,6 +399,7 @@ impl Engine {
                             test_start,
                             &input_path,
                             registry_sc,
+                            control_port,
                         )
                         .await;
                     }
@@ -433,7 +431,7 @@ impl Engine {
         // Apply summary presentation config (trend stats + effective
         // thresholds) to the collector so reporters see them.
         let summary_trend_stats = declared_trend_stats
-            .unwrap_or_else(|| tropel_metrics::collector::k6_default_trend_stats());
+            .unwrap_or_else(tropel_metrics::collector::k6_default_trend_stats);
         metrics
             .set_summary_config(summary_trend_stats, thresholds.clone())
             .await;
@@ -821,7 +819,7 @@ fn resolve_input_or_driver(
 // ══════════════════════════════════════════════════════════════════
 // Scenario VU runner
 // ══════════════════════════════════════════════════════════════════
-
+#[allow(clippy::too_many_arguments)]
 async fn run_scenario_vus(
     sc_name: String,
     start_delay: Duration,
@@ -839,6 +837,7 @@ async fn run_scenario_vus(
     test_start: Instant,
     grpc_protocol: Option<Arc<dyn Protocol>>,
     ws_protocol: Option<Arc<dyn Protocol>>,
+    control_port: Option<u16>,
 ) {
     if start_delay > Duration::ZERO {
         tokio::time::sleep(start_delay).await;
@@ -854,6 +853,19 @@ async fn run_scenario_vus(
 
     let executor = VUScheduler::new(&exec_cfg);
     let stop_signal = executor.stop_signal();
+
+    // Runtime control API (k6 /v1/status parity): when the executor is
+    // externally-controlled and a control port is configured, serve the
+    // endpoint so VUs can be scaled mid-run. The task aborts when the
+    // scenario finishes (we hold the handle below).
+    let control_server = if matches!(exec_cfg, ExecutionConfig::ExternallyControlled { .. }) {
+        control_port.map(|port| {
+            let sched_handle = executor.control_handle();
+            tokio::spawn(crate::control_api::serve_control_api(port, sched_handle))
+        })
+    } else {
+        None
+    };
 
     let total_iterations = match &exec_cfg {
         ExecutionConfig::SharedIterations { iterations, .. } => *iterations,
@@ -1070,6 +1082,11 @@ async fn run_scenario_vus(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    // Shut down the control API now that the scenario is over.
+    if let Some(handle) = control_server {
+        handle.abort();
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -1088,6 +1105,7 @@ impl DriverHttpClient for DriverHttpClientImpl {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_driver_vus(
     sc_name: String,
     start_delay: Duration,
@@ -1106,6 +1124,7 @@ async fn run_driver_vus(
     test_start: Instant,
     input_path: &str,
     registry: Arc<ExtensionRegistry>,
+    control_port: Option<u16>,
 ) {
     if start_delay > Duration::ZERO {
         tokio::time::sleep(start_delay).await;
@@ -1121,6 +1140,17 @@ async fn run_driver_vus(
 
     let executor = VUScheduler::new(&exec_cfg);
     let stop_signal = executor.stop_signal();
+
+    // Runtime control API — same wiring as run_scenario_vus.
+    let control_server = if matches!(exec_cfg, ExecutionConfig::ExternallyControlled { .. }) {
+        control_port.map(|port| {
+            let sched_handle = executor.control_handle();
+            tokio::spawn(crate::control_api::serve_control_api(port, sched_handle))
+        })
+    } else {
+        None
+    };
+
     let has_abort_thresholds = thresholds.values().any(|t| t.abort_on_fail);
     let think_time_cfg = extract_think_time(&exec_cfg);
     let driver_id = driver.id().to_string();
@@ -1373,6 +1403,11 @@ async fn run_driver_vus(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    // Shut down the control API now that the scenario is over.
+    if let Some(handle) = control_server {
+        handle.abort();
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -1401,6 +1436,7 @@ fn extract_think_time(exec_cfg: &ExecutionConfig) -> ThinkTimeConfig {
         ExecutionConfig::SharedIterations { think_time, .. } => think_time.clone(),
         ExecutionConfig::PerVUIterations { think_time, .. } => think_time.clone(),
         ExecutionConfig::RampingArrivalRate { think_time, .. } => think_time.clone(),
+        ExecutionConfig::ExternallyControlled { think_time, .. } => think_time.clone(),
     }
 }
 

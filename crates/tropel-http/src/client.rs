@@ -568,8 +568,8 @@ mod serde_urlencoded {
         let encoded: Vec<String> = pairs
             .iter()
             .map(|(k, v)| {
-                let k = urlencoding(&k);
-                let v = urlencoding(&v);
+                let k = urlencoding(k);
+                let v = urlencoding(v);
                 format!("{}={}", k, v)
             })
             .collect();

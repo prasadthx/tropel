@@ -42,7 +42,7 @@ pub fn transpile_file(path: &Path) -> Result<String> {
         .to_lowercase();
 
     // Read the source
-    let source = std::fs::read_to_string(path).map_err(|e| tropel_core::TropelError::Io(e))?;
+    let source = std::fs::read_to_string(path).map_err(tropel_core::TropelError::Io)?;
 
     let is_typescript = matches!(ext.as_str(), "ts" | "mts" | "tsx");
 

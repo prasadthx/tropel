@@ -306,7 +306,7 @@ fn parse_duration(s: &str) -> Option<Duration> {
 
 /// Inventory factory — must be a `fn` pointer for `inventory::submit!`.
 fn ws_factory() -> Box<dyn Protocol> {
-    Box::new(WebSocketProtocol::default())
+    Box::new(WebSocketProtocol)
 }
 
 inventory::submit!(ProtocolRegistration::new("ws", ws_factory));

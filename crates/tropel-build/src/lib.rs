@@ -545,7 +545,7 @@ fn resolve_workspace_root() -> Result<PathBuf> {
 }
 
 /// Generate the Cargo.toml content for the temporary build crate.
-fn generate_cargo_toml(config: &BuildConfig, workspace_root: &PathBuf) -> String {
+fn generate_cargo_toml(config: &BuildConfig, workspace_root: &Path) -> String {
     let mut deps_lines = String::new();
     let root = workspace_root.to_string_lossy().replace('\\', "/");
 

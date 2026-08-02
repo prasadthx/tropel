@@ -219,7 +219,7 @@ impl PmBridge {
                     if let Some(val) = st.collection_vars.get(&key) {
                         return Some(variable_value_to_string(val));
                     }
-                    st.globals.get(&key).map(|v| variable_value_to_string(v))
+                    st.globals.get(&key).map(variable_value_to_string)
                 }),
             );
 
@@ -368,7 +368,7 @@ impl PmBridge {
                     let st = state_clone.lock().unwrap();
                     st.iteration_data
                         .as_ref()
-                        .and_then(|data| data.get(&key).map(|val| variable_value_to_string(val)))
+                        .and_then(|data| data.get(&key).map(variable_value_to_string))
                 }),
             );
 
@@ -683,7 +683,7 @@ impl PmBridge {
 
                         let req = Request {
                             url: resolved_url,
-                            method: Method::from_str(&method).unwrap_or(Method::GET),
+                            method: Method::parse(&method).unwrap_or(Method::GET),
                             headers,
                             query_params: HashMap::new(),
                             body: request_body,

@@ -29,6 +29,7 @@ pub struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Commands {
     /// Run a load test
     Run {
@@ -116,6 +117,12 @@ pub enum Commands {
         /// Threshold expression (can be specified multiple times)
         #[arg(short = 't', long = "threshold")]
         threshold: Vec<String>,
+
+        /// Port for the runtime control API (k6 REST parity). When set with
+        /// an `externally-controlled` executor, binds 127.0.0.1:<port> and
+        /// serves GET/PATCH /v1/status so VUs can be adjusted mid-run.
+        #[arg(long = "control-port")]
+        control_port: Option<u16>,
 
         /// Insecure TLS (skip certificate verification)
         #[arg(short = 'k', long = "insecure")]
@@ -270,6 +277,7 @@ async fn run_command(cli: Cli) -> Result<()> {
         influxdb_addr,
         execution_segment,
         execution_segment_sequence,
+        control_port,
         subprocess_adapter,
         plugins_dir,
         ..
@@ -295,6 +303,7 @@ async fn run_command(cli: Cli) -> Result<()> {
     let influxdb_addr = influxdb_addr.clone();
     let execution_segment = execution_segment.clone();
     let execution_segment_sequence = execution_segment_sequence.clone();
+    let control_port = *control_port;
     let thresholds = threshold.clone();
     let insecure = *insecure;
     // `mode` is now optional so we can tell whether the user explicitly chose
@@ -448,6 +457,7 @@ async fn run_command(cli: Cli) -> Result<()> {
         execution_explicit: load_profile_explicit,
         execution_segment,
         execution_segment_sequence,
+        control_port,
         env: env_map,
         iteration_data,
         output: OutputConfig {
@@ -603,6 +613,10 @@ fn apply_overlay(
     if config.execution_segment_sequence.is_none() {
         config.execution_segment_sequence = overlay.execution_segment_sequence.clone();
     }
+    // Control API port: CLI flag wins; overlay fills the gap.
+    if config.control_port.is_none() {
+        config.control_port = overlay.control_port;
+    }
     // Env: overlay vars fill in, CLI -e already present wins (insert only
     // keys the overlay has that the CLI env doesn't).
     for (k, v) in &overlay.env {
@@ -730,7 +744,141 @@ fn merge_partial(base: PartialConfig, file: PartialConfig) -> PartialConfig {
         execution_segment_sequence: file
             .execution_segment_sequence
             .or(base.execution_segment_sequence),
+        control_port: file.control_port.or(base.control_port),
     }
+}
+
+async fn list_extensions(plugins_dir: Option<&std::path::Path>) -> Result<()> {
+    let mut registry = ExtensionRegistry::new();
+
+    // Include WASM plugins from --plugins-dir in the listing.
+    if let Some(dir) = plugins_dir {
+        let adapters = tropel_wasm::discover_plugins(dir);
+        tracing::info!(
+            "Loaded {} WASM plugin(s) from {}",
+            adapters.len(),
+            dir.display()
+        );
+        for adapter in adapters {
+            let id = format!("wasm:{}", adapter.plugin_id());
+            let adapter = adapter.clone();
+            registry.register_adapter_factory(&id, Arc::new(move || Box::new(adapter.clone())));
+        }
+    }
+
+    let inputs = registry.list_inputs();
+
+    println!("Tropel Extensions — v{}", env!("CARGO_PKG_VERSION"));
+    println!();
+
+    if inputs.is_empty() {
+        println!("  No input adapters registered.");
+        println!("  Use `tropel build --with <crate>` to build a custom binary with extensions.");
+    } else {
+        println!("  Input formats:");
+        for fmt in &inputs {
+            println!(
+                "    - {}  (use: `tropel run input.{} --format {})",
+                fmt, fmt, fmt
+            );
+        }
+        println!();
+        println!("  Use `tropel run <file> --format <name>` to select a specific format.");
+        println!("  Without `--format`, the engine auto-detects from file content.");
+    }
+
+    let protocols = registry.list_protocols();
+    if !protocols.is_empty() {
+        println!();
+        println!("  Protocols:");
+        for p in &protocols {
+            println!("    - {}", p);
+        }
+    }
+
+    let outputs = registry.list_outputs();
+    if !outputs.is_empty() {
+        println!();
+        println!("  Outputs:");
+        for o in &outputs {
+            println!("    - {}", o);
+        }
+    }
+
+    Ok(())
+}
+
+async fn build_custom(with: &[String], output: &std::path::Path, release: bool) -> Result<()> {
+    use tropel_build::{build, BuildConfig};
+
+    // Each `--with` spec is parsed AND validated here — names/versions/URLs
+    // are injected into the generated Cargo.toml, so a malformed or hostile
+    // value must fail before any file is written (build-time code injection).
+    let mut extensions = Vec::with_capacity(with.len());
+    for spec in with {
+        extensions.push(tropel_build::parse_dep_spec(spec)?);
+    }
+
+    let config = BuildConfig {
+        extensions,
+        output: output.to_path_buf(),
+        release,
+    };
+
+    build(&config)
+}
+
+fn print_version() -> Result<()> {
+    println!("Tropel v{}", env!("CARGO_PKG_VERSION"));
+    println!("Repository: https://github.com/prasadthx/tropel");
+    println!("License: MIT OR Apache-2.0");
+    Ok(())
+}
+
+/// Load iteration data from a CSV or JSON file.
+fn load_data_file(path: &PathBuf) -> Result<Vec<HashMap<String, serde_json::Value>>> {
+    let content = std::fs::read_to_string(path).map_err(TropelError::Io)?;
+
+    let trimmed = content.trim();
+
+    if trimmed.starts_with('[') {
+        let data: Vec<HashMap<String, serde_json::Value>> = serde_json::from_str(trimmed)
+            .map_err(|e| TropelError::Parse(format!("JSON data-file parse error: {}", e)))?;
+        return Ok(data);
+    }
+
+    if trimmed.contains(',') || trimmed.starts_with('"') {
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .from_reader(content.as_bytes());
+
+        let headers: Vec<String> = reader
+            .headers()
+            .map_err(|e| TropelError::Parse(format!("CSV header error: {}", e)))?
+            .iter()
+            .map(|h| h.to_string())
+            .collect();
+
+        let mut rows = Vec::new();
+        for result in reader.records() {
+            let record =
+                result.map_err(|e| TropelError::Parse(format!("CSV record error: {}", e)))?;
+            let mut map = HashMap::new();
+            for (i, field) in record.iter().enumerate() {
+                if i < headers.len() {
+                    map.insert(
+                        headers[i].clone(),
+                        serde_json::Value::String(field.to_string()),
+                    );
+                }
+            }
+            rows.push(map);
+        }
+        return Ok(rows);
+    }
+
+    Ok(vec![])
 }
 
 #[cfg(test)]
@@ -876,137 +1024,4 @@ mod overlay_tests {
         // File doesn't set execution → base (env) execution retained.
         assert!(merged.execution.is_some());
     }
-}
-
-async fn list_extensions(plugins_dir: Option<&std::path::Path>) -> Result<()> {
-    let mut registry = ExtensionRegistry::new();
-
-    // Include WASM plugins from --plugins-dir in the listing.
-    if let Some(dir) = plugins_dir {
-        let adapters = tropel_wasm::discover_plugins(dir);
-        tracing::info!(
-            "Loaded {} WASM plugin(s) from {}",
-            adapters.len(),
-            dir.display()
-        );
-        for adapter in adapters {
-            let id = format!("wasm:{}", adapter.plugin_id());
-            let adapter = adapter.clone();
-            registry.register_adapter_factory(&id, Arc::new(move || Box::new(adapter.clone())));
-        }
-    }
-
-    let inputs = registry.list_inputs();
-
-    println!("Tropel Extensions — v{}", env!("CARGO_PKG_VERSION"));
-    println!();
-
-    if inputs.is_empty() {
-        println!("  No input adapters registered.");
-        println!("  Use `tropel build --with <crate>` to build a custom binary with extensions.");
-    } else {
-        println!("  Input formats:");
-        for fmt in &inputs {
-            println!(
-                "    - {}  (use: `tropel run input.{} --format {})",
-                fmt, fmt, fmt
-            );
-        }
-        println!();
-        println!("  Use `tropel run <file> --format <name>` to select a specific format.");
-        println!("  Without `--format`, the engine auto-detects from file content.");
-    }
-
-    let protocols = registry.list_protocols();
-    if !protocols.is_empty() {
-        println!();
-        println!("  Protocols:");
-        for p in &protocols {
-            println!("    - {}", p);
-        }
-    }
-
-    let outputs = registry.list_outputs();
-    if !outputs.is_empty() {
-        println!();
-        println!("  Outputs:");
-        for o in &outputs {
-            println!("    - {}", o);
-        }
-    }
-
-    Ok(())
-}
-
-async fn build_custom(with: &[String], output: &std::path::Path, release: bool) -> Result<()> {
-    use tropel_build::{build, BuildConfig};
-
-    // Each `--with` spec is parsed AND validated here — names/versions/URLs
-    // are injected into the generated Cargo.toml, so a malformed or hostile
-    // value must fail before any file is written (build-time code injection).
-    let mut extensions = Vec::with_capacity(with.len());
-    for spec in with {
-        extensions.push(tropel_build::parse_dep_spec(spec)?);
-    }
-
-    let config = BuildConfig {
-        extensions,
-        output: output.to_path_buf(),
-        release,
-    };
-
-    build(&config)
-}
-
-fn print_version() -> Result<()> {
-    println!("Tropel v{}", env!("CARGO_PKG_VERSION"));
-    println!("Repository: https://github.com/prasadthx/tropel");
-    println!("License: MIT OR Apache-2.0");
-    Ok(())
-}
-
-/// Load iteration data from a CSV or JSON file.
-fn load_data_file(path: &PathBuf) -> Result<Vec<HashMap<String, serde_json::Value>>> {
-    let content = std::fs::read_to_string(path).map_err(|e| TropelError::Io(e))?;
-
-    let trimmed = content.trim();
-
-    if trimmed.starts_with('[') {
-        let data: Vec<HashMap<String, serde_json::Value>> = serde_json::from_str(trimmed)
-            .map_err(|e| TropelError::Parse(format!("JSON data-file parse error: {}", e)))?;
-        return Ok(data);
-    }
-
-    if trimmed.contains(',') || trimmed.starts_with('"') {
-        let mut reader = csv::ReaderBuilder::new()
-            .has_headers(true)
-            .flexible(true)
-            .from_reader(content.as_bytes());
-
-        let headers: Vec<String> = reader
-            .headers()
-            .map_err(|e| TropelError::Parse(format!("CSV header error: {}", e)))?
-            .iter()
-            .map(|h| h.to_string())
-            .collect();
-
-        let mut rows = Vec::new();
-        for result in reader.records() {
-            let record =
-                result.map_err(|e| TropelError::Parse(format!("CSV record error: {}", e)))?;
-            let mut map = HashMap::new();
-            for (i, field) in record.iter().enumerate() {
-                if i < headers.len() {
-                    map.insert(
-                        headers[i].clone(),
-                        serde_json::Value::String(field.to_string()),
-                    );
-                }
-            }
-            rows.push(map);
-        }
-        return Ok(rows);
-    }
-
-    Ok(vec![])
 }

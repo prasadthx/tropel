@@ -494,7 +494,7 @@ impl JsContext {
                 .map_err(|e| JsError::Eval(format!("JS eval_async error: {}", e)))?;
 
             if let Some(promise) = value.as_promise() {
-                let resolved = Self::finish_promise(&ctx, &promise)?;
+                let resolved = Self::finish_promise(&ctx, promise)?;
                 Self::resolved_value_to_string(&resolved, &ctx)
             } else {
                 value_to_string(&value, &ctx)
@@ -673,7 +673,7 @@ impl JsContext {
             let result = self.ctx.with(|ctx| {
                 let value = script.invoke(&ctx)?;
                 if let Some(promise) = value.as_promise() {
-                    Self::finish_promise(&ctx, &promise)?;
+                    Self::finish_promise(&ctx, promise)?;
                 }
                 Ok::<_, JsError>(true)
             });
@@ -708,7 +708,7 @@ impl JsContext {
             // Execute now before caching; drive any returned promise.
             let value = script.invoke(&ctx)?;
             if let Some(promise) = value.as_promise() {
-                Self::finish_promise(&ctx, &promise)?;
+                Self::finish_promise(&ctx, promise)?;
             }
 
             Ok::<_, JsError>(script)

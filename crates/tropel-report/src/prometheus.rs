@@ -313,8 +313,10 @@ mod tests {
     /// A minimal protobuf reader used only to validate the encoder output
     /// (round-trip). Handles the three remote-write messages.
     mod decode {
-        use super::*;
         use std::collections::HashMap;
+
+        /// Decoded payload: series key (sorted label pairs) → samples.
+        pub type Decoded = HashMap<Vec<(String, String)>, Vec<(f64, i64)>>;
 
         pub fn read_varint(buf: &[u8], pos: &mut usize) -> u64 {
             let mut result = 0u64;
@@ -341,12 +343,6 @@ mod tests {
         pub struct Label {
             pub name: String,
             pub value: String,
-        }
-
-        #[derive(Debug, PartialEq)]
-        pub struct DecodedSeries {
-            pub labels: Vec<Label>,
-            pub samples: Vec<(f64, i64)>,
         }
 
         fn parse_label(buf: &[u8]) -> Label {
@@ -389,7 +385,7 @@ mod tests {
             (value, ts)
         }
 
-        pub fn decode(buf: &[u8]) -> HashMap<Vec<(String, String)>, Vec<(f64, i64)>> {
+        pub fn decode(buf: &[u8]) -> Decoded {
             let mut out = HashMap::new();
             let mut pos = 0usize;
             while pos < buf.len() {

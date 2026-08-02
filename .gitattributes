@@ -1,0 +1,21 @@
+# Normalize line endings to LF on commit
+* text=auto
+
+# Generated / binary artifacts
+*.lock text=auto
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+
+# WASM artifacts (from plugin builds)
+*.wasm binary
+
+# Vendored JS shims are text
+js/**/*.js text eol=lf
+js/**/*.mjs text eol=lf

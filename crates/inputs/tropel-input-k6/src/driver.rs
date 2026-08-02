@@ -291,7 +291,7 @@ impl K6DriverInstance {
                         };
                         let req = Request {
                             url,
-                            method: Method::from_str(&method).unwrap_or(Method::GET),
+                            method: Method::parse(&method).unwrap_or(Method::GET),
                             headers,
                             query_params: HashMap::new(),
                             body: req_body,
@@ -385,7 +385,7 @@ impl K6DriverInstance {
                             .unwrap_or("text");
                         let req = Request {
                             url,
-                            method: Method::from_str(&method).unwrap_or(Method::GET),
+                            method: Method::parse(&method).unwrap_or(Method::GET),
                             headers,
                             query_params: HashMap::new(),
                             body: request_body,

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 ///   finishes faster than this, the VU waits to hit the target.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct ThinkTimeConfig {
     /// Fixed delay after each iteration (e.g., "2s", "500ms").
     /// If set, min/max_delay are ignored.
@@ -27,16 +28,6 @@ pub struct ThinkTimeConfig {
     pub iteration_pacing: Option<String>,
 }
 
-impl Default for ThinkTimeConfig {
-    fn default() -> Self {
-        Self {
-            delay: None,
-            min_delay: None,
-            max_delay: None,
-            iteration_pacing: None,
-        }
-    }
-}
 
 /// Configuration for a single named scenario within a multi-scenario run.
 /// Each scenario has its own executor, input, env, tags, and optional start time.
@@ -135,6 +126,11 @@ pub struct JobConfig {
     /// snapshot back for central merging.
     #[serde(default, alias = "distributedWorker")]
     pub distributed_worker: bool,
+    /// Port for the runtime control API (k6 REST parity). When set, an
+    /// `externally-controlled` scenario binds `127.0.0.1:<port>` and serves
+    /// `GET/PATCH /v1/status` so the VU count can be adjusted mid-run.
+    #[serde(default, alias = "controlPort")]
+    pub control_port: Option<u16>,
 }
 
 /// How to execute the load test.
@@ -242,6 +238,29 @@ pub enum ExecutionConfig {
         #[serde(default, alias = "thinkTime")]
         think_time: ThinkTimeConfig,
     },
+    /// Externally-controlled VUs — the VU count can be adjusted AT RUNTIME
+    /// via the control API (k6's `externally-controlled` executor / REST
+    /// `/v1/status` parity). Starts with `vus`, may grow up to `max_vus` and
+    /// shrink below `vus` as the controller commands. When `duration` is
+    /// unset the run continues until the controller (or signal) stops it.
+    #[serde(rename = "externally-controlled")]
+    ExternallyControlled {
+        /// Initial VU count.
+        vus: u32,
+        /// Maximum VU count the control API may scale up to.
+        max_vus: u32,
+        /// Optional wall-clock limit. When unset, the run continues until
+        /// the control API requests a stop (or a signal / threshold aborts).
+        #[serde(default, alias = "duration")]
+        duration: Option<String>,
+        /// How long to wait for in-flight iterations to finish after a
+        /// stop / shrink command. Defaults to 30s.
+        #[serde(default, alias = "gracefulStop")]
+        graceful_stop: Option<String>,
+        /// Think time / pacing configuration between iterations.
+        #[serde(default, alias = "thinkTime")]
+        think_time: ThinkTimeConfig,
+    },
 }
 
 impl ExecutionConfig {
@@ -255,6 +274,7 @@ impl ExecutionConfig {
             ExecutionConfig::SharedIterations { .. } => "shared-iterations",
             ExecutionConfig::RampingArrivalRate { .. } => "ramping-arrival-rate",
             ExecutionConfig::PerVUIterations { .. } => "per-vu-iterations",
+            ExecutionConfig::ExternallyControlled { .. } => "externally-controlled",
         }
     }
 }
@@ -486,6 +506,7 @@ impl Default for HttpConfig {
 /// TLS configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct TlsConfig {
     pub insecure_skip_verify: bool,
     pub min_version: Option<String>,
@@ -496,19 +517,6 @@ pub struct TlsConfig {
     pub allowed_ciphers: Vec<String>,
 }
 
-impl Default for TlsConfig {
-    fn default() -> Self {
-        Self {
-            insecure_skip_verify: false,
-            min_version: None,
-            max_version: None,
-            client_cert: None,
-            client_key: None,
-            client_passphrase: None,
-            allowed_ciphers: vec![],
-        }
-    }
-}
 
 impl Default for JobConfig {
     fn default() -> Self {
@@ -536,6 +544,7 @@ impl Default for JobConfig {
             execution_segment: None,
             execution_segment_sequence: None,
             distributed_worker: false,
+            control_port: None,
         }
     }
 }

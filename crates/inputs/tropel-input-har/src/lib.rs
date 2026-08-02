@@ -45,7 +45,10 @@ struct HarRoot {
 
 #[derive(Debug, Deserialize)]
 struct HarLog {
+    // `version` is parsed for spec fidelity but not consumed downstream
+    // (detect() checks it structurally on the raw JSON).
     #[serde(default)]
+    #[allow(dead_code)]
     version: Option<String>,
     entries: Vec<HarEntry>,
 }
@@ -286,7 +289,7 @@ fn is_static_resource(entry: &HarEntry) -> bool {
 
 /// Convert a HAR entry to a ScenarioItem.
 fn har_entry_to_item(entry: HarEntry, index: usize) -> ScenarioItem {
-    let method = Method::from_str(&entry.request.method).unwrap_or(Method::GET);
+    let method = Method::parse(&entry.request.method).unwrap_or(Method::GET);
     let url = entry.request.url.clone();
 
     let item_name = generate_item_name(&url, index);
@@ -368,7 +371,7 @@ fn build_body(pd: HarPostData) -> Body {
     if mime.contains("json") {
         // Parse JSON text into serde_json::Value for Body::Json
         let json_val =
-            serde_json::from_str(&pd.text).unwrap_or_else(|_| serde_json::Value::String(pd.text));
+            serde_json::from_str(&pd.text).unwrap_or(serde_json::Value::String(pd.text));
         Body::Json(json_val)
     } else if mime.contains("x-www-form-urlencoded") {
         if has_text {
@@ -425,7 +428,7 @@ fn generate_item_name(url: &str, index: usize) -> String {
         if let Some(path_pos) = after_scheme.find('/') {
             let path = &after_scheme[path_pos..];
             let path = path.trim_end_matches('/');
-            if let Some(last_seg) = path.rsplit('/').filter(|s: &&str| !s.is_empty()).next() {
+            if let Some(last_seg) = path.rsplit('/').find(|s: &&str| !s.is_empty()) {
                 return format!("request #{} ({})", index + 1, last_seg);
             }
         }

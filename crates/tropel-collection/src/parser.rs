@@ -114,7 +114,7 @@ fn convert_request_item(req: &RequestItem, parent_events: &[Event], index: usize
 }
 
 fn convert_request(detail: &RequestDetail, item_auth: &Option<CollectionAuth>) -> Request {
-    let method = Method::from_str(&detail.method).unwrap_or(Method::GET);
+    let method = Method::parse(&detail.method).unwrap_or(Method::GET);
 
     let url = build_url(detail);
 

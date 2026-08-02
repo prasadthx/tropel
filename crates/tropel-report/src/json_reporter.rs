@@ -70,7 +70,7 @@ impl Reporter for JsonReporter {
         if let Some(path) = &self.output_path {
             tokio::fs::write(path, &json_str)
                 .await
-                .map_err(|e| tropel_core::TropelError::Io(e))?;
+                .map_err(tropel_core::TropelError::Io)?;
         } else {
             // Print to stdout
             println!("{}", json_str);

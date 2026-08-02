@@ -25,11 +25,17 @@ pub struct CollectionInfo {
 }
 
 /// A single item or folder.
+//
+// `Folder` is much larger than `Request` (it nests recursively); boxing the
+// larger variant keeps the enum small without changing serde's untagged
+// shape (Box<T> serializes exactly like T). `Request` remains the largest
+// variant, so the size-difference lint is suppressed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum CollectionItem {
     Request(RequestItem),
-    Folder(FolderItem),
+    Folder(Box<FolderItem>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,10 +251,10 @@ pub struct Script {
     pub src: Option<String>,
 }
 
-impl Script {
+impl std::fmt::Display for Script {
     /// Join exec lines into a single script string.
-    pub fn to_string(&self) -> String {
-        self.exec.join("\n")
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.exec.join("\n"))
     }
 }
 

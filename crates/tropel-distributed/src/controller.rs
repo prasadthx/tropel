@@ -88,7 +88,7 @@ pub async fn run_controller(
             tokio::time::timeout(agent_timeout(config), listener.accept())
                 .await
                 .map_err(|_| TropelError::Execution("timed out waiting for an agent".into()))?
-                .map_err(|e| TropelError::Io(e))?;
+                .map_err(TropelError::Io)?;
         tracing::info!("Controller: agent {i} connected from {peer}");
 
         let assign = AssignMsg {
@@ -157,6 +157,9 @@ fn agent_timeout(config: &JobConfig) -> Duration {
             .sum::<Duration>(),
         ExecutionConfig::PerVUIterations { max_duration, .. } => {
             max_duration.as_deref().map(parse_duration).unwrap_or(Duration::ZERO)
+        }
+        ExecutionConfig::ExternallyControlled { duration, .. } => {
+            duration.as_deref().map(parse_duration).unwrap_or(Duration::ZERO)
         }
     };
     AGENT_BASE_TIMEOUT + declared + AGENT_GRACE

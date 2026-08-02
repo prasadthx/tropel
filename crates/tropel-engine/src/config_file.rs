@@ -40,6 +40,10 @@ pub struct PartialConfig {
     /// k6 `executionSegmentSequence` — full sequence of boundaries.
     #[serde(default, alias = "executionSegmentSequence")]
     pub execution_segment_sequence: Option<String>,
+    /// Port for the runtime control API (k6 REST parity) for
+    /// `externally-controlled` executors.
+    #[serde(default, alias = "controlPort")]
+    pub control_port: Option<u16>,
 }
 
 impl PartialConfig {

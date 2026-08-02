@@ -45,6 +45,14 @@ pub struct VUScheduler {
     /// the total number of exits to exactly the delta, eliminating the overshoot
     /// race where every VU reads the same active count and all exit.
     ramp_down_remaining: Arc<AtomicU32>,
+    /// Desired VU count for the externally-controlled executor, settable at
+    /// runtime via the control API. The control loop scales the pool toward
+    /// this target (clamped to `control_max_vus`).
+    control_target_vus: Arc<AtomicU32>,
+    /// Cap on the externally-controlled VU pool.
+    control_max_vus: Arc<AtomicU32>,
+    /// Wakes the externally-controlled control loop when the target changes.
+    control_notify: Arc<tokio::sync::Notify>,
 }
 
 impl VUScheduler {
@@ -63,6 +71,9 @@ impl VUScheduler {
             idle_vus: Arc::new(AtomicU32::new(0)),
             ramp_down_target: Arc::new(AtomicU32::new(u32::MAX)),
             ramp_down_remaining: Arc::new(AtomicU32::new(0)),
+            control_target_vus: Arc::new(AtomicU32::new(0)),
+            control_max_vus: Arc::new(AtomicU32::new(0)),
+            control_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -183,6 +194,30 @@ impl VUScheduler {
     /// Current count of idle VUs (waiting for tokens).
     pub fn idle_vu_count(&self) -> u32 {
         self.idle_vus.load(Ordering::Relaxed)
+    }
+
+    /// Set the externally-controlled VU target and cap from the control API.
+    /// Clamps `vus` to `[0, max]` and wakes the control loop.
+    pub fn set_control_target(&self, vus: u32, max_vus: u32) {
+        self.control_max_vus.store(max_vus, Ordering::Release);
+        self.control_target_vus
+            .store(vus.min(max_vus), Ordering::Release);
+        self.control_notify.notify_waiters();
+    }
+
+    /// Current externally-controlled VU target (as last set by the API).
+    pub fn control_target(&self) -> u32 {
+        self.control_target_vus.load(Ordering::Acquire)
+    }
+
+    /// Current externally-controlled VU cap.
+    pub fn control_max(&self) -> u32 {
+        self.control_max_vus.load(Ordering::Acquire)
+    }
+
+    /// Notify handle for the externally-controlled control loop.
+    pub fn control_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.control_notify.clone()
     }
 
     /// Get and reset the dropped iterations counter.
@@ -331,6 +366,21 @@ impl VUScheduler {
                     &run_vu,
                 )
                 .await;
+                Ok(())
+            }
+            ExecutionConfig::ExternallyControlled {
+                vus,
+                max_vus,
+                duration,
+                graceful_stop,
+                ..
+            } => {
+                let duration = duration
+                    .as_ref()
+                    .and_then(|d| parse_duration(d).ok());
+                let grace = graceful_stop_duration(graceful_stop);
+                self.run_externally_controlled(*vus, *max_vus, duration, grace, &run_vu)
+                    .await;
                 Ok(())
             }
         }
@@ -887,6 +937,121 @@ impl VUScheduler {
         tracing::info!("Per-VU iterations finished");
     }
 
+    /// Run with externally-controlled VUs — the pool scales at runtime via
+    /// the control API (`set_control_target`). k6's `externally-controlled`
+    /// executor / REST `/v1/status` parity.
+    ///
+    /// Starts `vus` VUs, then a control loop reconciles the live pool toward
+    /// `control_target_vus` (clamped to `control_max_vus`): growing spawns new
+    /// VU tasks, shrinking reuses the ramp-down claim mechanism so exactly the
+    /// surplus exits. Runs until `duration` elapses (when set) or a stop is
+    /// requested (control API stop, signal, threshold abort).
+    async fn run_externally_controlled<F>(
+        &self,
+        vus: u32,
+        max_vus: u32,
+        duration: Option<Duration>,
+        grace: Duration,
+        run_vu: &F,
+    ) where
+        F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
+    {
+        tracing::info!(
+            "Starting externally-controlled VUs: initial={}, max={} (duration: {:?}, grace: {:?})",
+            vus,
+            max_vus,
+            duration,
+            grace
+        );
+
+        // Seed the control state from the config.
+        self.control_max_vus.store(max_vus, Ordering::Release);
+        self.control_target_vus.store(vus.min(max_vus), Ordering::Release);
+
+        let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        // Monotonic VU id counter. Ids are handed to run_vu for data-row
+        // rotation / JS context naming; they must NEVER be reused while an
+        // old VU with the same id is still exiting (a regrow after a shrink
+        // would otherwise collide). Only ever incremented.
+        let mut next_vu_id = 0u32;
+        let initial = self.control_target();
+        for _ in 0..initial {
+            let handle = run_vu(self.shared_clone(), next_vu_id);
+            handles.push(handle);
+            next_vu_id += 1;
+        }
+
+        // Wait (bounded) for the initial VUs to register in `active_vus` so
+        // the first reconcile doesn't see active=0 and double-spawn. Each VU
+        // task increments active at startup, normally within milliseconds.
+        let reg_deadline = time::Instant::now() + Duration::from_secs(5);
+        while self.active_vus.load(Ordering::Acquire) < initial {
+            if time::Instant::now() >= reg_deadline {
+                break;
+            }
+            time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let control_notify = self.control_notify();
+        let started = time::Instant::now();
+
+        // Control loop: reconcile the LIVE pool toward the target. All
+        // decisions use the actual `active_vus` count — VUs exit on their own
+        // via stop / ramp-down claims, so a stale logical counter would both
+        // overshoot on regrow and leak un-cancelled surplus. The notify
+        // prevents busy-waiting; the 100ms tick bounds latency if a wake is
+        // missed (notify_waiters is edge-triggered).
+        loop {
+            if self.is_stop_requested() || self.is_force_stop_requested() {
+                break;
+            }
+            if let Some(dur) = duration {
+                if started.elapsed() >= dur {
+                    tracing::debug!(
+                        "Externally-controlled: duration ({:?}) elapsed — stopping",
+                        dur
+                    );
+                    break;
+                }
+            }
+
+            let target = self.control_target().min(self.control_max());
+            let active = self.active_vus.load(Ordering::Acquire);
+            if target > active {
+                // Grow: clear any pending ramp-down FIRST — otherwise the
+                // freshly spawned VUs would read the stale `ramp_down_target`
+                // (active > old target, remaining > 0) and immediately
+                // self-exit at their loop top, silently nullifying the grow.
+                self.clear_ramp_down();
+                for _ in active..target {
+                    let handle = run_vu(self.shared_clone(), next_vu_id);
+                    handles.push(handle);
+                    next_vu_id += 1;
+                }
+                tracing::debug!("Externally-controlled: VU pool {} → {}", active, target);
+            } else if target < active {
+                // Shrink: reuse the ramp-down claim mechanism so exactly
+                // `active - target` VUs exit (level-triggered; re-armed each
+                // tick against the live count, so the drain self-corrects
+                // even if some VUs died for other reasons).
+                tracing::debug!("Externally-controlled: VU pool {} → {}", active, target);
+                self.set_ramp_down_target(target, active);
+            }
+
+            tokio::select! {
+                _ = control_notify.notified() => {}
+                _ = time::sleep(Duration::from_millis(100)) => {}
+            }
+        }
+
+        // Signal soft stop — VUs finish their current iteration.
+        self.request_stop();
+        self.wait_for_drain(grace).await;
+        Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND).await;
+
+        tracing::info!("Externally-controlled finished");
+    }
+
     /// Await all VU JoinHandles, but bounded by a hard timeout so a VU that
     /// ignores `force_stop` **and** never trips the JS interrupt cannot hang
     /// the final join loop forever. Resolves when all handles end or `bound`
@@ -906,6 +1071,12 @@ impl VUScheduler {
         }
     }
 
+    /// Public handle for the control API — an `Arc` to this scheduler so
+    /// `serve_control_api` can set the VU target / request stop mid-run.
+    pub fn control_handle(&self) -> Arc<VUScheduler> {
+        self.shared_clone()
+    }
+
     /// Create a shared clone of this scheduler for passing to VU tasks.
     fn shared_clone(&self) -> Arc<VUScheduler> {
         Arc::new(VUScheduler {
@@ -921,6 +1092,9 @@ impl VUScheduler {
             idle_vus: self.idle_vus.clone(),
             ramp_down_target: self.ramp_down_target.clone(),
             ramp_down_remaining: self.ramp_down_remaining.clone(),
+            control_target_vus: self.control_target_vus.clone(),
+            control_max_vus: self.control_max_vus.clone(),
+            control_notify: self.control_notify.clone(),
         })
     }
 

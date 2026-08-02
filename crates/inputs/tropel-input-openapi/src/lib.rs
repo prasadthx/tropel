@@ -62,6 +62,8 @@ struct OasInfo {
 }
 
 #[derive(Debug, Deserialize)]
+// `description` is parsed for spec fidelity but not consumed downstream.
+#[allow(dead_code)]
 struct OasServer {
     url: String,
     #[serde(default)]
@@ -80,7 +82,9 @@ struct OasServerVariable {
 }
 
 /// A path item — can have one or more operations.
+// `summary`/`description` are parsed for spec fidelity but not consumed.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OasPathItem {
     #[serde(default)]
     summary: Option<String>,
@@ -138,6 +142,8 @@ impl OasPathItem {
 }
 
 #[derive(Debug, Deserialize)]
+// `description`/`responses` are parsed for spec fidelity but not consumed.
+#[allow(dead_code)]
 struct OasOperation {
     #[serde(default, rename = "operationId")]
     operation_id: Option<String>,
@@ -158,6 +164,8 @@ struct OasOperation {
 }
 
 #[derive(Debug, Deserialize)]
+// `description`/`required` are parsed for spec fidelity but not consumed.
+#[allow(dead_code)]
 struct OasParameter {
     #[serde(default)]
     name: String,
@@ -182,6 +190,8 @@ struct OasExample {
 }
 
 #[derive(Debug, Deserialize)]
+// `required` is parsed for spec fidelity but not consumed downstream.
+#[allow(dead_code)]
 struct OasSchema {
     #[serde(default)]
     r#type: Option<String>,
@@ -200,6 +210,8 @@ struct OasSchema {
 }
 
 #[derive(Debug, Deserialize)]
+// `description`/`required` are parsed for spec fidelity but not consumed.
+#[allow(dead_code)]
 struct OasRequestBody {
     #[serde(default)]
     description: Option<String>,
@@ -210,6 +222,8 @@ struct OasRequestBody {
 }
 
 #[derive(Debug, Deserialize)]
+// `examples` is parsed for spec fidelity but not consumed downstream.
+#[allow(dead_code)]
 struct OasMediaType {
     #[serde(default)]
     schema: Option<OasSchema>,
@@ -220,6 +234,8 @@ struct OasMediaType {
 }
 
 #[derive(Debug, Deserialize)]
+// `description`/`content` are parsed for spec fidelity but not consumed.
+#[allow(dead_code)]
 struct OasResponse {
     #[serde(default)]
     description: Option<String>,
@@ -228,6 +244,8 @@ struct OasResponse {
 }
 
 #[derive(Debug, Deserialize)]
+// `schemas` is parsed for spec fidelity but not consumed downstream.
+#[allow(dead_code)]
 struct OasComponents {
     #[serde(default)]
     schemas: Option<HashMap<String, OasSchema>>,
@@ -237,6 +255,10 @@ struct OasComponents {
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
+// `type`/`flows`/`bearerFormat`/`openIdConnectUrl` are parsed for spec
+// fidelity but not consumed downstream; `OAuth2` carries the largest payload
+// so the size-difference lint is suppressed.
+#[allow(dead_code, clippy::large_enum_variant)]
 enum OasSecurityScheme {
     // More specific variants first. Http requires `scheme`, OAuth2
     // requires `flows`, OpenIdConnect requires `openIdConnectUrl`.
@@ -267,6 +289,8 @@ enum OasSecurityScheme {
 }
 
 #[derive(Debug, Deserialize)]
+// All four flows are parsed for spec fidelity but not consumed downstream.
+#[allow(dead_code)]
 struct OauthFlows {
     #[serde(default, rename = "authorizationCode")]
     authorization_code: Option<OauthFlow>,
@@ -279,6 +303,8 @@ struct OauthFlows {
 }
 
 #[derive(Debug, Deserialize)]
+// URL/scopes fields are parsed for spec fidelity but not consumed downstream.
+#[allow(dead_code)]
 struct OauthFlow {
     #[serde(default, rename = "authorizationUrl")]
     authorization_url: Option<String>,
@@ -433,17 +459,17 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
             let body = operation
                 .request_body
                 .as_ref()
-                .and_then(|rb| build_request_body(rb));
+                .and_then(build_request_body);
 
             // Resolve auth
-            let auth = resolve_auth(&operation, &global_security, &doc.components);
+            let auth = resolve_auth(operation, &global_security, &doc.components);
 
             items.push(ScenarioItem {
                 id: format!("openapi-item-{}", index),
                 name: item_name,
                 request: Some(Request {
                     url: resolved_url,
-                    method: Method::from_str(method).unwrap_or(Method::GET),
+                    method: Method::parse(method).unwrap_or(Method::GET),
                     headers,
                     query_params,
                     body,
@@ -1024,7 +1050,7 @@ fn build_request_body(rb: &OasRequestBody) -> Option<Body> {
             .example
             .clone()
             .or_else(|| generate_schema_example(mt.schema.as_ref()));
-        return Some(json_val.map_or(Body::Raw(String::new()), |v| Body::Json(v)));
+        return Some(json_val.map_or(Body::Raw(String::new()), Body::Json));
     }
 
     None
