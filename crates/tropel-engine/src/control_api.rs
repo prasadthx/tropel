@@ -21,12 +21,19 @@ use tropel_executor::scheduler::VUScheduler;
 /// task is aborted by the scenario finishing.
 pub async fn serve_control_api(port: u16, scheduler: Arc<VUScheduler>) -> Result<()> {
     let addr = format!("127.0.0.1:{}", port);
-    let listener = TcpListener::bind(&addr).await.map_err(|e| {
-        tropel_core::TropelError::Config(format!(
-            "control API: failed to bind {}: {}",
-            addr, e
-        ))
-    })?;
+    // Bind failure must be visible: the spawned task's JoinHandle is only
+    // aborted (never awaited) by the engine, so a port conflict would
+    // otherwise leave the run silently without a control API.
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("control API: failed to bind {}: {}", addr, e);
+            return Err(tropel_core::TropelError::Config(format!(
+                "control API: failed to bind {}: {}",
+                addr, e
+            )));
+        }
+    };
     tracing::info!("Control API listening on http://{addr}");
 
     loop {
