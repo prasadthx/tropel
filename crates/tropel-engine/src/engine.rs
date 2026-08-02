@@ -1209,6 +1209,8 @@ async fn run_driver_vus(
     let has_abort_thresholds = thresholds.values().any(|t| t.abort_on_fail);
     let think_time_cfg = extract_think_time(&exec_cfg);
     let driver_id = driver.id().to_string();
+    // k6-style executor name (e.g. "constant-vus") — backs exec.scenario.executor().
+    let executor_name = exec_cfg.executor_name().to_string();
 
     let input_bytes = match std::fs::read(input_path) {
         Ok(b) => b,
@@ -1264,6 +1266,7 @@ async fn run_driver_vus(
         let sc_tags = sc_tags_c.clone();
         let sc_exec = sc_exec_c.clone();
         let rps_vu = rps_limiter_c.clone();
+        let executor_name = executor_name.clone();
 
         let (_, handle) = pool.spawn(async move {
             sched.add_active_vu(1).await;
@@ -1360,6 +1363,13 @@ async fn run_driver_vus(
                     ctx.env = vu_env.clone();
                     ctx.data_row = data_row;
                     ctx.http_client = Some(http_client_handle.clone());
+                    // Populate exec.* context so drivers can expose
+                    // exec.scenario/executor/vu/instance to scripts.
+                    ctx.set_exec_context(
+                        executor_name.clone(),
+                        sched.total_iterations().await,
+                        sched.active_vus().await,
+                    );
 
                     let result = driver_instance.run_iteration(&mut ctx).await;
                     let mut ctx_samples = std::mem::take(&mut ctx.samples);

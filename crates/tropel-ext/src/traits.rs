@@ -87,12 +87,22 @@ pub struct VuContext {
     pub env: HashMap<String, String>,
     /// Iteration data row (from CSV/JSON data file), if any.
     pub data_row: Option<HashMap<String, serde_json::Value>>,
-    /// The VU's unique identifier across the run.
+    /// The VU's unique identifier across the run (0-based internally;
+    /// k6's `__VU` / `exec.vu.idInTest` are 1-based — drivers offset).
     pub vu_id: u32,
     /// The iteration index for this VU.
     pub iteration: u64,
     /// The scenario name this VU belongs to.
     pub scenario_name: String,
+    /// Executor type name for `exec.scenario.executor()` (e.g.
+    /// "constant-vus"). Populated by the engine.
+    pub executor_name: String,
+    /// Total iterations completed across ALL VUs so far — backs
+    /// `exec.instance.iterationsCompleted()`. Populated by the engine.
+    pub iterations_completed: u64,
+    /// Currently active VU count — backs `exec.instance.vusActive()`.
+    /// Populated by the engine.
+    pub vus_active: u32,
     /// Samples collected during this iteration — the driver pushes
     /// samples here, and the engine drains them into the metrics pipeline.
     pub samples: Vec<Sample>,
@@ -112,11 +122,27 @@ impl VuContext {
             vu_id,
             iteration,
             scenario_name,
+            executor_name: String::new(),
+            iterations_completed: 0,
+            vus_active: 0,
             samples: Vec::new(),
             abort_requested: false,
             abort_message: None,
             http_client: None,
         }
+    }
+
+    /// Attach the execution-context info (executor name, global iteration
+    /// count, active VUs) so drivers can expose `exec.*` to scripts.
+    pub fn set_exec_context(
+        &mut self,
+        executor_name: String,
+        iterations_completed: u64,
+        vus_active: u32,
+    ) {
+        self.executor_name = executor_name;
+        self.iterations_completed = iterations_completed;
+        self.vus_active = vus_active;
     }
 
     /// Record a metric sample.

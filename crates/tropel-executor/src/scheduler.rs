@@ -446,7 +446,11 @@ impl VUScheduler {
             handles.push(handle);
         }
 
-        // Process each stage
+        // Process each stage — VU count is linearly interpolated across the
+        // FULL stage duration (k6 semantics): a ramp-up spreads new VUs over
+        // `stage.duration`, a constant stage HOLDS for its duration, and a
+        // ramp-down gradually lowers the target so VUs exit over the duration
+        // instead of as a cliff.
         for stage in stages {
             let stage_duration = parse_duration(&stage.duration).unwrap_or(Duration::from_secs(10));
             let target = stage.target;
@@ -457,35 +461,52 @@ impl VUScheduler {
                 target,
                 stage_duration
             );
-            let steps = 10.max((target as i64 - current_vus as i64).unsigned_abs());
-            let step_delay = stage_duration / steps as u32;
 
             if target > current_vus {
-                // Ramp up (active count incremented by each VU task itself).
+                // ── Linear ramp-up: spawn one VU every (duration / delta) ──
                 // No clear_ramp_down() here: if the previous ramp-down timed
                 // out with grace-expired stragglers still mid-iteration, they
                 // must still be able to claim a surplus slot and exit during
                 // this ramp-up. Stale state from a fully-drained ramp-down is
                 // harmless (remaining == 0 blocks claims; see clear below).
-                for _ in 0..(target - current_vus) {
+                let delta = target - current_vus;
+                let step_delay = stage_duration / delta as u32;
+                for _ in 0..delta {
                     let vu_id = current_vus;
                     let handle = run_vu(self.shared_clone(), vu_id);
                     handles.push(handle);
                     current_vus += 1;
                     time::sleep(step_delay).await;
                 }
-            } else {
-                // Ramp down: set the target so VUs self-select to exit.
-                // This is LEVEL-triggered, not EDGE-triggered — VUs claim a
-                // surplus slot via `try_claim_ramp_down` each iteration and
-                // exit if they win one. No global notify_waiters() required.
-                let to_stop = current_vus - target;
+            } else if target < current_vus {
+                // ── Linear ramp-down: lower the target gradually across the
+                //    duration so surplus VUs self-select to exit over time,
+                //    not all at once (no cliff). Level-triggered: each VU
+                //    claims a surplus slot via try_claim_ramp_down at its next
+                //    iteration start.
+                let delta = current_vus - target;
+                let step_delay = stage_duration / delta as u32;
+                for step in 1..=delta {
+                    // Interpolate the ramp-down target from current_vus down
+                    // to `target`, one unit at a time.
+                    let new_target = current_vus - step;
+                    if new_target < target {
+                        break;
+                    }
+                    self.set_ramp_down_target(new_target, current_vus);
+                    tracing::debug!(
+                        "Ramp-down step: target {new_target} (from {current_vus}, grace: {:?})",
+                        grace_rd
+                    );
+                    time::sleep(step_delay).await;
+                }
                 self.set_ramp_down_target(target, current_vus);
 
-                // Wait for the surplus VUs to drain within the graceful_ramp_down window
+                // Let the final surplus drain within the graceful_ramp_down
+                // window (residual VUs exit at their next loop-top claim).
                 tracing::debug!(
-                    "Ramp-down: waiting for {} VUs to exit (grace: {:?}, target: {})",
-                    to_stop,
+                    "Ramp-down: waiting for the last {} VUs to exit (grace: {:?}, target: {})",
+                    delta,
                     grace_rd,
                     target
                 );
@@ -513,6 +534,16 @@ impl VUScheduler {
                 // next `set_ramp_down_target` recomputes from the stale
                 // current_vus, so full correction waits for that drain).
                 current_vus = target;
+            } else {
+                // ── Constant stage: hold the current VU count for the FULL
+                //    stage duration (k6 holds `target` VUs). VUs keep
+                //    iterating; we simply wait out the stage.
+                tracing::debug!(
+                    "Hold: {} VUs constant for {:?}",
+                    current_vus,
+                    stage_duration
+                );
+                time::sleep(stage_duration).await;
             }
         }
 

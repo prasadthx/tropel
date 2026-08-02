@@ -126,7 +126,10 @@ impl Driver for K6Driver {
             js_ctx,
             _source_path: source_path.map(|p| p.to_path_buf()),
             http_bridge_registered: false,
+            script_bridges_registered: false,
             sample_sink: Arc::new(Mutex::new(Vec::new())),
+            exec_state: Arc::new(Mutex::new(K6ExecState::default())),
+            abort_requested: Arc::new(Mutex::new(None)),
         }))
     }
 
@@ -312,11 +315,35 @@ pub struct K6DriverInstance {
     /// registered. Registration happens on the first run_iteration() call
     /// because the HttpClient isn't available until init() completes.
     http_bridge_registered: bool,
+    /// Whether the script-state bridges (__tropel_pm_test,
+    /// __tropel_pm_custom_metric_add, __tropel_exec_*, __tropel_test_abort)
+    /// have been registered. Same lazy pattern as the HTTP bridge; these
+    /// read the per-VU exec_state / abort flag.
+    script_bridges_registered: bool,
     /// Shared sink for samples recorded by the native HTTP bridge closures
     /// (__tropel_k6_http_request / __tropel_k6_http_batch). The closures are
     /// 'static and can't reach the VuContext, so they push into this buffer
     /// and run_iteration() drains it into ctx.samples after each iteration.
     sample_sink: Arc<Mutex<Vec<Sample>>>,
+    /// Shared exec.* state — the pm.js / k6-shim / exec.js scripts read it
+    /// through __tropel_exec_* closures registered lazily; sync_globals()
+    /// refreshes it from the VuContext before each iteration.
+    exec_state: Arc<Mutex<K6ExecState>>,
+    /// test.abort() flag — set by __tropel_test_abort, drained by
+    /// run_iteration() into ctx.abort() so the engine stops the run.
+    abort_requested: Arc<Mutex<Option<String>>>,
+}
+
+/// Execution-context values exposed to scripts via `exec.*` (k6 API).
+/// Populated from the VuContext by sync_globals() before each iteration.
+#[derive(Debug, Clone, Default)]
+struct K6ExecState {
+    scenario_name: String,
+    executor_name: String,
+    vu_id: u32,
+    iteration: u64,
+    iterations_completed: u64,
+    vus_active: u32,
 }
 
 // Safety: each DriverInstance runs on its own VU thread (thread-per-core).
@@ -427,6 +454,9 @@ impl DriverInstance for K6DriverInstance {
         if !self.http_bridge_registered {
             self.maybe_register_http_bridge(ctx).await;
         }
+        if !self.script_bridges_registered {
+            self.register_script_bridges();
+        }
 
         // Sync VuContext state into JS globals (__tropel_vu_id, etc.)
         self.sync_globals(ctx).await?;
@@ -443,28 +473,36 @@ impl DriverInstance for K6DriverInstance {
         // rejections would be swallowed).
         let iter_start = Instant::now();
 
-        match self
+        let iter_result = self
             .js_ctx
             .run_script_cached(
                 "return __tropel_iteration()",
                 Some("k6-iteration.js".to_string()),
             )
-            .await
-        {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!("k6 iteration error: {}", e);
-                // Non-fatal — log and continue
-            }
-        }
+            .await;
 
         let iter_dur = iter_start.elapsed();
 
-        // Drain samples recorded by the native HTTP bridge closures during
-        // this iteration (http_req_* etc.) into the VuContext for the
-        // engine's metrics pipeline.
+        // Drain samples recorded by the native bridge closures during this
+        // iteration (http_req_*, checks, custom metrics) into the VuContext
+        // for the engine's metrics pipeline.
         let bridge_samples = std::mem::take(&mut *self.sample_sink.lock().unwrap());
         ctx.samples.extend(bridge_samples);
+
+        // Surface test.abort() to the engine so the run stops cleanly.
+        if let Some(msg) = std::mem::take(&mut *self.abort_requested.lock().unwrap()) {
+            ctx.abort(Some(msg));
+        }
+
+        // A rejected/thrown default export must fail the iteration (the
+        // engine logs it and bumps the error path), not be swallowed.
+        if let Err(e) = iter_result {
+            tracing::warn!("k6 iteration error: {}", e);
+            return Err(tropel_sdk::TropelError::Other(format!(
+                "k6 iteration failed: {}",
+                e
+            )));
+        }
 
         // Emit iteration_duration sample
         ctx.emit_sample(
@@ -722,6 +760,142 @@ impl K6DriverInstance {
 }
 
 impl K6DriverInstance {
+    /// Lazily register the script-state bridges (`__tropel_pm_test`,
+    /// `__tropel_pm_custom_metric_add`, `__tropel_exec_*`, `__tropel_test_abort`).
+    /// The k6 driver doesn't depend on tropel-pm (which installs these for the
+    /// declarative path), so it installs its own equivalents backed by the
+    /// per-VU sample_sink / exec_state / abort flag.
+    fn register_script_bridges(&mut self) {
+        let sink = self.sample_sink.clone();
+        let exec_state = self.exec_state.clone();
+        let abort = self.abort_requested.clone();
+
+        self.js_ctx.with_ctx(|rq_ctx| {
+            let globals = rq_ctx.globals();
+
+            // check() / pm.test() → checks Rate sample
+            let sink_test = sink.clone();
+            let _ = globals.set(
+                "__tropel_pm_test",
+                Func::from(move |name: String, passed: bool| {
+                    let mut v = sink_test.lock().unwrap();
+                    let now = SystemTime::now();
+                    let mut tags = TagMap::with_capacity(1);
+                    tags.insert("check", name);
+                    v.push(Sample {
+                        metric: "checks".into(),
+                        value: if passed { 1.0 } else { 0.0 },
+                        tags,
+                        timestamp: now,
+                        sample_type: SampleType::Rate,
+                    });
+                }),
+            );
+
+            // Custom metric .add() → typed sample (Counter/Gauge/Rate/Trend)
+            let sink_metric = sink.clone();
+            let _ = globals.set(
+                "__tropel_pm_custom_metric_add",
+                Func::from(
+                    move |name: String, value: f64, tags_json: String, metric_type_str: String| {
+                        let tags = if tags_json.is_empty() || tags_json == "{}" {
+                            TagMap::new()
+                        } else {
+                            let parsed: HashMap<String, String> =
+                                serde_json::from_str(&tags_json).unwrap_or_default();
+                            TagMap::from_pairs(parsed)
+                        };
+                        let sample_type = match metric_type_str.as_str() {
+                            "counter" => SampleType::Counter,
+                            "gauge" => SampleType::Point,
+                            "rate" => SampleType::Rate,
+                            _ => SampleType::Trend,
+                        };
+                        let mut v = sink_metric.lock().unwrap();
+                        v.push(Sample {
+                            metric: name,
+                            value,
+                            tags,
+                            timestamp: SystemTime::now(),
+                            sample_type,
+                        });
+                    },
+                ),
+            );
+
+            // exec.scenario.name() / executor()
+            let es_name = exec_state.clone();
+            let _ = globals.set(
+                "__tropel_exec_scenario_name",
+                Func::from(move || es_name.lock().unwrap().scenario_name.clone()),
+            );
+            let es_executor = exec_state.clone();
+            let _ = globals.set(
+                "__tropel_exec_scenario_executor",
+                Func::from(move || es_executor.lock().unwrap().executor_name.clone()),
+            );
+
+            // exec.vu.idInTest() / iterationInScenario()
+            let es_vu = exec_state.clone();
+            let _ = globals.set(
+                "__tropel_exec_vu_id",
+                Func::from(move || es_vu.lock().unwrap().vu_id + 1),
+            );
+            let es_iter = exec_state.clone();
+            let _ = globals.set(
+                "__tropel_exec_iteration",
+                Func::from(move || es_iter.lock().unwrap().iteration),
+            );
+
+            // exec.instance.iterationsCompleted() / vusActive()
+            let es_completed = exec_state.clone();
+            let _ = globals.set(
+                "__tropel_exec_iterations_completed",
+                Func::from(move || es_completed.lock().unwrap().iterations_completed),
+            );
+            let es_vus = exec_state.clone();
+            let _ = globals.set(
+                "__tropel_exec_vus_active",
+                Func::from(move || es_vus.lock().unwrap().vus_active),
+            );
+
+            // group() → group_duration Trend sample (duration in ms). The
+            // shim's group() wraps fn() between __tropel_pm_group_start/end.
+            let sink_group = sink.clone();
+            let _ = globals.set(
+                "__tropel_pm_group_start",
+                Func::from(move |_name: String| {}),
+            );
+            let _ = globals.set(
+                "__tropel_pm_group_end",
+                Func::from(move |name: String, duration_ms: f64| {
+                    let mut v = sink_group.lock().unwrap();
+                    let mut tags = TagMap::with_capacity(1);
+                    tags.insert("group", name);
+                    v.push(Sample {
+                        metric: "group_duration".into(),
+                        value: duration_ms * 1000.0, // μs, consistent with other Trends
+                        tags,
+                        timestamp: SystemTime::now(),
+                        sample_type: SampleType::Trend,
+                    });
+                }),
+            );
+
+            // test.abort(msg)
+            let abort_flag = abort.clone();
+            let _ = globals.set(
+                "__tropel_test_abort",
+                Func::from(move |msg: String| {
+                    *abort_flag.lock().unwrap() = Some(msg);
+                }),
+            );
+        });
+
+        self.script_bridges_registered = true;
+        tracing::debug!("K6Driver: registered script-state bridges");
+    }
+
     /// Sync VuContext state into JS globals so the script can read
     /// environment variables, data rows, etc.
     async fn sync_globals(&self, ctx: &VuContext) -> Result<()> {
@@ -737,15 +911,26 @@ impl K6DriverInstance {
             .js_ctx
             .set_global_str("__tropel_scenario", &ctx.scenario_name)
             .await;
-        // k6-compatible globals: __VU and __ITER
+        // k6-compatible globals: __VU (1-based, like k6) and __ITER (0-based)
         let _ = self
             .js_ctx
-            .set_global_str("__VU", &ctx.vu_id.to_string())
+            .set_global_str("__VU", &(ctx.vu_id + 1).to_string())
             .await;
         let _ = self
             .js_ctx
             .set_global_str("__ITER", &ctx.iteration.to_string())
             .await;
+
+        // Refresh the shared exec.* state read by the __tropel_exec_* bridges.
+        {
+            let mut es = self.exec_state.lock().unwrap();
+            es.scenario_name = ctx.scenario_name.clone();
+            es.executor_name = ctx.executor_name.clone();
+            es.vu_id = ctx.vu_id;
+            es.iteration = ctx.iteration;
+            es.iterations_completed = ctx.iterations_completed;
+            es.vus_active = ctx.vus_active;
+        }
 
         // Set env vars as JS globals. k6 scripts read `__ENV` (and Tropel's
         // own `__tropel_env`); both get the same object. Always set __ENV so
