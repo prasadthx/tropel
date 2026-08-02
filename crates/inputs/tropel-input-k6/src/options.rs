@@ -49,6 +49,38 @@ pub struct K6Options {
     /// absent, the k6 default set is used.
     #[serde(alias = "summaryTrendStats")]
     pub summary_trend_stats: Option<Vec<String>>,
+    /// DNS configuration (k6 `options.dns`): `{ ttl, select, policy }`.
+    #[serde(default)]
+    pub dns: Option<K6Dns>,
+    /// Close the connection after every request (k6 `noConnectionReuse`).
+    #[serde(alias = "noConnectionReuse")]
+    pub no_connection_reuse: Option<bool>,
+    /// k6 `noVUConnectionReuse` — accepted for compatibility; Tropel already
+    /// gives each VU its own client/pool, so it is effectively always on.
+    #[serde(alias = "noVUConnectionReuse")]
+    pub no_vu_connection_reuse: Option<bool>,
+    /// Global request-rate cap in requests/second (k6 `rps`).
+    #[serde(default)]
+    pub rps: Option<f64>,
+    /// Static hostname → IP mapping (k6 `hosts`).
+    #[serde(default)]
+    pub hosts: Option<HashMap<String, String>>,
+    /// Blocked IPs / CIDRs (k6 `blacklistIPs`).
+    #[serde(alias = "blacklistIPs")]
+    pub blacklist_ips: Option<Vec<String>>,
+}
+
+/// k6 `options.dns` — DNS cache TTL, address selection and family policy.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct K6Dns {
+    /// Cache TTL: `"5m"`, `"inf"`, `"0"`. Absent = no caching.
+    pub ttl: Option<String>,
+    /// Address selection: `"first"`, `"roundRobin"`, `"random"`.
+    pub select: Option<String>,
+    /// Address-family policy: `"preferIPv4"`, `"preferIPv6"`,
+    /// `"onlyIPv4"`, `"onlyIPv6"`, `"any"`.
+    pub policy: Option<String>,
 }
 
 /// A ramping stage. `target` is `f64` so a single struct serves both
@@ -166,6 +198,14 @@ impl K6Options {
                         thresholds,
                         discard_response_bodies: self.discard_response_bodies,
                         summary_trend_stats: self.summary_trend_stats.clone(),
+                        dns_ttl: self.dns.as_ref().and_then(|d| d.ttl.clone()),
+                        dns_select: self.dns.as_ref().and_then(|d| d.select.clone()),
+                        dns_policy: self.dns.as_ref().and_then(|d| d.policy.clone()),
+                        no_connection_reuse: self.no_connection_reuse,
+                        no_vu_connection_reuse: self.no_vu_connection_reuse,
+                        rps: self.rps,
+                        hosts: self.hosts.clone(),
+                        blacklist_ips: self.blacklist_ips.clone(),
                     });
                 }
             }
@@ -178,6 +218,14 @@ impl K6Options {
             thresholds,
             discard_response_bodies: self.discard_response_bodies,
             summary_trend_stats: self.summary_trend_stats.clone(),
+            dns_ttl: self.dns.as_ref().and_then(|d| d.ttl.clone()),
+            dns_select: self.dns.as_ref().and_then(|d| d.select.clone()),
+            dns_policy: self.dns.as_ref().and_then(|d| d.policy.clone()),
+            no_connection_reuse: self.no_connection_reuse,
+            no_vu_connection_reuse: self.no_vu_connection_reuse,
+            rps: self.rps,
+            hosts: self.hosts.clone(),
+            blacklist_ips: self.blacklist_ips.clone(),
         })
     }
 
@@ -587,5 +635,48 @@ mod tests {
         );
         assert_eq!(opts.graceful_stop.as_deref(), Some("45s"));
         assert_eq!(opts.graceful_ramp_down.as_deref(), Some("20s"));
+    }
+
+    #[test]
+    fn test_dns_and_http_options_map() {
+        let opts = parse(
+            r#"{
+                "vus": 1,
+                "duration": "10s",
+                "dns": { "ttl": "1m", "select": "roundRobin", "policy": "preferIPv4" },
+                "noConnectionReuse": true,
+                "noVUConnectionReuse": true,
+                "rps": 50,
+                "hosts": { "api.example.com": "10.0.0.1" },
+                "blacklistIPs": ["10.0.0.0/8", "192.168.1.5"]
+            }"#,
+        );
+        assert_eq!(opts.dns.as_ref().and_then(|d| d.ttl.as_deref()), Some("1m"));
+        assert_eq!(
+            opts.dns.as_ref().and_then(|d| d.select.as_deref()),
+            Some("roundRobin")
+        );
+        assert_eq!(
+            opts.dns.as_ref().and_then(|d| d.policy.as_deref()),
+            Some("preferIPv4")
+        );
+        assert_eq!(opts.no_connection_reuse, Some(true));
+        assert_eq!(opts.no_vu_connection_reuse, Some(true));
+        assert_eq!(opts.rps, Some(50.0));
+        assert_eq!(
+            opts.hosts.as_ref().and_then(|h| h.get("api.example.com")).map(|s| s.as_str()),
+            Some("10.0.0.1")
+        );
+        assert_eq!(opts.blacklist_ips.as_ref().map(|b| b.len()), Some(2));
+
+        let decl = opts.to_declared().expect("declared options");
+        assert_eq!(decl.dns_ttl.as_deref(), Some("1m"));
+        assert_eq!(decl.dns_select.as_deref(), Some("roundRobin"));
+        assert_eq!(decl.dns_policy.as_deref(), Some("preferIPv4"));
+        assert_eq!(decl.no_connection_reuse, Some(true));
+        assert_eq!(decl.no_vu_connection_reuse, Some(true));
+        assert_eq!(decl.rps, Some(50.0));
+        assert_eq!(decl.hosts.as_ref().map(|h| h.len()), Some(1));
+        assert_eq!(decl.blacklist_ips.as_ref().map(|b| b.len()), Some(2));
     }
 }

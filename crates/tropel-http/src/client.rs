@@ -1,5 +1,8 @@
 use crate::auth::AuthSigner;
+use crate::dns::DnsResolver;
+use crate::rps::RpsLimiter;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tropel_core::config::{HttpConfig, TlsConfig};
 use tropel_core::types::*;
@@ -16,12 +19,20 @@ pub struct HttpClient {
     /// When true, response bodies are discarded entirely.
     /// The body field will be empty, saving memory and bandwidth.
     discard_bodies: bool,
+    /// Optional global RPS limiter (k6 `options.rps`), shared across all
+    /// VUs of the run. `None` = unlimited.
+    rps: Option<Arc<RpsLimiter>>,
 }
 
 impl HttpClient {
     /// Create a new HTTP client from config (default TLS settings).
     pub fn new(config: &HttpConfig) -> Result<Self> {
         Self::with_tls(config, &TlsConfig::default())
+    }
+
+    /// Create a client with an optional global RPS limiter (no TLS overrides).
+    pub fn new_with_rps(config: &HttpConfig, rps: Option<Arc<RpsLimiter>>) -> Result<Self> {
+        Self::with_tls_and_rps(config, &TlsConfig::default(), rps)
     }
 
     /// Create a new HTTP client from config, applying the TLS settings:
@@ -40,10 +51,30 @@ impl HttpClient {
     /// rustls, which negotiates a safe default cipher set; a supplied
     /// passphrase logs a warning (its value is never logged).
     pub fn with_tls(config: &HttpConfig, tls: &TlsConfig) -> Result<Self> {
+        Self::with_tls_and_rps(config, tls, None)
+    }
+
+    /// Full constructor: TLS overrides plus an optional shared global RPS
+    /// limiter (k6 `options.rps`). The limiter is created once per run and
+    /// cloned into every per-VU client so the cap is global across VUs.
+    pub fn with_tls_and_rps(
+        config: &HttpConfig,
+        tls: &TlsConfig,
+        rps: Option<Arc<RpsLimiter>>,
+    ) -> Result<Self> {
+        // k6 `noConnectionReuse`: close the connection after every request.
+        // reqwest has no direct "reuse off" switch — setting the idle pool to
+        // 0 causes every returned connection to be closed instead of pooled,
+        // so each request opens a fresh connection.
+        let max_idle = if config.no_connection_reuse {
+            0
+        } else {
+            config.max_idle_connections
+        };
         let mut builder = reqwest::Client::builder()
             .cookie_store(true)
             .user_agent(&config.user_agent)
-            .pool_max_idle_per_host(config.max_idle_connections)
+            .pool_max_idle_per_host(max_idle)
             .timeout(DEFAULT_REQUEST_TIMEOUT);
 
         // ── TLS: insecure_skip_verify ──
@@ -137,15 +168,15 @@ impl HttpClient {
             }
         }
 
-        // Real sub-timing hooks:
-        // - `dns_resolver` times actual DNS lookups (replaces the default
-        //   GaiResolver with an equivalent getaddrinfo-based resolver).
+        // DNS resolver: k6-compatible options (hosts map, blacklist, TTL
+        // cache, select/policy) on top of real timed lookups.
+        let dns_resolver = DnsResolver::from_config(config);
         // - `connector_layer` times each connection attempt (DNS + TCP + TLS)
         //   via generic tower middleware that never names reqwest's sealed
         //   `Unnameable`/`Conn` types.
         // Results are recorded on the VU thread and consumed by `execute()`.
         builder = builder
-            .dns_resolver(crate::subtimings::TimingDnsResolver)
+            .dns_resolver(dns_resolver)
             .connector_layer(crate::subtimings::TimingConnectorLayer);
 
         let inner = builder
@@ -155,6 +186,7 @@ impl HttpClient {
         Ok(Self {
             inner,
             discard_bodies: config.discard_response_bodies,
+            rps,
         })
     }
 
@@ -185,6 +217,11 @@ impl HttpClient {
         request: &Request,
         signer: Option<&dyn AuthSigner>,
     ) -> Result<HttpResponse> {
+        // Global RPS pacing happens BEFORE the request timer starts, so the
+        // wait never inflates http_req_duration / TTFB.
+        if let Some(limiter) = &self.rps {
+            limiter.acquire().await;
+        }
         let total_start = std::time::Instant::now();
         crate::subtimings::begin_request(total_start);
 
@@ -530,7 +567,7 @@ mod multipart_tests {
     }
 }
 
-fn parse_duration(s: &str) -> Result<Duration> {
+pub(crate) fn parse_duration(s: &str) -> Result<Duration> {
     let s = s.trim();
     if let Some(num_str) = s.strip_suffix("ms") {
         let ms: u64 = num_str

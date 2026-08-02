@@ -116,6 +116,43 @@ impl Engine {
                             declared_trend_stats = Some(stats);
                         }
                     }
+                    // Script-declared HTTP/DNS options (k6 `options.dns`,
+                    // `noConnectionReuse`, `rps`, `hosts`, `blacklistIPs`)
+                    // fold into the HTTP client config.
+                    if let Some(ttl) = decl.dns_ttl {
+                        http_config.dns_ttl = Some(ttl);
+                    }
+                    if let Some(sel) = decl.dns_select {
+                        http_config.dns_select = Some(sel);
+                    }
+                    if let Some(pol) = decl.dns_policy {
+                        http_config.dns_policy = Some(pol);
+                    }
+                    if let Some(no) = decl.no_connection_reuse {
+                        http_config.no_connection_reuse = no;
+                    }
+                    if let Some(no) = decl.no_vu_connection_reuse {
+                        http_config.no_vu_connection_reuse = no;
+                    }
+                    if let Some(rps) = decl.rps {
+                        http_config.rps = Some(rps);
+                    }
+                    if let Some(hosts) = decl.hosts {
+                        http_config.hosts = hosts;
+                    }
+                    if let Some(bl) = decl.blacklist_ips {
+                        http_config.blacklist_ips = bl;
+                    }
+                    if http_config.dns_ttl.is_some()
+                        || http_config.dns_select.is_some()
+                        || http_config.dns_policy.is_some()
+                        || http_config.no_connection_reuse
+                        || http_config.rps.is_some()
+                        || !http_config.hosts.is_empty()
+                        || !http_config.blacklist_ips.is_empty()
+                    {
+                        tracing::info!("Script-declared DNS/HTTP options applied");
+                    }
                     // Merge script-declared thresholds (CLI/config keys win on
                     // collision — CLI keys are "threshold_N", so no clash).
                     for (k, v) in &decl.thresholds {
@@ -135,6 +172,17 @@ impl Engine {
                     }
                 }
             }
+        }
+
+        // Global RPS limiter (k6 `options.rps`): created ONCE per run and
+        // shared by every VU across every scenario, so the cap is global.
+        let rps_limiter: Option<Arc<tropel_http::RpsLimiter>> =
+            http_config.rps.map(|r| Arc::new(tropel_http::RpsLimiter::new(r)));
+        if rps_limiter.is_some() {
+            tracing::info!(
+                "Global RPS cap: {} req/s (shared across all VUs)",
+                http_config.rps.unwrap_or(0.0)
+            );
         }
 
         // Streaming outputs
@@ -325,6 +373,7 @@ impl Engine {
             let registry_sc = registry.clone();
             let fmt_hint = format_hint.clone();
             let control_port = config.control_port;
+            let rps_limiter_sc = rps_limiter.clone();
 
             let handle = tokio::spawn(async move {
                 let resolved = resolve_input_or_driver(
@@ -377,6 +426,7 @@ impl Engine {
                             grpc_protocol,
                             ws_protocol,
                             control_port,
+                            rps_limiter_sc,
                         )
                         .await;
                     }
@@ -400,6 +450,7 @@ impl Engine {
                             &input_path,
                             registry_sc,
                             control_port,
+                            rps_limiter_sc,
                         )
                         .await;
                     }
@@ -838,6 +889,7 @@ async fn run_scenario_vus(
     grpc_protocol: Option<Arc<dyn Protocol>>,
     ws_protocol: Option<Arc<dyn Protocol>>,
     control_port: Option<u16>,
+    rps_limiter: Option<Arc<tropel_http::RpsLimiter>>,
 ) {
     if start_delay > Duration::ZERO {
         tokio::time::sleep(start_delay).await;
@@ -878,6 +930,7 @@ async fn run_scenario_vus(
     let think_time_cfg = extract_think_time(&exec_cfg);
     // k6-style executor name (e.g. "constant-vus") — backs exec.scenario.executor().
     let executor_name = exec_cfg.executor_name().to_string();
+    let rps_limiter_c = rps_limiter.clone();
     let metrics_c = metrics.clone();
     let scenario_c = scenario.clone();
     let stop_c = stop_signal.clone();
@@ -898,6 +951,7 @@ async fn run_scenario_vus(
         let vu_env = vu_env_c.clone();
         let data_rows = data_rows_c.clone();
         let http_cfg = http_cfg_c.clone();
+        let rps_vu = rps_limiter_c.clone();
         let tls_cfg = tls_cfg_c.clone();
         let thresholds = thresholds_c.clone();
         let has_abort_thresholds = has_abort_thresholds;
@@ -913,7 +967,7 @@ async fn run_scenario_vus(
         let (_, handle) = pool.spawn(async move {
             sched.add_active_vu(1).await;
 
-            let client = match HttpClient::with_tls(&http_cfg, &tls_cfg) {
+            let client = match HttpClient::with_tls_and_rps(&http_cfg, &tls_cfg, rps_vu) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!("VU {}: Failed to create HTTP client: {}", vu_id, e);
@@ -1125,6 +1179,7 @@ async fn run_driver_vus(
     input_path: &str,
     registry: Arc<ExtensionRegistry>,
     control_port: Option<u16>,
+    rps_limiter: Option<Arc<tropel_http::RpsLimiter>>,
 ) {
     if start_delay > Duration::ZERO {
         tokio::time::sleep(start_delay).await;
@@ -1186,6 +1241,7 @@ async fn run_driver_vus(
     let input_bytes_c = input_bytes.clone();
     let input_p_c = input_p.clone();
     let registry_c = registry.clone();
+    let rps_limiter_c = rps_limiter.clone();
 
     executor.run(move |sched, vu_id| {
         let metrics = metrics_c.clone();
@@ -1207,6 +1263,7 @@ async fn run_driver_vus(
         let registry = registry_c.clone();
         let sc_tags = sc_tags_c.clone();
         let sc_exec = sc_exec_c.clone();
+        let rps_vu = rps_limiter_c.clone();
 
         let (_, handle) = pool.spawn(async move {
             sched.add_active_vu(1).await;
@@ -1239,7 +1296,7 @@ async fn run_driver_vus(
                 }
             };
 
-            let client = match HttpClient::with_tls(&http_cfg, &tls_cfg) {
+            let client = match HttpClient::with_tls_and_rps(&http_cfg, &tls_cfg, rps_vu) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!("VU {}: Failed to create HTTP client: {}", vu_id, e);

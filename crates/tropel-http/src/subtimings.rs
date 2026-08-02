@@ -107,32 +107,6 @@ pub(crate) fn take_slot() -> PhaseSlot {
     })
 }
 
-/// Custom DNS resolver that times real lookups.
-///
-/// Delegates to tokio's `lookup_host` (the same getaddrinfo-based resolution
-/// reqwest's default GaiResolver uses) and records the elapsed time into the
-/// thread-local slot.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct TimingDnsResolver;
-
-impl reqwest::dns::Resolve for TimingDnsResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let host = name.as_str().to_string();
-        Box::pin(async move {
-            let start = Instant::now();
-            // Port 0: hyper-util applies the request's port to each resolved
-            // address afterward (see HttpConnector::call_async → set_port).
-            // `(String, u16)` implements ToSocketAddrs; owning the host makes
-            // the future 'static for the boxed Resolving type.
-            let result = tokio::net::lookup_host((host, 0)).await;
-            record_dns(start.elapsed());
-            result
-                .map(|addrs| -> reqwest::dns::Addrs { Box::new(addrs) })
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
-        })
-    }
-}
-
 /// Tower layer that times each connector call.
 ///
 /// Fully generic over the request/response types (reqwest's connector service

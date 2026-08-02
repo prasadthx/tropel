@@ -250,6 +250,23 @@ pub struct DriverDeclaredOptions {
     /// Which trend statistics the summary shows (k6 `options.summaryTrendStats`).
     /// `None` uses the k6 default set.
     pub summary_trend_stats: Option<Vec<String>>,
+    /// DNS cache TTL (k6 `options.dns.ttl`) applied to the HTTP client.
+    pub dns_ttl: Option<String>,
+    /// DNS address selection policy (k6 `options.dns.select`).
+    pub dns_select: Option<String>,
+    /// DNS address-family policy (k6 `options.dns.policy`).
+    pub dns_policy: Option<String>,
+    /// k6 `options.noConnectionReuse` — close every connection per request.
+    pub no_connection_reuse: Option<bool>,
+    /// k6 `options.noVUConnectionReuse` — accepted for compatibility (each
+    /// VU already owns its client/pool, so it is effectively always on).
+    pub no_vu_connection_reuse: Option<bool>,
+    /// Global request-rate cap (k6 `options.rps`), requests/second.
+    pub rps: Option<f64>,
+    /// Static host → IP mapping (k6 `options.hosts`).
+    pub hosts: Option<HashMap<String, String>>,
+    /// Blocked IPs / CIDRs (k6 `options.blacklistIPs`).
+    pub blacklist_ips: Option<Vec<String>>,
 }
 
 /// A driver instance ready to run iterations.

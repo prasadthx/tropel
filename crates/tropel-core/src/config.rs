@@ -473,6 +473,47 @@ pub struct HttpConfig {
     /// Set this to bound memory for runs with pathological outliers.
     #[serde(default, alias = "histogramMaxMicros")]
     pub histogram_max_micros: Option<u64>,
+    /// DNS cache TTL (k6 `dns.ttl`), e.g. `"5m"`, `"inf"`. `None` (default)
+    /// disables caching — every request resolves. `"0"` also disables it.
+    #[serde(default, alias = "dnsTtl")]
+    pub dns_ttl: Option<String>,
+    /// DNS address selection policy (k6 `dns.select`): `"first"`,
+    /// `"roundRobin"`, `"random"`. `None` (default) keeps all resolved
+    /// addresses in lookup order (reqwest's default behavior).
+    #[serde(default, alias = "dnsSelect")]
+    pub dns_select: Option<String>,
+    /// DNS address policy (k6 `dns.policy`): `"preferIPv4"`, `"preferIPv6"`,
+    /// `"onlyIPv4"`, `"onlyIPv6"`, `"any"`. `None` (default) keeps the
+    /// resolved address family order unchanged.
+    #[serde(default, alias = "dnsPolicy")]
+    pub dns_policy: Option<String>,
+    /// Close the connection after every request (k6 `noConnectionReuse`).
+    /// Disables connection pooling entirely — each request opens a fresh
+    /// connection, which trades latency for isolation.
+    #[serde(default, alias = "noConnectionReuse")]
+    pub no_connection_reuse: bool,
+    /// k6 `noVUConnectionReuse` parity. Tropel already gives every VU its own
+    /// client with its own connection pool, so connections are never shared
+    /// across VUs regardless of this flag; it is accepted for script
+    /// compatibility and currently a no-op.
+    #[serde(default, alias = "noVUConnectionReuse")]
+    pub no_vu_connection_reuse: bool,
+    /// Global request-rate cap in requests/second (k6 `rps`). When set, the
+    /// whole run is paced so no more than this many requests start per second,
+    /// shared across all VUs. `None` (default) is unlimited.
+    #[serde(default)]
+    pub rps: Option<f64>,
+    /// Static hostname → IP mapping (k6 `hosts`), e.g.
+    /// `{"api.example.com": "127.0.0.1"}`. Lookups for these hosts are served
+    /// from the map without hitting DNS. Values may be comma-separated to
+    /// provide several addresses; keys may be wildcards (`"*.example.com"`).
+    #[serde(default)]
+    pub hosts: HashMap<String, String>,
+    /// IP addresses / CIDRs that requests may never connect to (k6
+    /// `blacklistIPs`), e.g. `["10.0.0.0/8", "192.168.1.5"]`. When every
+    /// resolved address is blacklisted the request fails with a clear error.
+    #[serde(default, alias = "blacklistIPs")]
+    pub blacklist_ips: Vec<String>,
 }
 
 fn default_expected_statuses() -> Vec<ExpectedStatus> {
@@ -499,6 +540,14 @@ impl Default for HttpConfig {
             max_redirects: 10,
             discard_response_bodies: false,
             histogram_max_micros: None,
+            dns_ttl: None,
+            dns_select: None,
+            dns_policy: None,
+            no_connection_reuse: false,
+            no_vu_connection_reuse: false,
+            rps: None,
+            hosts: HashMap::new(),
+            blacklist_ips: Vec::new(),
         }
     }
 }

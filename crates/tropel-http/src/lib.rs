@@ -6,9 +6,13 @@
 pub mod auth;
 pub mod blocking;
 pub mod client;
+pub mod dns;
 pub mod protocol;
+pub mod rps;
 pub mod subtimings;
 
 pub use auth::*;
 pub use client::*;
+pub use dns::*;
 pub use protocol::*;
+pub use rps::*;
