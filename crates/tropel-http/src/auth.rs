@@ -773,9 +773,17 @@ impl AuthSigner for DigestAuth {
             fields.push(("opaque".into(), opaque.clone()));
         }
 
+        // RFC 7616 §3.4.1: `qop`, `nc` and `algorithm` are `token` productions
+        // and MUST NOT be quoted (strict servers reject `qop=\"auth\"` — the
+        // old code quoted every field, so `nc`/`algorithm`/`qop` were wrong).
+        // All other directives (username, realm, nonce, uri, response,
+        // cnonce, opaque) are `quoted-string` and MUST be quoted.
         let header = fields
             .iter()
-            .map(|(k, v)| format!("{k}=\"{}\"", v.replace('"', "")))
+            .map(|(k, v)| match k.as_str() {
+                "qop" | "nc" | "algorithm" => format!("{k}={v}"),
+                _ => format!("{k}=\"{}\"", v.replace('"', "")),
+            })
             .collect::<Vec<_>>()
             .join(", ");
         Some(format!("Digest {header}"))
@@ -804,17 +812,41 @@ fn parse_challenge(header: &str) -> Option<HashMap<String, String>> {
         None => (trimmed, ""),
     };
     out.insert("scheme".to_string(), scheme.to_string());
-    for part in rest.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        if let Some((k, v)) = part.split_once('=') {
-            let v = v.trim().trim_matches('"').to_string();
-            out.insert(k.trim().to_ascii_lowercase(), v);
+
+    // Split on commas, but NOT commas inside a quoted-string — RFC 2617/7616
+    // challenges frequently quote a list (`qop=\"auth, auth-int\"`). The old
+    // naive `split(',')` split inside the quotes, so a challenge advertising
+    // `auth` second would be mis-parsed as only the first qop value.
+    let mut part_start = 0usize;
+    let bytes = rest.as_bytes();
+    let mut in_quotes = false;
+    for (i, b) in bytes.iter().enumerate() {
+        match b {
+            b'"' => in_quotes = !in_quotes,
+            b',' if !in_quotes => {
+                if let Some((k, v)) = parse_challenge_part(&rest[part_start..i]) {
+                    out.insert(k, v);
+                }
+                part_start = i + 1;
+            }
+            _ => {}
         }
     }
+    if let Some((k, v)) = parse_challenge_part(&rest[part_start..]) {
+        out.insert(k, v);
+    }
     Some(out)
+}
+
+/// Parse one `key=value` segment of a challenge (may be quoted or bare).
+fn parse_challenge_part(part: &str) -> Option<(String, String)> {
+    let part = part.trim();
+    if part.is_empty() {
+        return None;
+    }
+    let (k, v) = part.split_once('=')?;
+    let v = v.trim().trim_matches('"').to_string();
+    Some((k.trim().to_ascii_lowercase(), v))
 }
 
 // ─────────────────────────── Shared helpers ───────────────────────────
@@ -1188,8 +1220,11 @@ mod tests {
         assert!(header.contains("realm=\"testrealm@host.com\""));
         assert!(header.contains("nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\""));
         assert!(header.contains("uri=\"/dir/index.html\""));
-        assert!(header.contains("qop=\"auth\""));
-        assert!(header.contains("nc=\"00000001\""));
+        // qop/nc are bare tokens per RFC 7616 §3.4.1 — NOT quoted.
+        assert!(header.contains("qop=auth"));
+        assert!(!header.contains("qop=\"auth\""));
+        assert!(header.contains("nc=00000001"));
+        assert!(!header.contains("nc=\"00000001\""));
         assert!(header.contains("response=\""));
         assert!(header.contains("opaque=\"5ccc069c403ebaf9f0171e9517f40e41\""));
         // Deterministic response for MD5 no-cnonce variant — verify 32 hex chars.
@@ -1209,8 +1244,33 @@ mod tests {
         let header = DigestAuth::new("u", "p")
             .challenge_response(www, &req)
             .unwrap();
-        assert!(header.contains("algorithm=\"MD5\""));
+        // algorithm is a bare token per RFC 7616 §3.4.1.
+        assert!(header.contains("algorithm=MD5"));
+        assert!(!header.contains("algorithm=\"MD5\""));
         assert!(!header.contains("qop="));
+    }
+
+    #[test]
+    fn digest_quoted_multi_qop_selects_auth() {
+        // A challenge quoting a qop LIST must still select the `auth` form
+        // (the old comma-split broke on commas inside the quotes, so a
+        // `qop="auth-int, auth"` challenge was mis-parsed as only
+        // `auth-int` and fell back to the no-qop response).
+        let www = r#"Digest realm="x", qop="auth-int, auth", nonce="abc123""#;
+        let req = build_request("GET", "http://example.com/", None);
+        let header = DigestAuth::new("u", "p")
+            .challenge_response(www, &req)
+            .unwrap();
+        assert!(header.contains("qop=auth"));
+        assert!(header.contains("nc=00000001"));
+        assert!(header.contains("cnonce=\""));
+        // The response for the qop form is 32 hex chars (MD5).
+        let response = header
+            .split("response=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .unwrap();
+        assert_eq!(response.len(), 32);
     }
 
     #[test]

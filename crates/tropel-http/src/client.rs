@@ -585,7 +585,11 @@ pub fn body_size(body: &Body) -> usize {
             .map(|(k, v)| k.len() + v.len() + 1)
             .sum::<usize>(),
         Body::Binary(data) => data.len(),
-        Body::GraphQL { query, .. } => query.len() + 50, // approximate JSON wrapper
+        Body::GraphQL { query, variables } => {
+            // Exact wire size — the same serializer the client sends, so
+            // data_sent accounting can't diverge from the actual body.
+            Body::graphql_json_string(query, variables).len()
+        }
     }
 }
 
@@ -626,12 +630,11 @@ fn body_to_reqwest(body: &Body) -> reqwest::Body {
             reqwest::Body::from(serde_urlencoded::to_string(params).unwrap_or_default())
         }
         Body::Binary(data) => data.clone().into(),
-        Body::GraphQL {
-            query,
-            variables: _,
-        } => {
-            let body = serde_json::json!({ "query": query });
-            serde_json::to_string(&body).unwrap_or_default().into()
+        Body::GraphQL { query, variables } => {
+            // The single shared serializer — includes `variables` when
+            // present (the old code dropped them entirely, so scripts that
+            // relied on `variables` sent a query with NO variables).
+            Body::graphql_json_string(query, variables).into()
         }
     }
 }
@@ -656,6 +659,45 @@ mod multipart_tests {
         assert!(text.contains("two"));
         assert!(text.ends_with("------------------------tropel-boundary-7a2f24b9--\r\n"));
         assert_eq!(body_size(&Body::FormData(formdata)), bytes.len());
+    }
+
+    #[test]
+    fn graphql_body_includes_variables() {
+        // Regression: `body_to_reqwest` destructured `variables: _` and sent
+        // ONLY the query — a GraphQL request with variables silently dropped
+        // them (the server would error or return wrong results).
+        let mut vars: HashMap<String, serde_json::Value> = HashMap::new();
+        vars.insert("id".to_string(), serde_json::json!("42"));
+        let body = Body::GraphQL {
+            query: "query($id: ID!) { user(id: $id) { name } }".to_string(),
+            variables: Some(vars),
+        };
+        let req_body = body_to_reqwest(&body);
+        let bytes = req_body.as_bytes().expect("reqwest body is bytes");
+        let json: serde_json::Value =
+            serde_json::from_slice(bytes).expect("GraphQL wire body is valid JSON");
+        assert_eq!(json["query"], "query($id: ID!) { user(id: $id) { name } }");
+        assert_eq!(json["variables"]["id"], "42");
+        // body_size must account for the variables too (exact, not the old
+        // `query.len() + 50` approximation).
+        assert_eq!(body_size(&body), bytes.len());
+    }
+
+    #[test]
+    fn graphql_body_omits_empty_variables() {
+        // No variables map → the wire JSON has NO "variables" key at all
+        // (strict servers reject an empty `variables: {}`).
+        let body = Body::GraphQL {
+            query: "{ hello }".to_string(),
+            variables: None,
+        };
+        let req_body = body_to_reqwest(&body);
+        let bytes = req_body.as_bytes().expect("reqwest body is bytes");
+        let json: serde_json::Value =
+            serde_json::from_slice(bytes).expect("GraphQL wire body is valid JSON");
+        assert_eq!(json["query"], "{ hello }");
+        assert!(json.get("variables").is_none());
+        assert_eq!(body_size(&body), bytes.len());
     }
 }
 

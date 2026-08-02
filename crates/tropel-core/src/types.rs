@@ -172,8 +172,35 @@ impl Body {
                 s.len()
             }
             Body::Binary(v) => v.len(),
-            Body::GraphQL { query, .. } => query.len(),
+            Body::GraphQL { query, variables } => Self::graphql_json_string(query, variables).len(),
         }
+    }
+
+    /// Serialize a GraphQL body to its wire JSON.
+    ///
+    /// Returns `{"query": "..."}` plus a `"variables"` key ONLY when the
+    /// variables map is present and non-empty — strict GraphQL servers reject
+    /// an empty `"variables": {}` and Postman/k6 omit the key too. This is
+    /// the SINGLE source of truth for the GraphQL wire body: the HTTP client's
+    /// `body_to_reqwest` and `body_size` both call it, so the bytes sent and
+    /// the `data_sent` accounting can never diverge (the old code dropped
+    /// `variables` entirely and estimated size with `query.len() + 50`).
+    pub fn graphql_json_string(
+        query: &str,
+        variables: &Option<HashMap<String, serde_json::Value>>,
+    ) -> String {
+        let mut body = serde_json::Map::new();
+        body.insert("query".to_string(), serde_json::Value::String(query.to_string()));
+        if let Some(vars) = variables {
+            if !vars.is_empty() {
+                let mut obj = serde_json::Map::new();
+                for (k, v) in vars {
+                    obj.insert(k.clone(), v.clone());
+                }
+                body.insert("variables".to_string(), serde_json::Value::Object(obj));
+            }
+        }
+        serde_json::Value::Object(body).to_string()
     }
 }
 

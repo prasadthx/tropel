@@ -1,4 +1,4 @@
-use crate::collector::MetricsResult;
+use crate::collector::{parse_percentile, percentile_value, MetricsResult};
 use std::collections::HashMap;
 use std::time::Duration;
 use tropel_core::config::ThresholdConfig;
@@ -110,7 +110,7 @@ fn parse_duration(s: &str) -> std::result::Result<Duration, ()> {
 ///   "http_req_duration{status=200}.p95" → ("http_req_duration", [(status, 200)], "p95")
 ///   "http_reqs"                        → ("http_reqs", [], None)
 ///   "checks.pass_rate"                 → ("checks", [], "pass_rate")
-fn parse_metric_ref(metric_ref: &str) -> (&str, Vec<(&str, &str)>, Option<&str>) {
+pub(crate) fn parse_metric_ref(metric_ref: &str) -> (&str, Vec<(&str, &str)>, Option<&str>) {
     // Step 1: Find the tag block boundaries
     let (brace_start, brace_close) = {
         let start = metric_ref.find('{');
@@ -283,12 +283,22 @@ fn get_tag_scoped_metric_value(
             // Return the MAXIMUM max across all matches
             matched.iter().map(|m| m.max as f64).fold(0.0_f64, f64::max)
         }
-        Some("p50") | Some("median") => {
+        Some("p50") | Some("median") | Some("med") => {
             matched.iter().map(|m| m.p50 as f64).fold(0.0_f64, f64::max)
         }
         Some("p90") => matched.iter().map(|m| m.p90 as f64).fold(0.0_f64, f64::max),
         Some("p95") => matched.iter().map(|m| m.p95 as f64).fold(0.0_f64, f64::max),
         Some("p99") => matched.iter().map(|m| m.p99 as f64).fold(0.0_f64, f64::max),
+        // Any other pNN / p(NN) percentile — exact from the retained
+        // histogram of each matching series; worst (highest) wins across
+        // matches (consistent with the tracked buckets above).
+        Some(s) if parse_percentile(s).is_some() => {
+            let pct = parse_percentile(s).expect("guarded");
+            matched
+                .iter()
+                .map(|m| percentile_value(m, pct))
+                .fold(0.0_f64, f64::max)
+        }
         Some("count") => matched.iter().map(|m| m.count as f64).sum(),
         Some("rate") => {
             let total_sum: f64 = matched.iter().map(|m| m.sum).sum();
@@ -327,7 +337,7 @@ fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
                     Some("avg") => d.mean,
                     Some("min") => d.min as f64,
                     Some("max") => d.max as f64,
-                    Some("p50") | Some("median") => d.p50 as f64,
+                    Some("p50") | Some("median") | Some("med") => d.p50 as f64,
                     Some("p90") => d.p90 as f64,
                     Some("p95") => d.p95 as f64,
                     Some("p99") => d.p99 as f64,
@@ -339,6 +349,11 @@ fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
                         } else {
                             0.0
                         }
+                    }
+                    // Any other pNN / p(NN) percentile — exact from the
+                    // retained histogram (not the mean, not a bucket guess).
+                    Some(s) if parse_percentile(s).is_some() => {
+                        percentile_value(d, parse_percentile(s).expect("guarded"))
                     }
                     _ => d.mean, // default to mean if no stat specified
                 }
@@ -354,7 +369,7 @@ fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
                         Some("avg") => m.mean,
                         Some("min") => m.min as f64,
                         Some("max") => m.max as f64,
-                        Some("p50") | Some("median") => m.p50 as f64,
+                        Some("p50") | Some("median") | Some("med") => m.p50 as f64,
                         Some("p90") => m.p90 as f64,
                         Some("p95") => m.p95 as f64,
                         Some("p99") => m.p99 as f64,
@@ -368,6 +383,11 @@ fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
                             } else {
                                 0.0
                             }
+                        }
+                        // Any other pNN / p(NN) percentile — exact from the
+                        // retained histogram.
+                        Some(s) if parse_percentile(s).is_some() => {
+                            percentile_value(m, parse_percentile(s).expect("guarded"))
                         }
                         _ => m.mean,
                     };
@@ -405,6 +425,7 @@ mod tests {
                 p99: 1800,
                 last: 0.0,
                 rate: 0.0,
+                histogram: None,
             }),
             ..Default::default()
         }
@@ -451,6 +472,101 @@ mod tests {
         assert!(result.0, "pass rate 0.9 should be > 0.8");
     }
 
+    // ── Arbitrary-percentile tests ──
+
+    /// Build a MetricsResult whose http_req_duration carries a real retained
+    /// histogram with values 100..=1000 µs (10 samples, mean 550 µs).
+    /// p75 ≈ 775-800 µs — far above the mean — so a `.p75 < 600` threshold
+    /// MUST fail. Before the histogram was retained, any non-{p50,p90,p95,p99}
+    /// stat silently fell back to the mean (550) → false PASS.
+    fn make_histogram_metrics() -> MetricsResult {
+        use crate::histogram::LatencyHistogram;
+        let mut h = LatencyHistogram::new();
+        for i in 1..=10u64 {
+            h.record_micros(i * 100);
+        }
+        MetricsResult {
+            http_req_duration: Some(MetricSummary {
+                key: "http_req_duration".into(),
+                tags: vec![],
+                metric_type: MetricType::Trend,
+                count: 10,
+                sum: 5500.0,
+                mean: 550.0,
+                min: 100,
+                max: 1000,
+                p50: 500,
+                p90: 900,
+                p95: 950,
+                p99: 990,
+                last: 0.0,
+                rate: 0.0,
+                histogram: Some(h),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_arbitrary_percentile_exact_not_mean() {
+        let metrics = make_histogram_metrics();
+        // p75 of 100..1000 (10 values) is ~775-800 µs. The mean is 550.
+        let result = evaluate_single_threshold("http_req_duration.p75 < 600", &metrics);
+        assert!(!result.0, "p75 must be > 600 (mean fallback would false-PASS)");
+        assert!(
+            result.1 > 600.0 && result.1 < 850.0,
+            "p75 should be an exact histogram percentile, got {}",
+            result.1
+        );
+        assert_ne!(result.1, 550.0, "must not fall back to the mean");
+    }
+
+    #[test]
+    fn test_arbitrary_percentile_paren_syntax() {
+        let metrics = make_histogram_metrics();
+        // k6-style p(90) syntax
+        let result = evaluate_single_threshold("http_req_duration.p(90) < 2000", &metrics);
+        assert!(result.0, "p90 of 100..1000 is ~900, should be < 2000");
+        assert!(
+            result.1 >= 850.0 && result.1 <= 1000.0,
+            "p(90) should be an exact histogram percentile, got {}",
+            result.1
+        );
+    }
+
+    #[test]
+    fn test_arbitrary_percentile_tag_scoped() {
+        // Build a tag-scoped series carrying a histogram, then assert the
+        // tag-scoped path also resolves non-standard percentiles exactly.
+        use crate::histogram::LatencyHistogram;
+        let mut h = LatencyHistogram::new();
+        for i in 1..=10u64 {
+            h.record_micros(i * 100);
+        }
+        let mut metrics = MetricsResult::default();
+        metrics.metrics.push(MetricSummary {
+            key: "http_req_duration{status=200}".into(),
+            tags: vec![("status".into(), "200".into())],
+            metric_type: MetricType::Trend,
+            count: 10,
+            sum: 5500.0,
+            mean: 550.0,
+            min: 100,
+            max: 1000,
+            p50: 500,
+            p90: 900,
+            p95: 950,
+            p99: 990,
+            last: 0.0,
+            rate: 0.0,
+            histogram: Some(h),
+        });
+        let result =
+            evaluate_single_threshold("http_req_duration{status=200}.p75 < 600", &metrics);
+        assert!(!result.0, "tag-scoped p75 must also be exact, not the mean");
+        assert_ne!(result.1, 550.0);
+    }
+
     // ── Tag-scoped threshold tests ──
 
     fn make_tag_scoped_metrics() -> MetricsResult {
@@ -471,6 +587,7 @@ mod tests {
             p99: 1400,
             last: 0.0,
             rate: 0.0,
+            histogram: None,
         });
         metrics.metrics.push(MetricSummary {
             key: "http_req_duration{status=500}".into(),
@@ -487,6 +604,7 @@ mod tests {
             p99: 3000,
             last: 0.0,
             rate: 0.0,
+            histogram: None,
         });
         metrics
     }

@@ -1,4 +1,5 @@
 use crate::histogram::LatencyHistogram;
+use crate::thresholds::parse_metric_ref;
 use base64::Engine as _;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -437,6 +438,12 @@ struct Aggregator {
     >,
     /// Latency histogram ceiling in microseconds (None = auto-resize).
     histogram_max_micros: Option<u64>,
+    /// Whether any configured threshold/summary stat needs EXACT non-tracked
+    /// percentiles. Computed once when the summary config arrives (and in
+    /// [`merge_snapshots`]) so it stays stable across the many `results()`
+    /// calls during a run — the config fields themselves are `mem::take`n
+    /// into the first result, so they must not be re-inspected per call.
+    retain_histograms: bool,
 }
 
 impl Aggregator {
@@ -447,6 +454,7 @@ impl Aggregator {
             summary_trend_stats: k6_default_trend_stats(),
             effective_thresholds: std::collections::HashMap::new(),
             histogram_max_micros: None,
+            retain_histograms: false,
         }
     }
 
@@ -477,6 +485,8 @@ impl Aggregator {
                     summary_trend_stats,
                     effective_thresholds,
                 } => {
+                    agg.retain_histograms =
+                        config_needs_histograms(&summary_trend_stats, &effective_thresholds);
                     agg.summary_trend_stats = summary_trend_stats;
                     agg.effective_thresholds = effective_thresholds;
                 }
@@ -536,6 +546,16 @@ impl Aggregator {
         let mut merged_per_url: std::collections::BTreeMap<String, MetricSet> =
             std::collections::BTreeMap::new();
 
+        // Clone full histograms into summaries only when some configured
+        // threshold/summary stat needs an EXACT non-tracked percentile
+        // (p75, p99.9, …). The default tracked buckets (p50/p90/p95/p99) are
+        // precomputed, so this avoids an O(buckets) clone per `results()`
+        // call — the ~2s-per-VU threshold-check hot path. The flag is
+        // computed ONCE at config time (see `Aggregator::retain_histograms`)
+        // because the config fields below are mem::take n into the first
+        // result and would be empty on subsequent calls.
+        let retain_histograms = self.retain_histograms;
+
         for (key, set) in self.data.iter() {
             let key_str = key.to_key_string();
             let summary_tags: Vec<(String, String)> = key
@@ -561,6 +581,7 @@ impl Aggregator {
                     p99: 0,
                     last: 0.0,
                     rate: 0.0,
+                    histogram: None,
                 },
                 MetricType::Rate => MetricSummary {
                     key: key_str,
@@ -577,6 +598,7 @@ impl Aggregator {
                     p99: 0,
                     last: 0.0,
                     rate: set.rate(),
+                    histogram: None,
                 },
                 MetricType::Gauge => MetricSummary {
                     key: key_str,
@@ -601,6 +623,7 @@ impl Aggregator {
                     p99: 0,
                     last: set.last,
                     rate: 0.0,
+                    histogram: None,
                 },
                 MetricType::Trend => {
                     let stats = set.histogram.stats();
@@ -619,6 +642,7 @@ impl Aggregator {
                         p99: stats.p99,
                         last: 0.0,
                         rate: 0.0,
+                        histogram: retain_histograms.then(|| set.histogram.clone()),
                     }
                 }
             };
@@ -727,6 +751,7 @@ impl Aggregator {
                 p99: stats.p99,
                 last: 0.0,
                 rate: 0.0,
+                histogram: retain_histograms.then(|| merged.histogram.clone()),
             });
         }
 
@@ -748,6 +773,7 @@ impl Aggregator {
                 p99: stats.p99,
                 last: 0.0,
                 rate: 0.0,
+                histogram: retain_histograms.then(|| merged.histogram.clone()),
             });
         }
 
@@ -769,6 +795,7 @@ impl Aggregator {
                 p99: stats.p99,
                 last: 0.0,
                 rate: 0.0,
+                histogram: retain_histograms.then(|| merged.histogram.clone()),
             });
         }
 
@@ -951,6 +978,7 @@ pub fn merge_snapshots(
     thresholds: std::collections::HashMap<String, tropel_core::config::ThresholdConfig>,
 ) -> MetricsResult {
     let mut agg = Aggregator::new();
+    agg.retain_histograms = config_needs_histograms(&agg.summary_trend_stats, &thresholds);
     agg.effective_thresholds = thresholds;
     for snap in &snapshots {
         agg.absorb_snapshot(snap);
@@ -992,6 +1020,11 @@ pub struct MetricSummary {
     pub last: f64,
     /// Rate (Rate only: sum/count).
     pub rate: f64,
+    /// Retained latency histogram (Trend metrics only; `None` otherwise).
+    /// Kept so threshold/summary evaluation can compute EXACT arbitrary
+    /// percentiles (e.g. `p75`, `p99.9`, `p(90)`) instead of falling back
+    /// to the mean or a nearest-tracked-bucket approximation.
+    pub histogram: Option<LatencyHistogram>,
 }
 
 /// Aggregated metrics result.
@@ -1076,19 +1109,106 @@ pub fn trend_stat_value(stat: &str, m: &MetricSummary) -> Option<f64> {
         "count" => Some(m.count as f64),
         "sum" => Some(m.sum),
         "rate" => Some(m.rate),
-        s if s.starts_with("p(") && s.ends_with(')') => {
-            let pct: f64 = s[2..s.len() - 1].trim().parse().ok()?;
-            // k6 allows arbitrary percentiles; MetricsResult only tracks
-            // p50/p90/p95/p99 — map to the nearest tracked bucket.
-            let bucket = match pct {
-                x if x <= 50.0 => m.p50 as f64,
-                x if x <= 90.0 => m.p90 as f64,
-                x if x <= 95.0 => m.p95 as f64,
-                _ => m.p99 as f64,
-            };
-            Some(bucket)
+        s if parse_percentile(s).is_some() => {
+            let pct = parse_percentile(s).expect("checked by guard");
+            // Exact percentile from the retained histogram when available;
+            // falls back to the nearest tracked bucket only when the
+            // histogram was not retained (e.g. synthetic summaries).
+            Some(percentile_value(m, pct))
         }
         _ => None,
+    }
+}
+
+/// Do the configured threshold expressions and summary trend stats require
+/// the retained histogram (i.e. does any reference a non-tracked percentile)?
+fn config_needs_histograms(
+    trend_stats: &[String],
+    thresholds: &std::collections::HashMap<String, tropel_core::config::ThresholdConfig>,
+) -> bool {
+    trend_stats.iter().any(|s| stat_needs_histogram(s))
+        || thresholds.values().any(|t| {
+            // Mirror `evaluate_single_threshold`: the expression is
+            // "<metric_ref> <op> <value>", so parse ONLY the first token.
+            // Passing the whole expression would make the stat come out as
+            // e.g. "75 < 300" (the `.rfind('.')` grabs the trailing value)
+            // and retention would never trigger.
+            let metric_ref = t.expression.split_whitespace().next().unwrap_or("");
+            let (_, _, stat) = parse_metric_ref(metric_ref);
+            stat.map(stat_needs_histogram).unwrap_or(false)
+        })
+}
+
+/// Does a stat reference require the retained histogram to evaluate exactly?
+///
+/// The tracked buckets (p50/p90/p95/p99 and aliases avg/min/med/max/count/
+/// sum/rate/last) are precomputed in `MetricSummary`, so only NON-tracked
+/// percentile values (e.g. `p75`, `p(90.5)`, `p99.9`) need the histogram
+/// retained. This gates the per-`results()` histogram clone on the hot path:
+/// default configs (summaryTrendStats uses p(90)/p(95)/p(99)) never pay it.
+pub(crate) fn stat_needs_histogram(stat: &str) -> bool {
+    let s = stat.trim();
+    if matches!(
+        s,
+        "avg" | "mean"
+            | "min"
+            | "max"
+            | "count"
+            | "sum"
+            | "rate"
+            | "last"
+            | "p50"
+            | "median"
+            | "med"
+            | "p90"
+            | "p95"
+            | "p99"
+    ) {
+        return false;
+    }
+    match parse_percentile(s) {
+        // Non-tracked percentile values need the histogram for exactness;
+        // tracked values (50/90/95/99) in any syntax are already exact.
+        Some(pct) => !(pct == 50.0 || pct == 90.0 || pct == 95.0 || pct == 99.0),
+        None => false,
+    }
+}
+
+/// Parse a percentile stat reference like `p95`, `p75`, `p99.9` or `p(90)`
+/// into a percentile value in 0–100. Returns `None` for non-percentile stats.
+pub fn parse_percentile(stat: &str) -> Option<f64> {
+    let s = stat.trim();
+    if s.starts_with("p(") && s.ends_with(')') {
+        return s[2..s.len() - 1].trim().parse().ok();
+    }
+    let num = s.strip_prefix('p')?;
+    num.parse().ok()
+}
+
+/// Exact percentile from a Trend summary's retained histogram; falls back to
+/// the nearest tracked bucket (p50/p90/p95/p99) only when no histogram was
+/// retained (e.g. test fixtures, or the pre-config window before the summary
+/// config arrives).
+///
+/// The fallback is deliberately CONSERVATIVE for `<`/`<=` thresholds: for
+/// p75 the nearest tracked bucket is p90, which is ≥ p75 in any real
+/// distribution, so a `p75 < X` threshold evaluated against it can only
+/// false-FAIL, never false-PASS. Note the opposite caveat for `>`/`>=`
+/// thresholds (a higher bucket can false-PASS) — which is exactly why
+/// `retain_histograms` exists: when a non-tracked percentile is actually
+/// referenced in a threshold, the histogram IS retained and the value is
+/// exact, so this fallback only fires in the pre-config window / synthetic
+/// summaries.
+pub fn percentile_value(m: &MetricSummary, pct: f64) -> f64 {
+    if let Some(h) = &m.histogram {
+        h.percentile(pct) as f64
+    } else {
+        match pct {
+            x if x <= 50.0 => m.p50 as f64,
+            x if x <= 90.0 => m.p90 as f64,
+            x if x <= 95.0 => m.p95 as f64,
+            _ => m.p99 as f64,
+        }
     }
 }
 
@@ -1147,5 +1267,57 @@ mod tests {
         assert!(s.contains("http_req_duration"));
         assert!(s.contains("status"));
         assert!(s.contains("200"));
+    }
+
+    #[test]
+    fn test_stat_needs_histogram() {
+        // Tracked buckets + aliases — no histogram needed.
+        for tracked in ["avg", "min", "max", "count", "sum", "rate", "last",
+                        "p50", "median", "med", "p90", "p95", "p99"] {
+            assert!(!stat_needs_histogram(tracked), "{tracked} should not need a histogram");
+        }
+        // Tracked values in any syntax (incl. k6 p(NN) form) — exact already.
+        assert!(!stat_needs_histogram("p(90)"));
+        assert!(!stat_needs_histogram("p(99)"));
+        assert!(!stat_needs_histogram("p(50)"));
+        // Non-tracked percentiles — need the histogram for exactness.
+        assert!(stat_needs_histogram("p75"));
+        assert!(stat_needs_histogram("p(75)"));
+        assert!(stat_needs_histogram("p99.9"));
+        assert!(stat_needs_histogram("p(99.9)"));
+        // Non-percentile junk — no histogram, falls to default handling.
+        assert!(!stat_needs_histogram("bogus"));
+        assert!(!stat_needs_histogram(""));
+    }
+
+    #[test]
+    fn test_config_needs_histograms_threshold_scan() {
+        use tropel_core::config::ThresholdConfig;
+
+        let mut thresholds: std::collections::HashMap<String, ThresholdConfig> =
+            std::collections::HashMap::new();
+        thresholds.insert(
+            "p95".into(),
+            ThresholdConfig {
+                expression: "http_req_duration.p95 < 500".into(),
+                abort_on_fail: false,
+                delay_abort_eval: None,
+            },
+        );
+        assert!(!config_needs_histograms(&k6_default_trend_stats(), &thresholds));
+
+        thresholds.insert(
+            "p75".into(),
+            ThresholdConfig {
+                expression: "http_req_duration{status=200}.p75 < 300".into(),
+                abort_on_fail: false,
+                delay_abort_eval: None,
+            },
+        );
+        assert!(config_needs_histograms(&k6_default_trend_stats(), &thresholds));
+
+        // summaryTrendStats p(99.9) also triggers retention.
+        let stats = vec!["avg".into(), "p(99.9)".into()];
+        assert!(config_needs_histograms(&stats, &std::collections::HashMap::new()));
     }
 }
