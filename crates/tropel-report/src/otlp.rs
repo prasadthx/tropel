@@ -7,7 +7,10 @@
 //! Samples are buffered per metric name and flushed every `FLUSH_INTERVAL`
 //! (or when the buffer exceeds `MAX_BUFFERED_SAMPLES`), with a final flush
 //! on stream close. Metric type mapping follows the OTLP conventions:
-//! - `Counter` samples → monotonic `Sum` (CUMULATIVE temporality)
+//! - `Counter` samples → monotonic `Sum` with **DELTA** temporality: each
+//!   data point is the increment since the last export (aggregated per
+//!   tag-set within a flush window). CUMULATIVE would be wrong here — the
+//!   raw values are per-event deltas, not running totals from process start.
 //! - `Point` / `Gauge` samples → `Gauge`
 //! - `Rate` samples → `Gauge` (a rate is a point-in-time ratio)
 //! - `Trend` samples → each sample becomes a `Gauge` data point (raw
@@ -187,40 +190,88 @@ fn normalize_metrics_url(url: &str) -> String {
 }
 
 /// Build an OTLP/HTTP JSON `ExportMetricsServiceRequest` from buffered metrics.
+///
+/// Counters are aggregated per (metric, tag-set) within the flush window and
+/// reported with **DELTA** temporality (`aggregationTemporality: 1`): each
+/// data point is the sum of events since the last export. CUMULATIVE (2)
+/// would be wrong — raw counter samples are per-event increments, not
+/// running totals from process start, and a collector would interpret each
+/// as a cumulative total.
 fn build_export_request(metrics: &HashMap<String, Vec<Sample>>) -> serde_json::Value {
     let mut metric_values = Vec::with_capacity(metrics.len());
 
     for (name, samples) in metrics {
-        let mut is_counter = false;
-        let mut data_points = Vec::with_capacity(samples.len());
+        let is_counter = samples.iter().any(|s| s.sample_type == SampleType::Counter);
 
-        for s in samples {
-            if s.sample_type == SampleType::Counter {
-                is_counter = true;
+        let data_points: Vec<serde_json::Value> = if is_counter {
+            // Sum per (sorted tag-set). Keep the LAST timestamp seen for a
+            // tag-set so the delta point carries the newest time.
+            let mut per_tags: Vec<(Vec<(String, String)>, f64, u64)> = Vec::new();
+            for s in samples {
+                let mut tags: Vec<(String, String)> = s
+                    .tags
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+                tags.sort();
+                // Nanos since epoch fits comfortably in u64 (≈584 years).
+                let ts_nanos = s
+                    .timestamp
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                match per_tags.iter_mut().find(|(t, _, _)| *t == tags) {
+                    Some((_, sum, ts)) => {
+                        *sum += s.value;
+                        *ts = ts_nanos;
+                    }
+                    None => per_tags.push((tags, s.value, ts_nanos)),
+                }
             }
-            let attrs: Vec<serde_json::Value> = s
-                .tags
+            per_tags
+                .into_iter()
+                .map(|(tags, sum, ts)| {
+                    let attrs: Vec<serde_json::Value> = tags
+                        .iter()
+                        .map(|(k, v)| json!({ "key": k, "value": { "stringValue": v } }))
+                        .collect();
+                    json!({
+                        "timeUnixNano": ts.to_string(),
+                        "asDouble": sum,
+                        "attributes": attrs,
+                    })
+                })
+                .collect()
+        } else {
+            // Gauge: one data point per raw observation (unchanged).
+            samples
                 .iter()
-                .map(|(k, v)| json!({ "key": k, "value": { "stringValue": v } }))
-                .collect();
-            let ts_nanos = s
-                .timestamp
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-                .to_string();
-            data_points.push(json!({
-                "timeUnixNano": ts_nanos,
-                "asDouble": s.value,
-                "attributes": attrs,
-            }));
-        }
+                .map(|s| {
+                    let attrs: Vec<serde_json::Value> = s
+                        .tags
+                        .iter()
+                        .map(|(k, v)| json!({ "key": k, "value": { "stringValue": v } }))
+                        .collect();
+                    let ts_nanos = s
+                        .timestamp
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                        .to_string();
+                    json!({
+                        "timeUnixNano": ts_nanos,
+                        "asDouble": s.value,
+                        "attributes": attrs,
+                    })
+                })
+                .collect()
+        };
 
         let value_field = if is_counter {
             json!({
                 "sum": {
                     "dataPoints": data_points,
-                    "aggregationTemporality": 2, // CUMULATIVE
+                    "aggregationTemporality": 1, // DELTA
                     "isMonotonic": true,
                 }
             })
@@ -268,6 +319,15 @@ mod tests {
     fn sample(metric: &str, value: f64, sample_type: SampleType) -> Sample {
         let mut tags = TagMap::new();
         tags.insert("status", "200");
+        sample_typed(metric, value, sample_type, tags)
+    }
+
+    fn sample_typed(
+        metric: &str,
+        value: f64,
+        sample_type: SampleType,
+        tags: TagMap,
+    ) -> Sample {
         Sample {
             metric: metric.to_string(),
             value,
@@ -300,14 +360,55 @@ mod tests {
         assert!(s.contains("\"gauge\""));
         assert!(s.contains("\"asDouble\":12.5") || s.contains("\"asDouble\": 12.5"));
 
-        // Counter → monotonic sum.
+        // Counter → monotonic sum with DELTA temporality (per-event values
+        // are increments since the last export, not cumulative totals).
         assert!(s.contains("\"http_reqs\""));
         assert!(s.contains("\"sum\""));
         assert!(s.contains("\"isMonotonic\":true") || s.contains("\"isMonotonic\": true"));
-        assert!(s.contains("\"aggregationTemporality\":2"));
+        assert!(s.contains("\"aggregationTemporality\":1"));
 
         // Tags → attributes.
         assert!(s.contains("status"));
+    }
+
+    #[test]
+    fn counter_aggregates_per_tag_set_with_delta() {
+        // Regression for the temporality bug: raw counter samples are
+        // per-event deltas, so they must be SUMMED per tag-set and reported
+        // with DELTA temporality — never CUMULATIVE with per-event values.
+        let mut tags_a = TagMap::new();
+        tags_a.insert("status", "200");
+        let mut tags_b = TagMap::new();
+        tags_b.insert("status", "500");
+
+        let mut metrics: HashMap<String, Vec<Sample>> = HashMap::new();
+        metrics.insert(
+            "http_reqs".to_string(),
+            vec![
+                sample_typed("http_reqs", 1.0, SampleType::Counter, tags_a.clone()),
+                sample_typed("http_reqs", 1.0, SampleType::Counter, tags_a.clone()),
+                sample_typed("http_reqs", 1.0, SampleType::Counter, tags_b.clone()),
+            ],
+        );
+
+        let req = build_export_request(&metrics);
+        let s = req.to_string();
+
+        // DELTA temporality, monotonic sum.
+        assert!(s.contains("\"aggregationTemporality\":1"));
+        assert!(s.contains("\"isMonotonic\":true") || s.contains("\"isMonotonic\": true"));
+
+        // Exactly two data points: status=200 summed to 2.0, status=500 to 1.0.
+        assert_eq!(
+            s.matches("\"timeUnixNano\":").count(),
+            2,
+            "one aggregated delta point per tag-set, got: {s}"
+        );
+        assert!(s.contains("\"asDouble\":2.0") || s.contains("\"asDouble\": 2.0"));
+        assert!(s.contains("\"asDouble\":1.0") || s.contains("\"asDouble\": 1.0"));
+        // Both tag keys and both values appear in the attribute sets.
+        assert!(s.contains("\"status\""));
+        assert!(s.contains("\"200\"") && s.contains("\"500\""));
     }
 
     #[test]
