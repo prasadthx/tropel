@@ -50,6 +50,9 @@ pub struct VURunner {
     /// Registered protocol for `grpc://` / `grpcs://` URLs, if the binary
     /// links a gRPC extension (e.g. `tropel-x-grpc`).
     grpc_protocol: Option<Arc<dyn Protocol>>,
+    /// Registered protocol for `ws://` / `wss://` URLs, if the binary
+    /// links a WebSocket extension (e.g. `tropel-x-websocket`).
+    ws_protocol: Option<Arc<dyn Protocol>>,
     /// Expected status codes/ranges that determine request success.
     /// Controls http_req_failed metric: 1.0 when status is NOT expected.
     expected_statuses: Vec<ExpectedStatus>,
@@ -88,6 +91,7 @@ impl VURunner {
             config: RunnerConfig::default(),
             js_ctx: None,
             grpc_protocol: None,
+            ws_protocol: None,
             // Default: 2xx-3xx = success (matches k6 behavior)
             expected_statuses: vec![ExpectedStatus::Range("200-399".to_string())],
             vu_id,
@@ -105,6 +109,13 @@ impl VURunner {
     /// dispatch to it instead of the HTTP client.
     pub fn with_grpc_protocol(mut self, protocol: Option<Arc<dyn Protocol>>) -> Self {
         self.grpc_protocol = protocol;
+        self
+    }
+
+    /// Attach the registered WebSocket protocol so `ws://` / `wss://` URLs
+    /// dispatch to it instead of the HTTP client.
+    pub fn with_ws_protocol(mut self, protocol: Option<Arc<dyn Protocol>>) -> Self {
+        self.ws_protocol = protocol;
         self
     }
 
@@ -260,6 +271,8 @@ impl VURunner {
                     // samples and a Response for pm.response.
                     let is_grpc = resolved_url.starts_with("grpc://")
                         || resolved_url.starts_with("grpcs://");
+                    let is_ws = resolved_url.starts_with("ws://")
+                        || resolved_url.starts_with("wss://");
                     if is_grpc {
                         if let Some(proto) = &self.grpc_protocol {
                             let exec_start = Instant::now();
@@ -303,6 +316,53 @@ impl VURunner {
                         } else {
                             tracing::warn!(
                                 "VU {}: grpc:// URL '{}' but no gRPC protocol registered — skipping",
+                                iteration_index,
+                                resolved_url
+                            );
+                        }
+                    } else if is_ws {
+                        if let Some(proto) = &self.ws_protocol {
+                            let exec_start = Instant::now();
+                            match proto.execute(&resolved_req, None).await {
+                                Ok(outcome) => {
+                                    let duration = exec_start.elapsed();
+                                    tracing::trace!(
+                                        "VU runner: WebSocket call to {} completed in {:?}",
+                                        resolved_req.url,
+                                        duration
+                                    );
+                                    if let Some(resp) = outcome.response {
+                                        let mut state = self.pm_state.lock().unwrap();
+                                        state.response = Some(resp);
+                                    }
+                                    result.samples.extend(outcome.samples);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "VU {} WebSocket request '{}' failed: {}",
+                                        iteration_index,
+                                        item.name,
+                                        e
+                                    );
+                                    let err_tags = TagMap::from_pairs([
+                                        ("url", resolved_url.clone()),
+                                        ("method", request.method.to_string()),
+                                        ("name", item.name.clone()),
+                                        ("error", e.to_string()),
+                                    ]);
+                                    let now = std::time::SystemTime::now();
+                                    result.samples.push(tropel_core::types::Sample {
+                                        metric: "errors".to_string(),
+                                        value: 1.0,
+                                        tags: err_tags,
+                                        timestamp: now,
+                                        sample_type: SampleType::Counter,
+                                    });
+                                }
+                            }
+                        } else {
+                            tracing::warn!(
+                                "VU {}: ws:// URL '{}' but no WebSocket protocol registered — skipping",
                                 iteration_index,
                                 resolved_url
                             );

@@ -351,11 +351,15 @@ impl Engine {
                 };
 
                 let sc_name_log = sc_name.clone();
-                // Resolve the registered gRPC protocol once per scenario and
-                // share it across VUs so `grpc://` / `grpcs://` URLs dispatch
-                // to it (the runner's scheme check).
+                // Resolve the registered protocol extensions once per scenario
+                // and share them across VUs so `grpc://` / `grpcs://` and
+                // `ws://` / `wss://` URLs dispatch to them (the runner's
+                // scheme checks).
                 let grpc_protocol: Option<Arc<dyn Protocol>> = registry_sc
                     .get_protocol("grpc")
+                    .map(Arc::from);
+                let ws_protocol: Option<Arc<dyn Protocol>> = registry_sc
+                    .get_protocol("ws")
                     .map(Arc::from);
                 match resolved {
                     ResolvedInput::Scenario(scenario) => {
@@ -375,6 +379,7 @@ impl Engine {
                             data_rows,
                             test_start,
                             grpc_protocol,
+                            ws_protocol,
                         )
                         .await;
                     }
@@ -833,6 +838,7 @@ async fn run_scenario_vus(
     data_rows: Vec<HashMap<String, serde_json::Value>>,
     test_start: Instant,
     grpc_protocol: Option<Arc<dyn Protocol>>,
+    ws_protocol: Option<Arc<dyn Protocol>>,
 ) {
     if start_delay > Duration::ZERO {
         tokio::time::sleep(start_delay).await;
@@ -890,6 +896,7 @@ async fn run_scenario_vus(
         let sc_tags = sc_tags_c.clone();
         let executor_name = executor_name.clone();
         let grpc_protocol_vu = grpc_protocol.clone();
+        let ws_protocol_vu = ws_protocol.clone();
 
         let (_, handle) = pool.spawn(async move {
             sched.add_active_vu(1).await;
@@ -907,6 +914,7 @@ async fn run_scenario_vus(
             let mut runner = VURunner::new(scenario, client, vu_id, sc_name_vu.clone())
                 .with_expected_statuses(http_cfg.expected_statuses.clone())
                 .with_grpc_protocol(grpc_protocol_vu.clone())
+                .with_ws_protocol(ws_protocol_vu.clone())
                 .with_exec_context(
                     executor_name,
                     sched.active_vus_handle(),
