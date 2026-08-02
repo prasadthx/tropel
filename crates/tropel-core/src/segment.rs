@@ -9,6 +9,14 @@
 //! segment: VU counts, arrival rates, and iteration budgets are scaled by
 //! the segment's length, deterministically — every node computes its own
 //! share from the same inputs, with no coordination required.
+//!
+//! VU/iteration scaling uses k6's **telescoping** formula
+//! `floor(n·to) − floor(n·from)`, so the per-node shares across a sequence
+//! sum *exactly* to the original total (no lost or over-provisioned work).
+//! This exact-sum property relies on every node spelling the shared
+//! boundaries identically — use the same textual form (e.g. `"1/3"`, not
+//! `"1/3"` on one node and `"0.333…"` on another), or pass the same
+//! `executionSegmentSequence` so the sequence validation enforces it.
 
 use crate::config::{ArrivalRateStage, ExecutionConfig, Stage};
 use crate::{Result, TropelError};
@@ -144,25 +152,34 @@ impl ExecutionSegment {
         self.to - self.from
     }
 
-    /// Scale a VU count deterministically: at least 1 VU when the segment
-    /// covers a nonzero share and the workload is nonzero (a node must have
-    /// at least one worker to run anything).
+    /// Scale a VU count deterministically with k6's **telescoping** formula
+    /// `floor(n·to) − floor(n·from)` rather than an independent
+    /// `floor(n·(to−from))`. Telescoping distributes the integer-rounding
+    /// remainder across the segment sequence, so the scaled counts of ALL
+    /// nodes sum EXACTLY to the original `vus` — no work is lost or
+    /// over-provisioned. E.g. 10 VUs across 3 equal segments: `3+3+4` (not
+    /// `3+3+3`); 2 VUs across 3 segments: `0+1+1` (not `1+1+1`). A node may
+    /// legitimately get 0 VUs when its share floors to nothing — the
+    /// neighboring segment picks up that work.
     pub fn scale_vus(&self, vus: u32) -> u32 {
         if vus == 0 {
             return 0;
         }
-        let scaled = (vus as f64 * self.fraction()).floor() as u32;
-        scaled.max(1).min(vus)
+        let scaled = ((vus as f64) * self.to).floor() - ((vus as f64) * self.from).floor();
+        // to ≤ 1 ⇒ floor(n·to) ≤ n and floor(n·from) ≥ 0, so scaled ∈ [0, n].
+        // The min() is a defensive float-edge clamp only.
+        (scaled as u32).min(vus)
     }
 
-    /// Scale an iteration budget deterministically (floor). A nonzero budget
-    /// on a nonzero segment stays at least 1.
+    /// Scale an iteration budget deterministically with the same telescoping
+    /// formula as `scale_vus` (see its doc for why).
     pub fn scale_iterations(&self, iterations: u64) -> u64 {
         if iterations == 0 {
             return 0;
         }
-        let scaled = (iterations as f64 * self.fraction()).floor() as u64;
-        scaled.max(1).min(iterations)
+        let scaled =
+            ((iterations as f64) * self.to).floor() - ((iterations as f64) * self.from).floor();
+        (scaled as u64).min(iterations)
     }
 
     /// Scale a rate (iterations/sec) by the segment's fraction.
@@ -359,13 +376,13 @@ mod tests {
     #[test]
     fn scales_vus_and_iterations() {
         let third = ExecutionSegment::parse("0:1/3", None).unwrap();
-        // 9 VUs × 1/3 = 3
+        // 9 VUs × 1/3 = 3 (telescoping: floor(9·1/3) − floor(9·0) = 3)
         assert_eq!(third.scale_vus(9), 3);
         // 90 iterations × 1/3 = 30
         assert_eq!(third.scale_iterations(90), 30);
-        // Small values clamp to 1 (a node must have a worker)
-        assert_eq!(third.scale_vus(1), 1);
-        assert_eq!(third.scale_iterations(1), 1);
+        // A sub-unit share floors to 0 — no `.max(1)` over-provision
+        assert_eq!(third.scale_vus(1), 0);
+        assert_eq!(third.scale_iterations(1), 0);
         // Zero stays zero
         assert_eq!(third.scale_vus(0), 0);
         // Rate is fractional, not floored
@@ -374,6 +391,65 @@ mod tests {
         let full = ExecutionSegment::parse("0:1", None).unwrap();
         assert_eq!(full.scale_vus(9), 9);
         assert_eq!(full.scale_iterations(90), 90);
+    }
+
+    #[test]
+    fn telescoping_sums_exactly_across_segments() {
+        // The whole point of telescoping: scaled counts across ALL segments
+        // of a sequence sum EXACTLY to the original total. Independent
+        // `floor(n·fraction)` loses work (10 VUs / 3 nodes → 3+3+3=9);
+        // telescoping recovers it (3+3+4=10).
+        let s1 = ExecutionSegment::parse("0:1/3", None).unwrap();
+        let s2 = ExecutionSegment::parse("1/3:2/3", None).unwrap();
+        let s3 = ExecutionSegment::parse("2/3:1", None).unwrap();
+
+        // VUs 10/N3 → 3+3+4 = 10 (TODO's example)
+        assert_eq!(
+            s1.scale_vus(10) + s2.scale_vus(10) + s3.scale_vus(10),
+            10
+        );
+        assert_eq!((s1.scale_vus(10), s2.scale_vus(10), s3.scale_vus(10)), (3, 3, 4));
+
+        // Iters 10/N4 → 2+3+2+3 = 10 (TODO's example)
+        let q1 = ExecutionSegment::parse("0:1/4", None).unwrap();
+        let q2 = ExecutionSegment::parse("1/4:1/2", None).unwrap();
+        let q3 = ExecutionSegment::parse("1/2:3/4", None).unwrap();
+        let q4 = ExecutionSegment::parse("3/4:1", None).unwrap();
+        assert_eq!(
+            q1.scale_iterations(10)
+                + q2.scale_iterations(10)
+                + q3.scale_iterations(10)
+                + q4.scale_iterations(10),
+            10
+        );
+        assert_eq!(
+            (
+                q1.scale_iterations(10),
+                q2.scale_iterations(10),
+                q3.scale_iterations(10),
+                q4.scale_iterations(10)
+            ),
+            (2, 3, 2, 3)
+        );
+
+        // VUs 2/N3 → 0+1+1 = 2 (no `.max(1)` over-provision)
+        assert_eq!((s1.scale_vus(2), s2.scale_vus(2), s3.scale_vus(2)), (0, 1, 1));
+
+        // Arbitrary total sums back to itself for all segment counts
+        for vus in [1u32, 7, 100, 999] {
+            for n in [1usize, 2, 3, 7] {
+                let mut total = 0u64;
+                for i in 0..n {
+                    let seg = ExecutionSegment::new(
+                        i as f64 / n as f64,
+                        (i + 1) as f64 / n as f64,
+                    )
+                    .unwrap();
+                    total += seg.scale_vus(vus) as u64;
+                }
+                assert_eq!(total, vus as u64, "VUs {vus} across {n} segments");
+            }
+        }
     }
 
     #[test]
