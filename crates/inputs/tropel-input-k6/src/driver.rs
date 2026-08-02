@@ -39,7 +39,8 @@ use futures::future::join_all;
 use regex::Regex;
 use rquickjs::function::Func;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tropel_js::JsContext;
 use tropel_sdk::{Body, Method, Request, TagMap};
@@ -99,6 +100,11 @@ impl Driver for K6Driver {
         // Step 3: Bootstrap shim libraries & native modules
         bootstrap_js_libs(&js_ctx).await?;
 
+        // Install the k6 file-access bridges (open() + SharedArray cache).
+        // Needs the script directory for relative path resolution.
+        let script_dir = source_path.and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        register_k6_file_bridges(&js_ctx, script_dir);
+
         // Step 4: Eval the source as an ES module and install the entry-point
         // export as the global `__tropel_iteration`. When the scenario names
         // an `exec` function (k6 multi-scenario), install THAT export;
@@ -136,10 +142,11 @@ impl Driver for K6Driver {
         // yields `None` — the engine falls back to the CLI/JobConfig profile.
         let original = std::str::from_utf8(bytes).ok()?;
         let module_source = prepare_module_source(original, source_path).ok()?;
+        let script_dir = source_path.and_then(|p| p.parent().map(|d| d.to_path_buf()));
         // eval_module_export_json returns Result<Option<String>> — .ok()?
         // unwraps the Result, the second ? unwraps the Option.
         let json_str =
-            eval_module_export_json(&module_source, "options", env).await.ok()??;
+            eval_module_export_json(&module_source, "options", env, script_dir).await.ok()??;
         let options: K6Options = match serde_json::from_str(&json_str) {
             Ok(o) => o,
             Err(e) => {
@@ -170,7 +177,8 @@ impl Driver for K6Driver {
         // default summary / --summary-export.
         let original = std::str::from_utf8(bytes).ok()?;
         let module_source = prepare_module_source(original, source_path).ok()?;
-        eval_module_handle_summary(&module_source, summary_data_json, env)
+        let script_dir = source_path.and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        eval_module_handle_summary(&module_source, summary_data_json, env, script_dir)
             .await
             .ok()?
     }
@@ -179,6 +187,118 @@ impl Driver for K6Driver {
 // Register K6Driver for compile-time discovery.
 inventory::submit!(DriverRegistration::new("k6", || Box::new(K6Driver))
 .with_priority(10));
+
+// ──────────────────────────────────────────────────────────────────────
+// k6 `open()` + `k6/data` SharedArray native cache
+// ──────────────────────────────────────────────────────────────────────
+//
+// k6 semantics: `new SharedArray(name, factory)` computes the data ONCE per
+// process (in the init context) and shares it read-only across all VUs. In
+// Tropel each VU owns its own JsContext (thread-per-core), so the "shared"
+// payload lives on the native side: the first VU context that constructs a
+// given SharedArray runs the factory, serializes the result to JSON, and
+// stores it in this process-global cache; every other VU context rebuilds the
+// same read-only view from the cached JSON without re-running the factory.
+//
+// Keyed by name only — matches k6 (the name is the identity).
+static SHARED_ARRAY_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn shared_array_cache() -> &'static Mutex<HashMap<String, String>> {
+    SHARED_ARRAY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Register the k6 file-access native bridges on a JS context:
+///
+/// - `__tropel_k6_open(path, mode)` — reads a file (relative to the script's
+///   directory, or absolute) and returns its contents: `"t"` mode returns the
+///   UTF-8 text, `"b"` mode returns base64-encoded bytes (the shim decodes
+///   into an ArrayBuffer, matching k6's `open(path, 'b')`). A missing/unreadable
+///   file throws a JS `Error` (k6 behavior).
+/// - `__tropel_k6_shared_array_get(name)` / `__tropel_k6_shared_array_set(name, json)`
+///   — process-global SharedArray cache.
+///
+/// The bridges must be installed on EVERY k6 context that may evaluate script
+/// code (the per-VU init context AND the throwaway options/handleSummary
+/// contexts), because k6 scripts routinely call `open()`/`new SharedArray()`
+/// at module top level while building `export const options`.
+fn register_k6_file_bridges(ctx: &JsContext, script_dir: Option<PathBuf>) {
+    ctx.with_ctx(|rq_ctx| {
+        let globals = rq_ctx.globals();
+        let dir = script_dir.clone();
+        // Key the SharedArray cache by script dir + name so two different
+        // scripts sharing a process (multi-scenario, repeated in-process runs)
+        // never collide on the same name (k6 keys by the init context).
+        let cache_prefix = dir
+            .as_ref()
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        let _ = globals.set(
+            "__tropel_k6_open",
+            Func::from(
+                move |ctx: rquickjs::Ctx,
+                      path: String,
+                      mode: String|
+                      -> std::result::Result<String, rquickjs::Error> {
+                    let p = Path::new(&path);
+                    let full = if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        match &dir {
+                            Some(d) => d.join(p),
+                            None => p.to_path_buf(),
+                        }
+                    };
+                    match std::fs::read(&full) {
+                        Ok(bytes) => {
+                            if mode == "b" {
+                                use base64::Engine;
+                                Ok(base64::engine::general_purpose::STANDARD
+                                    .encode(bytes))
+                            } else {
+                                Ok(String::from_utf8_lossy(&bytes).into_owned())
+                            }
+                        }
+                        Err(e) => {
+                            let msg = format!("open('{}'): {}", path, e);
+                            let exc = rquickjs::Exception::from_message(ctx.clone(), &msg)
+                                .map_err(|_| rquickjs::Error::Exception)?;
+                            Err(ctx.throw(exc.into_object().into_value()))
+                        }
+                    }
+                },
+            ),
+        );
+
+        let get_prefix = cache_prefix.clone();
+        let _ = globals.set(
+            "__tropel_k6_shared_array_get",
+            Func::from(move |name: String| -> String {
+                let key = format!("{}|{}", get_prefix, name);
+                shared_array_cache()
+                    .lock()
+                    .map(|c| c.get(&key).cloned().unwrap_or_default())
+                    .unwrap_or_default()
+            }),
+        );
+
+        let set_prefix = cache_prefix.clone();
+        let _ = globals.set(
+            "__tropel_k6_shared_array_set",
+            Func::from(move |name: String, json: String| {
+                let key = format!("{}|{}", set_prefix, name);
+                if let Ok(mut c) = shared_array_cache().lock() {
+                    c.insert(key, json);
+                }
+            }),
+        );
+    });
+}
+
+/// The k6 `open()` + `k6/data` SharedArray shim (globals `open` and
+/// `SharedArray`), which delegates to the native bridges above.
+const OPEN_DATA_SHIM: &str =
+    include_str!("../../../../js/k6-shim/open-data-shim.js");
 
 // ══════════════════════════════════════════════════════════════════
 // K6DriverInstance — per-iteration execution
@@ -599,10 +719,21 @@ async fn eval_module_export_json(
     source: &str,
     export: &str,
     env: &HashMap<String, String>,
+    script_dir: Option<PathBuf>,
 ) -> Result<Option<String>> {
     let js_ctx = JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
         .await
         .map_err(|e| TropelError::Other(format!("JS context creation failed: {}", e)))?;
+
+    // k6 scripts often read data files at init time (`JSON.parse(open(...))`
+    // or `new SharedArray(...)`) while building `export const options` —
+    // install the file bridges AND the open/SharedArray shim so the throwaway
+    // context can resolve them (the shim defines the JS globals on top of the
+    // native bridges).
+    register_k6_file_bridges(&js_ctx, script_dir);
+    js_ctx.bootstrap_library(OPEN_DATA_SHIM).await.map_err(|e| {
+        TropelError::Other(format!("k6 open/SharedArray shim bootstrap failed: {}", e))
+    })?;
 
     // Minimal globals a k6 script may reference while building its options.
     // `__ENV` carries the job's env vars so options computed from them
@@ -634,10 +765,17 @@ async fn eval_module_handle_summary(
     source: &str,
     data_json: &str,
     env: &HashMap<String, String>,
+    script_dir: Option<PathBuf>,
 ) -> Result<Option<HashMap<String, String>>> {
     let js_ctx = JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
         .await
         .map_err(|e| TropelError::Other(format!("JS context creation failed: {}", e)))?;
+
+    // `handleSummary` may reference `open()`/SharedArray captured at init.
+    register_k6_file_bridges(&js_ctx, script_dir);
+    js_ctx.bootstrap_library(OPEN_DATA_SHIM).await.map_err(|e| {
+        TropelError::Other(format!("k6 open/SharedArray shim bootstrap failed: {}", e))
+    })?;
 
     // Minimal globals a k6 script may reference while building its summary.
     let _ = js_ctx.set_global_str("__VU", "0").await;
@@ -836,10 +974,11 @@ async fn bootstrap_js_libs(ctx: &JsContext) -> Result<()> {
     }
 
     // Phase 3: Bootstrapping libraries that depend on native functions
-    let native_dependent_libraries: [(&str, &str); 3] = [
+    let native_dependent_libraries: [(&str, &str); 4] = [
         ("pm-api", include_str!("../../../../js/pm-api/pm.js")),
         ("sleep-shim", SLEEP_SHIM),
         ("k6-shim", include_str!("../../../../js/k6-shim/k6-shim.js")),
+        ("open-data-shim", OPEN_DATA_SHIM),
     ];
 
     for (name, code) in &native_dependent_libraries {
@@ -1194,8 +1333,151 @@ mod tests {
         assert_eq!(map.get("stdout").map(|s| s.as_str()), Some("async 3"));
     }
 
-    #[test]
-    fn test_declared_options_driver_e2e() {
+    // ── k6 `open()` + `k6/data` SharedArray ──
+
+    /// Create a JsContext with the k6 file bridges + shim installed.
+    async fn ctx_with_file_bridges(script_dir: Option<PathBuf>) -> JsContext {
+        let js_ctx = JsContext::new(None, Some(Duration::from_secs(5)))
+            .await
+            .expect("context creation should succeed");
+        register_k6_file_bridges(&js_ctx, script_dir);
+        js_ctx
+            .bootstrap_library(OPEN_DATA_SHIM)
+            .await
+            .expect("open-data shim should bootstrap");
+        js_ctx
+    }
+
+    fn temp_script_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tropel-k6-open-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn test_open_reads_text_relative_to_script_dir() {
+        let dir = temp_script_dir("text");
+        std::fs::write(dir.join("data.txt"), "hello from open").unwrap();
+        let js_ctx = ctx_with_file_bridges(Some(dir.clone())).await;
+        let out = js_ctx
+            .eval("open('data.txt')")
+            .await
+            .expect("open should succeed");
+        assert_eq!(out, "hello from open");
+        // Absolute path also works.
+        let abs = dir.join("data.txt").to_string_lossy().to_string();
+        let out = js_ctx
+            .eval(&format!("open('{}')", abs.replace('\\', "\\\\")))
+            .await
+            .expect("absolute open should succeed");
+        assert_eq!(out, "hello from open");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_open_binary_returns_array_buffer() {
+        let dir = temp_script_dir("bin");
+        std::fs::write(dir.join("blob.bin"), [0u8, 1, 2, 255, 128]).unwrap();
+        let js_ctx = ctx_with_file_bridges(Some(dir.clone())).await;
+        let out = js_ctx
+            .eval(
+                "var b = open('blob.bin', 'b');\
+                 (b instanceof ArrayBuffer) ? 'AB:' + b.byteLength : 'not-ab';",
+            )
+            .await
+            .expect("binary open should succeed");
+        assert_eq!(out, "AB:5");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_open_missing_file_throws_js_error() {
+        let dir = temp_script_dir("missing");
+        let js_ctx = ctx_with_file_bridges(Some(dir.clone())).await;
+        let out = js_ctx
+            .eval(
+                "try { open('nope.txt'); 'no-throw'; }\
+                 catch (e) { 'threw:' + (e && e.message ? e.message : String(e)); }",
+            )
+            .await
+            .expect("eval should succeed");
+        assert!(
+            out.starts_with("threw:"),
+            "missing file must throw a JS error, got: {out}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_shared_array_computes_once_across_contexts() {
+        // First context constructs the SharedArray and populates the native
+        // cache; a second context (another VU) must see the same data WITHOUT
+        // re-running the factory (k6 semantics: computed once, shared).
+        let dir = temp_script_dir("shared");
+        let name = "tropel-shared-test-1";
+        let js_ctx1 = ctx_with_file_bridges(Some(dir.clone())).await;
+        let script = format!(
+            "var calls = 0;\
+             var sa = new SharedArray('{name}', function () {{ calls++; return [10, 20, 30]; }});\
+             JSON.stringify({{ len: sa.length, first: sa[0], at: sa.at(1), calls: calls }});"
+        );
+        let out1 = js_ctx1
+            .eval(&script)
+            .await
+            .expect("first SharedArray construction should succeed");
+        assert!(
+            out1.contains("\"len\":3")
+                && out1.contains("\"first\":10")
+                && out1.contains("\"at\":20")
+                && out1.contains("\"calls\":1"),
+            "first context must run the factory once, got: {out1}"
+        );
+
+        // Second context: same name -> cached, factory NOT re-run.
+        let js_ctx2 = ctx_with_file_bridges(Some(dir.clone())).await;
+        let script2 = format!(
+            "var calls = 0;\
+             var sa = new SharedArray('{name}', function () {{ calls++; return [99]; }});\
+             JSON.stringify({{ len: sa.length, first: sa[0], calls: calls }});"
+        );
+        let out2 = js_ctx2
+            .eval(&script2)
+            .await
+            .expect("cached SharedArray construction should succeed");
+        assert!(
+            out2.contains("\"len\":3")
+                && out2.contains("\"first\":10")
+                && out2.contains("\"calls\":0"),
+            "second context must reuse cached data without re-running the factory, got: {out2}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_shared_array_is_read_only() {
+        let dir = temp_script_dir("ro");
+        let js_ctx = ctx_with_file_bridges(Some(dir.clone())).await;
+        let out = js_ctx
+            .eval(
+                "var sa = new SharedArray('tropel-shared-test-ro', function () { return [1, 2, 3]; });\
+                 try { sa[0] = 999; 'no-throw'; }\
+                 catch (e) { 'threw:' + (e && e.message ? e.message : String(e)); }",
+            )
+            .await
+            .expect("read-only assignment should be catchable");
+        assert!(
+            out.starts_with("threw:"),
+            "SharedArray writes must throw, got: {out}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_declared_options_driver_e2e() {
         // Full path: K6Driver::declared_options on a script with options.
         // Uses a raw module eval through the same helper the driver uses.
         let source = r#"

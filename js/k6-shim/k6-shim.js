@@ -341,9 +341,12 @@ function fail(msg) {
     throw new Error('k6 fail: ' + (msg || 'test failed'));
 }
 
-// check(val, conds) — defined in pm-api/pm.js if loaded, else here
+// check(val, conds) — defined in pm-api/pm.js if loaded, else here.
+// NOTE: uses `var` assignment (NOT `function` inside the guard) — QuickJS
+// block-scopes function declarations, so a `function` here would be invisible
+// outside the if-block whenever the fallback actually ran.
 if (typeof check !== 'function') {
-    function check(val, conds) {
+    var check = function (val, conds) {
         if (!conds || typeof conds !== 'object') {
             return true;
         }
@@ -370,12 +373,12 @@ if (typeof check !== 'function') {
             }
         }
         return allPassed;
-    }
+    };
 }
 
 // group(name, fn) — defined in pm-api/pm.js if loaded, else here
 if (typeof group !== 'function') {
-    function group(name, fn) {
+    var group = function (name, fn) {
         if (typeof __tropel_pm_group_start === 'function') {
             __tropel_pm_group_start(name);
             var startTime = Date.now();
@@ -392,16 +395,16 @@ if (typeof group !== 'function') {
                 return fn();
             }
         }
-    }
+    };
 }
 
 // sleep(seconds) — bootstrapped by the engine, but ensure it exists
 if (typeof sleep !== 'function') {
-    function sleep(seconds) {
+    var sleep = function (seconds) {
         if (typeof __tropel_native_sleep === 'function') {
             __tropel_native_sleep(seconds * 1000);
         }
-    }
+    };
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -416,15 +419,17 @@ var __ITER = __ITER || 0;
 // k6/metrics — Metric constructors
 // ══════════════════════════════════════════════════════════════════
 
-// These are also defined in pm-api/pm.js — only define if missing
+// These are also defined in pm-api/pm.js — only define if missing.
+// NOTE: `var` assignments, not `function` declarations — QuickJS block-scopes
+// the latter, so a guarded fallback would be invisible outside its if-block.
 if (typeof Counter !== 'function') {
-    function Counter(name) {
+    var Counter = function (name) {
         if (!name || typeof name !== 'string') {
             throw new Error('Counter requires a metric name');
         }
         this._name = name;
         this._type = 'counter';
-    }
+    };
     Counter.prototype.add = function (value, tags) {
         if (typeof __tropel_pm_custom_metric_add === 'function') {
             var tagsStr = tags ? JSON.stringify(tags) : '{}';
@@ -434,13 +439,13 @@ if (typeof Counter !== 'function') {
     };
 }
 if (typeof Gauge !== 'function') {
-    function Gauge(name) {
+    var Gauge = function (name) {
         if (!name || typeof name !== 'string') {
             throw new Error('Gauge requires a metric name');
         }
         this._name = name;
         this._type = 'gauge';
-    }
+    };
     Gauge.prototype.add = function (value, tags) {
         if (typeof __tropel_pm_custom_metric_add === 'function') {
             var tagsStr = tags ? JSON.stringify(tags) : '{}';
@@ -450,13 +455,13 @@ if (typeof Gauge !== 'function') {
     };
 }
 if (typeof Rate !== 'function') {
-    function Rate(name) {
+    var Rate = function (name) {
         if (!name || typeof name !== 'string') {
             throw new Error('Rate requires a metric name');
         }
         this._name = name;
         this._type = 'rate';
-    }
+    };
     Rate.prototype.add = function (value, tags) {
         if (typeof __tropel_pm_custom_metric_add === 'function') {
             var tagsStr = tags ? JSON.stringify(tags) : '{}';
@@ -466,13 +471,13 @@ if (typeof Rate !== 'function') {
     };
 }
 if (typeof Trend !== 'function') {
-    function Trend(name) {
+    var Trend = function (name) {
         if (!name || typeof name !== 'string') {
             throw new Error('Trend requires a metric name');
         }
         this._name = name;
         this._type = 'trend';
-    }
+    };
     Trend.prototype.add = function (value, tags) {
         if (typeof __tropel_pm_custom_metric_add === 'function') {
             var tagsStr = tags ? JSON.stringify(tags) : '{}';

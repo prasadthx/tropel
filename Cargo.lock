@@ -4110,12 +4110,14 @@ name = "tropel-input-k6"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.23.0",
  "futures",
  "inventory",
  "regex",
  "rquickjs",
  "serde",
  "serde_json",
+ "tokio",
  "tracing",
  "tropel-es",
  "tropel-http",

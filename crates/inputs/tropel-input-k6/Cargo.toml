@@ -21,3 +21,7 @@ serde_json.workspace = true
 inventory.workspace = true
 tracing.workspace = true
 rquickjs.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
