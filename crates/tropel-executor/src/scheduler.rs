@@ -488,12 +488,17 @@ impl VUScheduler {
                 let step_delay = stage_duration / delta as u32;
                 for step in 1..=delta {
                     // Interpolate the ramp-down target from current_vus down
-                    // to `target`, one unit at a time.
+                    // to `target`, one unit at a time. Arm EXACTLY ONE surplus
+                    // slot per step (remaining = new_target+1 - new_target = 1)
+                    // so exactly one VU exits per step window — a true linear
+                    // ramp. Re-arming to a GROWING value (current_vus -
+                    // new_target = step) would let VUs exit in bursts and
+                    // overshoot below the final target.
                     let new_target = current_vus - step;
                     if new_target < target {
                         break;
                     }
-                    self.set_ramp_down_target(new_target, current_vus);
+                    self.set_ramp_down_target(new_target, new_target + 1);
                     tracing::debug!(
                         "Ramp-down step: target {new_target} (from {current_vus}, grace: {:?})",
                         grace_rd

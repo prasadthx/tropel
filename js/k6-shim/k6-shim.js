@@ -285,8 +285,39 @@ http.batch = function (requests) {
         var batchResultJson = __tropel_k6_http_batch(JSON.stringify(normalized));
         var batchResult = JSON.parse(batchResultJson);
         for (var ei = 0; ei < entries.length; ei++) {
-            var key = entries[ei].key != null ? String(entries[ei].key) : String(ei);
-            results[key] = batchResult[key];
+            var entry = entries[ei];
+            var key = entry.key != null ? String(entry.key) : String(ei);
+            // Wrap each entry as a K6Response so `.json()`, `.status`, `.body`
+            // behave like the sequential path (k6 returns Response objects).
+            var raw = batchResult[key] || {};
+            var headers = raw.headers || {};
+            var normalizedHeaders = {};
+            if (Array.isArray(headers)) {
+                for (var hi = 0; hi < headers.length; hi++) {
+                    var h = headers[hi];
+                    if (h && h.key) {
+                        normalizedHeaders[h.key.toLowerCase()] = h.value !== undefined ? h.value : '';
+                    }
+                }
+            } else {
+                for (var hk in headers) {
+                    if (headers.hasOwnProperty(hk)) {
+                        normalizedHeaders[hk.toLowerCase()] = headers[hk];
+                    }
+                }
+            }
+            var code = raw.code || raw.status_code || raw.status || 0;
+            var rtime = raw.responseTime || raw.response_time || 0;
+            var timings = {
+                blocked: 0,
+                connecting: 0,
+                tls_handshaking: 0,
+                sending: 0,
+                waiting: rtime,
+                receiving: 0,
+                duration: rtime
+            };
+            results[key] = new K6Response(code, raw.body || '', normalizedHeaders, timings, entry.url);
         }
     } else {
         for (var ei = 0; ei < entries.length; ei++) {

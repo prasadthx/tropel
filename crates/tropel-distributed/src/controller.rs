@@ -80,48 +80,83 @@ pub async fn run_controller(
         sequence.as_deref().unwrap_or("")
     );
 
-    let mut snapshots: Vec<MetricsSnapshot> = Vec::with_capacity(num_agents as usize);
+    // Spawn ALL agent handlers concurrently: each task accepts its own
+    // connection on the shared listener, dispatches its segment, and reads
+    // that agent's snapshot. All agents therefore run SIMULTANEOUSLY (the
+    // whole point of distributed load) instead of serially — before this
+    // change the controller blocked on agent N's full run before even
+    // accepting agent N+1, so wall-clock ≈ N × duration and the target
+    // never saw aggregate load.
+    let listener = std::sync::Arc::new(listener);
+    let per_agent_timeout = agent_timeout(config);
+    let mut agent_tasks = Vec::with_capacity(num_agents as usize);
 
     for (i, segment) in segments.iter().enumerate() {
-        tracing::info!("Controller: waiting for agent {}/{}...", i + 1, num_agents);
-        let (mut stream, peer) =
-            tokio::time::timeout(agent_timeout(config), listener.accept())
-                .await
-                .map_err(|_| TropelError::Execution("timed out waiting for an agent".into()))?
-                .map_err(TropelError::Io)?;
-        tracing::info!("Controller: agent {i} connected from {peer}");
-
-        let assign = AssignMsg {
-            config: worker_config.clone(),
-            segment: segment.clone(),
-            sequence: sequence.clone(),
-            index: i as u32,
-            total: num_agents,
-        };
-        write_frame(&mut stream, &assign).await?;
-
-        let snapshot = match tokio::time::timeout(agent_timeout(config), read_agent_snapshot(&mut stream))
+        let listener = listener.clone();
+        let worker_config = worker_config.clone();
+        let segment = segment.clone();
+        let sequence = sequence.clone();
+        agent_tasks.push(tokio::spawn(async move {
+            tracing::info!("Controller: waiting for agent {}/{}...", i + 1, num_agents);
+            let (mut stream, peer) = tokio::time::timeout(
+                per_agent_timeout,
+                listener.accept(),
+            )
             .await
-        {
-            Ok(Ok(snapshot)) => snapshot,
-            Ok(Err(e)) => {
-                tracing::error!("Controller: agent {i} failed: {e}");
-                return Err(e);
-            }
-            Err(_) => {
-                return Err(TropelError::Execution(format!(
+            .map_err(|_| TropelError::Execution("timed out waiting for an agent".into()))?
+            .map_err(TropelError::Io)?;
+            tracing::info!("Controller: agent {i} connected from {peer}");
+
+            let assign = AssignMsg {
+                config: worker_config,
+                segment,
+                sequence,
+                index: i as u32,
+                total: num_agents,
+            };
+            write_frame(&mut stream, &assign).await?;
+
+            let snapshot = tokio::time::timeout(
+                per_agent_timeout,
+                read_agent_snapshot(&mut stream),
+            )
+            .await
+            .map_err(|_| {
+                TropelError::Execution(format!(
                     "agent {i} timed out before shipping its snapshot"
-                )));
-            }
-        };
-        tracing::info!(
-            "Controller: agent {i} shipped {} series ({} events)",
-            snapshot.series.len(),
-            snapshot.series.iter().map(|s| s.count as u64).sum::<u64>()
-        );
-        snapshots.push(snapshot);
+                ))
+            })??;
+            Ok::<_, TropelError>((i as u32, snapshot))
+        }));
     }
 
+    // Join all agent tasks. Results are placed back at their agent index so
+    // the merged snapshot ordering matches the original deterministic order.
+    let mut snapshots: Vec<Option<MetricsSnapshot>> =
+        vec![None; num_agents as usize];
+    for task in agent_tasks {
+        match task.await {
+            Ok(Ok((i, snapshot))) => {
+                tracing::info!(
+                    "Controller: agent {i} shipped {} series ({} events)",
+                    snapshot.series.len(),
+                    snapshot.series.iter().map(|s| s.count as u64).sum::<u64>()
+                );
+                snapshots[i as usize] = Some(snapshot);
+            }
+            Ok(Err(e)) => {
+                tracing::error!("Controller: agent failed: {e}");
+                return Err(e);
+            }
+            Err(e) => {
+                return Err(TropelError::Execution(format!(
+                    "agent task panicked: {e}"
+                )));
+            }
+        }
+    }
+
+    let snapshots: Vec<MetricsSnapshot> = snapshots.into_iter().flatten().collect();
     tracing::info!("Controller: all {num_agents} agents done — merging losslessly");
     Ok(merge_snapshots(snapshots, config.thresholds.clone()))
 }
