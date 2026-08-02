@@ -22,6 +22,9 @@ pub struct HttpClient {
     /// Optional global RPS limiter (k6 `options.rps`), shared across all
     /// VUs of the run. `None` = unlimited.
     rps: Option<Arc<RpsLimiter>>,
+    /// Log every HTTP request/response (method, URL, status, timing) at
+    /// debug level — the `--http-debug` flag / `HttpConfig.http_debug`.
+    http_debug: bool,
 }
 
 impl HttpClient {
@@ -203,6 +206,7 @@ impl HttpClient {
             inner,
             discard_bodies: config.discard_response_bodies,
             rps,
+            http_debug: config.http_debug,
         })
     }
 
@@ -247,6 +251,18 @@ impl HttpClient {
             .as_ref()
             .map(|b| body_size(b) as u64)
             .unwrap_or(0);
+
+        if self.http_debug {
+            // info! so the flag is self-sufficient: the default log filter is
+            // WARN, and a debug-level line would only appear with RUST_LOG.
+            tracing::info!(
+                "HTTP >>> {:?} {} (body {} bytes, {} headers)",
+                request.method,
+                request.url,
+                request_body_size,
+                request.headers.len()
+            );
+        }
 
         // Build the reqwest request
         let multipart_content_type = if matches!(request.body, Some(Body::FormData(_))) {
@@ -444,6 +460,17 @@ impl HttpClient {
             // connect_elapsed spans DNS + TCP (+ TLS for https); subtract the
             // separately-measured DNS to leave the transport phases.
             timings.connecting = connect_elapsed.saturating_sub(timings.dns);
+        }
+
+        if self.http_debug {
+            tracing::info!(
+                "HTTP <<< {:?} {} -> {} ({} bytes in {:.2?})",
+                request.method,
+                request.url,
+                status_code,
+                size,
+                total_duration
+            );
         }
 
         let response = HttpResponse {

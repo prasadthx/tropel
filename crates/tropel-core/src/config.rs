@@ -514,6 +514,10 @@ pub struct HttpConfig {
     /// resolved address is blacklisted the request fails with a clear error.
     #[serde(default, alias = "blacklistIPs")]
     pub blacklist_ips: Vec<String>,
+    /// Log every HTTP request/response at debug level (method, URL, status,
+    /// timing). Off by default; enable with the `--http-debug` CLI flag.
+    #[serde(default)]
+    pub http_debug: bool,
 }
 
 fn default_expected_statuses() -> Vec<ExpectedStatus> {
@@ -548,6 +552,7 @@ impl Default for HttpConfig {
             rps: None,
             hosts: HashMap::new(),
             blacklist_ips: Vec::new(),
+            http_debug: false,
         }
     }
 }
