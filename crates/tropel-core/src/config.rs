@@ -361,6 +361,16 @@ pub struct OutputConfig {
     /// for streaming line-protocol datagrams.
     #[serde(default)]
     pub influxdb_addr: Option<String>,
+    /// Tag-key allowlist for network outputs (prometheus/otlp/statsd/
+    /// influxdb). Only these tag keys are forwarded; empty (default) forwards
+    /// all tags. Bounds label cardinality at the backend.
+    #[serde(default)]
+    pub tag_allowlist: Vec<String>,
+    /// Max tag keys per sample forwarded to network outputs. When a sample
+    /// carries more, tags are kept deterministically (sorted by key, first
+    /// `cap` kept). `None` (default) = no cap.
+    #[serde(default)]
+    pub max_tags_per_sample: Option<usize>,
 }
 
 impl Default for OutputConfig {
@@ -376,6 +386,8 @@ impl Default for OutputConfig {
             json_stream: None,
             statsd_addr: None,
             influxdb_addr: None,
+            tag_allowlist: Vec::new(),
+            max_tags_per_sample: None,
         }
     }
 }

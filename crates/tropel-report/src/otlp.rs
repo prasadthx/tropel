@@ -26,6 +26,7 @@ use tokio::sync::broadcast;
 use tropel_core::types::{Sample, SampleType};
 use tropel_core::{Result, TropelError};
 
+use crate::output::TagPolicy;
 use crate::Output;
 
 /// How often buffered samples are exported to the collector.
@@ -46,6 +47,8 @@ pub struct OtlpOutput {
     /// Buffered samples grouped by metric name.
     metrics: Mutex<HashMap<String, Vec<Sample>>>,
     total_buffered: AtomicUsize,
+    /// Tag forwarding policy (allowlist + cardinality cap).
+    tag_policy: TagPolicy,
 }
 
 impl OtlpOutput {
@@ -57,16 +60,24 @@ impl OtlpOutput {
             client: reqwest::Client::new(),
             metrics: Mutex::new(HashMap::new()),
             total_buffered: AtomicUsize::new(0),
+            tag_policy: TagPolicy::default(),
         }
+    }
+
+    /// Set the tag forwarding policy (allowlist + cardinality cap).
+    pub fn with_tag_policy(mut self, policy: TagPolicy) -> Self {
+        self.tag_policy = policy;
+        self
     }
 
     /// Spawn a consumer task that exports samples to the collector.
     pub fn spawn(
         mut rx: broadcast::Receiver<Sample>,
         endpoint: String,
+        tag_policy: TagPolicy,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let output = OtlpOutput::new(endpoint);
+            let output = OtlpOutput::new(endpoint).with_tag_policy(tag_policy);
             let mut tick = tokio::time::interval(FLUSH_INTERVAL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -102,7 +113,8 @@ impl OtlpOutput {
         })
     }
 
-    fn buffer(&self, sample: Sample) {
+    fn buffer(&self, mut sample: Sample) {
+        sample.tags = self.tag_policy.apply(&sample.tags);
         self.metrics
             .lock()
             .unwrap()

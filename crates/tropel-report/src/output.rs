@@ -12,8 +12,57 @@
 use async_trait::async_trait;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
-use tropel_core::types::Sample;
+use tropel_core::types::{Sample, TagMap};
 use tropel_core::Result;
+
+/// Tag forwarding policy for network outputs (prometheus/otlp/statsd/influxdb).
+///
+/// Bounds label cardinality, which otherwise grows unboundedly with unique
+/// tag values (e.g. per-request `url` tags) and can balloon the series count
+/// at the backend or be rejected outright. Two levers:
+///
+/// - `allowlist`: only these tag keys are forwarded. Empty (default) =
+///   forward everything.
+/// - `max_tags`: hard cap on the number of tag keys per sample. When
+///   exceeded, tags are kept deterministically (sorted by key, first `cap`
+///   kept) so behavior is stable run-to-run.
+#[derive(Debug, Clone, Default)]
+pub struct TagPolicy {
+    /// Only these tag keys are forwarded. Empty = forward all tags.
+    pub allowlist: Vec<String>,
+    /// Max tag keys per sample. `None` = no cap.
+    pub max_tags: Option<usize>,
+}
+
+impl TagPolicy {
+    /// Apply the policy to a sample's tags: allowlist first, then the cap.
+    pub fn apply(&self, tags: &TagMap) -> TagMap {
+        let mut out = TagMap::new();
+        if self.allowlist.is_empty() {
+            for (k, v) in tags.iter() {
+                out.insert(k, v);
+            }
+        } else {
+            for (k, v) in tags.iter() {
+                if self.allowlist.iter().any(|a| a == k) {
+                    out.insert(k, v);
+                }
+            }
+        }
+        if let Some(cap) = self.max_tags {
+            if out.len() > cap {
+                let mut pairs: Vec<(String, String)> = out
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+                pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                pairs.truncate(cap);
+                out = TagMap::from_pairs(pairs);
+            }
+        }
+        out
+    }
+}
 
 /// The number of seconds between each live progress update.
 const PROGRESS_INTERVAL_SECS: u64 = 2;

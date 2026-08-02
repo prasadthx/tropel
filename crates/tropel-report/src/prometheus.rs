@@ -4,10 +4,18 @@
 //! (e.g. `http://localhost:9090/api/v1/write`) as snappy-compressed
 //! protobuf `WriteRequest` batches during the load test.
 //!
-//! Samples are buffered per time series (metric name + sorted labels, with
-//! `__name__` carrying the metric name) and flushed every `FLUSH_INTERVAL`
-//! or when the buffer exceeds `MAX_BUFFERED_SAMPLES`. A final flush happens
-//! when the sample stream closes (test end).
+//! Samples are **aggregated per time series per flush window**: raw
+//! per-request samples would (a) push the same `(series, timestamp)` twice
+//! when two requests land in the same millisecond — remote-write rejects
+//! that with a 400 — and (b) balloon the payload to one sample per request.
+//! Instead, each series collapses to ONE sample per flush: counters/rates
+//! sum, points take the last value, and trends emit `_count`/`_sum`
+//! sub-series (the Prometheus summary convention), all stamped with the
+//! flush time.
+//!
+//! Samples are flushed every `FLUSH_INTERVAL` or when the number of series
+//! exceeds `MAX_BUFFERED_SERIES`. A final flush happens when the sample
+//! stream closes (test end).
 //!
 //! The wire format is the standard Prometheus remote-write protocol:
 //! `Content-Encoding: snappy` + `Content-Type: application/x-protobuf` with
@@ -20,17 +28,19 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
-use tropel_core::types::Sample;
+use tropel_core::types::{Sample, SampleType};
 use tropel_core::{Result, TropelError};
 
+use crate::output::TagPolicy;
 use crate::Output;
 
 /// How often buffered samples are flushed to the endpoint.
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
-/// Max buffered samples before a forced flush.
-const MAX_BUFFERED_SAMPLES: usize = 10_000;
+/// Max distinct series before a forced flush (aggregation keeps one sample
+/// per series per window, so this bounds payload by cardinality, not volume).
+const MAX_BUFFERED_SERIES: usize = 10_000;
 /// Remote-write URL path appended when the user gives only a base URL.
 const REMOTE_WRITE_PATH: &str = "/api/v1/write";
 
@@ -43,10 +53,21 @@ const REMOTE_WRITE_PATH: &str = "/api/v1/write";
 pub struct PrometheusRemoteWriteOutput {
     url: String,
     client: reqwest::Client,
-    /// Buffered samples keyed by time series (metric + sorted labels).
-    series: Mutex<HashMap<SeriesKey, Vec<(f64, i64)>>>,
-    /// Total buffered sample count (fast read without taking the lock).
+    /// Per-series aggregation accumulated during the current flush window.
+    series: Mutex<HashMap<SeriesKey, SeriesAgg>>,
+    /// Number of series currently buffered (fast read without the lock).
     total_buffered: AtomicUsize,
+    /// Tag forwarding policy (allowlist + cardinality cap).
+    tag_policy: TagPolicy,
+}
+
+/// Per-series aggregation for the current flush window.
+#[derive(Debug, Clone)]
+struct SeriesAgg {
+    sample_type: SampleType,
+    count: u64,
+    sum: f64,
+    last: f64,
 }
 
 /// A single time series identity: metric name plus sorted (name, value) labels.
@@ -58,17 +79,16 @@ struct SeriesKey {
 }
 
 impl SeriesKey {
-    fn from_sample(sample: &Sample) -> Self {
-        let mut labels: Vec<(String, String)> = sample
-            .tags
+    fn from_parts(metric: &str, tags: &tropel_core::types::TagMap) -> Self {
+        let mut labels: Vec<(String, String)> = tags
             .iter()
             .filter(|(k, _)| k != &"__name__") // avoid duplicate __name__ label
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         labels.sort();
-        labels.insert(0, ("__name__".to_string(), sample.metric.clone()));
+        labels.insert(0, ("__name__".to_string(), metric.to_string()));
         Self {
-            metric: sample.metric.clone(),
+            metric: metric.to_string(),
             labels,
         }
     }
@@ -85,19 +105,30 @@ impl PrometheusRemoteWriteOutput {
             client: reqwest::Client::new(),
             series: Mutex::new(HashMap::new()),
             total_buffered: AtomicUsize::new(0),
+            tag_policy: TagPolicy::default(),
         }
+    }
+
+    /// Set the tag forwarding policy (allowlist + cardinality cap).
+    pub fn with_tag_policy(mut self, policy: TagPolicy) -> Self {
+        self.tag_policy = policy;
+        self
     }
 
     /// Spawn a consumer task that pushes samples to the endpoint.
     ///
     /// Subscribes to the metrics collector's broadcast stream, buffers
-    /// samples, flushes every `FLUSH_INTERVAL` (and when the buffer exceeds
-    /// `MAX_BUFFERED_SAMPLES`), and performs a final flush when the channel
-    /// closes (test end). Returns a `JoinHandle` that completes when the
-    /// sender is dropped.
-    pub fn spawn(mut rx: broadcast::Receiver<Sample>, url: String) -> tokio::task::JoinHandle<()> {
+    /// samples, flushes every `FLUSH_INTERVAL` (and when the number of
+    /// series exceeds `MAX_BUFFERED_SERIES`), and performs a final flush
+    /// when the channel closes (test end). Returns a `JoinHandle` that
+    /// completes when the sender is dropped.
+    pub fn spawn(
+        mut rx: broadcast::Receiver<Sample>,
+        url: String,
+        tag_policy: TagPolicy,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let output = PrometheusRemoteWriteOutput::new(url);
+            let output = PrometheusRemoteWriteOutput::new(url).with_tag_policy(tag_policy);
             let mut tick = tokio::time::interval(FLUSH_INTERVAL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -106,7 +137,7 @@ impl PrometheusRemoteWriteOutput {
                     res = rx.recv() => match res {
                         Ok(sample) => {
                             output.buffer(&sample);
-                            if output.total_buffered.load(Ordering::Relaxed) >= MAX_BUFFERED_SAMPLES {
+                            if output.total_buffered.load(Ordering::Relaxed) >= MAX_BUFFERED_SERIES {
                                 if let Err(e) = output.flush().await {
                                     tracing::warn!("prometheus remote-write flush failed: {e}");
                                 }
@@ -134,17 +165,32 @@ impl PrometheusRemoteWriteOutput {
         })
     }
 
-    /// Buffer a sample into its time series.
+    /// Buffer a sample into its per-series aggregation for this flush window.
+    /// The sample's tags pass through the tag policy first (allowlist + cap).
+    /// `total_buffered` tracks DISTINCT series (only bumped on first sight of
+    /// a series), so the forced-flush threshold bounds cardinality — the
+    /// thing that actually determines payload size after aggregation.
     fn buffer(&self, sample: &Sample) {
+        let tags = self.tag_policy.apply(&sample.tags);
+        let key = SeriesKey::from_parts(&sample.metric, &tags);
         let mut series = self.series.lock().unwrap();
-        let key = SeriesKey::from_sample(sample);
-        let ts_ms = sample
-            .timestamp
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        series.entry(key).or_default().push((sample.value, ts_ms));
-        self.total_buffered.fetch_add(1, Ordering::Relaxed);
+        match series.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let agg = e.get_mut();
+                agg.count += 1;
+                agg.sum += sample.value;
+                agg.last = sample.value;
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(SeriesAgg {
+                    sample_type: sample.sample_type.clone(),
+                    count: 1,
+                    sum: sample.value,
+                    last: sample.value,
+                });
+                self.total_buffered.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Drain the buffer, encode a snappy-compressed `WriteRequest`, and POST
@@ -155,7 +201,7 @@ impl PrometheusRemoteWriteOutput {
             let mut guard = self.series.lock().unwrap();
             let taken = std::mem::take(&mut *guard);
             // Reset the counter inside the lock so a concurrent `buffer()`
-            // cannot push a sample after `mem::take` but before the reset,
+            // cannot push a series after `mem::take` but before the reset,
             // leaving the map non-empty with the counter at 0 (the 5s tick's
             // `> 0` check would then skip a flush until the next sample).
             self.total_buffered.store(0, Ordering::Relaxed);
@@ -165,7 +211,21 @@ impl PrometheusRemoteWriteOutput {
             return Ok(());
         }
 
-        let payload = encode_write_request(&series);
+        // Aggregate per series for THIS flush window into the wire map. One
+        // sample per series (stamped at flush time) means a remote-write
+        // request can never contain duplicate (series, timestamp) — the 400
+        // cause — and the payload is bounded by cardinality, not request
+        // volume.
+        let ts_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let wire_series: HashMap<SeriesKey, Vec<(f64, i64)>> = series
+            .iter()
+            .flat_map(|(key, agg)| expand_series(key, agg, ts_ms))
+            .collect();
+
+        let payload = encode_write_request(&wire_series);
         let compressed = snap::raw::Encoder::new()
             .compress_vec(&payload)
             .map_err(|e| TropelError::Report(format!("snappy compress failed: {e}")))?;
@@ -215,6 +275,47 @@ fn normalize_remote_write_url(url: &str) -> String {
         trimmed.to_string()
     } else {
         format!("{trimmed}{REMOTE_WRITE_PATH}")
+    }
+}
+
+/// Expand one flush-window aggregation into wire series (one sample per
+/// series, all stamped with the flush time `ts_ms`):
+/// - Counter/Rate → the window sum
+/// - Point → the last observed value
+/// - Trend → two series, `{metric}_count` and `{metric}_sum` (the Prometheus
+///   summary convention, so backends can derive mean/p50-style aggregates)
+fn expand_series(
+    key: &SeriesKey,
+    agg: &SeriesAgg,
+    ts_ms: i64,
+) -> Vec<(SeriesKey, Vec<(f64, i64)>)> {
+    match agg.sample_type {
+        SampleType::Counter | SampleType::Rate => {
+            vec![(key.clone(), vec![(agg.sum, ts_ms)])]
+        }
+        SampleType::Point => {
+            vec![(key.clone(), vec![(agg.last, ts_ms)])]
+        }
+        SampleType::Trend => {
+            // `{metric}_count` — labels share everything except __name__.
+            let mut count_labels = key.labels.clone();
+            count_labels[0].1 = format!("{}_count", key.metric);
+            let count_key = SeriesKey {
+                metric: format!("{}_count", key.metric),
+                labels: count_labels,
+            };
+            // `{metric}_sum` — labels share everything except __name__.
+            let mut sum_labels = key.labels.clone();
+            sum_labels[0].1 = format!("{}_sum", key.metric);
+            let sum_key = SeriesKey {
+                metric: format!("{}_sum", key.metric),
+                labels: sum_labels,
+            };
+            vec![
+                (count_key, vec![(agg.count as f64, ts_ms)]),
+                (sum_key, vec![(agg.sum, ts_ms)]),
+            ]
+        }
     }
 }
 
@@ -301,12 +402,16 @@ mod tests {
     use tropel_core::types::{Sample, SampleType, TagMap};
 
     fn sample(metric: &str, value: f64, tags: TagMap) -> Sample {
+        sample_typed(metric, value, tags, SampleType::Point)
+    }
+
+    fn sample_typed(metric: &str, value: f64, tags: TagMap, sample_type: SampleType) -> Sample {
         Sample {
             metric: metric.to_string(),
             value,
             tags,
             timestamp: SystemTime::now(),
-            sample_type: SampleType::Point,
+            sample_type,
         }
     }
 
@@ -415,64 +520,136 @@ mod tests {
         }
     }
 
+    /// Aggregate a list of samples through the same path `buffer()`+`flush()`
+    /// use (policy applied, per-series aggregation, flush-time stamping).
+    fn aggregate(samples: &[Sample], ts_ms: i64) -> HashMap<SeriesKey, Vec<(f64, i64)>> {
+        let mut series: HashMap<SeriesKey, SeriesAgg> = HashMap::new();
+        for s in samples {
+            let key = SeriesKey::from_parts(&s.metric, &s.tags);
+            let agg = series.entry(key).or_insert(SeriesAgg {
+                sample_type: s.sample_type.clone(),
+                count: 0,
+                sum: 0.0,
+                last: 0.0,
+            });
+            agg.count += 1;
+            agg.sum += s.value;
+            agg.last = s.value;
+        }
+        series
+            .iter()
+            .flat_map(|(k, a)| expand_series(k, a, ts_ms))
+            .collect()
+    }
+
     #[test]
     fn remote_write_roundtrip() {
         let mut tags = TagMap::new();
         tags.insert("status", "200");
         tags.insert("method", "GET");
 
-        let s1 = sample("http_req_duration", 123.5, tags.clone());
-        let s2 = sample("http_req_duration", 200.0, tags.clone());
-        let s3 = sample("http_reqs", 1.0, TagMap::new());
+        let s1 = sample_typed("http_req_duration", 123.5, tags.clone(), SampleType::Trend);
+        let s2 = sample_typed("http_req_duration", 200.0, tags.clone(), SampleType::Trend);
+        let s3 = sample_typed("http_reqs", 1.0, TagMap::new(), SampleType::Counter);
 
-        let mut series: HashMap<SeriesKey, Vec<(f64, i64)>> = HashMap::new();
-        for s in [&s1, &s2, &s3] {
-            let key = SeriesKey::from_sample(s);
-            let ts = s.timestamp.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-            series.entry(key).or_default().push((s.value, ts));
-        }
+        // Two raw trend samples in one flush window aggregate to ONE sample
+        // per sub-series (the whole point: no duplicate (series, ts) → 400).
+        let series = aggregate(&[s1, s2, s3], 1000);
 
         let encoded = encode_write_request(&series);
         let decoded = decode::decode(&encoded);
 
-        assert_eq!(decoded.len(), 2, "two distinct series expected");
+        // http_req_duration_count, http_req_duration_sum, http_reqs
+        assert_eq!(decoded.len(), 3, "three series expected after aggregation");
 
-        // Verify the http_req_duration series (labels sorted, __name__ first).
-        let mut found_dur = None;
+        // Trend → _count/_sum sub-series with correct aggregates.
+        let mut found_count = None;
+        let mut found_sum = None;
         for (labels, samples) in &decoded {
             let map: HashMap<&str, &str> = labels
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
-            if map.get("__name__") == Some(&"http_req_duration") {
-                assert_eq!(map.get("status"), Some(&"200"));
-                assert_eq!(map.get("method"), Some(&"GET"));
-                assert_eq!(samples.len(), 2);
-                // values preserved exactly
-                let mut vals: Vec<f64> = samples.iter().map(|(v, _)| *v).collect();
-                vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                assert_eq!(vals, vec![123.5, 200.0]);
-                found_dur = Some(());
+            match map.get("__name__") {
+                Some(&"http_req_duration_count") => {
+                    assert_eq!(map.get("status"), Some(&"200"));
+                    assert_eq!(map.get("method"), Some(&"GET"));
+                    assert_eq!(samples, &vec![(2.0, 1000)]);
+                    found_count = Some(());
+                }
+                Some(&"http_req_duration_sum") => {
+                    assert_eq!(samples, &vec![(323.5, 1000)]); // 123.5 + 200.0
+                    found_sum = Some(());
+                }
+                _ => {}
             }
         }
-        assert!(found_dur.is_some(), "http_req_duration series missing");
+        assert!(found_count.is_some(), "_count sub-series missing");
+        assert!(found_sum.is_some(), "_sum sub-series missing");
 
-        // Verify http_reqs has just __name__.
+        // Counter http_reqs → single series, sum, just __name__ label.
         for (labels, samples) in &decoded {
             if labels.iter().any(|(k, _)| k == "http_reqs") {
                 assert_eq!(labels.len(), 1);
-                assert_eq!(samples.len(), 1);
+                assert_eq!(samples, &vec![(1.0, 1000)]);
             }
         }
+    }
+
+    #[test]
+    fn aggregation_collapses_duplicate_timestamps() {
+        // Regression: two raw samples with the SAME series + ms timestamp
+        // previously produced a duplicate (series, ts) pair → remote-write
+        // rejects with 400. Aggregation must collapse them to one sample.
+        let mut tags = TagMap::new();
+        tags.insert("status", "200");
+        let s1 = sample_typed("http_req_duration", 100.0, tags.clone(), SampleType::Trend);
+        let s2 = sample_typed("http_req_duration", 250.0, tags.clone(), SampleType::Trend);
+
+        let series = aggregate(&[s1, s2], 5000);
+        // Two sub-series (count + sum), each with exactly ONE sample.
+        assert_eq!(series.len(), 2);
+        for samples in series.values() {
+            assert_eq!(samples.len(), 1, "one aggregated sample per series per window");
+        }
+    }
+
+    #[test]
+    fn tag_policy_applies_allowlist_and_cap() {
+        let mut tags = TagMap::new();
+        tags.insert("status", "200");
+        tags.insert("method", "GET");
+        tags.insert("url", "https://x/y?z=1");
+
+        // Allowlist: only status survives.
+        let policy = TagPolicy {
+            allowlist: vec!["status".to_string()],
+            max_tags: None,
+        };
+        let filtered = policy.apply(&tags);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered.get("status"), Some("200"));
+        assert!(filtered.get("method").is_none());
+        assert!(filtered.get("url").is_none());
+
+        // Cap: at most 2 tag keys (sorted, deterministic: method, status).
+        let policy = TagPolicy {
+            allowlist: Vec::new(),
+            max_tags: Some(2),
+        };
+        let capped = policy.apply(&tags);
+        assert_eq!(capped.len(), 2);
+        let mut keys: Vec<&str> = capped.iter().map(|(k, _)| k).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["method", "status"]);
     }
 
     #[test]
     fn snappy_roundtrip() {
         let mut tags = TagMap::new();
         tags.insert("status", "200");
-        let s = sample("http_req_duration", 42.0, tags);
         let mut series = HashMap::new();
-        let key = SeriesKey::from_sample(&s);
+        let key = SeriesKey::from_parts("http_req_duration", &tags);
         series.insert(key, vec![(42.0, 1000)]);
 
         let encoded = encode_write_request(&series);

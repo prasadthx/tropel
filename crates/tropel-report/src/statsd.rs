@@ -23,6 +23,7 @@ use tokio::sync::broadcast;
 use tropel_core::types::{Sample, SampleType};
 use tropel_core::{Result, TropelError};
 
+use crate::output::TagPolicy;
 use crate::Output;
 
 /// How often buffered samples are sent.
@@ -40,6 +41,8 @@ pub struct StatsdOutput {
     /// Datagram payload (single line per sample, joined by `\n` on send).
     buffer: Mutex<Vec<String>>,
     total_buffered: AtomicUsize,
+    /// Tag forwarding policy (allowlist + cardinality cap).
+    tag_policy: TagPolicy,
 }
 
 impl StatsdOutput {
@@ -53,13 +56,24 @@ impl StatsdOutput {
             addr,
             buffer: Mutex::new(Vec::new()),
             total_buffered: AtomicUsize::new(0),
+            tag_policy: TagPolicy::default(),
         })
     }
 
+    /// Set the tag forwarding policy (allowlist + cardinality cap).
+    pub fn with_tag_policy(mut self, policy: TagPolicy) -> Self {
+        self.tag_policy = policy;
+        self
+    }
+
     /// Spawn a consumer task sending samples to the agent.
-    pub fn spawn(mut rx: broadcast::Receiver<Sample>, addr: String) -> tokio::task::JoinHandle<()> {
+    pub fn spawn(
+        mut rx: broadcast::Receiver<Sample>,
+        addr: String,
+        tag_policy: TagPolicy,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let output = match StatsdOutput::new(addr) {
+            let output = match StatsdOutput::new(addr).map(|o| o.with_tag_policy(tag_policy)) {
                 Ok(o) => o,
                 Err(e) => {
                     tracing::warn!("statsd output disabled: {e}");
@@ -108,13 +122,10 @@ impl StatsdOutput {
             SampleType::Trend | SampleType::Point => "g",
         };
         let mut line = format!("{}:{}|{}", sample.metric, sample.value, stype);
-        if !sample.tags.is_empty() {
-            let tags: Vec<String> = sample
-                .tags
-                .iter()
-                .map(|(k, v)| format!("{k}:{v}"))
-                .collect();
-            line.push_str(&format!("|#{}", tags.join(",")));
+        let tags = self.tag_policy.apply(&sample.tags);
+        if !tags.is_empty() {
+            let tag_list: Vec<String> = tags.iter().map(|(k, v)| format!("{k}:{v}")).collect();
+            line.push_str(&format!("|#{}", tag_list.join(",")));
         }
         self.buffer.lock().unwrap().push(line);
         self.total_buffered.fetch_add(1, Ordering::Relaxed);

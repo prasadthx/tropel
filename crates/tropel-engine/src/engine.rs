@@ -31,7 +31,7 @@ use tropel_http::client::HttpClient;
 use tropel_http::AuthSigner;
 use tropel_metrics::collector::MetricsCollector;
 use tropel_metrics::thresholds::check_abort_on_fail;
-use tropel_report::{create_reporter, InfluxdbOutput, JsonStreamOutput, OtlpOutput, PrometheusRemoteWriteOutput, Reporter, StatsdOutput, StreamingStdoutOutput};
+use tropel_report::{create_reporter, InfluxdbOutput, JsonStreamOutput, OtlpOutput, PrometheusRemoteWriteOutput, Reporter, StatsdOutput, StreamingStdoutOutput, TagPolicy};
 
 /// The engine orchestrates a complete load test job.
 pub struct Engine {
@@ -196,6 +196,13 @@ impl Engine {
             let handle = StreamingStdoutOutput::spawn(rx);
             output_handles.push(handle);
         }
+        // Shared tag-forwarding policy for the network outputs: bounds label
+        // cardinality at the backend (allowlist + per-sample cap).
+        let tag_policy = TagPolicy {
+            allowlist: config.output.tag_allowlist.clone(),
+            max_tags: config.output.max_tags_per_sample,
+        };
+
         // Prometheus remote-write and OTLP outputs (streaming, best-effort).
         // When the user drives prometheus through the extension output
         // (`--reporter prometheus`), the extension handles it — skip the
@@ -215,13 +222,14 @@ impl Engine {
         if let Some(url) = &config.output.prometheus_remote_write_url {
             if !prometheus_via_extension {
                 let rx = sample_tx.subscribe();
-                let handle = PrometheusRemoteWriteOutput::spawn(rx, url.clone());
+                let handle =
+                    PrometheusRemoteWriteOutput::spawn(rx, url.clone(), tag_policy.clone());
                 output_handles.push(handle);
             }
         }
         if let Some(endpoint) = &config.output.otlp_endpoint {
             let rx = sample_tx.subscribe();
-            let handle = OtlpOutput::spawn(rx, endpoint.clone());
+            let handle = OtlpOutput::spawn(rx, endpoint.clone(), tag_policy.clone());
             output_handles.push(handle);
         }
         // JSON-stream (NDJSON file) output.
@@ -233,13 +241,13 @@ impl Engine {
         // StatsD / Datadog output (UDP datagrams).
         if let Some(addr) = &config.output.statsd_addr {
             let rx = sample_tx.subscribe();
-            let handle = StatsdOutput::spawn(rx, addr.clone());
+            let handle = StatsdOutput::spawn(rx, addr.clone(), tag_policy.clone());
             output_handles.push(handle);
         }
         // InfluxDB output (line protocol over UDP).
         if let Some(addr) = &config.output.influxdb_addr {
             let rx = sample_tx.subscribe();
-            let handle = InfluxdbOutput::spawn(rx, addr.clone());
+            let handle = InfluxdbOutput::spawn(rx, addr.clone(), tag_policy.clone());
             output_handles.push(handle);
         }
         // Registered extension outputs: any configured reporter name that
