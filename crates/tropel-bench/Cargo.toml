@@ -1,0 +1,25 @@
+[package]
+name = "tropel-bench"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Criterion benchmark suite for Tropel: context bootstrap, per-iteration overhead, native-vs-JS, VUs/sec, memory-per-VU"
+
+[dependencies]
+tropel-js.workspace = true
+tropel-native.workspace = true
+tropel-engine.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+# Minimal criterion (no plotters/html_reports/rayon — keeps the dep tree lean).
+criterion = { version = "0.5.1", default-features = false, features = ["cargo_bench_support"] }
+# RSS measurement for the memory-per-VU bench (Windows). Already in the tree.
+windows-sys = { version = "0.61.2", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+[[bench]]
+name = "perf"
+harness = false
