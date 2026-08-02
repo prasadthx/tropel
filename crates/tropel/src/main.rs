@@ -14,10 +14,27 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-// Outer tokio runtime: 2 workers. VUs run on the thread-per-core VUWorkerPool
-// (current-thread runtimes, one per CPU core), so the orchestrator only needs
-// minimal worker threads for scenario coordination and final metric collection.
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> tropel_core::Result<()> {
-    tropel_engine::cli::run_cli().await
+/// Outer tokio runtime worker count.
+///
+/// VUs run on the thread-per-core `VUWorkerPool` (current-thread runtimes,
+/// one per CPU core), so the outer orchestrator only needs minimal workers
+/// for scenario coordination and final metric collection. Default 2; override
+/// with `TROPEL_TOKIO_WORKERS` (clamped to [1, 128] — more than the core
+/// count would only add contention).
+fn outer_worker_threads() -> usize {
+    std::env::var("TROPEL_TOKIO_WORKERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(2)
+        .clamp(1, 128)
+}
+
+fn main() -> tropel_core::Result<()> {
+    let workers = outer_worker_threads();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .expect("failed to build outer tokio runtime");
+    rt.block_on(tropel_engine::cli::run_cli())
 }

@@ -168,6 +168,22 @@ impl HttpClient {
             }
         }
 
+        // TCP keep-alive: `idle_connection_timeout` controls the socket-level
+        // keep-alive idle period (probes sent after this much idle). This is
+        // distinct from the connection-pool idle timeout above.
+        if let Some(timeout_str) = &config.idle_connection_timeout {
+            if let Ok(timeout) = parse_duration(timeout_str) {
+                builder = builder.tcp_keepalive(timeout);
+            }
+        }
+
+        // HTTP/2 toggle: when disabled, force HTTP/1.1. When enabled (default)
+        // reqwest negotiates HTTP/2 over TLS via ALPN (and h2c prior knowledge
+        // for plaintext where the server supports it).
+        if !config.http2 {
+            builder = builder.http1_only();
+        }
+
         // DNS resolver: k6-compatible options (hosts map, blacklist, TTL
         // cache, select/policy) on top of real timed lookups.
         let dns_resolver = DnsResolver::from_config(config);
