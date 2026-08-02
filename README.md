@@ -2,7 +2,10 @@
 
 > *Spanish: "a rushing throng; in droves"*
 
-**Tropel** is a high-performance, open-source load-testing framework built in Rust. It runs **Postman collections** as load tests with full `pm.*` fidelity, using a native Rust hot path with an embedded QuickJS engine for script execution.
+**Tropel** is a high-performance, open-source load-testing framework built in
+Rust. It runs **Postman collections**, **HAR files**, **OpenAPI specs**, and
+**k6 scripts** as load tests — with a native Rust hot path and an embedded
+QuickJS engine for script execution.
 
 ## Quick Start
 
@@ -13,25 +16,54 @@ cargo build --release
 # Run a Postman collection as a load test
 ./target/release/tropel run examples/collections/simple-api.json \
   --vus 10 \
-  --duration 30s \
-  --env BASE_URL=https://api.example.com
+  --duration 30s
 
-# Run with JSON output
-./target/release/tropel run collection.json \
-  --reporter json \
-  --output results.json
+# Preview what a run will execute
+./target/release/tropel inspect collection.json
+
+# List the input formats this binary ships
+./target/release/tropel extensions
 ```
 
-## Features
+Full docs: **[docs/](docs/README.md)** — CLI reference, executors, scripting,
+metrics, extensions, distributed execution.
 
-- ✅ **Postman Collection v2.1/v2.0 support** — full `pm.*` API fidelity
-- 🚀 **Native Rust HTTP engine** — connection pooling, HTTP/2, TLS (rustls)
-- ⚡ **Embedded QuickJS** — lightweight ES2020+ JavaScript per VU
-- 📊 **HDR Histogram metrics** — p50/p90/p95/p99 latencies
-- 🎯 **Thresholds** — pass/fail exit codes
-- 🔧 **Extensible** — xk6-style extension system (protocols, outputs, JS modules)
-- 📤 **Multiple reporters** — stdout summary, JSON, CSV
-- 🔒 **Full auth support** — Bearer, Basic, API Key, Digest, OAuth1, OAuth2, AWS SigV4, Hawk
+## What Tropel does
+
+- **Six executors** — constant-vus, ramping-vus, shared/per-vu iterations,
+  constant & ramping arrival rate, with graceful stop/ramp-down, think time,
+  and pacing.
+- **Postman `pm.*` scripting** — `pm.test`, `pm.expect`, `pm.response`,
+  `pm.variables`/`pm.environment`, `pm.iterationData`,
+  `pm.execution.setNextRequest`, `pm.sendRequest`, custom metrics.
+- **k6-style scripting** — JS/TS scripts with `http.*`, `check()`, `group()`,
+  `sleep()`, `Counter/Gauge/Rate/Trend`; exported `options` are honored.
+- **HDR-histogram metrics** — p50/p90/p95/p99, sub-timings (TTFB etc.),
+  tag-scoped aggregation, thresholds with k6-compatible abort semantics.
+- **Streaming outputs** — NDJSON, StatsD, InfluxDB, Prometheus, OTLP, plus
+  stdout/JSON/CSV reporters.
+- **Thread-per-core VUs** — each VU owns its QuickJS context and HTTP client
+  on its own OS thread; lock-free metrics hot path.
+- **Extensible** — `tropel-sdk` + `tropel build --with <crate>` for native
+  extensions, and a sandboxed **WASM plugin** tier (`--plugins-dir`) for
+  third-party input formats without recompiling.
+- **Distributed** — k6-style execution segments for multi-node runs.
+
+## Status
+
+Tropel is **actively developed**. Most load-testing fundamentals are shipped
+and tested; a few areas remain partial. **See
+[docs/roadmap.md](docs/roadmap.md) for the honest per-area capability matrix**
+— this README intentionally links there instead of repeating claims.
+
+Notable limitations today:
+
+- **WASM plugins are declarative-only** (input parsing). Imperative WASM
+  drivers (http/sleep/metrics from inside a plugin) are not implemented.
+- **JMeter and Locust adapters are not started** (planned §11.6).
+- **gRPC / WebSocket protocol crates** (`tropel-x-grpc`,
+  `tropel-x-websocket`) exist and build, but are not yet wired into the
+  executor hot path.
 
 ## Architecture
 
@@ -46,152 +78,75 @@ cargo build --release
                     └──┬───────┬──────┬───┘
                        │       │      │
               ┌────────▼──┐ ┌──▼───┐ ┌▼─────────┐
-              │  Input    │ │Exec. │ │  Report   │
-              │ Adapters  │ │Sched.│ │  stdout/  │
-              └─────┬─────┘ └──┬───┘ │  json/csv │
-                    │          │     └───────────┘
-              ┌─────▼─────┐ ┌──▼───────────┐
-              │ Postman    │ │  Protocols   │
-              │ Collection │ │  (HTTP, ...) │
-              │  →Scenario │ └──────┬───────┘
-              └────────────┘        │
-                           ┌────────▼────────┐
-                           │  Native Builtins │
-                           │  (crypto/hash/   │
-                           │   encode/assert) │
-                           └────────┬────────┘
-                                    │
-                           ┌────────▼────────┐
-                           │  tropel-pm      │
-                           │  pm.* bridge    │
-                           └────────┬────────┘
-                                    │
-                           ┌────────▼────────┐
-                           │  tropel-js      │
-                           │  QuickJS per VU │
-                           └─────────────────┘
+              │  Input    │ │Exec. │ │  Output  │
+              │  Adapters │ │Sched.│ │  stdout/  │
+              │  +Drivers │ └──┬───┘ │  json/csv │
+              └─────┬─────┘   │     │   +streams│
+                    │         │     └───────────┘
+        ┌───────────▼───┐ ┌───▼───────────┐
+        │ Postman/HAR/  │ │  Protocol     │
+        │ OpenAPI/k6/   │ │  HTTP (+gRPC, │
+        │ WASM/subproc  │ │  WebSocket …) │
+        └───────────────┘ └──────┬───────┘
+                                 │
+                    ┌────────────▼───────────┐
+                    │  tropel-js (QuickJS)    │
+                    │  per-VU, thread-local   │
+                    └────────────┬───────────┘
+                                 │
+                    ┌────────────▼───────────┐
+                    │  tropel-native bridge   │
+                    │  crypto/hash/encode/    │
+                    │  assert/json/http/sleep │
+                    └─────────────────────────┘
 ```
 
-## Usage
-
-### CLI Options
-
-```bash
-tropel run <input> [options]
-
-Arguments:
-  input                     Path to Postman Collection JSON file
-
-Options:
-  -u, --vus <N>             Number of virtual users (default: 1)
-  -d, --duration <D>        Test duration (e.g., "30s", "5m", "1h")
-  -e, --env <KEY=VALUE>     Environment variable (can be repeated)
-  -E, --env-file <PATH>     Environment file (JSON)
-  -D, --data-file <PATH>    Data file (CSV or JSON)
-  -r, --reporter <FORMAT>   Report format: stdout, json, csv (default: stdout)
-  -o, --output <PATH>       Output file path
-  -t, --threshold <EXPR>    Threshold expression (can be repeated)
-  -k, --insecure            Insecure TLS (skip cert verification)
-  -m, --mode <MODE>         Run mode: constant-vus, ramping-vus,
-                            shared-iterations, arrival-rate (default: constant-vus)
-  -v, --verbose             Show verbose output
-```
-
-### Execution Modes
-
-| Mode | Description |
-|------|-------------|
-| `constant-vus` | Fixed number of VUs for a duration |
-| `ramping-vus` | Ramp VUs up/down through stages |
-| `shared-iterations` | Run a fixed number of iterations across all VUs |
-| `arrival-rate` | Maintain a constant request rate |
-
-### Example: Ramping VUs
-
-```bash
-tropel run collection.json \
-  --mode ramping-vus \
-  --start-vus 1 \
-  --stages '[{"duration":"30s","target":10},{"duration":"1m","target":10},{"duration":"30s","target":0}]' \
-  --reporter stdout
-```
-
-### Example: Thresholds
-
-```bash
-tropel run collection.json \
-  --vus 100 \
-  --duration 1m \
-  --threshold "http_req_duration p95 < 500" \
-  --threshold "checks rate > 0.99"
-```
-
-## Project Structure
+## Crates
 
 ```
-tropel/
-├── Cargo.toml                    # Workspace root
-├── crates/
-│   ├── tropel/                   # CLI binary
-│   ├── tropel-engine/            # Orchestration facade
-│   ├── tropel-core/              # Shared domain types
-│   ├── tropel-collection/        # Postman Collection parser
-│   ├── tropel-variables/         # {{var}} resolution
-│   ├── tropel-js/                # QuickJS host
-│   ├── tropel-native/            # Native builtins
-│   ├── tropel-pm/                # pm.* API bridge
-│   ├── tropel-http/              # HTTP protocol executor
-│   ├── tropel-executor/          # VU scheduler
-│   ├── tropel-metrics/           # HDR histogram aggregation
-│   ├── tropel-report/            # Reporters
-│   ├── tropel-ext/               # Extension SDK
-│   ├── tropel-build/             # Custom binary builder
-│   ├── inputs/tropel-input-postman/
-│   └── extensions/
-│       ├── tropel-x-grpc/        # (future) gRPC protocol
-│       ├── tropel-x-websocket/   # (future) WebSocket protocol
-│       └── tropel-x-prometheus/  # (future) Prometheus output
-├── js/                           # Vendored JS libraries
-│   ├── pm-api/                   # pm.* JS glue
-│   ├── chai/                     # Assertion library
-│   ├── lodash/                   # Utility library
-│   └── cryptojs-shim/            # CryptoJS-compatible API
-└── examples/
-    └── collections/              # Sample collections
+crates/
+├── tropel/               CLI binary
+├── tropel-engine/        Orchestration facade (run/inspect/archive/build)
+├── tropel-core/          Shared domain types, config, execution segments
+├── tropel-collection/    Postman collection model + parser
+├── tropel-variables/     {{var}} / {{$dynamic}} resolution
+├── tropel-executor/      VU scheduler + runner (thread-per-core)
+├── tropel-http/          HTTP client, auth (Bearer/Basic/ApiKey/OAuth1/OAuth2/
+│                         SigV4/Hawk/Digest), sub-timings
+├── tropel-js/            QuickJS host, compile-once scripts
+├── tropel-native/        Native bridge (crypto, hash, encoding, assert, JSON)
+├── tropel-pm/            pm.* bridge + k6 shim glue
+├── tropel-metrics/       HDR histograms, first-class metric types, thresholds
+├── tropel-report/        Reporters + streaming outputs
+├── tropel-es/            ESM/TypeScript transpiler + bundler
+├── tropel-sdk/           Stable public adapter/driver contract
+├── tropel-ext/           Registry, traits (InputAdapter, Driver)
+├── tropel-wasm/          WASM plugin runtime (wasmtime, fuel, AOT, pooling)
+├── tropel-build/         Custom binary builder
+├── tropel-distributed/   Controller/agent, execution segments
+├── tropel-bench/         Criterion benchmark suite
+├── inputs/               tropel-input-{postman,har,openapi,k6,subprocess}
+└── extensions/           tropel-x-{grpc,websocket,prometheus}
+js/                       Vendored shims (pm-api, chai, lodash, cryptojs-shim, k6-shim)
 ```
-
-## Build Dependencies
-
-Building Tropel requires a **C toolchain** (QuickJS compiles C source):
-
-- **Linux:** `build-essential` (`gcc`/`clang`)
-- **macOS:** Xcode Command Line Tools
-- **Windows:** MSVC Build Tools
-
-Everything else is pure Rust.
 
 ## Development
 
 ```bash
-# Format code
 cargo fmt
-
-# Lint
 cargo clippy --workspace -- -D warnings
-
-# Run tests
 cargo test --workspace
-
-# Build release
 cargo build --release
 
-# Run benchmarks
-cargo bench
+# Benchmarks (see crates/tropel-bench)
+cargo bench -p tropel-bench --bench perf          # release profile
+cargo bench -p tropel-bench --bench perf --profile dev  # fast, disk-light
 ```
 
 ## License
 
 Licensed under either of:
+
 - MIT license ([LICENSE-MIT](LICENSE-MIT))
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
 
