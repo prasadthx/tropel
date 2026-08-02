@@ -964,7 +964,10 @@ async fn run_scenario_vus(
         let grpc_protocol_vu = grpc_protocol.clone();
         let ws_protocol_vu = ws_protocol.clone();
 
-        let (_, handle) = pool.spawn(async move {
+        // 1-VU-per-task: pin this VU to its own dedicated worker thread so a
+        // blocking script `sleep()` (std::thread::sleep) never freezes a
+        // co-located VU — there is no co-located VU.
+        let handle = pool.spawn_vu(vu_id, async move {
             sched.add_active_vu(1).await;
 
             let client = match HttpClient::with_tls_and_rps(&http_cfg, &tls_cfg, rps_vu) {
@@ -1268,7 +1271,10 @@ async fn run_driver_vus(
         let rps_vu = rps_limiter_c.clone();
         let executor_name = executor_name.clone();
 
-        let (_, handle) = pool.spawn(async move {
+        // 1-VU-per-task: pin this VU to its own dedicated worker thread (see
+        // run_scenario_vus for the rationale — blocking sleep() must never
+        // freeze a co-located VU).
+        let handle = pool.spawn_vu(vu_id, async move {
             sched.add_active_vu(1).await;
 
             // Re-resolve driver from registry so each VU gets a fresh instance
