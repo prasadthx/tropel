@@ -454,39 +454,17 @@ impl AuthSigner for OAuth1Auth {
         }
         params.extend(oauth.clone());
 
-        // Sort, percent-encode, join.
-        let mut encoded: Vec<(String, String)> = params
-            .into_iter()
-            .map(|(k, v)| (enc(&k), enc(&v)))
-            .collect();
-        encoded.sort();
-        let param_string = encoded
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("&");
-
-        // Base string URI: scheme://host[:port]/path (no query).
+        // RFC 5849 §3.4.1.1: signature base string = HTTPMethod & "&" &
+        // baseURI & "&" & normalizedParams — the separators are literal `&`
+        // characters (ASCII 38), NOT newlines. Verified against the oauth.net
+        // canonical test vector (see tests).
         let base_uri = base_url(url);
-        let base_string = format!(
-            "{}\n{}\n{}",
-            method.to_uppercase(),
-            enc(&base_uri),
-            enc(&param_string)
+        let base_string = oauth1_base_string(method, &base_uri, &params);
+        let signature = oauth1_hmac_sha1(
+            &base_string,
+            &self.consumer_secret,
+            self.token_secret.as_deref().unwrap_or(""),
         );
-
-        // Signing key: encoded consumer secret & encoded token secret.
-        let key = format!(
-            "{}&{}",
-            enc(&self.consumer_secret),
-            enc(self.token_secret.as_deref().unwrap_or(""))
-        );
-        let signature = {
-            let mut mac = <HmacSha1 as KeyInit>::new_from_slice(key.as_bytes())
-                .map_err(|_| TropelError::Http("OAuth1 key derivation failed".into()))?;
-            mac.update(base_string.as_bytes());
-            base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
-        };
 
         // Header params are quoted, nonce/signature included.
         let mut header_params = oauth;
@@ -499,6 +477,43 @@ impl AuthSigner for OAuth1Auth {
             .join(", ");
         set_auth_header(request, &format!("OAuth {header_value}"))
     }
+}
+
+/// RFC 5849 §3.4.1.1 signature base string.
+///
+/// `HTTPMethod & "&" & baseURI & "&" & normalizedParams` where the
+/// separators are literal `&` characters (ASCII 38), NOT newlines. Each
+/// component is percent-encoded per RFC 3986 (unreserved chars pass
+/// through); the params are sorted by encoded name (then value).
+fn oauth1_base_string(method: &str, base_uri: &str, params: &[(String, String)]) -> String {
+    let mut encoded: Vec<(String, String)> = params
+        .iter()
+        .map(|(k, v)| (enc(k), enc(v)))
+        .collect();
+    encoded.sort();
+    let param_string = encoded
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!(
+        "{}&{}&{}",
+        method.to_uppercase(),
+        enc(base_uri),
+        enc(&param_string)
+    )
+}
+
+/// RFC 5849 §3.4.2 HMAC-SHA1 signature over the base string.
+///
+/// Signing key = `enc(consumer_secret) & enc(token_secret)`. HMAC accepts
+/// any key length, so `new_from_slice` cannot fail here.
+fn oauth1_hmac_sha1(base_string: &str, consumer_secret: &str, token_secret: &str) -> String {
+    let key = format!("{}&{}", enc(consumer_secret), enc(token_secret));
+    let mut mac = <HmacSha1 as KeyInit>::new_from_slice(key.as_bytes())
+        .expect("HMAC-SHA1 accepts any key length");
+    mac.update(base_string.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
 
 fn is_form_urlencoded(request: &reqwest::Request) -> bool {
@@ -589,34 +604,64 @@ impl AuthSigner for HawkAuth {
             }
         });
 
-        // Normalized string per Hawk spec ("hawk.1.header\n..."); payload
-        // hash and ext are empty (not supported by this shim).
-        let normalized = format!(
-            "hawk.1.header\n{method}\n{resource}\n{host}\n{port}\n{ts}\n{nonce}\n\n\n"
+        // Normalized string per the Hawk spec (mozilla/hawk lib/crypto.js
+        // generateNormalizedString): ts and nonce come FIRST, immediately
+        // after the scheme line; method/resource/host/port follow; then hash
+        // and ext (empty here — this shim doesn't do payload validation). The
+        // previous ordering (method…port before ts/nonce) produced a MAC that
+        // mismatches a Hawk server (verified against the Hawk API.md
+        // reference vectors in the tests below).
+        let normalized = hawk_normalized_string(
+            &method, &ts, &nonce, &resource, &host, port, "", "",
         );
-
-        let mac = if self
-            .algorithm
-            .as_deref()
-            .map(|a| a.eq_ignore_ascii_case("sha1"))
-            .unwrap_or(false)
-        {
-            let mut mac = <HmacSha1 as KeyInit>::new_from_slice(self.auth_key.as_bytes())
-                .map_err(|_| TropelError::Http("Hawk key derivation failed".into()))?;
-            mac.update(normalized.as_bytes());
-            base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
-        } else {
-            let mut mac = <HmacSha256 as KeyInit>::new_from_slice(self.auth_key.as_bytes())
-                .map_err(|_| TropelError::Http("Hawk key derivation failed".into()))?;
-            mac.update(normalized.as_bytes());
-            base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
-        };
+        let mac = hawk_mac(&normalized, &self.auth_key, self.algorithm.as_deref());
 
         let header = format!(
             "Hawk id=\"{}\", ts=\"{}\", nonce=\"{}\", mac=\"{}\"",
             self.auth_id, ts, nonce, mac
         );
         set_auth_header(request, &header)
+    }
+}
+
+/// Hawk normalized request string ("hawk.1.header" scheme).
+///
+/// Each value is followed by a newline, in the order: scheme, ts, nonce,
+/// method (uppercased), resource, host (lowercased), port, hash, ext.
+/// ts/nonce come FIRST per the Hawk spec — the earlier implementation put
+/// method/resource/host/port first, producing a MAC any Hawk server rejects.
+fn hawk_normalized_string(
+    method: &str,
+    ts: &str,
+    nonce: &str,
+    resource: &str,
+    host: &str,
+    port: u16,
+    hash: &str,
+    ext: &str,
+) -> String {
+    let method = method.to_uppercase();
+    let host = host.to_lowercase();
+    format!(
+        "hawk.1.header\n{ts}\n{nonce}\n{method}\n{resource}\n{host}\n{port}\n{hash}\n{ext}\n"
+    )
+}
+
+/// Hawk request MAC = base64(HMAC(algorithm, key, normalized)).
+fn hawk_mac(normalized: &str, key: &str, algorithm: Option<&str>) -> String {
+    let sha1 = algorithm
+        .map(|a| a.eq_ignore_ascii_case("sha1"))
+        .unwrap_or(false);
+    if sha1 {
+        let mut mac = <HmacSha1 as KeyInit>::new_from_slice(key.as_bytes())
+            .expect("HMAC-SHA1 accepts any key length");
+        mac.update(normalized.as_bytes());
+        base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+    } else {
+        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key.as_bytes())
+            .expect("HMAC-SHA256 accepts any key length");
+        mac.update(normalized.as_bytes());
+        base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
     }
 }
 
@@ -1027,6 +1072,109 @@ mod tests {
         assert!(h.contains("ts=\""));
         assert!(h.contains("nonce=\""));
         assert!(h.contains("mac=\""));
+    }
+
+    #[test]
+    fn oauth1_base_string_uses_amp_separators() {
+        // RFC 5849 §3.4.1.1: the three components are joined with literal `&`
+        // characters (ASCII 38), never `\n` — the old implementation used
+        // newlines, producing a signature any OAuth1 server rejects.
+        let base = oauth1_base_string(
+            "POST",
+            "http://example.com/request",
+            &[("a".to_string(), "1".to_string())],
+        );
+        assert!(base.starts_with("POST&http%3A%2F%2Fexample.com%2Frequest&a%3D1"));
+        assert!(!base.contains('\n'));
+    }
+
+    #[test]
+    fn oauth1_matches_oauth_net_reference_vector() {
+        // Canonical oauth.net/core/1.0a example — reproduced verbatim in the
+        // test suites of every OAuth 1.0a implementation. Verified against
+        // openssl HMAC-SHA1.
+        let params: Vec<(String, String)> = vec![
+            ("file".into(), "vacation.jpg".into()),
+            ("oauth_consumer_key".into(), "dpf43f3p2l4k3l03".into()),
+            ("oauth_nonce".into(), "kllo9940pd9333jh".into()),
+            ("oauth_signature_method".into(), "HMAC-SHA1".into()),
+            ("oauth_timestamp".into(), "1191242096".into()),
+            ("oauth_token".into(), "nnch734d00sl2jdk".into()),
+            ("oauth_version".into(), "1.0".into()),
+            ("size".into(), "original".into()),
+        ];
+        let base = oauth1_base_string("GET", "http://photos.example.net/photos", &params);
+        assert_eq!(
+            base,
+            "GET&http%3A%2F%2Fphotos.example.net%2Fphotos&file%3Dvacation.jpg%26oauth_consumer_key%3Ddpf43f3p2l4k3l03%26oauth_nonce%3Dkllo9940pd9333jh%26oauth_signature_method%3DHMAC-SHA1%26oauth_timestamp%3D1191242096%26oauth_token%3Dnnch734d00sl2jdk%26oauth_version%3D1.0%26size%3Doriginal"
+        );
+        let sig = oauth1_hmac_sha1(&base, "kd94hf93k423kf44", "pfkkdhi9sl3r4s00");
+        assert_eq!(sig, "tR3+Ty81lMeYAr/Fid0kMTYa/WM=");
+    }
+
+    #[test]
+    fn hawk_normalized_orders_ts_nonce_first() {
+        // Hawk spec: ts and nonce come FIRST, immediately after the scheme
+        // line — the old implementation put method/resource/host/port first.
+        let normalized = hawk_normalized_string(
+            "GET",
+            "1353832234",
+            "j4h3g2",
+            "/resource/1?b=1&a=2",
+            "example.com",
+            8000,
+            "",
+            "",
+        );
+        let lines: Vec<&str> = normalized.lines().collect();
+        assert_eq!(lines[0], "hawk.1.header");
+        assert_eq!(lines[1], "1353832234");
+        assert_eq!(lines[2], "j4h3g2");
+        assert_eq!(lines[3], "GET");
+        assert_eq!(lines[4], "/resource/1?b=1&a=2");
+        assert_eq!(lines[5], "example.com");
+        assert_eq!(lines[6], "8000");
+    }
+
+    #[test]
+    fn hawk_matches_api_reference_vector() {
+        // Hawk API.md "Protocol Example": GET /resource/1?b=1&a=2 on
+        // example.com:8000 with ext="some-app-ext-data". Published MAC:
+        // 6R4rV5iE+NPoym+WwjeHzjAGXUtLNIxmo1vpMofpLAE=
+        let normalized = hawk_normalized_string(
+            "GET",
+            "1353832234",
+            "j4h3g2",
+            "/resource/1?b=1&a=2",
+            "example.com",
+            8000,
+            "",
+            "some-app-ext-data",
+        );
+        assert_eq!(
+            normalized,
+            "hawk.1.header\n1353832234\nj4h3g2\nGET\n/resource/1?b=1&a=2\nexample.com\n8000\n\nsome-app-ext-data\n"
+        );
+        let mac = hawk_mac(&normalized, "werxhqb98rpaxn39848xrunpaw3489ruxnpa98w4rxn", None);
+        assert_eq!(mac, "6R4rV5iE+NPoym+WwjeHzjAGXUtLNIxmo1vpMofpLAE=");
+    }
+
+    #[test]
+    fn hawk_matches_api_payload_hash_vector() {
+        // Hawk API.md "Payload Validation": POST /resource/1?b=1&a=2 with a
+        // payload hash and ext. Published MAC: aSe1DERmZuRl3pI36/9BdZmnErTw3sNzOOAUlfeKjVw=
+        let normalized = hawk_normalized_string(
+            "POST",
+            "1353832234",
+            "j4h3g2",
+            "/resource/1?b=1&a=2",
+            "example.com",
+            8000,
+            "Yi9LfIIFRtBEPt74PVmbTF/xVAwPn7ub15ePICfgnuY=",
+            "some-app-ext-data",
+        );
+        let mac = hawk_mac(&normalized, "werxhqb98rpaxn39848xrunpaw3489ruxnpa98w4rxn", None);
+        assert_eq!(mac, "aSe1DERmZuRl3pI36/9BdZmnErTw3sNzOOAUlfeKjVw=");
     }
 
     #[test]
