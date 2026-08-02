@@ -9,15 +9,22 @@
 //!    smoke runs: one command, N logical workers, lossless central merge.
 //! 2. **`generate_k8s_manifests`** — deterministic Kubernetes YAML for the
 //!    same topology in a cluster: a ConfigMap carrying the job config, a
-//!    controller Deployment + Service, and an agent StatefulSet with
-//!    `replicas = agents`. Agents reach the controller through the Service
-//!    DNS name, so no external address configuration is needed.
+//!    controller **Job** + Service, and an agent **Indexed Job** with
+//!    `completions/parallelism = agents`, plus a headless Service so each
+//!    agent pod has a stable `tropel-agent-<i>.<ns>.svc` DNS name. Agents
+//!    reach the controller through the controller Service DNS name, so no
+//!    external address configuration is needed.
+//!
+//! Jobs (not Deployments/StatefulSets) are the right shape here: a load
+//! test is **run-to-completion**. A Deployment would restart the exited
+//! controller pod forever, and a StatefulSet's kubelet would keep re-running
+//! finished agents in a loop. A Job runs each pod once and stays finished;
+//! `completionMode: Indexed` plus the headless Service gives agents stable
+//! per-pod identity without a StatefulSet.
 //!
 //! A full CRD-style operator (kube-rs) is deliberately NOT used: the
 //! manifest generation is dependency-light, testable offline, and the
-//! cluster topology is static per run (a Job is a poor fit because agents
-//! must stay up until the controller has assigned every segment — a
-//! StatefulSet with a fixed replica count is the right shape).
+//! cluster topology is static per run.
 
 use tokio::net::TcpListener;
 use tropel_core::config::JobConfig;
@@ -81,13 +88,19 @@ pub async fn run_cloud(config: &JobConfig, agents: u32) -> Result<MetricsResult>
 /// 1. `ConfigMap tropel-job` — the serialized job config (agents receive
 ///    their assignments from the controller over TCP, so only the
 ///    controller mounts this).
-/// 2. `Deployment tropel-controller` — 1 replica, listens on
+/// 2. `Job tropel-controller` — `completions: 1`, listens on
 ///    `0.0.0.0:<listen_port>`, mounts the job ConfigMap, runs
 ///    `cloud-run controller --config /etc/tropel/job.json --agents N`.
+///    Run-to-completion: a finished Job is not restarted by kubelet (a
+///    Deployment would re-run the finished controller forever).
 /// 3. `Service tropel-controller` — ClusterIP so agents resolve the
 ///    controller by DNS name (`tropel-controller.<ns>.svc`).
-/// 4. `StatefulSet tropel-agent` — `replicas = agents`, runs
-///    `cloud-run agent --controller tropel-controller:<port>`.
+/// 4. `Job tropel-agent` — **Indexed** Job (`completions/parallelism =
+///    agents`, `completionMode: Indexed`), runs
+///    `cloud-run agent --controller tropel-controller:<port>`. Each pod
+///    runs its agent once and exits; the Job completes when all agents do.
+/// 5. `Service tropel-agent` — headless (`clusterIP: None`) so each agent
+///    pod owns a stable `tropel-agent-<i>.<ns>.svc` DNS name.
 ///
 /// `image` defaults to `tropel:latest`. `namespace` defaults to `default`
 /// and is applied to every object's metadata.
@@ -126,21 +139,20 @@ data:
   job.json: |-
 {job_block}
 ---
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: batch/v1
+kind: Job
 metadata:
   name: tropel-controller
   namespace: {ns}
 spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: tropel-controller
+  completions: 1
+  backoffLimit: 0
   template:
     metadata:
       labels:
         app: tropel-controller
     spec:
+      restartPolicy: Never
       containers:
         - name: controller
           image: {img}
@@ -178,22 +190,22 @@ spec:
       port: {listen_port}
       targetPort: {listen_port}
 ---
-apiVersion: apps/v1
-kind: StatefulSet
+apiVersion: batch/v1
+kind: Job
 metadata:
   name: tropel-agent
   namespace: {ns}
 spec:
-  serviceName: tropel-controller
-  replicas: {agents}
-  selector:
-    matchLabels:
-      app: tropel-agent
+  completions: {agents}
+  parallelism: {agents}
+  completionMode: Indexed
+  backoffLimit: 0
   template:
     metadata:
       labels:
         app: tropel-agent
     spec:
+      restartPolicy: Never
       containers:
         - name: agent
           image: {img}
@@ -202,6 +214,20 @@ spec:
             - agent
             - --controller
             - tropel-controller:{listen_port}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tropel-agent
+  namespace: {ns}
+spec:
+  clusterIP: None
+  selector:
+    app: tropel-agent
+  ports:
+    - name: control
+      port: {listen_port}
+      targetPort: {listen_port}
 "#
     );
     Ok(manifest)
@@ -293,12 +319,16 @@ mod tests {
         for needle in [
             "kind: ConfigMap",
             "name: tropel-job",
-            "kind: Deployment",
+            "kind: Job",
             "name: tropel-controller",
             "kind: Service",
-            "kind: StatefulSet",
             "name: tropel-agent",
-            "replicas: 3",
+            "completions: 3",
+            "parallelism: 3",
+            "completionMode: Indexed",
+            "restartPolicy: Never",
+            "clusterIP: None",
+            "backoffLimit: 0",
             "image: reg/tropel:v1",
             "namespace: loadtest",
             "cloud-run",
@@ -311,6 +341,10 @@ mod tests {
         ] {
             assert!(yaml.contains(needle), "manifest missing {needle:?}");
         }
+        // Run-to-completion: Deployments/StatefulSets would make kubelet
+        // re-run finished pods forever — a Job must not contain them.
+        assert!(!yaml.contains("kind: Deployment"), "no Deployment allowed");
+        assert!(!yaml.contains("kind: StatefulSet"), "no StatefulSet allowed");
         // The job config JSON must be embedded verbatim in the ConfigMap.
         assert!(yaml.contains("\"input\": \"coll.json\""));
         assert!(yaml.contains("\"type\": \"constant-vus\""));
