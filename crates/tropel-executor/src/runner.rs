@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use tropel_core::config::ExpectedStatus;
 use tropel_core::scenario::Scenario;
-use tropel_core::types::{AuthConfig, Sample, SampleType, TagMap};
+use tropel_core::types::{Sample, SampleType, TagMap};
 use tropel_core::Result;
 use tropel_ext::traits::Protocol;
 use tropel_http::client::HttpClient;
@@ -366,7 +366,7 @@ impl VURunner {
                         .auth
                         .as_ref()
                         .or(self.scenario.auth.as_ref())
-                        .and_then(|auth| build_auth_signer(auth));
+                        .and_then(|auth| tropel_http::auth::build_auth_signer(auth));
 
                     // Execute the request directly via the per-VU HTTP client
                     tracing::trace!("VU runner: executing request to {}", resolved_req.url);
@@ -640,28 +640,4 @@ fn resolve_body(
     }
 }
 
-/// Build an auth signer from an AuthConfig.
-fn build_auth_signer(auth: &AuthConfig) -> Option<Box<dyn tropel_http::auth::AuthSigner>> {
-    match auth {
-        AuthConfig::Bearer { token } => Some(Box::new(tropel_http::auth::BearerAuth::new(token))),
-        AuthConfig::Basic { username, password } => Some(Box::new(
-            tropel_http::auth::BasicAuth::new(username, password),
-        )),
-        AuthConfig::ApiKey {
-            key,
-            value,
-            location,
-        } => Some(Box::new(tropel_http::auth::ApiKeyAuth::new(
-            key,
-            value,
-            location.clone(),
-        ))),
-        _ => {
-            tracing::warn!(
-                "Auth type {:?} not yet implemented, sending without auth",
-                auth
-            );
-            None
-        }
-    }
-}
+

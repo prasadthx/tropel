@@ -298,35 +298,77 @@ impl HttpClient {
             req_builder = req_builder.timeout(timeout);
         }
 
-        // Apply auth — sign takes ownership and returns a new builder
-        let req_builder = if let Some(signer) = signer {
-            match signer.sign(req_builder) {
-                Ok(builder) => builder,
-                Err(e) => {
-                    return Err(TropelError::Http(format!("Auth signing failed: {}", e)));
-                }
-            }
-        } else {
-            req_builder
-        };
+        // Build the request, then apply auth IN PLACE. Signers need the final
+        // method/URL/body (SigV4, OAuth1, Hawk), which a RequestBuilder cannot
+        // expose, so the auth happens on the built Request.
+        let mut built_request = req_builder.build().map_err(|e| {
+            TropelError::Http(format!("Failed to build request: {}", e))
+        })?;
+        if let Some(signer) = signer {
+            signer
+                .sign(&mut built_request)
+                .map_err(|e| TropelError::Http(format!("Auth signing failed: {}", e)))?;
+        }
+
+        // Keep a clone for the Digest challenge-response retry below. For all
+        // other signers `challenge_response` returns None and this is unused.
+        let retry_request = built_request.try_clone();
 
         // ═══════════════════════════════════════════════════════
         // Phase 1: Send request → receive response head (TTFB)
         // ═══════════════════════════════════════════════════════
-        // `send().await` returns the Response once the status line and
-        // response headers are received. The request body has been sent
-        // by this point (or is being streamed).
-        //
-        // The measured "waiting" time includes everything up to this point:
-        // blocked + DNS + TCP connect + TLS handshake + sending + server
-        // processing. Without connector-level instrumentation we cannot
-        // separate these phases.
+        // The response head (status line + headers) is received when this
+        // resolves. The measured "waiting" time includes everything up to
+        // this point: blocked + DNS + TCP connect + TLS handshake + sending +
+        // server processing.
         let waiting_start = std::time::Instant::now();
-        let response = req_builder
-            .send()
+        let mut response = self
+            .inner
+            .execute(built_request)
             .await
             .map_err(|e| TropelError::Http(format!("Request failed: {}", e)))?;
-        let waiting_duration = waiting_start.elapsed();
+        let mut waiting_duration = waiting_start.elapsed();
+
+        // HTTP Digest (RFC 7616) is challenge-response: the first request goes
+        // out unauthenticated, and on a 401 with a `WWW-Authenticate: Digest`
+        // header we compute the Authorization value and retry once. The
+        // retried response replaces the 401 for all downstream processing.
+        if response.status().as_u16() == 401 {
+            if let Some(signer) = signer {
+                let www = response
+                    .headers()
+                    .get(reqwest::header::WWW_AUTHENTICATE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                if let Some(www) = www {
+                    if let Some(mut retry) = retry_request {
+                        if let Some(auth_value) = signer.challenge_response(&www, &retry) {
+                            retry
+                                .headers_mut()
+                                .insert(
+                                    reqwest::header::AUTHORIZATION,
+                                    auth_value.parse().map_err(|_| {
+                                        TropelError::Http(
+                                            "Invalid digest Authorization header value".into(),
+                                        )
+                                    })?,
+                                );
+                            let retry_start = std::time::Instant::now();
+                            response = self
+                                .inner
+                                .execute(retry)
+                                .await
+                                .map_err(|e| TropelError::Http(format!("Request failed: {}", e)))?;
+                            waiting_duration = retry_start.elapsed();
+                            tracing::debug!(
+                                "Digest auth: retried after 401 challenge (status now {})",
+                                response.status().as_u16()
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         let status_code = response.status().as_u16();
         let status_text = response
@@ -404,14 +446,13 @@ impl HttpClient {
     }
 
     /// Get an auth signer based on the auth config.
+    ///
+    /// Delegates to the single consolidated signer builder
+    /// ([`crate::auth::build_auth_signer`]) shared with the executor runner,
+    /// so every auth type (Bearer, Basic, ApiKey, OAuth2, SigV4, OAuth1,
+    /// Hawk, Digest) is supported in exactly one place.
     pub fn get_signer(&self, auth: &AuthConfig) -> Option<Box<dyn AuthSigner>> {
-        match auth {
-            AuthConfig::Basic { username, password } => {
-                Some(Box::new(crate::auth::BasicAuth::new(username, password)))
-            }
-            AuthConfig::Bearer { token } => Some(Box::new(crate::auth::BearerAuth::new(token))),
-            _ => None, // Other auth types not yet fully implemented
-        }
+        crate::auth::build_auth_signer(auth)
     }
 }
 
