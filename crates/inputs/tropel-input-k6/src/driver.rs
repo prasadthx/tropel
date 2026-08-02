@@ -38,6 +38,7 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use regex::Regex;
 use rquickjs::function::Func;
+use rquickjs::loader::{ImportAttributes, Loader, Resolver};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -103,7 +104,17 @@ impl Driver for K6Driver {
         // Install the k6 file-access bridges (open() + SharedArray cache).
         // Needs the script directory for relative path resolution.
         let script_dir = source_path.and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        register_k6_file_bridges(&js_ctx, script_dir);
+        register_k6_file_bridges(&js_ctx, script_dir.clone());
+
+        // Register the ES-module resolver/loader so local imports
+        // (`import { x } from "./helpers.js"`) resolve to files on disk,
+        // with on-the-fly TypeScript transpilation for imported `.ts` files.
+        js_ctx.set_module_loader(
+            K6ModuleResolver {
+                script_dir: script_dir.clone(),
+            },
+            K6ModuleLoader,
+        );
 
         // Step 4: Eval the source as an ES module and install the entry-point
         // export as the global `__tropel_iteration`. When the scenario names
@@ -958,6 +969,119 @@ impl K6DriverInstance {
 }
 
 // ══════════════════════════════════════════════════════════════════
+// ES-module local-import support (module resolver + loader)
+// ══════════════════════════════════════════════════════════════════
+
+/// Resolves relative ES-module specifiers to files on disk.
+///
+/// k6 scripts import local helpers with relative specifiers
+/// (`import { x } from "./helpers.js"`). rquickjs consults this resolver
+/// whenever a declared module contains an `import`/`export … from`
+/// statement. Bare specifiers (`k6`, `k6/http`, npm packages) are not
+/// resolvable on disk — k6 virtual modules are stripped by
+/// `preprocess_k6_source_module` and provided by the shim, so a bare
+/// specifier reaching the resolver is an error.
+#[derive(Clone)]
+struct K6ModuleResolver {
+    script_dir: Option<PathBuf>,
+}
+
+impl Resolver for K6ModuleResolver {
+    fn resolve<'js>(
+        &mut self,
+        _ctx: &rquickjs::Ctx<'js>,
+        base: &str,
+        name: &str,
+        _attributes: Option<ImportAttributes<'js>>,
+    ) -> rquickjs::Result<String> {
+        // Only relative/absolute specifiers can point at files. Bare
+        // specifiers (k6 virtual modules, npm packages) error loudly.
+        if !(name.starts_with("./")
+            || name.starts_with("../")
+            || Path::new(name).is_absolute())
+        {
+            return Err(rquickjs::Error::new_loading_message(
+                name,
+                "bare module specifiers are not supported (k6 virtual modules are provided by the shim)",
+            ));
+        }
+
+        // Base directory: the importing module's directory. For the entry
+        // module (named "k6-script") or non-path bases, fall back to the
+        // script directory.
+        let base_dir = if base == "k6-script" || base.is_empty() {
+            self.script_dir.clone().unwrap_or_default()
+        } else {
+            Path::new(base)
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_default()
+        };
+
+        let candidate = if Path::new(name).is_absolute() {
+            PathBuf::from(name)
+        } else {
+            base_dir.join(name)
+        };
+
+        // Extension probing: try as-is, then with common JS/TS extensions,
+        // then index files. `with_extension` returns a fresh PathBuf (the
+        // original candidate is never mutated), so each attempt is distinct.
+        let mut attempts: Vec<PathBuf> = Vec::new();
+        attempts.push(candidate.clone());
+        if candidate.extension().is_none() {
+            for ext in ["js", "mjs", "cjs", "ts", "mts", "tsx"] {
+                attempts.push(candidate.with_extension(ext));
+            }
+            attempts.push(candidate.join("index.js"));
+            attempts.push(candidate.join("index.ts"));
+            attempts.push(candidate.join("index.mjs"));
+        }
+        for a in &attempts {
+            if a.is_file() {
+                return Ok(a.to_string_lossy().into_owned());
+            }
+        }
+        Err(rquickjs::Error::new_loading_message(
+            name,
+            format!("cannot resolve module '{}' from '{}'", name, base),
+        ))
+    }
+}
+
+/// Loads a resolved module file into the runtime, transpiling TypeScript
+/// on the fly when the file is `.ts`/`.mts`/`.tsx`.
+struct K6ModuleLoader;
+
+impl Loader for K6ModuleLoader {
+    fn load<'js>(
+        &mut self,
+        ctx: &rquickjs::Ctx<'js>,
+        name: &str,
+        _attributes: Option<ImportAttributes<'js>>,
+    ) -> rquickjs::Result<rquickjs::Module<'js>> {
+        let raw = std::fs::read_to_string(name).map_err(|e| {
+            rquickjs::Error::new_loading_message(name, format!("read error: {}", e))
+        })?;
+        // Strip k6-virtual imports from the loaded module too — helper files
+        // commonly `import { check } from "k6"` / `import http from "k6/http"`,
+        // and those specifiers have no on-disk module (the shim provides the
+        // globals). Mirroring the entry module's preprocess keeps imported
+        // files consistent; local imports inside them still resolve via the
+        // resolver.
+        let preprocessed = preprocess_k6_source_module(&raw);
+        let source = if tropel_es::is_typescript_file(name) {
+            tropel_es::typescript_to_javascript_keep_exports(&preprocessed, name).map_err(|e| {
+                rquickjs::Error::new_loading_message(name, format!("TS transpile error: {}", e))
+            })?
+        } else {
+            preprocessed
+        };
+        rquickjs::Module::declare(ctx.clone(), name, source)
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════
 // Source pre-processing
 // ══════════════════════════════════════════════════════════════════
 
@@ -967,22 +1091,22 @@ impl K6DriverInstance {
 /// Unlike the old script-mode preprocessor (which stripped `export` modifiers
 /// so the source could be eval'd), this variant KEEPS all `export` modifiers —
 /// `export const options`, `export default function`, `export function
-/// setup()` — because they are valid (and load-bearing) in a module. Only two
-/// things are removed:
+/// setup()` — because they are valid (and load-bearing) in a module.
 ///
-/// 1. k6 virtual imports (`import … from "k6/…"`) and k6 re-exports — the
-///    k6 shim provides those APIs as globals, and there is no module loader
-///    for the `k6/*` specifiers on disk.
-/// 2. Unresolvable generic re-exports (`export { x } from "./other"`,
-///    `export * from "./other"`) — no on-disk bundling/loader here either.
+/// Only k6 virtual imports and re-exports are removed: `import … from
+/// "k6/…"`, `import "k6/…"`, `export { x } from "k6/…"` and
+/// `export * from "k6/…"` — the k6 shim provides those APIs as globals, and
+/// there is no `k6/*` module on disk to resolve.
 ///
-/// Standalone named-export blocks (`export { x }`) are kept — they are plain
-/// ESM. `import { x } from "./local"` is also kept (it fails at eval time if
-/// there is no such module on disk, same as script mode fails on any import).
+/// Local imports (`import { x } from "./helpers.js"`) and local re-exports
+/// (`export { x } from "./helpers"`, `export * from "./helpers"`) are KEPT:
+/// the ES-module loader registered on the context (`K6ModuleResolver` +
+/// `K6ModuleLoader`) resolves them to files on disk, transpiling TypeScript
+/// on the fly.
 fn preprocess_k6_source_module(source: &str) -> String {
     let mut result = source.to_string();
 
-    // ── 1. Remove k6 virtual import / re-export lines entirely ──
+    // ── Remove k6 virtual import / re-export lines entirely ──
     let re_import =
         Regex::new(r#"(?m)^\s*import\s+.*?from\s+['"]k6(?:/[^'""]*)?['""]\s*;?\s*$"#).unwrap();
     result = re_import.replace_all(&result, "").to_string();
@@ -996,14 +1120,10 @@ fn preprocess_k6_source_module(source: &str) -> String {
             .unwrap();
     result = re_reexport.replace_all(&result, "").to_string();
 
-    // ── 2. Remove unresolvable generic re-exports ──
-    let re_reexport_generic =
-        Regex::new(r#"\bexport\s*\{[^}]*\}\s*from\s+['"][^'"]+['"]\s*;?"#).unwrap();
-    result = re_reexport_generic.replace_all(&result, "").to_string();
-
-    let re_reexport_star =
-        Regex::new(r#"\bexport\s*\*\s*[^'"]*?from\s+['"][^'"]+['"]\s*;?"#).unwrap();
-    result = re_reexport_star.replace_all(&result, "").to_string();
+    let re_reexport_star_k6 =
+        Regex::new(r#"(?m)^\s*export\s+\*\s*[^'"]*?from\s+['"]k6(?:/[^'""]*)?['""]\s*;?\s*$"#)
+            .unwrap();
+    result = re_reexport_star_k6.replace_all(&result, "").to_string();
 
     result
 }
@@ -1064,8 +1184,15 @@ async fn eval_module_export_json(
     // or `new SharedArray(...)`) while building `export const options` —
     // install the file bridges AND the open/SharedArray shim so the throwaway
     // context can resolve them (the shim defines the JS globals on top of the
-    // native bridges).
-    register_k6_file_bridges(&js_ctx, script_dir);
+    // native bridges). Also register the module loader so `options` blocks
+    // that import local helpers (`import { x } from "./helpers.js"`) resolve.
+    register_k6_file_bridges(&js_ctx, script_dir.clone());
+    js_ctx.set_module_loader(
+        K6ModuleResolver {
+            script_dir: script_dir.clone(),
+        },
+        K6ModuleLoader,
+    );
     js_ctx.bootstrap_library(OPEN_DATA_SHIM).await.map_err(|e| {
         TropelError::Other(format!("k6 open/SharedArray shim bootstrap failed: {}", e))
     })?;
@@ -1106,8 +1233,17 @@ async fn eval_module_handle_summary(
         .await
         .map_err(|e| TropelError::Other(format!("JS context creation failed: {}", e)))?;
 
-    // `handleSummary` may reference `open()`/SharedArray captured at init.
-    register_k6_file_bridges(&js_ctx, script_dir);
+    // `handleSummary` may reference `open()`/SharedArray captured at init, so
+    // install the file bridges + shim on the throwaway context too. Also
+    // register the module loader so a `handleSummary` module that imports
+    // local helpers (`import { x } from "./helpers.js"`) resolves them.
+    register_k6_file_bridges(&js_ctx, script_dir.clone());
+    js_ctx.set_module_loader(
+        K6ModuleResolver {
+            script_dir: script_dir.clone(),
+        },
+        K6ModuleLoader,
+    );
     js_ctx.bootstrap_library(OPEN_DATA_SHIM).await.map_err(|e| {
         TropelError::Other(format!("k6 open/SharedArray shim bootstrap failed: {}", e))
     })?;
@@ -1459,20 +1595,39 @@ mod tests {
     }
 
     #[test]
-    fn test_module_preprocess_removes_reexports() {
+    fn test_module_preprocess_strips_only_k6_reexports() {
+        // Local re-exports are KEPT — the ES-module loader resolves them to
+        // files on disk. Only k6-virtual re-exports (no such module on disk,
+        // shim provides globals) are stripped.
         let code = r#"
             export { default } from "./other";
             export * from "./helpers";
+            export { check } from "k6";
+            export * from "k6/http";
             export const options = {};
             export default function() {}
         "#;
         let result = preprocess_k6_source_module(code);
-        assert!(!result.contains("./other"), "re-export kept: {result}");
-        assert!(!result.contains("./helpers"), "re-export kept: {result}");
+        assert!(result.contains("./other"), "local re-export stripped: {result}");
+        assert!(result.contains("./helpers"), "local re-export stripped: {result}");
+        assert!(!result.contains("from \"k6\""), "k6 re-export kept: {result}");
+        assert!(!result.contains("from \"k6/http\""), "k6 re-export kept: {result}");
         assert!(result.contains("export const options"), "options lost: {result}");
         assert!(
             result.contains("export default function"),
             "default export lost: {result}"
+        );
+    }
+
+    #[test]
+    fn test_module_preprocess_keeps_local_import() {
+        // `import { x } from "./helpers.js"` must survive preprocessing —
+        // the registered module resolver resolves it at eval time.
+        let code = "import { triple } from './helpers.js';\nexport default function() {}\n";
+        let result = preprocess_k6_source_module(code);
+        assert!(
+            result.contains("from './helpers.js'"),
+            "local import stripped: {result}"
         );
     }
 
@@ -1691,6 +1846,112 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // ── ES-module local imports (module resolver + loader) ──
+
+    #[tokio::test]
+    async fn test_module_local_import_resolves_to_disk() {
+        // k6 script importing a local helper: `import { x } from "./helpers.js"`
+        // must resolve via the registered module resolver/loader, not fail at
+        // eval time (the pre-existing behavior before the loader landed).
+        let dir = temp_script_dir("localimport");
+        std::fs::write(
+            dir.join("helpers.js"),
+            "export function triple(x) { return x * 3; }\n",
+        )
+        .unwrap();
+        let source = r#"
+            import { triple } from "./helpers.js";
+            export default function() { globalThis.__tropel_import_result = triple(14); }
+        "#;
+        let js_ctx = JsContext::new(None, Some(Duration::from_secs(5)))
+            .await
+            .expect("context creation should succeed");
+        js_ctx.set_module_loader(
+            K6ModuleResolver {
+                script_dir: Some(dir.clone()),
+            },
+            K6ModuleLoader,
+        );
+        install_iteration_global(&js_ctx, source, None)
+            .expect("module with local import should install");
+        js_ctx
+            .run_script_cached(
+                "return __tropel_iteration()",
+                Some("k6-iteration.js".to_string()),
+            )
+            .await
+            .expect("iteration should run");
+        let result = js_ctx
+            .get_global("__tropel_import_result")
+            .await
+            .unwrap();
+        assert_eq!(result.as_deref(), Some("42"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_module_local_import_typescript_transpiles() {
+        // Imported `.ts` helpers must be transpiled on the fly by the loader.
+        let dir = temp_script_dir("localimportts");
+        std::fs::write(
+            dir.join("calc.ts"),
+            "export function add(a: number, b: number): number { return a + b; }\n",
+        )
+        .unwrap();
+        let source = r#"
+            import { add } from "./calc.ts";
+            export default function() { globalThis.__tropel_ts_result = add(20, 22); }
+        "#;
+        let js_ctx = JsContext::new(None, Some(Duration::from_secs(5)))
+            .await
+            .expect("context creation should succeed");
+        js_ctx.set_module_loader(
+            K6ModuleResolver {
+                script_dir: Some(dir.clone()),
+            },
+            K6ModuleLoader,
+        );
+        install_iteration_global(&js_ctx, source, None)
+            .expect("module with TS local import should install");
+        js_ctx
+            .run_script_cached(
+                "return __tropel_iteration()",
+                Some("k6-iteration.js".to_string()),
+            )
+            .await
+            .expect("iteration should run");
+        let result = js_ctx.get_global("__tropel_ts_result").await.unwrap();
+        assert_eq!(result.as_deref(), Some("42"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_module_local_import_missing_file_errors() {
+        // A local import that doesn't exist on disk must fail loudly at
+        // module-install time (matches k6's behavior for unresolvable
+        // imports), not silently no-op.
+        let dir = temp_script_dir("localimportmissing");
+        let source = r#"
+            import { nope } from "./does-not-exist.js";
+            export default function() {}
+        "#;
+        let js_ctx = JsContext::new(None, Some(Duration::from_secs(5)))
+            .await
+            .expect("context creation should succeed");
+        js_ctx.set_module_loader(
+            K6ModuleResolver {
+                script_dir: Some(dir.clone()),
+            },
+            K6ModuleLoader,
+        );
+        let err = install_iteration_global(&js_ctx, source, None).err();
+        assert!(
+            err.is_some(),
+            "unresolvable local import must fail module install"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

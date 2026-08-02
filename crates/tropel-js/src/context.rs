@@ -738,6 +738,26 @@ impl JsContext {
         self.context_id
     }
 
+    /// Register an ES-module resolver/loader for `import` / `export … from`
+    /// specifiers that point at files on disk.
+    ///
+    /// rquickjs consults the runtime's module loader whenever a declared
+    /// module contains an `import` or `export … from` statement, so registering
+    /// a resolver + loader lets embedded scripts import local modules (e.g. a
+    /// k6 script doing `import { x } from "./helpers.js"`).
+    ///
+    /// Must be called before the importing module is evaluated. The loader is
+    /// installed on the underlying `JSRuntime` (`JS_SetModuleLoaderFunc2`), so
+    /// it applies to all contexts of this runtime — no ordering constraint
+    /// relative to `Context::full`.
+    pub fn set_module_loader<R, L>(&self, resolver: R, loader: L)
+    where
+        R: rquickjs::loader::Resolver + 'static,
+        L: rquickjs::loader::Loader + 'static,
+    {
+        self.rt.set_loader(resolver, loader);
+    }
+
     /// Execute a closure with access to the underlying rquickjs Ctx.
     /// This is used by bridge modules to register native functions as JS globals.
     /// The closure runs synchronously within the JS context lock.
