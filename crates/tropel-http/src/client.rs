@@ -2,7 +2,7 @@ use crate::auth::AuthSigner;
 use crate::dns::DnsResolver;
 use crate::rps::RpsLimiter;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tropel_core::config::{HttpConfig, TlsConfig};
 use tropel_core::types::*;
@@ -15,7 +15,25 @@ const MULTIPART_BOUNDARY: &str = "------------------------tropel-boundary-7a2f24
 /// Per-VU HTTP client with auth and response tracking.
 #[derive(Clone)]
 pub struct HttpClient {
+    /// Primary client: follows redirects per `HttpConfig.max_redirects`.
     inner: reqwest::Client,
+    /// Twin client that never follows redirects (`Policy::none()`), used when
+    /// a request sets `follow_redirects: false` (reqwest bakes the redirect
+    /// policy into the client at build time, so per-request redirect control
+    /// needs a second client). `None` when `max_redirects == 0` — the primary
+    /// client already never follows.
+    no_redirect: Option<reqwest::Client>,
+    /// Lazily-built clients for per-request mTLS identities, keyed by
+    /// `(cert_path, key_path, follow_redirects)`. The identity is baked into
+    /// the client at build time, so a per-request `Request.certificate` needs
+    /// its own client; built on first use and cached per distinct identity.
+    /// `Arc<Mutex<…>>` because `std::sync::Mutex` is not `Clone` while
+    /// `HttpClient` derives `Clone`.
+    cert_clients: Arc<Mutex<HashMap<(String, String, bool), reqwest::Client>>>,
+    /// Config snapshot used to lazily build per-certificate clients.
+    config: HttpConfig,
+    /// TLS snapshot used to lazily build per-certificate clients.
+    tls: TlsConfig,
     /// When true, response bodies are discarded entirely.
     /// The body field will be empty, saving memory and bandwidth.
     discard_bodies: bool,
@@ -65,6 +83,50 @@ impl HttpClient {
         tls: &TlsConfig,
         rps: Option<Arc<RpsLimiter>>,
     ) -> Result<Self> {
+        let identity = Self::load_global_identity(tls)?;
+        let redirect = if config.max_redirects > 0 {
+            reqwest::redirect::Policy::limited(config.max_redirects as usize)
+        } else {
+            reqwest::redirect::Policy::none()
+        };
+        let inner = Self::build_client(config, tls, identity.clone(), redirect)?;
+        // When the primary client follows redirects, a second client with
+        // `Policy::none()` backs `follow_redirects: false` requests. When
+        // `max_redirects == 0` the primary already never follows, so both
+        // request shapes reuse `inner`.
+        let no_redirect = if config.max_redirects > 0 {
+            Some(Self::build_client(
+                config,
+                tls,
+                identity,
+                reqwest::redirect::Policy::none(),
+            )?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            inner,
+            no_redirect,
+            cert_clients: Arc::new(Mutex::new(HashMap::new())),
+            config: config.clone(),
+            tls: tls.clone(),
+            discard_bodies: config.discard_response_bodies,
+            rps,
+            http_debug: config.http_debug,
+        })
+    }
+
+    /// Build a `reqwest::Client` from the full HTTP/TLS configuration with an
+    /// optional mTLS identity and an explicit redirect policy. This is the
+    /// single builder shared by the primary client, the no-redirect twin, and
+    /// the lazily-built per-request-certificate clients.
+    fn build_client(
+        config: &HttpConfig,
+        tls: &TlsConfig,
+        identity: Option<reqwest::Identity>,
+        redirect: reqwest::redirect::Policy,
+    ) -> Result<reqwest::Client> {
         // k6 `noConnectionReuse`: close the connection after every request.
         // reqwest has no direct "reuse off" switch — setting the idle pool to
         // 0 causes every returned connection to be closed instead of pooled,
@@ -102,61 +164,8 @@ impl HttpClient {
         }
 
         // ── TLS: mTLS client identity ──
-        if let Some(cert_path) = &tls.client_cert {
-            let cert_bytes = std::fs::read(cert_path).map_err(|e| {
-                TropelError::Config(format!("Failed to read client cert '{}': {}", cert_path, e))
-            })?;
-
-            // PEM cert + key pair — client_key is REQUIRED here: an identity
-            // without key material is meaningless, so fail fast with a clear
-            // message instead of a confusing parse error.
-            let key_path = tls.client_key.as_deref().ok_or_else(|| {
-                TropelError::Config(format!(
-                    "TLS client_cert '{}' set but no client_key: a client \
-                     identity requires both a certificate and its private key",
-                    cert_path
-                ))
-            })?;
-            let key_bytes = std::fs::read(key_path).map_err(|e| {
-                TropelError::Config(format!("Failed to read client key '{}': {}", key_path, e))
-            })?;
-
-            // PKCS#12 bundles and encrypted PEM keys require the native-tls
-            // backend, which this build does not enable (rustls only). Warn
-            // when a passphrase was supplied so users aren't surprised that
-            // it's ignored; the key must be unencrypted PEM. The passphrase
-            // VALUE is never logged (it is a secret).
-            if tls.client_passphrase.is_some() {
-                tracing::warn!(
-                    "client_passphrase is only honored with the native-tls backend; \
-                     this rustls build uses unencrypted PEM keys, so the supplied \
-                     passphrase will be ignored"
-                );
-            }
-
-            // Concatenate cert + key into ONE PEM buffer and use
-            // `Identity::from_pem` (the only identity constructor available
-            // under the rustls feature). It parses mixed PEM sections and
-            // accepts PKCS#8 (`BEGIN PRIVATE KEY`), PKCS#1
-            // (`BEGIN RSA PRIVATE KEY`) and SEC1 (`BEGIN EC PRIVATE KEY`)
-            // keys. `from_pkcs8_pem`/`from_pkcs12_der` exist but are gated
-            // behind native-tls.
-            let mut combined = cert_bytes;
-            combined.extend_from_slice(b"\n");
-            combined.extend_from_slice(&key_bytes);
-            let identity = reqwest::Identity::from_pem(&combined).map_err(|e| {
-                TropelError::Config(format!(
-                    "Failed to load PEM client identity (cert '{}', key '{}'): {}",
-                    cert_path, key_path, e
-                ))
-            })?;
+        if let Some(identity) = identity {
             builder = builder.identity(identity);
-        } else if tls.client_key.is_some() {
-            // Asymmetry guard: a key without a cert is meaningless and would
-            // otherwise be silently ignored (the block above is cert-gated).
-            tracing::warn!(
-                "client_key is set without client_cert — the key will be ignored"
-            );
         }
 
         if !config.decompress {
@@ -165,13 +174,7 @@ impl HttpClient {
             builder = builder.no_brotli();
         }
 
-        if config.max_redirects > 0 {
-            builder = builder.redirect(reqwest::redirect::Policy::limited(
-                config.max_redirects as usize,
-            ));
-        } else {
-            builder = builder.redirect(reqwest::redirect::Policy::none());
-        }
+        builder = builder.redirect(redirect);
 
         if let Some(timeout_str) = &config.keep_alive {
             if let Ok(timeout) = parse_duration(timeout_str) {
@@ -206,16 +209,123 @@ impl HttpClient {
             .dns_resolver(dns_resolver)
             .connector_layer(crate::subtimings::TimingConnectorLayer);
 
-        let inner = builder
+        builder
             .build()
-            .map_err(|e| TropelError::Http(format!("Failed to create HTTP client: {}", e)))?;
+            .map_err(|e| TropelError::Http(format!("Failed to create HTTP client: {}", e)))
+    }
 
-        Ok(Self {
-            inner,
-            discard_bodies: config.discard_response_bodies,
-            rps,
-            http_debug: config.http_debug,
+    /// Load the global mTLS identity from `TlsConfig` (if configured).
+    fn load_global_identity(tls: &TlsConfig) -> Result<Option<reqwest::Identity>> {
+        if let Some(cert_path) = &tls.client_cert {
+            let key_path = tls.client_key.as_deref().ok_or_else(|| {
+                TropelError::Config(format!(
+                    "TLS client_cert '{}' set but no client_key: a client \
+                     identity requires both a certificate and its private key",
+                    cert_path
+                ))
+            })?;
+            Ok(Some(Self::load_pem_identity(
+                cert_path,
+                key_path,
+                tls.client_passphrase.as_deref(),
+            )?))
+        } else {
+            if tls.client_key.is_some() {
+                tracing::warn!("client_key is set without client_cert — the key will be ignored");
+            }
+            Ok(None)
+        }
+    }
+
+    /// Read a PEM cert + key pair from disk and build a `reqwest::Identity`.
+    ///
+    /// Concatenates cert + key into ONE PEM buffer and uses
+    /// `Identity::from_pem` (the only identity constructor available under the
+    /// rustls feature). It parses mixed PEM sections and accepts PKCS#8
+    /// (`BEGIN PRIVATE KEY`), PKCS#1 (`BEGIN RSA PRIVATE KEY`) and SEC1
+    /// (`BEGIN EC PRIVATE KEY`) keys. PKCS#12 bundles and encrypted PEM keys
+    /// require the native-tls backend; a supplied passphrase logs a warning
+    /// (its value is never logged) and the key must be unencrypted PEM.
+    fn load_pem_identity(
+        cert_path: &str,
+        key_path: &str,
+        passphrase: Option<&str>,
+    ) -> Result<reqwest::Identity> {
+        if passphrase.is_some() {
+            tracing::warn!(
+                "client_passphrase is only honored with the native-tls backend; \
+                 this rustls build uses unencrypted PEM keys, so the supplied \
+                 passphrase will be ignored"
+            );
+        }
+        let cert_bytes = std::fs::read(cert_path).map_err(|e| {
+            TropelError::Config(format!("Failed to read client cert '{}': {}", cert_path, e))
+        })?;
+        let key_bytes = std::fs::read(key_path).map_err(|e| {
+            TropelError::Config(format!("Failed to read client key '{}': {}", key_path, e))
+        })?;
+        let mut combined = cert_bytes;
+        combined.extend_from_slice(b"\n");
+        combined.extend_from_slice(&key_bytes);
+        reqwest::Identity::from_pem(&combined).map_err(|e| {
+            TropelError::Config(format!(
+                "Failed to load PEM client identity (cert '{}', key '{}'): {}",
+                cert_path, key_path, e
+            ))
         })
+    }
+
+    /// Pick the `reqwest::Client` for a request, honoring the per-request
+    /// `follow_redirects` and `certificate` overrides that reqwest bakes in at
+    /// client-build time:
+    /// - `follow_redirects: false` → the no-redirect twin client
+    /// - `certificate` → a lazily-built client with that mTLS identity,
+    ///   cached per (cert, key, follow_redirects) so each distinct identity
+    ///   is loaded from disk exactly once
+    ///
+    /// Note: the `cert_clients` lock is held across `load_pem_identity` (file
+    /// reads) and `build_client`. This is safe because clients are per-VU and
+    /// run on single-threaded current-thread runtimes (no awaits under the
+    /// lock, no concurrent callers for the same `HttpClient`). A future
+    /// refactor that shares one client across threads must build outside the
+    /// lock instead.
+    fn select_client(&self, request: &Request) -> Result<reqwest::Client> {
+        let follow = request.follow_redirects;
+        match &request.certificate {
+            Some(cert) => {
+                let cert_path = cert.cert.as_deref().ok_or_else(|| {
+                    TropelError::Config("per-request certificate requires a cert path".into())
+                })?;
+                let key_path = cert.key.as_deref().ok_or_else(|| {
+                    TropelError::Config("per-request certificate requires a key path".into())
+                })?;
+                let cache_key = (cert_path.to_string(), key_path.to_string(), follow);
+                let mut cache = self.cert_clients.lock().unwrap();
+                if let Some(client) = cache.get(&cache_key) {
+                    return Ok(client.clone());
+                }
+                let identity =
+                    Self::load_pem_identity(cert_path, key_path, cert.passphrase.as_deref())?;
+                let redirect = if follow && self.config.max_redirects > 0 {
+                    reqwest::redirect::Policy::limited(self.config.max_redirects as usize)
+                } else {
+                    reqwest::redirect::Policy::none()
+                };
+                let client =
+                    Self::build_client(&self.config, &self.tls, Some(identity), redirect)?;
+                cache.insert(cache_key, client.clone());
+                Ok(client)
+            }
+            None => {
+                if follow {
+                    Ok(self.inner.clone())
+                } else if let Some(no_redirect) = &self.no_redirect {
+                    Ok(no_redirect.clone())
+                } else {
+                    Ok(self.inner.clone())
+                }
+            }
+        }
     }
 
     /// Execute an HTTP request with sub-timing instrumentation.
@@ -279,10 +389,15 @@ impl HttpClient {
             None
         };
 
+        // Per-request overrides (mTLS identity, follow_redirects) are baked
+        // into the reqwest client at build time, so select the right client
+        // for THIS request before building the RequestBuilder.
+        let client = self.select_client(request)?;
+
         let mut req_builder = match request.method {
-            Method::GET => self.inner.get(&request.url),
+            Method::GET => client.get(&request.url),
             Method::POST => {
-                let rb = self.inner.post(&request.url);
+                let rb = client.post(&request.url);
                 if let Some(body) = &request.body {
                     rb.body(body_to_reqwest(body))
                 } else {
@@ -290,7 +405,7 @@ impl HttpClient {
                 }
             }
             Method::PUT => {
-                let rb = self.inner.put(&request.url);
+                let rb = client.put(&request.url);
                 if let Some(body) = &request.body {
                     rb.body(body_to_reqwest(body))
                 } else {
@@ -298,17 +413,17 @@ impl HttpClient {
                 }
             }
             Method::PATCH => {
-                let rb = self.inner.patch(&request.url);
+                let rb = client.patch(&request.url);
                 if let Some(body) = &request.body {
                     rb.body(body_to_reqwest(body))
                 } else {
                     rb
                 }
             }
-            Method::DELETE => self.inner.delete(&request.url),
-            Method::HEAD => self.inner.head(&request.url),
-            Method::OPTIONS => self.inner.request(reqwest::Method::OPTIONS, &request.url),
-            Method::TRACE => self.inner.request(reqwest::Method::TRACE, &request.url),
+            Method::DELETE => client.delete(&request.url),
+            Method::HEAD => client.head(&request.url),
+            Method::OPTIONS => client.request(reqwest::Method::OPTIONS, &request.url),
+            Method::TRACE => client.request(reqwest::Method::TRACE, &request.url),
             Method::CONNECT => {
                 return Err(TropelError::Http("CONNECT method not supported".into()));
             }
@@ -362,8 +477,7 @@ impl HttpClient {
         // this point: blocked + DNS + TCP connect + TLS handshake + sending +
         // server processing.
         let waiting_start = std::time::Instant::now();
-        let mut response = self
-            .inner
+        let mut response = client
             .execute(built_request)
             .await
             .map_err(|e| TropelError::Http(format!("Request failed: {}", e)))?;
@@ -394,8 +508,7 @@ impl HttpClient {
                                     })?,
                                 );
                             let retry_start = std::time::Instant::now();
-                            response = self
-                                .inner
+                            response = client
                                 .execute(retry)
                                 .await
                                 .map_err(|e| TropelError::Http(format!("Request failed: {}", e)))?;
@@ -760,6 +873,7 @@ mod serde_urlencoded {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::time::Duration;
 
     #[test]
@@ -791,6 +905,141 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(result, "key=value&name=hello+world");
+    }
+
+    // ── per-request client selection (TROPEL_TODO_V2: "client cert and
+    //    follow_redirects are ignored — fixed at client build") ──
+
+    #[test]
+    fn no_redirect_twin_built_only_when_following_enabled() {
+        // max_redirects > 0 → a Policy::none() twin exists to serve
+        // `follow_redirects: false` requests (the redirect policy is baked
+        // into the client at build time).
+        let cfg = HttpConfig::default(); // max_redirects = 10
+        let client = HttpClient::new(&cfg).unwrap();
+        assert!(client.no_redirect.is_some());
+
+        // max_redirects == 0 → the primary client already never follows, so
+        // no twin is needed and both request shapes share `inner`.
+        let mut no_redirect_cfg = HttpConfig::default();
+        no_redirect_cfg.max_redirects = 0;
+        let client = HttpClient::new(&no_redirect_cfg).unwrap();
+        assert!(client.no_redirect.is_none());
+    }
+
+    #[test]
+    fn select_client_no_error_for_plain_requests() {
+        // Both follow shapes resolve to a client (no panics / no errors);
+        // behavioral proof of which one is used lives in the async redirect
+        // test below.
+        let cfg = HttpConfig::default();
+        let client = HttpClient::new(&cfg).unwrap();
+        for follow in [true, false] {
+            let req = Request {
+                follow_redirects: follow,
+                ..Default::default()
+            };
+            assert!(client.select_client(&req).is_ok(), "follow={}", follow);
+        }
+    }
+
+    #[test]
+    fn select_client_cert_missing_file_errors() {
+        // Regression: Request.certificate was silently ignored at client
+        // build. A missing cert file must now surface a Config error instead
+        // of proceeding without the identity.
+        let cfg = HttpConfig::default();
+        let client = HttpClient::new(&cfg).unwrap();
+        let cert = CertificateConfig {
+            cert: Some("missing.pem".to_string()),
+            key: Some("missing.key".to_string()),
+            passphrase: None,
+        };
+        // Both attempts fail on the missing files (proving the cert path IS
+        // exercised) rather than being silently ignored.
+        let follow_req = Request {
+            certificate: Some(cert.clone()),
+            follow_redirects: true,
+            ..Default::default()
+        };
+        let no_follow_req = Request {
+            certificate: Some(cert),
+            follow_redirects: false,
+            ..Default::default()
+        };
+        assert!(client.select_client(&follow_req).is_err());
+        assert!(client.select_client(&no_follow_req).is_err());
+    }
+
+    #[test]
+    fn select_client_certificate_requires_both_paths() {
+        let cfg = HttpConfig::default();
+        let client = HttpClient::new(&cfg).unwrap();
+        let req = Request {
+            certificate: Some(CertificateConfig {
+                cert: Some("cert.pem".to_string()),
+                key: None,
+                passphrase: None,
+            }),
+            ..Default::default()
+        };
+        let err = client.select_client(&req).unwrap_err();
+        assert!(format!("{}", err).contains("key path"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn follow_redirects_false_returns_redirect_not_followed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Tiny redirect server: /start → 302 → /final; /final → 200.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let req = String::from_utf8_lossy(&buf);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let resp = if path == "/start" {
+                        "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string()
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let cfg = HttpConfig::default();
+        let client = HttpClient::new(&cfg).unwrap();
+
+        // follow_redirects: true (default) → redirect is followed → 200.
+        let follow_req = Request {
+            url: format!("http://{}/start", addr),
+            method: Method::GET,
+            follow_redirects: true,
+            ..Default::default()
+        };
+        let resp = client.execute(&follow_req, None).await.unwrap();
+        assert_eq!(resp.status_code, 200, "redirect should be followed");
+
+        // follow_redirects: false → the 302 is returned to the caller.
+        let no_follow_req = Request {
+            url: format!("http://{}/start", addr),
+            method: Method::GET,
+            follow_redirects: false,
+            ..Default::default()
+        };
+        let resp = client.execute(&no_follow_req, None).await.unwrap();
+        assert_eq!(resp.status_code, 302, "redirect must NOT be followed");
+
+        server.abort();
     }
 }
 
