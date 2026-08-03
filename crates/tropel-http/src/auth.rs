@@ -243,16 +243,14 @@ impl AuthSigner for AwsSigV4Auth {
             None => EMPTY_SHA256.to_string(),
         };
 
-        // Canonical URI: use the path exactly as the url crate stores it — it
-        // is already RFC 3986 percent-encoded with the same unreserved rules
-        // AWS requires. Re-encoding it would double-encode `%` → `%25` and
-        // break signatures for any path containing special characters.
+        // Canonical URI. AWS requires DOUBLE URI-encoding of the path for
+        // every service EXCEPT the S3 family (s3, s3control, s3-object-lambda,
+        // …), which sign the single-encoded path exactly as sent. The url
+        // crate already single-encodes `path()` with the RFC 3986 unreserved
+        // rules, so re-encoding each segment yields the required second
+        // encoding for non-S3 services.
         let path = url.path();
-        let canonical_uri = if path.is_empty() {
-            "/".to_string()
-        } else {
-            path.to_string()
-        };
+        let canonical_uri = sigv4_canonical_uri(path, &service);
 
         // Canonical query string: sorted by encoded key.
         let mut pairs: Vec<(String, String)> = url
@@ -267,34 +265,14 @@ impl AuthSigner for AwsSigV4Auth {
             .join("&");
 
         // Canonical headers: host + x-amz-* AND every header already present
-        // on the request (lowercased, deduped). AWS requires all request-
-        // affecting headers to be covered by the signature — hardcoding just
-        // the x-amz-* set would leave user headers (Content-Type, custom
-        // x-*) unsigned, which strict services reject. Matches k6/Postman,
-        // which sign every header present.
-        let host = canonical_host(url);
-        let mut headers: Vec<(String, String)> = vec![
-            ("host".to_string(), host),
-            ("x-amz-content-sha256".to_string(), payload_hash.clone()),
-            ("x-amz-date".to_string(), amz_date.clone()),
-        ];
-        if let Some(token) = &self.session_token {
-            headers.push(("x-amz-security-token".to_string(), token.clone()));
-        }
-        for (name, value) in request.headers() {
-            let key = name.as_str().to_ascii_lowercase();
-            if headers.iter().any(|(k, _)| k == &key) {
-                continue;
-            }
-            // AWS canonicalization: trim, collapse sequential spaces.
-            let v = value
-                .to_str()
-                .unwrap_or("")
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
-            headers.push((key, v));
-        }
+        // on the request (lowercased, deduped), including ALL values of
+        // multi-value headers comma-joined (AWS canonicalization).
+        let mut headers = sigv4_canonical_headers(
+            request,
+            &payload_hash,
+            &amz_date,
+            self.session_token.as_deref(),
+        );
         headers.sort();
         let signed_headers = headers
             .iter()
@@ -385,6 +363,89 @@ fn hex_hmac_sha256(key: &[u8], data: &[u8]) -> String {
 /// RFC 3986 percent-encode (unreserved chars pass through).
 fn enc(s: &str) -> String {
     utf8_percent_encode(s, &UNRESERVED).to_string()
+}
+
+/// Canonical URI for SigV4.
+///
+/// AWS requires DOUBLE URI-encoding of the absolute path for every service
+/// EXCEPT the S3 family (s3, s3control, s3-object-lambda, s3-outposts,
+/// s3express), which sign the single-encoded path exactly as sent. The `url`
+/// crate already single-encodes `Url::path()` with the RFC 3986 unreserved
+/// rules, so re-encoding each segment yields the required second encoding
+/// for non-S3 services (`%` is not unreserved → `%25`). Empty segments
+/// (leading/trailing slash, `//`) are preserved; an empty path becomes `/`.
+fn sigv4_canonical_uri(path: &str, service: &str) -> String {
+    if is_s3_family(service) {
+        return if path.is_empty() {
+            "/".to_string()
+        } else {
+            path.to_string()
+        };
+    }
+    if path.is_empty() {
+        return "/".to_string();
+    }
+    let encoded: Vec<String> = path.split('/').map(enc).collect();
+    encoded.join("/")
+}
+
+/// True for the S3 family of services, which sign the single-encoded path.
+///
+/// Matches both spellings of S3 Control's signing name ("s3-control" is what
+/// `default_service` derives from `s3-control.<region>.amazonaws.com`; some
+/// tools emit the un-hyphenated "s3control").
+fn is_s3_family(service: &str) -> bool {
+    matches!(
+        service,
+        "s3" | "s3control" | "s3-control" | "s3-object-lambda" | "s3-outposts" | "s3express"
+    )
+}
+
+/// Canonical headers for SigV4.
+///
+/// Collects the `host` header plus every header already present on the
+/// request (lowercased, deduped), joining the VALUES of multi-value headers
+/// with ", " per AWS canonicalization, then adds the `x-amz-*` signing
+/// headers. The `Authorization` header is never signed (it is the output of
+/// this signer). Uses `get_all` so duplicate header values are preserved —
+/// the old `headers().iter()` collapsed multi-value headers to the first.
+fn sigv4_canonical_headers(
+    request: &reqwest::Request,
+    payload_hash: &str,
+    amz_date: &str,
+    session_token: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut out: HashMap<String, String> = HashMap::new();
+
+    out.insert("host".to_string(), canonical_host(request.url()));
+
+    for name in request.headers().keys() {
+        let key = name.as_str().to_ascii_lowercase();
+        if key == "authorization" {
+            continue;
+        }
+        // Non-UTF8 header values cannot appear in a canonical request (the
+        // sigstring is ASCII); such values are skipped rather than panicking.
+        // HeaderMap preserves insertion order, so the comma-join is stable.
+        let values: Vec<&str> = request
+            .headers()
+            .get_all(name)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(|s| s.trim())
+            .collect();
+        if values.is_empty() {
+            continue;
+        }
+        out.insert(key, values.join(", "));
+    }
+
+    out.insert("x-amz-content-sha256".to_string(), payload_hash.to_string());
+    out.insert("x-amz-date".to_string(), amz_date.to_string());
+    if let Some(token) = session_token {
+        out.insert("x-amz-security-token".to_string(), token.to_string());
+    }
+    out.into_iter().collect()
 }
 
 // ─────────────────────────── OAuth1 (RFC 5849) ───────────────────────────
@@ -717,6 +778,15 @@ impl AuthSigner for DigestAuth {
         // strict servers reject an explicit `algorithm=MD5`).
         let server_algorithm = challenge.get("algorithm").map(|s| s.to_ascii_uppercase());
         let algorithm = server_algorithm.clone().unwrap_or_else(|| "MD5".to_string());
+        // RFC 7616 §3.4.4: the "-sess" variants (MD5-sess / SHA-256-sess)
+        // only change how HA1 is derived (nonce + cnonce are folded in); the
+        // hash function itself is always the base algorithm (MD5 or SHA-256).
+        let base_algorithm = if algorithm.starts_with("SHA-256") {
+            "SHA-256"
+        } else {
+            "MD5"
+        };
+        let is_sess = algorithm.ends_with("-SESS");
         let qop = challenge.get("qop");
 
         let method = request.method().as_str();
@@ -727,18 +797,12 @@ impl AuthSigner for DigestAuth {
             None => url.path().to_string(),
         };
 
-        // HA1 = H(username:realm:password)
+        // Base HA1 = H(username:realm:password)
         let ha1_input = format!("{}:{}:{}", self.username, realm, self.password);
-        let ha1 = match algorithm.as_str() {
-            "SHA-256" => hex_sha256(ha1_input.as_bytes()),
-            _ => hex_md5(ha1_input.as_bytes()),
-        };
+        let base_ha1 = digest_with(&ha1_input, base_algorithm);
         // HA2 = H(method:uri)
         let ha2_input = format!("{method}:{uri}");
-        let ha2 = match algorithm.as_str() {
-            "SHA-256" => hex_sha256(ha2_input.as_bytes()),
-            _ => hex_md5(ha2_input.as_bytes()),
-        };
+        let ha2 = digest_with(&ha2_input, base_algorithm);
 
         let mut fields: Vec<(String, String)> = vec![
             ("username".into(), self.username.clone()),
@@ -747,23 +811,36 @@ impl AuthSigner for DigestAuth {
             ("uri".into(), uri),
         ];
 
+        // -sess requires a cnonce even when qop is absent (RFC 7616 §3.4.4).
         let response = if let Some(qop) = qop {
             if qop.split(',').any(|q| q.trim() == "auth") {
                 let nc = "00000001".to_string();
-                let cnonce = generate_nonce();
-                let response_input =
-                    format!("{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}");
-                let response = digest_with(&response_input, &algorithm);
+                let c = generate_nonce();
+                let ha1 = sess_fold_ha1(&base_ha1, is_sess, nonce, &c, base_algorithm);
+                let response_input = format!("{ha1}:{nonce}:{nc}:{c}:auth:{ha2}");
+                let response = digest_with(&response_input, base_algorithm);
                 fields.push(("qop".into(), "auth".into()));
                 fields.push(("nc".into(), nc));
-                fields.push(("cnonce".into(), cnonce));
+                fields.push(("cnonce".into(), c));
                 response
             } else {
                 // qop present but no 'auth' — fall back to the no-qop form.
-                digest_with(&format!("{ha1}:{nonce}:{ha2}"), &algorithm)
+                if is_sess {
+                    let c = generate_nonce();
+                    let ha1 = sess_fold_ha1(&base_ha1, true, nonce, &c, base_algorithm);
+                    fields.push(("cnonce".into(), c.clone()));
+                    digest_with(&format!("{ha1}:{nonce}:{ha2}"), base_algorithm)
+                } else {
+                    digest_with(&format!("{base_ha1}:{nonce}:{ha2}"), base_algorithm)
+                }
             }
+        } else if is_sess {
+            let c = generate_nonce();
+            let ha1 = sess_fold_ha1(&base_ha1, true, nonce, &c, base_algorithm);
+            fields.push(("cnonce".into(), c.clone()));
+            digest_with(&format!("{ha1}:{nonce}:{ha2}"), base_algorithm)
         } else {
-            digest_with(&format!("{ha1}:{nonce}:{ha2}"), &algorithm)
+            digest_with(&format!("{base_ha1}:{nonce}:{ha2}"), base_algorithm)
         };
         fields.push(("response".into(), response));
         if let Some(alg) = server_algorithm {
@@ -787,6 +864,22 @@ impl AuthSigner for DigestAuth {
             .collect::<Vec<_>>()
             .join(", ");
         Some(format!("Digest {header}"))
+    }
+}
+
+/// RFC 7616 §3.4.4: the `-sess` HA1 folds nonce + cnonce into the base HA1
+/// (`H(base_ha1:nonce:cnonce)`); non-sess algorithms use the base HA1 as-is.
+fn sess_fold_ha1(
+    base_ha1: &str,
+    is_sess: bool,
+    nonce: &str,
+    cnonce: &str,
+    base_algorithm: &str,
+) -> String {
+    if is_sess {
+        digest_with(&format!("{base_ha1}:{nonce}:{cnonce}"), base_algorithm)
+    } else {
+        base_ha1.to_string()
     }
 }
 
@@ -1026,6 +1119,47 @@ mod tests {
         assert_eq!(
             req.headers().get("x-amz-content-sha256").unwrap(),
             EMPTY_SHA256
+        );
+    }
+
+    #[test]
+    fn sigv4_non_s3_path_is_double_encoded_s3_single() {
+        // Non-S3 services double URI-encode the path (AWS SigV4 spec); the
+        // url crate already single-encodes `path()`, so the canonical URI
+        // must re-encode each segment (e.g. `%20` → `%2520`).
+        let canonical = sigv4_canonical_uri("/my%20file%2Fname", "execute-api");
+        assert_eq!(canonical, "/my%2520file%252Fname");
+        // The S3 family signs the single-encoded path exactly as sent.
+        assert_eq!(sigv4_canonical_uri("/my%20file%2Fname", "s3"), "/my%20file%2Fname");
+        assert_eq!(sigv4_canonical_uri("/my%20file%2Fname", "s3-object-lambda"), "/my%20file%2Fname");
+        // S3 Control's signing name is hyphenated ("s3-control") — must not
+        // double-encode either.
+        assert_eq!(sigv4_canonical_uri("/my%20file%2Fname", "s3-control"), "/my%20file%2Fname");
+        // Empty path → "/".
+        assert_eq!(sigv4_canonical_uri("", "execute-api"), "/");
+        // Empty segments (leading/trailing slash) are preserved.
+        assert_eq!(sigv4_canonical_uri("/a//b/", "execute-api"), "/a//b/");
+    }
+
+    #[test]
+    fn sigv4_multi_value_headers_joined_in_canonical_headers() {
+        let mut req = build_request("GET", "https://example.com/thing", None);
+        req.headers_mut().append("x-test", "one".parse().unwrap());
+        req.headers_mut().append("x-test", "two".parse().unwrap());
+        req.headers_mut().append("x-test", "three".parse().unwrap());
+        let headers = sigv4_canonical_headers(&req, "HASH", "20260729T000000Z", None);
+        // Multi-value header values are comma-joined in canonicalization;
+        // host + x-amz-* are also present.
+        let map: std::collections::HashMap<String, String> = headers.into_iter().collect();
+        assert_eq!(map.get("x-test").map(|s| s.as_str()), Some("one, two, three"));
+        assert_eq!(map.get("host").map(|s| s.as_str()), Some("example.com"));
+        assert_eq!(
+            map.get("x-amz-content-sha256").map(|s| s.as_str()),
+            Some("HASH")
+        );
+        assert_eq!(
+            map.get("x-amz-date").map(|s| s.as_str()),
+            Some("20260729T000000Z")
         );
     }
 
@@ -1271,6 +1405,57 @@ mod tests {
             .and_then(|s| s.split('"').next())
             .unwrap();
         assert_eq!(response.len(), 32);
+    }
+
+    #[test]
+    fn digest_sess_algorithm_folds_nonce_and_cnonce() {
+        // RFC 7616 §3.4.4: MD5-sess / SHA-256-sess fold nonce + cnonce into
+        // HA1 and require a cnonce even without qop; the hash function stays
+        // the base algorithm. The response must be 32 hex chars (MD5 base)
+        // and the algorithm echoed unquoted as a bare token.
+        let www = r#"Digest realm="x", nonce="abc123", algorithm=MD5-sess"#;
+        let req = build_request("GET", "http://example.com/", None);
+        let header = DigestAuth::new("u", "p")
+            .challenge_response(www, &req)
+            .unwrap();
+        assert!(header.contains("algorithm=MD5-SESS"));
+        assert!(header.contains("cnonce=\""));
+        let response = header
+            .split("response=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .unwrap();
+        assert_eq!(response.len(), 32);
+        assert!(response.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // SHA-256-sess with qop: base hash is SHA-256 → 64 hex chars.
+        let www = r#"Digest realm="x", qop="auth", nonce="abc123", algorithm=SHA-256-sess"#;
+        let header = DigestAuth::new("u", "p")
+            .challenge_response(www, &req)
+            .unwrap();
+        assert!(header.contains("algorithm=SHA-256-SESS"));
+        assert!(header.contains("cnonce=\""));
+        assert!(header.contains("qop=auth"));
+        let response = header
+            .split("response=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .unwrap();
+        assert_eq!(response.len(), 64);
+        assert!(response.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Non-sess SHA-256 stays 64 hex chars and needs no cnonce without qop.
+        let www = r#"Digest realm="x", nonce="abc123", algorithm=SHA-256"#;
+        let header = DigestAuth::new("u", "p")
+            .challenge_response(www, &req)
+            .unwrap();
+        assert!(!header.contains("cnonce="));
+        let response = header
+            .split("response=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .unwrap();
+        assert_eq!(response.len(), 64);
     }
 
     #[test]
