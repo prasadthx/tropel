@@ -33,6 +33,11 @@ use tropel_metrics::collector::MetricsCollector;
 use tropel_metrics::thresholds::check_abort_on_fail;
 use tropel_report::{create_reporter, InfluxdbOutput, JsonStreamOutput, OtlpOutput, PrometheusRemoteWriteOutput, Reporter, StatsdOutput, StreamingStdoutOutput, TagPolicy};
 
+/// Capacity of the streaming-output broadcast ring. Sized for ~2.5s of
+/// samples at ~100k samples/s so consumer stalls don't drop live data
+/// (see the ring construction in `Engine::run`).
+const SAMPLE_STREAM_CAPACITY: usize = 1 << 18; // 262_144
+
 /// The engine orchestrates a complete load test job.
 pub struct Engine {
     extension_registry: ExtensionRegistry,
@@ -189,9 +194,16 @@ impl Engine {
             );
         }
 
-        // Streaming outputs
+        // Streaming outputs. Size the broadcast ring to comfortably cover the
+        // expected sample rate: a 10k buffer held only ~100ms of samples at
+        // ~100k samples/s, so ANY consumer stall longer than that dropped
+        // live samples (streaming outputs were lossy by design). 2^18 slots
+        // hold ~2.5s of peak-rate samples — short consumer hiccups (GC, a
+        // flush that batches 10k) no longer lose data. Each slot is a small
+        // fixed-size struct (the tags HashMap is heap-allocated), so the
+        // preallocated ring is a few tens of MB worst case.
         let mut output_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-        let (sample_tx, _) = broadcast::channel::<Sample>(10_000);
+        let (sample_tx, _) = broadcast::channel::<Sample>(SAMPLE_STREAM_CAPACITY);
         metrics.set_sample_sink(Some(sample_tx.clone()));
 
         let has_stdout = config.output.reporters.iter().any(|r| r == "stdout");
@@ -499,10 +511,11 @@ impl Engine {
             .set_summary_config(summary_trend_stats, thresholds.clone())
             .await;
 
-        // Raw snapshot FIRST (build_results mem::takes the summary config,
-        // so the snapshot must be captured before results() drains it).
-        // Distributed agents ship this to a controller for lossless merge;
-        // single-node runs never consume it, so skip the serialize cost.
+        // Raw snapshot (build_results now clones the summary config into
+        // every result, so ordering no longer matters — captured here only
+        // for the lossless distributed merge). Distributed agents ship this
+        // to a controller; single-node runs never consume it, so skip the
+        // serialize cost.
         let snapshot = if config.distributed_worker {
             metrics.snapshot().await
         } else {
@@ -951,10 +964,17 @@ async fn run_scenario_vus(
     let pool_c = pool.clone();
     let http_cfg_c = http_cfg.clone();
     let tls_cfg_c = tls_cfg.clone();
-    let thresholds_c = thresholds.clone();
     let vu_env_c = vu_env.clone();
     let sc_name_c = sc_name.clone();
     let sc_tags_c = sc_tags.clone();
+
+    let abort_monitor = spawn_abort_coordinator(
+        has_abort_thresholds,
+        metrics.clone(),
+        executor.control_handle(),
+        thresholds.clone(),
+        test_start,
+    );
 
     executor.run(move |sched, vu_id| {
         let metrics = metrics_c.clone();
@@ -966,8 +986,6 @@ async fn run_scenario_vus(
         let http_cfg = http_cfg_c.clone();
         let rps_vu = rps_limiter_c.clone();
         let tls_cfg = tls_cfg_c.clone();
-        let thresholds = thresholds_c.clone();
-        let has_abort_thresholds = has_abort_thresholds;
         let pool = pool_c.clone();
         let think_time = think_time_cfg.clone();
         let sc_name_vu = sc_name_c.clone();
@@ -1095,20 +1113,6 @@ async fn run_scenario_vus(
                     merge_scenario_tags(&mut iter_samples, &sc_tags);
                     metrics.record_batch(&iter_samples).await;
 
-                    if has_abort_thresholds {
-                        let elapsed = test_start.elapsed();
-                        if elapsed > Duration::from_secs(1) {
-                            let slot = elapsed.as_secs() / 2;
-                            let prev = (elapsed - Duration::from_millis(100)).as_secs() / 2;
-                            if slot != prev {
-                                let results = metrics.results().await;
-                                if check_abort_on_fail(&thresholds, &results, elapsed) {
-                                    sched.request_stop();
-                                }
-                            }
-                        }
-                    }
-
                     {
                         let state = pm_state.lock().unwrap();
                         if state.abort_requested {
@@ -1143,6 +1147,12 @@ async fn run_scenario_vus(
         });
         handle
     }).await.ok();
+
+    // Stop the single abort coordinator — the run has finished, so a
+    // lingering 2s poller would otherwise keep the metrics aggregator alive.
+    if let Some(monitor) = abort_monitor {
+        monitor.abort();
+    }
 
     // Emit a guaranteed final vus/vus_max sample. The periodic sampler only
     // fires every 100 iterations per VU, so a short run would otherwise emit
@@ -1293,7 +1303,6 @@ async fn run_driver_vus(
     let pool_c = pool.clone();
     let http_cfg_c = http_cfg.clone();
     let tls_cfg_c = tls_cfg.clone();
-    let thresholds_c = thresholds.clone();
     let vu_env_c = vu_env.clone();
     let sc_name_c = sc_name.clone();
     let sc_tags_c = sc_tags.clone();
@@ -1304,6 +1313,14 @@ async fn run_driver_vus(
     let registry_c = registry.clone();
     let rps_limiter_c = rps_limiter.clone();
 
+    let abort_monitor = spawn_abort_coordinator(
+        has_abort_thresholds,
+        metrics.clone(),
+        executor.control_handle(),
+        thresholds.clone(),
+        test_start,
+    );
+
     executor.run(move |sched, vu_id| {
         let metrics = metrics_c.clone();
         let stop = stop_c.clone();
@@ -1312,8 +1329,6 @@ async fn run_driver_vus(
         let data_rows = data_rows_c.clone();
         let http_cfg = http_cfg_c.clone();
         let tls_cfg = tls_cfg_c.clone();
-        let thresholds = thresholds_c.clone();
-        let has_abort_thresholds = has_abort_thresholds;
         let pool = pool_c.clone();
         let think_time = think_time_cfg.clone();
         let sc_name_vu = sc_name_c.clone();
@@ -1483,20 +1498,6 @@ async fn run_driver_vus(
                     merge_scenario_tags(&mut iter_samples, &sc_tags);
                     metrics.record_batch(&iter_samples).await;
 
-                    if has_abort_thresholds {
-                        let elapsed = test_start.elapsed();
-                        if elapsed > Duration::from_secs(1) {
-                            let slot = elapsed.as_secs() / 2;
-                            let prev = (elapsed - Duration::from_millis(100)).as_secs() / 2;
-                            if slot != prev {
-                                let results = metrics.results().await;
-                                if check_abort_on_fail(&thresholds, &results, elapsed) {
-                                    sched.request_stop();
-                                }
-                            }
-                        }
-                    }
-
                     sched.increment_iterations().await;
                     iteration_index
                 }.await;
@@ -1521,6 +1522,12 @@ async fn run_driver_vus(
         });
         handle
     }).await.ok();
+
+    // Stop the single abort coordinator — the run has finished, so a
+    // lingering 2s poller would otherwise keep the metrics aggregator alive.
+    if let Some(monitor) = abort_monitor {
+        monitor.abort();
+    }
 
     // Emit a guaranteed final vus/vus_max sample. The periodic sampler only
     // fires every 100 iterations per VU, so a short run would otherwise emit
@@ -1586,6 +1593,49 @@ async fn run_driver_vus(
 /// Merge per-scenario tags into a batch of samples (k6 semantics: scenario
 /// tags apply to every metric the scenario emits). Scenario tags win over a
 /// sample's own tags on key collision.
+/// Single abort-on-fail coordinator: instead of EVERY VU calling
+/// `metrics.results()` (a full aggregate rebuild) at each 2s slot boundary
+/// — the thundering herd — ONE task polls `results()` every 2s and requests
+/// stop on the first breached abortOnFail threshold. VUs only observe the
+/// level-triggered stop flag between iterations. Returns `None` when no
+/// threshold aborts; the caller must `abort()` the returned handle once the
+/// run has finished so the task doesn't keep the metrics aggregator alive.
+fn spawn_abort_coordinator(
+    has_abort_thresholds: bool,
+    metrics: Arc<MetricsCollector>,
+    sched: Arc<VUScheduler>,
+    thresholds: HashMap<String, tropel_core::config::ThresholdConfig>,
+    test_start: Instant,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !has_abort_thresholds {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(2));
+        // Delay, not Burst: if a slow results() call makes us miss ticks,
+        // DON'T fire them all back-to-back — that would recreate a
+        // mini-herd of aggregate rebuilds (the very problem this fixes).
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick fires immediately; consume it so the first check
+        // happens at ~2s (mirrors the old `elapsed > 1s` gate).
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if sched.is_stop_requested() || sched.is_force_stop_requested() {
+                break;
+            }
+            let elapsed = test_start.elapsed();
+            if elapsed > Duration::from_secs(1) {
+                let results = metrics.results().await;
+                if check_abort_on_fail(&thresholds, &results, elapsed) {
+                    sched.request_stop();
+                    break;
+                }
+            }
+        }
+    }))
+}
+
 fn merge_scenario_tags(samples: &mut [Sample], tags: &HashMap<String, String>) {
     if tags.is_empty() {
         return;

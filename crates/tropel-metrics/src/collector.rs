@@ -441,8 +441,8 @@ struct Aggregator {
     /// Whether any configured threshold/summary stat needs EXACT non-tracked
     /// percentiles. Computed once when the summary config arrives (and in
     /// [`merge_snapshots`]) so it stays stable across the many `results()`
-    /// calls during a run — the config fields themselves are `mem::take`n
-    /// into the first result, so they must not be re-inspected per call.
+    /// calls during a run — the config fields are cloned into every result,
+    /// so they must not be re-inspected per call.
     retain_histograms: bool,
 }
 
@@ -559,8 +559,10 @@ impl Aggregator {
         // precomputed, so this avoids an O(buckets) clone per `results()`
         // call — the ~2s-per-VU threshold-check hot path. The flag is
         // computed ONCE at config time (see `Aggregator::retain_histograms`)
-        // because the config fields below are mem::take n into the first
-        // result and would be empty on subsequent calls.
+        // because the config fields below are cloned into every result, so
+        // repeated `results()` calls (the 2s abort-threshold checks) keep
+        // returning the same trend stats / threshold set instead of emptying
+        // them after the first call.
         let retain_histograms = self.retain_histograms;
 
         for (key, set) in self.data.iter() {
@@ -963,8 +965,8 @@ impl Aggregator {
             },
             iterations,
             vus_max,
-            summary_trend_stats: std::mem::take(&mut self.summary_trend_stats),
-            effective_thresholds: std::mem::take(&mut self.effective_thresholds),
+            summary_trend_stats: self.summary_trend_stats.clone(),
+            effective_thresholds: self.effective_thresholds.clone(),
         }
     }
 
@@ -1450,5 +1452,39 @@ mod tests {
         // summaryTrendStats p(99.9) also triggers retention.
         let stats = vec!["avg".into(), "p(99.9)".into()];
         assert!(config_needs_histograms(&stats, &std::collections::HashMap::new()));
+    }
+
+    #[test]
+    fn test_build_results_keeps_summary_config_across_calls() {
+        // Regression: build_results() used to mem::take the summary config,
+        // so the SECOND results() call (every abort-threshold check after the
+        // first) returned empty trend stats and thresholds. Now cloned into
+        // every result.
+        use tropel_core::config::ThresholdConfig;
+
+        let mut agg = Aggregator::new();
+        let mut thresholds: std::collections::HashMap<String, ThresholdConfig> =
+            std::collections::HashMap::new();
+        thresholds.insert(
+            "p95".into(),
+            ThresholdConfig {
+                expression: "http_req_duration.p95 < 500".into(),
+                abort_on_fail: true,
+                delay_abort_eval: None,
+            },
+        );
+        agg.summary_trend_stats = vec!["avg".into(), "p(95)".into()];
+        agg.effective_thresholds = thresholds.clone();
+
+        let first = agg.build_results();
+        assert_eq!(first.summary_trend_stats, vec!["avg", "p(95)"]);
+        assert_eq!(first.effective_thresholds.len(), 1);
+        assert!(first.effective_thresholds.contains_key("p95"));
+
+        // Second call must still carry the config (previously drained).
+        let second = agg.build_results();
+        assert_eq!(second.summary_trend_stats, vec!["avg", "p(95)"]);
+        assert_eq!(second.effective_thresholds.len(), 1);
+        assert!(second.effective_thresholds.contains_key("p95"));
     }
 }
