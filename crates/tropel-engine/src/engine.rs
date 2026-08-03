@@ -1021,6 +1021,27 @@ async fn run_scenario_vus(
                     if sched.try_claim_ramp_down(active).await { break; }
                 }
 
+                // Externally-controlled pause gate: while paused, hold here
+                // instead of starting the next iteration. Level-triggered —
+                // the loop re-checks is_paused each wake, so an edge-triggered
+                // resume notify can't be missed.
+                while sched.is_paused()
+                    && !sched.is_stop_requested()
+                    && !sched.is_force_stop_requested()
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                if sched.is_stop_requested() || sched.is_force_stop_requested() { break; }
+
+                // Shared-iterations mode: PRE-CLAIM this iteration slot
+                // atomically (lock-free CAS) before running, so concurrent
+                // VUs can never overshoot the budget by up to vus−1 — the
+                // old run-then-check let every VU read the same
+                // under-budget snapshot and start one more iteration.
+                if !is_per_vu_iterations && total_iters != u64::MAX {
+                    if !sched.try_claim_shared_iteration(total_iters) { break; }
+                }
+
                 vu_sample_counter += 1;
                 if vu_sample_counter % 100 == 0 {
                     let active = sched.active_vus().await;
@@ -1115,8 +1136,6 @@ async fn run_scenario_vus(
                 if total_iters != u64::MAX {
                     if is_per_vu_iterations {
                         if iteration_index >= total_iters { break; }
-                    } else {
-                        if sched.total_iterations().await >= total_iters { break; }
                     }
                 }
             }
@@ -1352,6 +1371,27 @@ async fn run_driver_vus(
                     if sched.try_claim_ramp_down(active).await { break; }
                 }
 
+                // Externally-controlled pause gate: while paused, hold here
+                // instead of starting the next iteration. Level-triggered —
+                // the loop re-checks is_paused each wake, so an edge-triggered
+                // resume notify can't be missed.
+                while sched.is_paused()
+                    && !sched.is_stop_requested()
+                    && !sched.is_force_stop_requested()
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                if sched.is_stop_requested() || sched.is_force_stop_requested() { break; }
+
+                // Shared-iterations mode: PRE-CLAIM this iteration slot
+                // atomically (lock-free CAS) before running, so concurrent
+                // VUs can never overshoot the budget by up to vus−1 — the
+                // old run-then-check let every VU read the same
+                // under-budget snapshot and start one more iteration.
+                if !is_per_vu_iterations && total_iters != u64::MAX {
+                    if !sched.try_claim_shared_iteration(total_iters) { break; }
+                }
+
                 vu_sample_counter += 1;
                 if vu_sample_counter % 100 == 0 {
                     let active = sched.active_vus().await;
@@ -1464,8 +1504,6 @@ async fn run_driver_vus(
                 if total_iters != u64::MAX {
                     if is_per_vu_iterations {
                         if iteration_index >= total_iters { break; }
-                    } else {
-                        if sched.total_iterations().await >= total_iters { break; }
                     }
                 }
             }
