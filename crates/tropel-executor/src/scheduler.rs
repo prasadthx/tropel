@@ -1570,6 +1570,7 @@ mod tests {
 
         let sched = VUScheduler::new(&ExecutionConfig::ConstantArrivalRate {
             rate: 10.0,
+            time_unit: "1s".to_string(),
             duration: "1s".to_string(),
             pre_alloc_vus: 2,
             max_vus: 50,
