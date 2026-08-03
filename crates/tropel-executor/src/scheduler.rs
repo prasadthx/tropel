@@ -53,6 +53,12 @@ pub struct VUScheduler {
     /// Lock-free total-iteration counter, shared the same way for
     /// `exec.instance.iterationsCompleted` (a GLOBAL total across all VUs).
     total_iterations: Arc<AtomicU64>,
+    /// Lock-free claimed-iteration counter for shared-iterations mode.
+    /// Pre-claimed (CAS) BEFORE an iteration starts so the iteration budget
+    /// can never be overshot by concurrent VUs finishing simultaneously.
+    /// Distinct from `total_iterations` (the COMPLETED count backing
+    /// exec.instance.iterationsCompleted).
+    claimed_iterations: Arc<AtomicU64>,
     stop_signal: Arc<tokio::sync::Notify>,
     /// Level-triggered stop flag — VUs check this between iterations and exit
     /// gracefully (finish current iteration first).
@@ -83,6 +89,17 @@ pub struct VUScheduler {
     control_target_vus: Arc<AtomicU32>,
     /// Cap on the externally-controlled VU pool.
     control_max_vus: Arc<AtomicU32>,
+    /// Hard ceiling for `control_max_vus` — the configured `max_vus` from the
+    /// executor options. The control API may LOWER `max` but can never raise
+    /// it past this value (a client can't exceed the configured cap).
+    control_hard_max: Arc<AtomicU32>,
+    /// Logical externally-controlled pool size: VUs the control loop has
+    /// spawned minus those that claimed a ramp-down exit. Bumped synchronously
+    /// at spawn so reconciliation never double-spawns on lagging registration.
+    control_spawned: Arc<AtomicU32>,
+    /// Pause flag (externally-controlled only): while set, VUs hold at the
+    /// top of their loop and the control loop keeps the pool but doesn't grow.
+    control_paused: Arc<AtomicBool>,
     /// Wakes the externally-controlled control loop when the target changes.
     control_notify: Arc<tokio::sync::Notify>,
 }
@@ -94,6 +111,7 @@ impl VUScheduler {
             config: config.clone(),
             active_vus: Arc::new(AtomicU32::new(0)),
             total_iterations: Arc::new(AtomicU64::new(0)),
+            claimed_iterations: Arc::new(AtomicU64::new(0)),
             stop_signal: Arc::new(tokio::sync::Notify::new()),
             stop_requested: Arc::new(AtomicBool::new(false)),
             force_stop_requested: Arc::new(AtomicBool::new(false)),
@@ -105,6 +123,9 @@ impl VUScheduler {
             ramp_down_remaining: Arc::new(AtomicU32::new(0)),
             control_target_vus: Arc::new(AtomicU32::new(0)),
             control_max_vus: Arc::new(AtomicU32::new(0)),
+            control_hard_max: Arc::new(AtomicU32::new(u32::MAX)),
+            control_spawned: Arc::new(AtomicU32::new(0)),
+            control_paused: Arc::new(AtomicBool::new(false)),
             control_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -181,7 +202,8 @@ impl VUScheduler {
         if my_active_vus <= target {
             return false;
         }
-        self.ramp_down_remaining
+        let claimed = self
+            .ramp_down_remaining
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |r| {
                 if r > 0 {
                     Some(r - 1)
@@ -189,7 +211,18 @@ impl VUScheduler {
                     None
                 }
             })
-            .is_ok()
+            .is_ok();
+        if claimed {
+            // A VU is about to exit — keep the logical externally-controlled
+            // pool in sync (saturating so non-externally-controlled modes,
+            // where the counter stays 0, are unaffected).
+            self.control_spawned
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                    Some(v.saturating_sub(1))
+                })
+                .ok();
+        }
+        claimed
     }
 
     /// Try to consume one arrival-rate token. Returns true if a token was available.
@@ -229,12 +262,28 @@ impl VUScheduler {
     }
 
     /// Set the externally-controlled VU target and cap from the control API.
-    /// Clamps `vus` to `[0, max]` and wakes the control loop.
+    /// The API can lower `max` but never raise it above the configured
+    /// ceiling (`control_hard_max`). Clamps `vus` to `[0, max]` and wakes the
+    /// control loop.
     pub fn set_control_target(&self, vus: u32, max_vus: u32) {
-        self.control_max_vus.store(max_vus, Ordering::Release);
+        let hard = self.control_hard_max.load(Ordering::Acquire);
+        let max = max_vus.min(hard);
+        self.control_max_vus.store(max, Ordering::Release);
         self.control_target_vus
-            .store(vus.min(max_vus), Ordering::Release);
+            .store(vus.min(max), Ordering::Release);
         self.control_notify.notify_waiters();
+    }
+
+    /// Set the externally-controlled pause flag (k6 `paused`). While paused,
+    /// VUs hold at the top of their loop and the pool is kept, not grown.
+    pub fn set_paused(&self, paused: bool) {
+        self.control_paused.store(paused, Ordering::Release);
+        self.control_notify.notify_waiters();
+    }
+
+    /// Whether the externally-controlled executor is paused.
+    pub fn is_paused(&self) -> bool {
+        self.control_paused.load(Ordering::Acquire)
     }
 
     /// Current externally-controlled VU target (as last set by the API).
@@ -262,6 +311,28 @@ impl VUScheduler {
         self.active_vus.load(Ordering::Acquire)
     }
 
+    /// The PRE-ALLOCATED peak VU count from the execution config — the number
+    /// of VUs the scheduler commits to spinning up, regardless of how many are
+    /// mid-iteration at any instant. Backs the `vus_max` metric (k6 emits the
+    /// configured peak, not a sampled current active count).
+    pub fn peak_vus(&self) -> u32 {
+        match &self.config {
+            ExecutionConfig::ConstantVus { vus, .. } => *vus,
+            ExecutionConfig::RampingVus {
+                stages,
+                start_vus,
+                ..
+            } => stages
+                .iter()
+                .fold(*start_vus, |acc, s| acc.max(s.target)),
+            ExecutionConfig::SharedIterations { vus, .. } => *vus,
+            ExecutionConfig::ConstantArrivalRate { max_vus, .. } => *max_vus,
+            ExecutionConfig::PerVUIterations { vus, .. } => *vus,
+            ExecutionConfig::RampingArrivalRate { max_vus, .. } => *max_vus,
+            ExecutionConfig::ExternallyControlled { max_vus, .. } => *max_vus,
+        }
+    }
+
     /// Get total iterations completed.
     pub async fn total_iterations(&self) -> u64 {
         self.total_iterations.load(Ordering::Acquire)
@@ -270,6 +341,27 @@ impl VUScheduler {
     /// Increment iteration count.
     pub async fn increment_iterations(&self) {
         self.total_iterations.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Try to atomically claim one slot of a shared iteration budget.
+    /// Returns `true` if this VU may start an iteration, `false` when the
+    /// budget is exhausted.
+    ///
+    /// Lock-free CAS: across all VUs exactly `budget` claims ever succeed,
+    /// so the old run-then-check pattern — where each VU incremented the
+    /// completed counter AFTER running and compared against the budget —
+    /// could let up to `vus−1` extra iterations slip through when several
+    /// VUs finished concurrently.
+    pub fn try_claim_shared_iteration(&self, budget: u64) -> bool {
+        self.claimed_iterations
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                if c >= budget {
+                    None
+                } else {
+                    Some(c + 1)
+                }
+            })
+            .is_ok()
     }
 
     /// Shared handle to the active-VU counter — handed to a VU's PmState so
@@ -542,21 +634,24 @@ impl VUScheduler {
 
                 if drained {
                     // All surplus VUs exited — clear ramp-down state so a
-                    // subsequent stage can't spuriously claim. If it timed out
-                    // (grace-expired stragglers), KEEP the state so those VUs
-                    // still exit at their next loop-top claim.
+                    // subsequent stage can't spuriously claim.
                     self.clear_ramp_down();
+                    current_vus = target;
+                } else {
+                    // Drain timed out (grace-expired stragglers still
+                    // mid-iteration). KEEP the ramp-down state so those VUs
+                    // still exit at their next loop-top claim, and adopt the
+                    // REAL active count as `current_vus` — the old code set
+                    // `current_vus = target` here, so a subsequent stage
+                    // computed `remaining` from the under-count and the pool
+                    // could settle ABOVE its target.
+                    let real = self.active_vus.load(Ordering::Acquire);
+                    tracing::debug!(
+                        "Ramp-down drain timed out: adopting real active count {} as current_vus",
+                        real
+                    );
+                    current_vus = real;
                 }
-
-                // NOTE: after a timed-out drain, `current_vus` is stale
-                // (actual active_vus still includes stragglers + retained
-                // VUs). A subsequent ramp-down then computes `remaining` from
-                // this under-count, so the pool can settle above its target.
-                // Bounded: the kept claims still drain the stragglers, and
-                // once they exit, active converges to the tracked count (the
-                // next `set_ramp_down_target` recomputes from the stale
-                // current_vus, so full correction waits for that drain).
-                current_vus = target;
             } else {
                 // ── Constant stage: hold the current VU count for the FULL
                 //    stage duration (k6 holds `target` VUs). VUs keep
@@ -1018,7 +1113,9 @@ impl VUScheduler {
             grace
         );
 
-        // Seed the control state from the config.
+        // Seed the control state from the config. `control_hard_max` is the
+        // configured ceiling the control API can never raise past.
+        self.control_hard_max.store(max_vus, Ordering::Release);
         self.control_max_vus.store(max_vus, Ordering::Release);
         self.control_target_vus.store(vus.min(max_vus), Ordering::Release);
 
@@ -1034,6 +1131,9 @@ impl VUScheduler {
             handles.push(handle);
             next_vu_id += 1;
         }
+        // Logical pool size — bumped synchronously at spawn so reconcile
+        // never double-spawns on lagging registration.
+        self.control_spawned.store(initial, Ordering::Release);
 
         // Wait (bounded) for the initial VUs to register in `active_vus` so
         // the first reconcile doesn't see active=0 and double-spawn. Each VU
@@ -1069,27 +1169,46 @@ impl VUScheduler {
                 }
             }
 
+            if self.is_paused() {
+                // Paused: hold the pool (no grow/shrink). The select keeps
+                // this responsive to resume (control_notify) while the tick
+                // covers an edge-triggered wake that was missed.
+                tokio::select! {
+                    _ = control_notify.notified() => {}
+                    _ = time::sleep(Duration::from_millis(100)) => {}
+                }
+                continue;
+            }
+
             let target = self.control_target().min(self.control_max());
-            let active = self.active_vus.load(Ordering::Acquire);
-            if target > active {
+            let spawned = self.control_spawned.load(Ordering::Acquire);
+            if target > spawned {
                 // Grow: clear any pending ramp-down FIRST — otherwise the
                 // freshly spawned VUs would read the stale `ramp_down_target`
                 // (active > old target, remaining > 0) and immediately
                 // self-exit at their loop top, silently nullifying the grow.
                 self.clear_ramp_down();
-                for _ in active..target {
+                for _ in spawned..target {
                     let handle = run_vu(self.shared_clone(), next_vu_id);
                     handles.push(handle);
                     next_vu_id += 1;
                 }
-                tracing::debug!("Externally-controlled: VU pool {} → {}", active, target);
-            } else if target < active {
+                // Synchronous bump — the next tick sees this count even if
+                // the new VUs haven't registered in `active_vus` yet, so a
+                // lagging registration can never trigger a double-spawn.
+                self.control_spawned.store(target, Ordering::Release);
+                tracing::debug!("Externally-controlled: VU pool {} → {}", spawned, target);
+            } else if target < spawned {
                 // Shrink: reuse the ramp-down claim mechanism so exactly
-                // `active - target` VUs exit (level-triggered; re-armed each
-                // tick against the live count, so the drain self-corrects
-                // even if some VUs died for other reasons).
-                tracing::debug!("Externally-controlled: VU pool {} → {}", active, target);
-                self.set_ramp_down_target(target, active);
+                // `spawned - target` VUs exit. Each claim decrements
+                // `control_spawned`, so this is armed ONLY while the previous
+                // surplus is fully drained (remaining == 0) — re-arming every
+                // tick against the lagging `active` counter used to inflate
+                // the surplus and overshoot below target.
+                if self.ramp_down_remaining.load(Ordering::Relaxed) == 0 {
+                    self.set_ramp_down_target(target, spawned);
+                }
+                tracing::debug!("Externally-controlled: shrinking pool {} → {}", spawned, target);
             }
 
             tokio::select! {
@@ -1137,6 +1256,7 @@ impl VUScheduler {
             config: self.config.clone(),
             active_vus: self.active_vus.clone(),
             total_iterations: self.total_iterations.clone(),
+            claimed_iterations: self.claimed_iterations.clone(),
             stop_signal: self.stop_signal.clone(),
             stop_requested: self.stop_requested.clone(),
             force_stop_requested: self.force_stop_requested.clone(),
@@ -1148,6 +1268,9 @@ impl VUScheduler {
             ramp_down_remaining: self.ramp_down_remaining.clone(),
             control_target_vus: self.control_target_vus.clone(),
             control_max_vus: self.control_max_vus.clone(),
+            control_hard_max: self.control_hard_max.clone(),
+            control_spawned: self.control_spawned.clone(),
+            control_paused: self.control_paused.clone(),
             control_notify: self.control_notify.clone(),
         })
     }
@@ -1309,6 +1432,160 @@ mod tests {
         // Stale target reset — no claim, even though a stale snapshot says
         // active > old target.
         assert!(!sched.try_claim_ramp_down(8).await);
+    }
+
+    /// Locked: shared-iteration pre-claim CAS never overshoots the budget,
+    /// no matter how many VUs contend simultaneously (the old run-then-check
+    /// allowed up to vus−1 extras).
+    #[tokio::test]
+    async fn try_claim_shared_iteration_bounds_to_budget() {
+        let sched = VUScheduler::new(&ExecutionConfig::SharedIterations {
+            iterations: 5,
+            max_duration: None,
+            vus: 10,
+            graceful_stop: None,
+            think_time: Default::default(),
+        });
+
+        // 1000 "VUs" all claim concurrently-ish: exactly 5 succeed.
+        let mut claimed = 0u64;
+        for _ in 0..1000 {
+            if sched.try_claim_shared_iteration(5) {
+                claimed += 1;
+            }
+        }
+        assert_eq!(claimed, 5);
+
+        // Exhausted budget — a late VU must not start.
+        assert!(!sched.try_claim_shared_iteration(5));
+    }
+
+    /// Locked: the control API can LOWER the pool cap but can never raise it
+    /// past the configured `max_vus` ceiling (a client can't exceed the run's
+    /// cap just by PATCHing a bigger max).
+    #[tokio::test]
+    async fn control_max_clamped_to_configured_ceiling() {
+        let sched = VUScheduler::new(&ExecutionConfig::ExternallyControlled {
+            vus: 1,
+            max_vus: 10,
+            duration: None,
+            graceful_stop: None,
+            think_time: Default::default(),
+        });
+        sched.control_hard_max.store(10, Ordering::Release);
+
+        // Client tries to raise max above the configured 10 → clamped.
+        sched.set_control_target(8, 100);
+        assert_eq!(sched.control_target(), 8);
+        assert_eq!(sched.control_max(), 10);
+
+        // Lowering is allowed.
+        sched.set_control_target(3, 7);
+        assert_eq!(sched.control_target(), 3);
+        assert_eq!(sched.control_max(), 7);
+
+        // vus is also clamped to max.
+        sched.set_control_target(50, 6);
+        assert_eq!(sched.control_target(), 6);
+    }
+
+    /// Locked: pause is level-triggered and independent of the target/cap.
+    #[tokio::test]
+    async fn pause_is_level_triggered_and_independent() {
+        let sched = VUScheduler::new(&ExecutionConfig::ExternallyControlled {
+            vus: 1,
+            max_vus: 10,
+            duration: None,
+            graceful_stop: None,
+            think_time: Default::default(),
+        });
+        assert!(!sched.is_paused());
+        sched.set_paused(true);
+        assert!(sched.is_paused());
+        // Target/cap updates don't clear pause.
+        sched.set_control_target(5, 9);
+        assert!(sched.is_paused());
+        sched.set_paused(false);
+        assert!(!sched.is_paused());
+    }
+
+    /// Locked: a ramp-down claim decrements the logical externally-controlled
+    /// pool (control_spawned), so reconcile growth can't double-spawn after
+    /// VUs exit.
+    #[tokio::test]
+    async fn ramp_down_claim_syncs_control_spawned() {
+        let sched = VUScheduler::new(&ExecutionConfig::ExternallyControlled {
+            vus: 1,
+            max_vus: 10,
+            duration: None,
+            graceful_stop: None,
+            think_time: Default::default(),
+        });
+        sched.control_spawned.store(8, Ordering::Release);
+        sched.set_ramp_down_target(5, 8);
+        assert!(sched.try_claim_ramp_down(8).await);
+        assert_eq!(sched.control_spawned.load(Ordering::Acquire), 7);
+        // Non-claiming mode (counter at 0) never underflows.
+        let sched2 = VUScheduler::new(&ExecutionConfig::ConstantVus {
+            vus: 1,
+            duration: "1s".to_string(),
+            graceful_stop: None,
+            think_time: Default::default(),
+        });
+        assert_eq!(sched2.control_spawned.load(Ordering::Acquire), 0);
+        sched2.set_ramp_down_target(0, 1);
+        assert!(sched2.try_claim_ramp_down(1).await);
+        assert_eq!(sched2.control_spawned.load(Ordering::Acquire), 0);
+    }
+
+    /// Locked: peak_vus() reports the PRE-ALLOCATED peak per executor type
+    /// (k6 semantics for vus_max), not a sampled current active count.
+    #[test]
+    fn peak_vus_reports_preallocated_peak() {
+        let sched = VUScheduler::new(&ExecutionConfig::ConstantVus {
+            vus: 4,
+            duration: "1s".to_string(),
+            graceful_stop: None,
+            think_time: Default::default(),
+        });
+        assert_eq!(sched.peak_vus(), 4);
+
+        let sched = VUScheduler::new(&ExecutionConfig::RampingVus {
+            start_vus: 2,
+            stages: vec![
+                tropel_core::config::Stage {
+                    duration: "1s".to_string(),
+                    target: 10,
+                },
+                tropel_core::config::Stage {
+                    duration: "1s".to_string(),
+                    target: 5,
+                },
+            ],
+            graceful_ramp_down: None,
+            graceful_stop: None,
+            think_time: Default::default(),
+        });
+        assert_eq!(sched.peak_vus(), 10); // max stage target, not start
+
+        let sched = VUScheduler::new(&ExecutionConfig::ConstantArrivalRate {
+            rate: 10.0,
+            duration: "1s".to_string(),
+            pre_alloc_vus: 2,
+            max_vus: 50,
+            graceful_stop: None,
+            think_time: Default::default(),
+        });
+        assert_eq!(sched.peak_vus(), 50); // max_vus, not pre_alloc
+
+        let sched = VUScheduler::new(&ExecutionConfig::ExternallyControlled {
+            vus: 3,
+            max_vus: 20,
+            duration: None,
+            graceful_stop: None,
+            think_time: Default::default(),
+        });
+        assert_eq!(sched.peak_vus(), 20);
     }
 
     /// Ramp-down claims only apply when the pool is actually above target.

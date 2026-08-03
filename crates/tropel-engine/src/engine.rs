@@ -1029,7 +1029,7 @@ async fn run_scenario_vus(
                     && !sched.is_stop_requested()
                     && !sched.is_force_stop_requested()
                 {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 if sched.is_stop_requested() || sched.is_force_stop_requested() { break; }
 
@@ -1045,7 +1045,8 @@ async fn run_scenario_vus(
                 vu_sample_counter += 1;
                 if vu_sample_counter % 100 == 0 {
                     let active = sched.active_vus().await;
-                    utils_emit_vus_metrics(&metrics, active, &sc_tags).await;
+                    let peak = sched.peak_vus();
+                    utils_emit_vus_metrics(&metrics, active, peak, &sc_tags).await;
                 }
 
                 let iter_start = Instant::now();
@@ -1142,6 +1143,15 @@ async fn run_scenario_vus(
         });
         handle
     }).await.ok();
+
+    // Emit a guaranteed final vus/vus_max sample. The periodic sampler only
+    // fires every 100 iterations per VU, so a short run would otherwise emit
+    // NO vus/vus_max samples and the summary would read vus_max: 0. The peak
+    // is the pre-allocated config peak (k6 semantics); active is deliberately
+    // 0 here because all VUs have joined — vus_max is what the summary needs,
+    // and vus is only consumed through the collector's max-of-gauges, so the
+    // trailing 0 is harmless.
+    utils_emit_vus_metrics(&metrics, 0, executor.peak_vus(), &sc_tags).await;
 
     // Record dropped iterations (carries the scenario tags like every other
     // sample this scenario emits)
@@ -1379,7 +1389,7 @@ async fn run_driver_vus(
                     && !sched.is_stop_requested()
                     && !sched.is_force_stop_requested()
                 {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 if sched.is_stop_requested() || sched.is_force_stop_requested() { break; }
 
@@ -1395,7 +1405,8 @@ async fn run_driver_vus(
                 vu_sample_counter += 1;
                 if vu_sample_counter % 100 == 0 {
                     let active = sched.active_vus().await;
-                    utils_emit_vus_metrics(&metrics, active, &sc_tags).await;
+                    let peak = sched.peak_vus();
+                    utils_emit_vus_metrics(&metrics, active, peak, &sc_tags).await;
                 }
 
                 let iter_start = Instant::now();
@@ -1511,6 +1522,15 @@ async fn run_driver_vus(
         handle
     }).await.ok();
 
+    // Emit a guaranteed final vus/vus_max sample. The periodic sampler only
+    // fires every 100 iterations per VU, so a short run would otherwise emit
+    // NO vus/vus_max samples and the summary would read vus_max: 0. The peak
+    // is the pre-allocated config peak (k6 semantics); active is deliberately
+    // 0 here because all VUs have joined — vus_max is what the summary needs,
+    // and vus is only consumed through the collector's max-of-gauges, so the
+    // trailing 0 is harmless.
+    utils_emit_vus_metrics(&metrics, 0, executor.peak_vus(), &sc_tags).await;
+
     // Record dropped iterations (carries the scenario tags like every other
     // sample this scenario emits)
     {
@@ -1589,7 +1609,12 @@ fn extract_think_time(exec_cfg: &ExecutionConfig) -> ThinkTimeConfig {
     }
 }
 
-async fn utils_emit_vus_metrics(metrics: &MetricsCollector, active: u32, sc_tags: &HashMap<String, String>) {
+async fn utils_emit_vus_metrics(
+    metrics: &MetricsCollector,
+    active: u32,
+    peak: u32,
+    sc_tags: &HashMap<String, String>,
+) {
     let now = std::time::SystemTime::now();
     let mut vus_tags = TagMap::new();
     // k6 tags vus/vus_max per scenario; carry the scenario tags along.
@@ -1600,6 +1625,7 @@ async fn utils_emit_vus_metrics(metrics: &MetricsCollector, active: u32, sc_tags
         .record_batch(&[
             Sample {
                 metric: "vus".into(),
+                // Current ACTIVE VU count, sampled over time (Gauge).
                 value: active as f64,
                 tags: vus_tags.clone(),
                 timestamp: now,
@@ -1607,7 +1633,10 @@ async fn utils_emit_vus_metrics(metrics: &MetricsCollector, active: u32, sc_tags
             },
             Sample {
                 metric: "vus_max".into(),
-                value: active as f64,
+                // PRE-ALLOCATED peak from the execution config (k6 semantics)
+                // — NOT the current active count, which understated the peak
+                // whenever it was sampled between VU churn.
+                value: peak as f64,
                 tags: vus_tags,
                 timestamp: now,
                 sample_type: tropel_core::types::SampleType::Point,

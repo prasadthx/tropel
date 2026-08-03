@@ -1,10 +1,14 @@
 //! Minimal runtime control API — k6 REST `/v1/status` parity.
 //!
 //! Binds `127.0.0.1:<port>` and serves:
-//! - `GET  /v1/status`  → `{"vus": N, "max": M}` (current target/cap)
-//! - `PATCH /v1/status` → body `{"vus": N, "max": M}` (k6 accepts a nested
-//!   `{"data":{"attributes":{...}}}` envelope too) — adjusts the
-//!   externally-controlled scheduler's VU pool at runtime.
+//! - `GET  /v1/status`  → k6 JSON:API shape
+//!   `{"data":{"type":"status","id":"default","attributes":{...}}}`
+//!   (vus / max / paused / running / stopped / tainted)
+//! - `PATCH /v1/status` → k6 envelope `{"data":{"attributes":{...}}}` or a
+//!   flat `{"vus":N,"max":M,"paused":bool}` — adjusts the
+//!   externally-controlled scheduler's VU pool / pause state at runtime.
+//!   `max` is clamped to the configured `max_vus` ceiling, so a client can
+//!   never grow the pool past the run's cap.
 //! - `POST /v1/stop`    → requests a graceful stop.
 //!
 //! Everything else returns 404. This is intentionally dependency-free: a
@@ -111,33 +115,31 @@ fn route(
     sched: &Arc<VUScheduler>,
 ) -> (String, String) {
     match (method, path) {
-        ("GET", "/v1/status") => {
-            let vus = sched.control_target();
-            let max = sched.control_max();
-            (
-                "200 OK".to_string(),
-                format!(r#"{{"vus":{},"max":{}}}"#, vus, max),
-            )
-        }
-        ("PATCH", "/v1/status") => {
-            match parse_status_body(body) {
-                Some((vus, max)) => {
+        ("GET", "/v1/status") => ("200 OK".to_string(), status_json(sched)),
+        ("PATCH", "/v1/status") => match parse_status_body(body) {
+            Some(patch) => {
+                // Apply only the fields the client sent (k6 allows partial
+                // PATCHes: just vus, just max, just paused, or any combo).
+                if patch.vus.is_some() || patch.max.is_some() {
+                    let vus = patch.vus.unwrap_or_else(|| sched.control_target());
+                    let max = patch.max.unwrap_or_else(|| sched.control_max());
                     sched.set_control_target(vus, max);
                     tracing::info!("Control API: set VUs target={} max={}", vus, max);
-                    (
-                        "200 OK".to_string(),
-                        format!(r#"{{"vus":{},"max":{}}}"#, vus.min(max), max),
-                    )
                 }
-                None => (
-                    "400 Bad Request".to_string(),
-                    "{\"error\":\"expected {\\\"vus\\\":N,\\\"max\\\":M}\"}".to_string(),
-                ),
+                if let Some(paused) = patch.paused {
+                    sched.set_paused(paused);
+                    tracing::info!("Control API: paused={}", paused);
+                }
+                ("200 OK".to_string(), status_json(sched))
             }
-        }
+            None => (
+                "400 Bad Request".to_string(),
+                "{\"error\":\"expected {\\\"vus\\\":N,\\\"max\\\":M,\\\"paused\\\":bool}\"}".to_string(),
+            ),
+        },
         ("POST", "/v1/stop") => {
             sched.request_stop();
-            ("200 OK".to_string(), r#"{"stopped":true}"#.to_string())
+            ("200 OK".to_string(), status_json(sched))
         }
         _ => (
             "404 Not Found".to_string(),
@@ -146,10 +148,34 @@ fn route(
     }
 }
 
+/// Render the k6 JSON:API status document. `running` is false once a stop
+/// has been requested; `tainted` is always null (no threshold-taint tracking).
+fn status_json(sched: &Arc<VUScheduler>) -> String {
+    let vus = sched.control_target();
+    let max = sched.control_max();
+    let paused = sched.is_paused();
+    let stopped = sched.is_stop_requested();
+    let running = !stopped;
+    format!(
+        r#"{{"data":{{"type":"status","id":"default","attributes":{{"vus":{},"max":{},"paused":{},"running":{},"stopped":{},"tainted":null}}}}}}"#,
+        vus, max, paused, running, stopped
+    )
+}
+
+/// A parsed PATCH /v1/status body. All fields optional — k6 allows partial
+/// patches (`{"paused":true}` alone is valid).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StatusPatch {
+    vus: Option<u32>,
+    max: Option<u32>,
+    paused: Option<bool>,
+}
+
 /// Parse a PATCH /v1/status body. Accepts both the flat form
 /// `{"vus":5,"max":10}` and the k6 envelope `{"data":{"attributes":{"vus":5,"max":10}}}`.
-/// Values are capped to u32 and max is clamped to be >= vus target handling.
-fn parse_status_body(body: &[u8]) -> Option<(u32, u32)> {
+/// Returns `None` when the body is unparseable or carries none of the known
+/// fields (so a garbage body can't be silently swallowed).
+fn parse_status_body(body: &[u8]) -> Option<StatusPatch> {
     let text = std::str::from_utf8(body).ok()?;
     let json: serde_json::Value = serde_json::from_str(text).ok()?;
 
@@ -159,18 +185,14 @@ fn parse_status_body(body: &[u8]) -> Option<(u32, u32)> {
         .and_then(|d| d.get("attributes"))
         .or_else(|| Some(&json))?;
 
-    let vus = attrs
-        .get("vus")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-    let max = attrs
-        .get("max")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-    if max == 0 {
+    let vus = attrs.get("vus").and_then(|v| v.as_u64()).map(|v| v as u32);
+    let max = attrs.get("max").and_then(|v| v.as_u64()).map(|v| v as u32);
+    let paused = attrs.get("paused").and_then(|v| v.as_bool());
+
+    if vus.is_none() && max.is_none() && paused.is_none() {
         return None;
     }
-    Some((vus, max))
+    Some(StatusPatch { vus, max, paused })
 }
 
 #[cfg(test)]
@@ -179,26 +201,81 @@ mod tests {
 
     #[test]
     fn parses_flat_body() {
-        assert_eq!(parse_status_body(br#"{"vus":5,"max":20}"#), Some((5, 20)));
+        assert_eq!(
+            parse_status_body(br#"{"vus":5,"max":20}"#),
+            Some(StatusPatch {
+                vus: Some(5),
+                max: Some(20),
+                paused: None
+            })
+        );
     }
 
     #[test]
     fn parses_k6_envelope() {
         assert_eq!(
             parse_status_body(br#"{"data":{"attributes":{"vus":3,"max":9}}}"#),
-            Some((3, 9))
+            Some(StatusPatch {
+                vus: Some(3),
+                max: Some(9),
+                paused: None
+            })
         );
     }
 
     #[test]
-    fn rejects_empty_max() {
-        assert_eq!(parse_status_body(br#"{"vus":5}"#), None);
-        assert_eq!(parse_status_body(b"garbage"), None);
+    fn parses_paused_only() {
+        assert_eq!(
+            parse_status_body(br#"{"paused":true}"#),
+            Some(StatusPatch {
+                vus: None,
+                max: None,
+                paused: Some(true)
+            })
+        );
     }
 
     #[test]
-    fn rejects_missing_vus_as_zero_then_fails_on_zero_max() {
-        // max present but vus absent → vus defaults 0; max>0 → Some((0, max)).
-        assert_eq!(parse_status_body(br#"{"max":7}"#), Some((0, 7)));
+    fn partial_patch_with_only_vus_is_valid() {
+        assert_eq!(
+            parse_status_body(br#"{"vus":5}"#),
+            Some(StatusPatch {
+                vus: Some(5),
+                max: None,
+                paused: None
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_garbage_and_unknown_only() {
+        assert_eq!(parse_status_body(br#"{"foo":1}"#), None); // no known field
+        assert_eq!(parse_status_body(b"garbage"), None);
+        assert_eq!(parse_status_body(b"{}"), None);
+    }
+
+    #[test]
+    fn status_json_is_k6_shape() {
+        let sched = VUScheduler::new(&tropel_core::config::ExecutionConfig::ExternallyControlled {
+            vus: 2,
+            max_vus: 10,
+            duration: None,
+            graceful_stop: None,
+            think_time: Default::default(),
+        });
+        let sched = Arc::new(sched);
+        sched.set_control_target(4, 10);
+        let body = status_json(&sched);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let attrs = &v["data"]["attributes"];
+        assert_eq!(attrs["type"], serde_json::Value::Null); // type/id live on data, not attributes
+        assert_eq!(v["data"]["type"], "status");
+        assert_eq!(v["data"]["id"], "default");
+        assert_eq!(attrs["vus"], 4);
+        assert_eq!(attrs["max"], 10);
+        assert_eq!(attrs["paused"], false);
+        assert_eq!(attrs["running"], true);
+        assert_eq!(attrs["stopped"], false);
+        assert!(attrs.get("tainted").is_some());
     }
 }
