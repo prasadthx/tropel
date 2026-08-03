@@ -589,7 +589,7 @@ async fn run_command(cli: Cli) -> Result<()> {
 
     tracing::info!("Execution config: {:?}", config.execution);    // Create the engine with extension registry (subprocess + WASM plugins
     // registered the same way `inspect`/`list` do — one shared builder).
-    let registry = build_registry(subprocess_adapter, plugins_dir.as_deref());
+    let registry = build_registry(subprocess_adapter, plugins_dir.as_deref())?;
     let engine = Engine::new(registry);
     let result = engine.run(&config).await?;
 
@@ -824,17 +824,30 @@ fn merge_partial(base: PartialConfig, file: PartialConfig) -> PartialConfig {
 fn build_registry(
     subprocess_adapter: &[String],
     plugins_dir: Option<&Path>,
-) -> ExtensionRegistry {
+) -> Result<ExtensionRegistry> {
     let mut registry = ExtensionRegistry::new();
 
     // Register any subprocess adapters specified via --subprocess-adapter
     for cmd in subprocess_adapter {
+        // `SubprocessAdapter::new` rejects empty commands with a TropelError
+        // (the old `parts[1..]` panicked) — surface that here, at CLI parse
+        // time, instead of letting the factory panic later.
+        if cmd.trim().is_empty() {
+            return Err(TropelError::Other(format!(
+                "--subprocess-adapter requires a non-empty command (got {cmd:?})"
+            )));
+        }
         let id = format!("subprocess:{}", cmd);
         tracing::info!("Registering subprocess adapter (command: {})", cmd);
         let cmd_clone = cmd.clone();
         registry.register_adapter_factory(
             &id,
-            Arc::new(move || Box::new(tropel_input_subprocess::SubprocessAdapter::new(&cmd_clone))),
+            Arc::new(move || {
+                Box::new(
+                    tropel_input_subprocess::SubprocessAdapter::new(&cmd_clone)
+                        .expect("command validated non-empty above"),
+                )
+            }),
         );
     }
 
@@ -853,7 +866,7 @@ fn build_registry(
         }
     }
 
-    registry
+    Ok(registry)
 }
 
 /// `tropel inspect <input>` — show how an input resolves and what it contains
@@ -866,7 +879,7 @@ async fn inspect_command(
     plugins_dir: Option<&Path>,
     subprocess_adapter: &[String],
 ) -> Result<()> {
-    let registry = build_registry(subprocess_adapter, plugins_dir);
+    let registry = build_registry(subprocess_adapter, plugins_dir)?;
     let bytes = std::fs::read(input)
         .map_err(|e| TropelError::Parse(format!("Failed to read '{}': {}", input.display(), e)))?;
 
@@ -1119,7 +1132,7 @@ async fn archive_command(
 }
 
 async fn list_extensions(plugins_dir: Option<&std::path::Path>) -> Result<()> {
-    let registry = build_registry(&[], plugins_dir);
+    let registry = build_registry(&[], plugins_dir)?;
 
     let inputs = registry.list_inputs();
 

@@ -62,6 +62,7 @@ const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 ///
 /// Created with a command string (e.g. `"python3 my-adapter.py"`).
 /// The adapter calls the command for each `detect()` and `parse()` call.
+#[derive(Debug)]
 pub struct SubprocessAdapter {
     /// The command to run (e.g. "python3 my-adapter.py").
     command: String,
@@ -80,18 +81,28 @@ impl SubprocessAdapter {
     /// The command string is split into program and arguments using
     /// simple whitespace splitting (no shell parsing). For complex
     /// commands, wrap in a shell script.
-    pub fn new(command: &str) -> Self {
+    ///
+    /// Returns a [`TropelError`] for an empty or whitespace-only command
+    /// (`--subprocess-adapter ""`): the old `parts[1..]` slicing panicked on
+    /// the empty split, which was reachable straight from the CLI.
+    pub fn new(command: &str) -> Result<Self> {
+        if command.trim().is_empty() {
+            return Err(TropelError::Other(
+                "subprocess adapter command cannot be empty".to_string(),
+            ));
+        }
         let parts: Vec<&str> = command.split_whitespace().collect();
-        let program = parts.first().unwrap_or(&command).to_string();
-        let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+        // Non-empty trim guarantees ≥1 part; skip(1) is panic-free regardless.
+        let program = parts.first().unwrap().to_string();
+        let args: Vec<String> = parts.iter().skip(1).map(|s| s.to_string()).collect();
 
-        Self {
+        Ok(Self {
             command: command.to_string(),
             program,
             args,
             timeout: DEFAULT_TIMEOUT,
             max_output: MAX_OUTPUT_BYTES,
-        }
+        })
     }
 
     /// Set the per-call timeout. The child is killed when it expires.
@@ -373,41 +384,56 @@ mod tests {
 
     #[test]
     fn test_new_adapter_splits_command() {
-        let adapter = SubprocessAdapter::new("python3 my-adapter.py");
+        let adapter = SubprocessAdapter::new("python3 my-adapter.py").unwrap();
         assert_eq!(adapter.program, "python3");
         assert_eq!(adapter.args, vec!["my-adapter.py"]);
     }
 
     #[test]
     fn test_new_adapter_simple() {
-        let adapter = SubprocessAdapter::new("cat");
+        let adapter = SubprocessAdapter::new("cat").unwrap();
         assert_eq!(adapter.program, "cat");
         assert!(adapter.args.is_empty());
     }
 
     #[test]
     fn test_new_adapter_complex() {
-        let adapter = SubprocessAdapter::new("node /path/to/adapter.js --verbose");
+        let adapter = SubprocessAdapter::new("node /path/to/adapter.js --verbose").unwrap();
         assert_eq!(adapter.program, "node");
         assert_eq!(adapter.args, vec!["/path/to/adapter.js", "--verbose"]);
     }
 
     #[test]
+    fn test_new_rejects_empty_command() {
+        // Regression: `--subprocess-adapter ""` panicked on `parts[1..]`
+        // (empty split slice). Must return a TropelError, not panic.
+        for cmd in ["", "   ", "\t\n"] {
+            let err = SubprocessAdapter::new(cmd).unwrap_err();
+            let msg = format!("{}", err);
+            assert!(
+                msg.contains("cannot be empty"),
+                "Expected empty-command error, got: {}",
+                msg
+            );
+        }
+    }
+
+    #[test]
     fn test_id_is_command() {
-        let adapter = SubprocessAdapter::new("python3 my-adapter.py");
+        let adapter = SubprocessAdapter::new("python3 my-adapter.py").unwrap();
         assert_eq!(adapter.id(), "python3 my-adapter.py");
     }
 
     #[test]
     fn test_detect_fails_for_nonexistent_command() {
-        let adapter = SubprocessAdapter::new("this-command-does-not-exist-hopefully");
+        let adapter = SubprocessAdapter::new("this-command-does-not-exist-hopefully").unwrap();
         // Should return false (not crash)
         assert!(!adapter.detect(b"hello"));
     }
 
     #[test]
     fn test_parse_fails_for_nonexistent_command() {
-        let adapter = SubprocessAdapter::new("this-command-does-not-exist-hopefully");
+        let adapter = SubprocessAdapter::new("this-command-does-not-exist-hopefully").unwrap();
         let result = adapter.parse(b"hello");
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -421,7 +447,7 @@ mod tests {
 
     #[test]
     fn test_parse_with_cat_returns_error_for_non_json() {
-        let adapter = SubprocessAdapter::new("cat");
+        let adapter = SubprocessAdapter::new("cat").unwrap();
         // cat echoes stdin to stdout — that won't be valid JSON
         let result = adapter.parse(br#"not json"#);
         assert!(result.is_err());
@@ -438,7 +464,7 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, body).expect("write script");
         let cmd = format!("sh {}", path.to_string_lossy().replace('\\', "/"));
-        SubprocessAdapter::new(&cmd)
+        SubprocessAdapter::new(&cmd).unwrap()
     }
 
     #[test]
