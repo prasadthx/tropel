@@ -36,13 +36,20 @@
 use crate::options::K6Options;
 use async_trait::async_trait;
 use futures::future::join_all;
+use futures_util::{SinkExt, StreamExt};
 use regex::Regex;
 use rquickjs::function::Func;
 use rquickjs::loader::{ImportAttributes, Loader, Resolver};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::Message;
 use tropel_js::JsContext;
 use tropel_sdk::{Body, Method, Request, Sample, SampleType, TagMap};
 use tropel_sdk::{Driver, DriverDeclaredOptions, DriverInstance, DriverRegistration, VuContext};
@@ -141,6 +148,9 @@ impl Driver for K6Driver {
             sample_sink: Arc::new(Mutex::new(Vec::new())),
             exec_state: Arc::new(Mutex::new(K6ExecState::default())),
             abort_requested: Arc::new(Mutex::new(None)),
+            ws_sessions: Arc::new(Mutex::new(HashMap::new())),
+            ws_next_id: Arc::new(AtomicU64::new(0)),
+            ws_bridges_registered: false,
         }))
     }
 
@@ -382,6 +392,15 @@ pub struct K6DriverInstance {
     /// test.abort() flag — set by __tropel_test_abort, drained by
     /// run_iteration() into ctx.abort() so the engine stops the run.
     abort_requested: Arc<Mutex<Option<String>>>,
+    /// Live WebSocket sessions created by `__tropel_k6_ws_connect`. The
+    /// bridge closures are 'static and can't own the VuContext, so the
+    /// registry lives here; `__tropel_k6_ws_finish` removes the session and
+    /// emits its ws_* samples into the sample_sink.
+    ws_sessions: Arc<Mutex<HashMap<u64, Arc<WsSession>>>>,
+    /// Monotonic session-id allocator for ws sessions.
+    ws_next_id: Arc<AtomicU64>,
+    /// Whether the ws bridges (__tropel_k6_ws_*) have been registered.
+    ws_bridges_registered: bool,
 }
 
 /// Execution-context values exposed to scripts via `exec.*` (k6 API).
@@ -394,6 +413,46 @@ struct K6ExecState {
     iteration: u64,
     iterations_completed: u64,
     vus_active: u32,
+}
+
+/// A live `ws.connect()` session. The bridge side owns the events channel
+/// (JS polls it with `__tropel_k6_ws_step`) and the command channel (JS sends
+/// text/ping/close frames via `__tropel_k6_ws_send` / `_ping` / `_close`).
+struct WsSession {
+    /// Events produced by the background reader task, drained by `step()`.
+    events_rx: Receiver<WsEvent>,
+    /// Commands (send/ping/close) forwarded to the background writer task.
+    cmd_tx: tokio::sync::mpsc::Sender<WsCommand>,
+    /// Peer URL (for ws_* metric tags).
+    url: String,
+    /// Wall-clock when the session started (ws_req_duration).
+    start: Instant,
+    /// Handshake duration (ws_connecting trend).
+    connecting: Duration,
+    /// Counters accumulated by the JS-facing bridges (atomics: the session
+    /// is shared through an `Arc` across the send/step/finish closures).
+    msgs_sent: AtomicU64,
+    bytes_sent: AtomicU64,
+    msgs_received: AtomicU64,
+    bytes_received: AtomicU64,
+}
+
+/// A single WebSocket event delivered to JS via `__tropel_k6_ws_step`.
+enum WsEvent {
+    Open,
+    Text(String),
+    Binary(usize),
+    Ping,
+    Pong,
+    Close { code: u16, reason: String },
+    Error(String),
+}
+
+/// A command sent from JS (via the ws bridges) to the background writer task.
+enum WsCommand {
+    SendText(String),
+    Ping,
+    Close { code: u16, reason: String },
 }
 
 // Safety: each DriverInstance runs on its own VU thread (thread-per-core).
@@ -467,6 +526,29 @@ fn push_http_samples(
     });
 }
 
+/// Send a ws command to the session's writer task without silently dropping
+/// frames. `try_send` + a short bounded retry: the writer task lives on the
+/// separate I/O runtime (not the VU's reactor), so parking this VU thread for
+/// a few ms never deadlocks it — while `blocking_send` would panic inside the
+/// VU runtime (it calls `block_on`). Returns false if the session is gone.
+fn try_send_cmd(
+    tx: &tokio::sync::mpsc::Sender<WsCommand>,
+    mut cmd: WsCommand,
+) -> bool {
+    for _ in 0..50 {
+        match tx.try_send(cmd) {
+            Ok(()) => return true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(c)) => {
+                // Channel full — writer draining; park briefly and retry.
+                cmd = c;
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return false,
+        }
+    }
+    false
+}
+
 /// Record samples for a request that failed at the transport level (timeout,
 /// connection refused, …). Failed requests must still appear in the summary:
 /// `http_reqs` increments and `http_req_failed` (Rate) becomes 1.0 — matching
@@ -506,6 +588,9 @@ impl DriverInstance for K6DriverInstance {
         }
         if !self.script_bridges_registered {
             self.register_script_bridges();
+        }
+        if !self.ws_bridges_registered {
+            self.register_ws_bridges();
         }
 
         // Sync VuContext state into JS globals (__tropel_vu_id, etc.)
@@ -944,6 +1029,457 @@ impl K6DriverInstance {
 
         self.script_bridges_registered = true;
         tracing::debug!("K6Driver: registered script-state bridges");
+    }
+
+    /// Lazily register the WebSocket bridges backing the k6-shim's `ws.*`
+    /// event-driven API (`ws.connect` + `socket.on('open'|'message'|'close')`).
+    ///
+    /// Bridge contract (see `js/k6-shim/k6-shim.js`):
+    /// - `__tropel_k6_ws_connect(url, headers_json) -> {id, error}` opens the
+    ///   connection (blocking, on the dedicated I/O runtime) and returns a
+    ///   session id.
+    /// - `__tropel_k6_ws_step(id, timeout_ms) -> {type, data?, code?, reason?}`
+    ///   blocks up to timeout_ms for the next event (open/message/close/error/
+    ///   ping/pong). Each call also resets the per-eval interrupt deadline so a
+    ///   long-lived session isn't killed by the eval timeout.
+    /// - `__tropel_k6_ws_send(id, data)` / `_ping(id)` / `_close(id, code,
+    ///   reason)` forward frames to the background writer task.
+    /// - `__tropel_k6_ws_finish(id)` tears the session down and emits its
+    ///   `ws_*` samples into the sample_sink (same metric names as the
+    ///   declarative WebSocket protocol extension).
+    fn register_ws_bridges(&mut self) {
+        let sessions = self.ws_sessions.clone();
+        let next_id = self.ws_next_id.clone();
+        let sink = self.sample_sink.clone();
+        let (deadline, max_exec) = self.js_ctx.interrupt_deadline_handle();
+
+        self.js_ctx.with_ctx(|rq_ctx| {
+            let globals = rq_ctx.globals();
+
+            // ── ws.connect(url, headers_json) -> {id, error} ──
+            let sessions_conn = sessions.clone();
+            let next_id_conn = next_id.clone();
+            let _ = globals.set(
+                "__tropel_k6_ws_connect",
+                Func::from(
+                    move |url: String, headers_json: String| -> String {
+                        let headers = parse_headers_tolerant(&headers_json);
+                        // Build the handshake request with the given headers.
+                        let mut handshake = match url.clone().into_client_request() {
+                            Ok(r) => r,
+                            Err(e) => {
+                                return serde_json::json!({
+                                    "id": 0,
+                                    "error": format!("invalid ws url '{url}': {e}"),
+                                })
+                                .to_string();
+                            }
+                        };
+                        for (k, v) in &headers {
+                            if let (Ok(hname), Ok(hv)) = (
+                                http::HeaderName::from_bytes(k.as_bytes()),
+                                http::HeaderValue::from_str(v),
+                            ) {
+                                handshake.headers_mut().insert(hname, hv);
+                            }
+                        }
+
+                        let id = next_id_conn.fetch_add(1, Ordering::Relaxed) + 1;
+                        let (events_tx, events_rx) = std::sync::mpsc::channel::<WsEvent>();
+                        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<WsCommand>(64);
+                        let connect_start = Instant::now();
+
+                        // Connect on the dedicated I/O runtime (safe from inside
+                        // ctx.with on a current-thread VU runtime), then spawn a
+                        // background reader/writer task that owns the socket and
+                        // streams events into the channel. The task lives on the
+                        // I/O runtime, so blocking this VU thread on recv_timeout
+                        // never deadlocks a VU reactor.
+                        // `events_tx` is cloned for the reader task: the outer
+                        // future keeps the original to deliver the Open event
+                        // before returning, so the two don't fight over ownership.
+                        let events_tx_reader = events_tx.clone();
+                        let url_err = url.clone();
+                        let connect_result = tropel_http::blocking::execute_blocking(
+                            async move {
+                                let (ws, _resp) =
+                                    tokio_tungstenite::connect_async(handshake)
+                                        .await
+                                        .map_err(|e| {
+                                            TropelError::Extension(format!(
+                                                "WebSocket connect to '{}': {}",
+                                                url_err, e
+                                            ))
+                                        })?;
+                                let connecting = connect_start.elapsed();
+                                let (sink, stream) = ws.split();
+
+                                tokio::spawn(async move {
+                                    let mut sink = sink;
+                                    let mut stream = stream;
+                                    let mut cmd_rx = cmd_rx;
+                                    loop {
+                                        tokio::select! {
+                                            cmd = cmd_rx.recv() => match cmd {
+                                                Some(WsCommand::SendText(t)) => {
+                                                    if sink.send(Message::Text(t.into())).await.is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                                Some(WsCommand::Ping) => {
+                                                    if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                                Some(WsCommand::Close { code, reason }) => {
+                                                    // SplitSink has no inherent close();
+                                                    // send a Close frame instead.
+                                                    let _ = sink
+                                                        .send(Message::Close(Some(CloseFrame {
+                                                            code: CloseCode::from(code),
+                                                            reason: reason.into(),
+                                                        })))
+                                                        .await;
+                                                    break;
+                                                }
+                                                None => break,
+                                            },
+                                            msg = stream.next() => match msg {
+                                                Some(Ok(Message::Text(t))) => {
+                                                    if events_tx_reader
+                                                        .send(WsEvent::Text(t.to_string()))
+                                                        .is_err()
+                                                    {
+                                                        break;
+                                                    }
+                                                }
+                                                Some(Ok(Message::Binary(b))) => {
+                                                    if events_tx_reader
+                                                        .send(WsEvent::Binary(b.len()))
+                                                        .is_err()
+                                                    {
+                                                        break;
+                                                    }
+                                                }
+                                                Some(Ok(Message::Ping(_))) => {
+                                                    if events_tx_reader.send(WsEvent::Ping).is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                                Some(Ok(Message::Pong(_))) => {
+                                                    if events_tx_reader.send(WsEvent::Pong).is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                                Some(Ok(Message::Frame(_))) => {} // raw frame passthrough
+
+                                                Some(Ok(Message::Close(f))) => {
+                                                    let (code, reason) = f
+                                                        .map(|f| {
+                                                            (u16::from(f.code), f.reason.to_string())
+                                                        })
+                                                        .unwrap_or((1000, String::new()));
+                                                    let _ = events_tx_reader.send(WsEvent::Close {
+                                                        code,
+                                                        reason,
+                                                    });
+                                                    break;
+                                                }
+                                                Some(Err(e)) => {
+                                                    let _ = events_tx_reader.send(
+                                                        WsEvent::Error(e.to_string()),
+                                                    );
+                                                    break;
+                                                }
+                                                None => {
+                                                    let _ = events_tx_reader.send(WsEvent::Close {
+                                                        code: 1006,
+                                                        reason: "connection closed".into(),
+                                                    });
+                                                    break;
+                                                }
+                                            },
+                                        }
+                                    }
+                                });
+
+                                // Open is delivered as the first event once the
+                                // handshake completes (step() returns it).
+                                let _ = events_tx.send(WsEvent::Open);
+                                Ok::<Duration, TropelError>(connecting)
+                            },
+                        );
+
+                        match connect_result {
+                            Ok(connecting) => {
+                                sessions_conn.lock().unwrap().insert(
+                                    id,
+                                    Arc::new(WsSession {
+                                        events_rx,
+                                        cmd_tx,
+                                        url: url.clone(),
+                                        start: Instant::now(),
+                                        connecting,
+                                        msgs_sent: AtomicU64::new(0),
+                                        bytes_sent: AtomicU64::new(0),
+                                        msgs_received: AtomicU64::new(0),
+                                        bytes_received: AtomicU64::new(0),
+                                    }),
+                                );
+                                serde_json::json!({ "id": id, "error": null }).to_string()
+                            }
+                            Err(e) => serde_json::json!({
+                                "id": 0,
+                                "error": e.to_string(),
+                            })
+                            .to_string(),
+                        }
+                    },
+                ),
+            );
+
+            // ── ws step(id, timeout_ms) -> event JSON ──
+            let sessions_step = sessions.clone();
+            let deadline_step = deadline.clone();
+            let _ = globals.set(
+                "__tropel_k6_ws_step",
+                Func::from(
+                    move |id: u64, timeout_ms: f64| -> String {
+                        // Reset the per-eval interrupt deadline so a long ws
+                        // session isn't killed by the eval timeout mid-pump.
+                        let now_ns = SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos() as u64;
+                        deadline_step.store(
+                            now_ns.saturating_add(max_exec.as_nanos() as u64),
+                            Ordering::Relaxed,
+                        );
+
+                        let timeout = Duration::from_millis(timeout_ms.max(1.0) as u64);
+                        let guard = sessions_step.lock().unwrap();
+                        let Some(session) = guard.get(&id).cloned() else {
+                            return serde_json::json!({
+                                "type": "close",
+                                "code": 1006,
+                                "reason": "session not found",
+                            })
+                            .to_string();
+                        };
+                        drop(guard);
+                        match session.events_rx.recv_timeout(timeout) {
+                            Ok(WsEvent::Open) => {
+                                serde_json::json!({"type": "open"}).to_string()
+                            }
+                            Ok(WsEvent::Text(t)) => {
+                                session.msgs_received.fetch_add(1, Ordering::Relaxed);
+                                session.bytes_received.fetch_add(t.len() as u64, Ordering::Relaxed);
+                                serde_json::json!({"type": "message", "data": t}).to_string()
+                            }
+                            Ok(WsEvent::Binary(n)) => {
+                                session.msgs_received.fetch_add(1, Ordering::Relaxed);
+                                session.bytes_received.fetch_add(n as u64, Ordering::Relaxed);
+                                serde_json::json!({
+                                    "type": "message",
+                                    "data": format!("<binary {n} bytes>"),
+                                })
+                                .to_string()
+                            }
+                            Ok(WsEvent::Ping) => {
+                                serde_json::json!({"type": "ping"}).to_string()
+                            }
+                            Ok(WsEvent::Pong) => {
+                                serde_json::json!({"type": "pong"}).to_string()
+                            }
+                            Ok(WsEvent::Close { code, reason }) => serde_json::json!({
+                                "type": "close",
+                                "code": code,
+                                "reason": reason,
+                            })
+                            .to_string(),
+                            Ok(WsEvent::Error(m)) => serde_json::json!({
+                                "type": "error",
+                                "message": m,
+                            })
+                            .to_string(),
+                            Err(RecvTimeoutError::Timeout) => {
+                                serde_json::json!({"type": "none"}).to_string()
+                            }
+                            Err(RecvTimeoutError::Disconnected) => serde_json::json!({
+                                "type": "close",
+                                "code": 1006,
+                                "reason": "connection closed",
+                            })
+                            .to_string(),
+                        }
+                    },
+                ),
+            );
+
+            // ── ws send / ping / close ──
+            // `try_send` + a bounded retry: the writer task lives on the
+            // separate I/O runtime (NOT this VU's reactor), so parking this
+            // VU thread briefly never deadlocks it — and no frame is silently
+            // dropped under a send burst. `blocking_send` is NOT used: it
+            // block_on's and would panic inside the VU runtime.
+            let sessions_send = sessions.clone();
+            let _ = globals.set(
+                "__tropel_k6_ws_send",
+                Func::from(
+                    move |id: u64, data: String| -> String {
+                        let guard = sessions_send.lock().unwrap();
+                        let Some(session) = guard.get(&id).cloned() else {
+                            return serde_json::json!({"ok": false}).to_string();
+                        };
+                        drop(guard);
+                        session.msgs_sent.fetch_add(1, Ordering::Relaxed);
+                        session.bytes_sent.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        let ok = try_send_cmd(&session.cmd_tx, WsCommand::SendText(data));
+                        serde_json::json!({"ok": ok}).to_string()
+                    },
+                ),
+            );
+            let sessions_ping = sessions.clone();
+            let _ = globals.set(
+                "__tropel_k6_ws_ping",
+                Func::from(
+                    move |id: u64| -> String {
+                        let guard = sessions_ping.lock().unwrap();
+                        let Some(session) = guard.get(&id).cloned() else {
+                            return serde_json::json!({"ok": false}).to_string();
+                        };
+                        drop(guard);
+                        let ok = try_send_cmd(&session.cmd_tx, WsCommand::Ping);
+                        serde_json::json!({"ok": ok}).to_string()
+                    },
+                ),
+            );
+            let sessions_close = sessions.clone();
+            let _ = globals.set(
+                "__tropel_k6_ws_close",
+                Func::from(
+                    move |id: u64, code: f64, reason: String| -> String {
+                        let guard = sessions_close.lock().unwrap();
+                        let Some(session) = guard.get(&id).cloned() else {
+                            return serde_json::json!({"ok": false}).to_string();
+                        };
+                        drop(guard);
+                        let ok = try_send_cmd(
+                            &session.cmd_tx,
+                            WsCommand::Close {
+                                code: code as u16,
+                                reason,
+                            },
+                        );
+                        serde_json::json!({"ok": ok}).to_string()
+                    },
+                ),
+            );
+
+            // ── ws finish(id) -> teardown + ws_* metrics ──
+            let sessions_finish = sessions.clone();
+            let sink_finish = sink.clone();
+            let _ = globals.set(
+                "__tropel_k6_ws_finish",
+                Func::from(
+                    move |id: u64| -> String {
+                        let session = sessions_finish.lock().unwrap().remove(&id);
+                        let Some(session) = session else {
+                            return serde_json::json!({"ok": false}).to_string();
+                        };
+                        let duration = session.start.elapsed();
+                        let now = SystemTime::now();
+                        let mut tags = TagMap::with_capacity(5);
+                        tags.insert("url", session.url.clone());
+                        tags.insert("method", String::from("GET"));
+                        tags.insert("status", String::from("101"));
+                        tags.insert("name", session.url.clone());
+                        tags.insert("group", String::from("ws"));
+
+                        let msgs_sent = session.msgs_sent.load(Ordering::Relaxed);
+                        let bytes_sent = session.bytes_sent.load(Ordering::Relaxed);
+                        let msgs_received = session.msgs_received.load(Ordering::Relaxed);
+                        let bytes_received = session.bytes_received.load(Ordering::Relaxed);
+
+                        let mut v = sink_finish.lock().unwrap();
+                        v.push(Sample {
+                            metric: "ws_connecting".into(),
+                            value: session.connecting.as_micros() as f64,
+                            tags: tags.clone(),
+                            timestamp: now,
+                            sample_type: SampleType::Trend,
+                        });
+                        v.push(Sample {
+                            metric: "ws_msgs_sent".into(),
+                            value: msgs_sent as f64,
+                            tags: tags.clone(),
+                            timestamp: now,
+                            sample_type: SampleType::Counter,
+                        });
+                        v.push(Sample {
+                            metric: "ws_msgs_received".into(),
+                            value: msgs_received as f64,
+                            tags: tags.clone(),
+                            timestamp: now,
+                            sample_type: SampleType::Counter,
+                        });
+                        v.push(Sample {
+                            metric: "ws_bytes_sent".into(),
+                            value: bytes_sent as f64,
+                            tags: tags.clone(),
+                            timestamp: now,
+                            sample_type: SampleType::Counter,
+                        });
+                        v.push(Sample {
+                            metric: "ws_bytes_received".into(),
+                            value: bytes_received as f64,
+                            tags: tags.clone(),
+                            timestamp: now,
+                            sample_type: SampleType::Counter,
+                        });
+                        v.push(Sample {
+                            metric: "ws_sessions".into(),
+                            value: 1.0,
+                            tags: tags.clone(),
+                            timestamp: now,
+                            sample_type: SampleType::Counter,
+                        });
+                        v.push(Sample {
+                            metric: "ws_req_duration".into(),
+                            value: duration.as_micros() as f64,
+                            tags: tags.clone(),
+                            timestamp: now,
+                            sample_type: SampleType::Trend,
+                        });
+                        v.push(Sample {
+                            metric: "ws_req_failed".into(),
+                            value: 0.0,
+                            tags: tags.clone(),
+                            timestamp: now,
+                            sample_type: SampleType::Rate,
+                        });
+                        v.push(Sample {
+                            metric: "data_sent".into(),
+                            value: bytes_sent as f64,
+                            tags: tags.clone(),
+                            timestamp: now,
+                            sample_type: SampleType::Counter,
+                        });
+                        v.push(Sample {
+                            metric: "data_received".into(),
+                            value: bytes_received as f64,
+                            tags,
+                            timestamp: now,
+                            sample_type: SampleType::Counter,
+                        });
+                        serde_json::json!({"ok": true}).to_string()
+                    },
+                ),
+            );
+        });
+
+        self.ws_bridges_registered = true;
+        tracing::debug!("K6Driver: registered ws bridges");
     }
 
     /// Sync VuContext state into JS globals so the script can read

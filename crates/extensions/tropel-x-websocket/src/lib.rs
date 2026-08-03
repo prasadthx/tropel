@@ -138,20 +138,38 @@ impl Protocol for WebSocketProtocol {
         }
         let msgs_sent = messages.len() as u64;
 
-        // ── Read responses until the wait window elapses or a close frame ──
-        let wait = config
+        // ── Read responses until the peer closes or the window elapses ──
+        //
+        // Event-driven: the session ends the moment the server sends a close
+        // frame, closes the stream, or errors — not when an arbitrary timer
+        // expires. `wait` is an optional *ceiling* (default 1s); `"until-close"`
+        // (or an absent `wait`) removes the ceiling entirely, so a chatty or
+        // long-lived server drives the session length. The request timeout and
+        // MAX_BODY_BYTES remain as hard safety caps so an unresponsive peer
+        // can never hang the VU.
+        let wait: Option<Duration> = match config
             .and_then(|c| c.get("wait"))
             .and_then(|w| w.as_str())
-            .and_then(parse_duration)
-            .unwrap_or(DEFAULT_WAIT);
+        {
+            Some(s) if s == "until-close" => None,
+            Some(s) => parse_duration(s).or(Some(DEFAULT_WAIT)),
+            // Absent `wait` keeps the historical 1s default — only the
+            // explicit "until-close" opts into an unbounded (request-timeout
+            // capped) session.
+            None => Some(DEFAULT_WAIT),
+        };
+        // Hard ceiling when the wait window is unbounded: the request timeout.
+        let hard_cap = req.timeout.unwrap_or(Duration::from_secs(30));
+        let session_deadline = tokio::time::Instant::now()
+            + wait.unwrap_or(hard_cap);
         let mut received: Vec<String> = Vec::new();
         let mut bytes_received: u64 = 0;
-        let deadline = tokio::time::Instant::now() + wait;
         loop {
-            if tokio::time::Instant::now() >= deadline {
+            if tokio::time::Instant::now() >= session_deadline {
                 break;
             }
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining = session_deadline
+                .saturating_duration_since(tokio::time::Instant::now());
             match tokio::time::timeout(remaining, ws.next()).await {
                 Ok(Some(Ok(Message::Text(t)))) => {
                     let s = t.to_string();
@@ -162,14 +180,14 @@ impl Protocol for WebSocketProtocol {
                     bytes_received += b.len() as u64;
                     received.push(format!("<binary {} bytes>", b.len()));
                 }
-                Ok(Some(Ok(Message::Close(_)))) => break,
-                Ok(Some(Ok(_))) => {} // ping/pong frames
+                Ok(Some(Ok(Message::Close(_)))) => break, // server closed — event-driven end
+                Ok(Some(Ok(_))) => {}                      // ping/pong frames
                 Ok(Some(Err(e))) => {
                     tracing::debug!("WebSocket read error: {}", e);
                     break;
                 }
-                Ok(None) => break, // stream ended
-                Err(_) => break,   // wait window elapsed
+                Ok(None) => break, // stream ended — event-driven end
+                Err(_) => break,   // window elapsed
             }
             if bytes_received >= MAX_BODY_BYTES as u64 {
                 break;

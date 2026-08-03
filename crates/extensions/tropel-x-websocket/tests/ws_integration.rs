@@ -123,6 +123,58 @@ async fn multiple_messages_via_config() {
     assert_eq!(msgs_sent, 3.0);
 }
 
+/// Server that echoes one message then sends a close frame — used to prove
+/// event-driven (until-close) termination without a fixed-wait drain.
+async fn spawn_echo_then_close_server() -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                if let Some(Ok(msg)) = ws.next().await {
+                    if !matches!(msg, Message::Close(_)) {
+                        let _ = ws.send(msg).await; // echo it back
+                    }
+                    // Then close the connection so the client session ends
+                    // promptly (event-driven) instead of waiting out a cap.
+                    let _ = ws.send(Message::Close(None)).await;
+                }
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn until_close_ends_session_when_server_closes() {
+    // Event-driven termination: with `wait: "until-close"` the session must
+    // end the moment the server closes the connection — no fixed-wait drain.
+    let addr = spawn_echo_then_close_server().await;
+    // The request body is the message the ext sends; the server echoes it
+    // then closes, which must end the session promptly (event-driven).
+    let req = make_request(
+        &format!("ws://{addr}/until-close"),
+        Some(Body::Raw("ping".into())),
+    );
+    let config = serde_json::json!({ "wait": "until-close" });
+    let start = std::time::Instant::now();
+    let outcome = WebSocketProtocol.execute(&req, Some(&config)).await.unwrap();
+    let elapsed = start.elapsed();
+    let resp = outcome.response.unwrap();
+    assert_eq!(resp.status_code, 101);
+    // The server closes right after echoing, so the session ends promptly —
+    // far below the 5s request-timeout cap. This proves no fixed-wait drain.
+    assert!(elapsed < Duration::from_secs(1), "until-close took {elapsed:?}");
+    let received: Vec<String> = serde_json::from_slice(&resp.body).unwrap();
+    assert_eq!(received, vec!["ping"]);
+}
+
 #[tokio::test]
 async fn connection_refused_is_error() {
     // Bind then drop to free the port, guaranteeing ECONNREFUSED.

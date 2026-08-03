@@ -309,6 +309,16 @@ impl JsContext {
         self.interrupt_deadline.store(deadline, Ordering::Relaxed);
     }
 
+    /// Return the interrupt-deadline handle and the max execution time so a
+    /// caller that drives a LONG native session from inside a single eval
+    /// (e.g. a WebSocket event loop in a k6 `ws.connect`) can re-arm the
+    /// per-eval deadline as the session progresses. Without this, a ws
+    /// session longer than the script timeout would have its JS handler
+    /// invocations interrupted mid-session.
+    pub fn interrupt_deadline_handle(&self) -> (Arc<AtomicU64>, Duration) {
+        (self.interrupt_deadline.clone(), self.max_execution_time)
+    }
+
     /// Pump the QuickJS job queue to resolve pending promises.
     ///
     /// After evaluating code that creates Promises (via `async` functions or

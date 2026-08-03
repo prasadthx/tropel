@@ -364,6 +364,178 @@ function normalizeBatchEntry(req, defaultKey) {
 }
 
 // ══════════════════════════════════════════════════════════════════
+// ws.* — k6/ws parity (event-driven WebSocket)
+// ══════════════════════════════════════════════════════════════════
+//
+// Delegates to native bridges registered by the K6Driver:
+//   __tropel_k6_ws_connect(url, headers_json) -> {id, error}
+//   __tropel_k6_ws_step(id, timeout_ms)          -> {type, ...}
+//   __tropel_k6_ws_send(id, data) / _ping(id) / _close(id, code, reason)
+//   __tropel_k6_ws_finish(id)
+//
+// QuickJS has no async event loop, so ws.connect() runs a synchronous
+// event pump: the callback registers handlers, then the pump calls
+// __tropel_k6_ws_step() to block for the next event (open/message/close/
+// error/ping/pong) and dispatches to the registered socket.on() handlers.
+// The pump ends when the socket closes (server close, socket.close(), or an
+// error). This mirrors k6's semantics within one iteration: the VU stays on
+// the socket until it closes.
+
+var ws = {};
+
+function K6Socket(sessionId) {
+    this._id = sessionId;
+    this._handlers = {};
+    this._timers = [];
+    this._closed = false;
+}
+
+K6Socket.prototype.on = function (event, handler) {
+    if (typeof handler !== 'function') {
+        throw new Error('socket.on(event, handler) requires a function handler');
+    }
+    var list = this._handlers[event] || (this._handlers[event] = []);
+    list.push(handler);
+    return this;
+};
+
+K6Socket.prototype._emit = function (event, arg1, arg2) {
+    var list = this._handlers[event];
+    if (!list) {
+        return;
+    }
+    for (var i = 0; i < list.length; i++) {
+        try {
+            list[i].call(this, arg1, arg2);
+        } catch (e) {
+            fail('ws handler "' + event + '" threw: ' + e);
+        }
+    }
+};
+
+K6Socket.prototype.send = function (data) {
+    if (typeof __tropel_k6_ws_send !== 'function') {
+        throw new Error('ws.send requires the native ws bridge (__tropel_k6_ws_send)');
+    }
+    __tropel_k6_ws_send(this._id, String(data));
+    return this;
+};
+
+K6Socket.prototype.ping = function () {
+    if (typeof __tropel_k6_ws_ping !== 'function') {
+        throw new Error('ws.ping requires the native ws bridge (__tropel_k6_ws_ping)');
+    }
+    __tropel_k6_ws_ping(this._id);
+    return this;
+};
+
+K6Socket.prototype.close = function (code, reason) {
+    if (typeof __tropel_k6_ws_close !== 'function') {
+        throw new Error('ws.close requires the native ws bridge (__tropel_k6_ws_close)');
+    }
+    __tropel_k6_ws_close(this._id, code || 1000, reason || '');
+    this._closed = true;
+    return this;
+};
+
+K6Socket.prototype.setTimeout = function (fn, ms) {
+    this._timers.push({ fn: fn, ms: ms, at: Date.now() + ms, interval: false });
+    return this;
+};
+
+K6Socket.prototype.setInterval = function (fn, ms) {
+    this._timers.push({ fn: fn, ms: ms, at: Date.now() + ms, interval: true });
+    return this;
+};
+
+// Fire due timers. One-shot timeouts are removed; intervals are rescheduled.
+K6Socket.prototype._runTimers = function () {
+    var now = Date.now();
+    var keep = [];
+    for (var i = 0; i < this._timers.length; i++) {
+        var t = this._timers[i];
+        if (now >= t.at) {
+            try {
+                t.fn();
+            } catch (e) {
+                fail('ws timer threw: ' + e);
+            }
+            if (t.interval) {
+                t.at = now + t.ms;
+                keep.push(t);
+            }
+        } else {
+            keep.push(t);
+        }
+    }
+    this._timers = keep;
+};
+
+ws.connect = function (url, params, callback) {
+    params = params || {};
+    var headers = params.headers || {};
+    if (typeof __tropel_k6_ws_connect !== 'function') {
+        throw new Error(
+            'ws.connect requires the native ws bridge (__tropel_k6_ws_connect) — ' +
+            'check that the K6Driver installed the ws bridges'
+        );
+    }
+    var connectRes = JSON.parse(__tropel_k6_ws_connect(url, JSON.stringify(headers)));
+    if (connectRes.error) {
+        throw new Error('ws.connect failed: ' + connectRes.error);
+    }
+    var socket = new K6Socket(connectRes.id);
+    // Safety cap: if the peer never closes and the script never calls
+    // close(), end the session after params.timeout (ms) so the synchronous
+    // pump can never hang the VU. Default 5 minutes.
+    var maxSessionMs = (params.timeout > 0) ? params.timeout : 300000;
+    var sessionStart = Date.now();
+    var settled = false;
+    try {
+        if (typeof callback === 'function') {
+            callback(socket);
+        }
+        // Synchronous event pump: drive the socket until it closes.
+        while (!settled && !socket._closed) {
+            if (Date.now() - sessionStart > maxSessionMs) {
+                socket.close(1000, 'session timeout');
+                settled = true;
+                break;
+            }
+            socket._runTimers();
+            var evt = JSON.parse(__tropel_k6_ws_step(connectRes.id, 50));
+            if (evt.type === 'open') {
+                socket._emit('open');
+            } else if (evt.type === 'message') {
+                socket._emit('message', evt.data);
+            } else if (evt.type === 'ping') {
+                socket._emit('ping');
+            } else if (evt.type === 'pong') {
+                socket._emit('pong');
+            } else if (evt.type === 'close') {
+                socket._emit('close', evt.code, evt.reason);
+                settled = true;
+            } else if (evt.type === 'error') {
+                socket._emit('error', evt.message);
+                settled = true;
+            }
+            // {type:'none'} — step timed out with no event; loop again
+            // (timers may fire, or close may arrive on a later step).
+        }
+    } finally {
+        // ALWAYS tear down the native session — even when the user callback
+        // or a socket.on handler threw — so the registry entry and its
+        // background socket task are not leaked.
+        if (typeof __tropel_k6_ws_finish === 'function') {
+            try {
+                __tropel_k6_ws_finish(connectRes.id);
+            } catch (e) { /* teardown must not mask the original error */ }
+        }
+    }
+    return socket;
+};
+
+// ══════════════════════════════════════════════════════════════════
 // Global functions
 // ══════════════════════════════════════════════════════════════════
 
