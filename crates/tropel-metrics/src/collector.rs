@@ -546,6 +546,13 @@ impl Aggregator {
         let mut merged_per_url: std::collections::BTreeMap<String, MetricSet> =
             std::collections::BTreeMap::new();
 
+        // Per-group merge: one MetricSet per (metric, group) pair for series
+        // carrying a `group` tag — k6 aggregates group-scoped metrics per
+        // group in its per-group breakdown, so reporters must render merged
+        // histograms, not the raw per-(url,status) series.
+        let mut merged_per_group: std::collections::BTreeMap<(String, String), MetricSet> =
+            std::collections::BTreeMap::new();
+
         // Clone full histograms into summaries only when some configured
         // threshold/summary stat needs an EXACT non-tracked percentile
         // (p75, p99.9, …). The default tracked buckets (p50/p90/p95/p99) are
@@ -678,7 +685,36 @@ impl Aggregator {
                         }
                     }
                 }
-            } else if key.metric.starts_with("http_reqs") {
+            }
+
+            // Per-group merge: any series carrying a `group` tag (the runner
+            // emits `group=http` by default; named groups from `group()`/
+            // `pm.group` produce the meaningful rows) merges into one
+            // MetricSet per (metric, group) so per-group breakdowns show
+            // true aggregated histograms.
+            if let Some(group) = key.tags.iter().find(|(k, _)| k.as_ref() == "group") {
+                let g = group.1.as_ref().to_string();
+                let fam = key.metric.to_string();
+                let entry = merged_per_group.entry((fam, g));
+                match entry {
+                    Entry::Occupied(mut e) => {
+                        let merged = e.get_mut();
+                        merged.histogram.merge(&set.histogram);
+                        merged.count += set.count;
+                        merged.sum += set.sum;
+                        if set.metric_type == MetricType::Gauge {
+                            merged.min = merged.min.min(set.min);
+                            merged.max = merged.max.max(set.max);
+                            merged.last = set.last;
+                        }
+                    }
+                    Entry::Vacant(v) => {
+                        v.insert(set.clone());
+                    }
+                }
+            }
+
+            if key.metric.starts_with("http_reqs") {
                 http_reqs += set.count as u64;
             } else if key.metric.starts_with("errors") {
                 errors += set.count as u64;
@@ -755,6 +791,95 @@ impl Aggregator {
             });
         }
 
+        // Build per-group summaries (merged histograms per (metric, group))
+        // so reporters show k6-style per-group breakdowns. Kept OUT of
+        // `metrics` like `per_url` so thresholds never double-count.
+        let mut per_group = Vec::with_capacity(merged_per_group.len());
+        for ((fam, group), merged) in merged_per_group {
+            let summary = match merged.metric_type {
+                MetricType::Trend => {
+                    let stats = merged.histogram.stats();
+                    MetricSummary {
+                        key: format!("{fam}{{group={group}}}"),
+                        tags: vec![("group".to_string(), group.clone())],
+                        metric_type: MetricType::Trend,
+                        count: merged.count as u64,
+                        sum: merged.sum,
+                        mean: merged.mean(),
+                        min: stats.min,
+                        max: stats.max,
+                        p50: stats.p50,
+                        p90: stats.p90,
+                        p95: stats.p95,
+                        p99: stats.p99,
+                        last: 0.0,
+                        rate: 0.0,
+                        histogram: retain_histograms.then(|| merged.histogram.clone()),
+                    }
+                }
+                MetricType::Counter => MetricSummary {
+                    key: format!("{fam}{{group={group}}}"),
+                    tags: vec![("group".to_string(), group.clone())],
+                    metric_type: MetricType::Counter,
+                    count: merged.count as u64,
+                    sum: merged.sum,
+                    mean: merged.mean(),
+                    min: 0,
+                    max: 0,
+                    p50: 0,
+                    p90: 0,
+                    p95: 0,
+                    p99: 0,
+                    last: 0.0,
+                    rate: 0.0,
+                    histogram: None,
+                },
+                MetricType::Rate => MetricSummary {
+                    key: format!("{fam}{{group={group}}}"),
+                    tags: vec![("group".to_string(), group.clone())],
+                    metric_type: MetricType::Rate,
+                    count: merged.count as u64,
+                    sum: merged.sum,
+                    mean: merged.mean(),
+                    min: 0,
+                    max: 0,
+                    p50: 0,
+                    p90: 0,
+                    p95: 0,
+                    p99: 0,
+                    last: 0.0,
+                    rate: merged.rate(),
+                    histogram: None,
+                },
+                MetricType::Gauge => MetricSummary {
+                    key: format!("{fam}{{group={group}}}"),
+                    tags: vec![("group".to_string(), group.clone())],
+                    metric_type: MetricType::Gauge,
+                    count: merged.count as u64,
+                    sum: merged.sum,
+                    mean: merged.mean(),
+                    min: if merged.min == f64::MAX {
+                        0
+                    } else {
+                        merged.min as u64
+                    },
+                    max: if merged.max == f64::MIN {
+                        0
+                    } else {
+                        merged.max as u64
+                    },
+                    p50: 0,
+                    p90: 0,
+                    p95: 0,
+                    p99: 0,
+                    last: merged.last,
+                    rate: 0.0,
+                    histogram: None,
+                },
+            };
+            per_group.push(summary);
+        }
+
         // Build headline iteration_duration from merged histogram
         if let Some(ref merged) = merged_iter_dur {
             let stats = merged.histogram.stats();
@@ -816,6 +941,7 @@ impl Aggregator {
         MetricsResult {
             metrics,
             per_url,
+            per_group,
             checks_total,
             checks_passed,
             checks_failed,
@@ -1037,6 +1163,10 @@ pub struct MetricsResult {
     /// already exist as raw per-(url,method,status) series. Reporters render
     /// these for the per-URL breakdown.
     pub per_url: Vec<MetricSummary>,
+    /// Per-group summaries (histograms merged per (metric, group) for
+    /// series carrying a `group` tag) — k6-style per-group breakdown data.
+    /// Also kept OUT of `metrics` so thresholds never double-count.
+    pub per_group: Vec<MetricSummary>,
     pub checks_total: u64,
     pub checks_passed: u64,
     pub checks_failed: u64,
@@ -1071,6 +1201,7 @@ impl Default for MetricsResult {
         Self {
             metrics: vec![],
             per_url: vec![],
+            per_group: vec![],
             checks_total: 0,
             checks_passed: 0,
             checks_failed: 0,

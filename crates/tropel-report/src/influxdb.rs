@@ -1,14 +1,24 @@
 //! # InfluxDB streaming output
 //!
-//! Streams samples to an InfluxDB instance over UDP as line-protocol
-//! datagrams (`metric[,tag=val,...] field=value`). Tags are encoded as
-//! InfluxDB tags; the numeric sample value is the field `value`.
+//! Streams samples to an InfluxDB instance as line-protocol
+//! (`metric[,tag=val,...] field=value`). Tags are encoded as InfluxDB tags;
+//! the numeric sample value is the field `value`.
 //!
-//! Per InfluxDB's UDP semantics, the line carries **no timestamp** — the
-//! server assigns arrival time (the UDP transport ignores client
-//! timestamps). Samples are buffered and sent every `FLUSH_INTERVAL` (or
-//! when the buffer exceeds `MAX_BUFFERED_SAMPLES`); UDP is best-effort,
-//! failures are logged, never fatal.
+//! **Transports** (k6 parity):
+//!
+//! - **HTTP** — the default when `addr` is an `http(s)://` URL. k6 writes
+//!   over HTTP, not UDP. URL shapes:
+//!   - v2: `http://host:8086?org=<o>&bucket=<b>[&token=<t>]` → POSTs
+//!     `/api/v2/write?org=…&bucket=…&precision=ns` with `Authorization:
+//!     Token <t>` (token from the URL or the `INFLUXDB_V2_TOKEN` env var).
+//!   - v1: `http://host:8086/<db>` (or `?db=<db>`) → POSTs `/write?db=<db>`.
+//! - **UDP** — when `addr` is a bare `host:port` (backward compatible;
+//!   k6 dropped UDP, so HTTP is preferred). Per InfluxDB's UDP semantics
+//!   the line carries no timestamp — the server assigns arrival time.
+//!
+//! Samples are buffered and sent every `FLUSH_INTERVAL` (or when the
+//! buffer exceeds `MAX_BUFFERED_SAMPLES`); failures are logged, never
+//! fatal to the run.
 
 use async_trait::async_trait;
 use std::net::SocketAddr;
@@ -32,9 +42,31 @@ const MAX_BUFFERED_SAMPLES: usize = 10_000;
 /// flush path from producing an EMSGSIZE failure that drops everything.
 const MAX_DATAGRAM_BYTES: usize = 8 * 1024;
 
-/// InfluxDB line-protocol UDP streaming output.
+/// Where samples are sent — either a UDP socket or an HTTP write endpoint.
+#[derive(Debug)]
+enum InfluxTarget {
+    /// Bare `host:port` → UDP line-protocol datagrams (no timestamp).
+    Udp(SocketAddr),
+    /// `http(s)://` URL → HTTP write. For v2 the URL carries `org`/`bucket`
+    /// (and optionally `token`) query params; for v1 the db comes from the
+    /// path or a `db` query param.
+    Http {
+        /// Base URL without query (e.g. `http://localhost:8086`).
+        base: String,
+        /// v1 database name (`POST /write?db=<db>`).
+        db: Option<String>,
+        /// v2 organization (`POST /api/v2/write?org=<org>`).
+        org: Option<String>,
+        /// v2 bucket.
+        bucket: Option<String>,
+        /// v2 auth token (`Authorization: Token <token>`).
+        token: Option<String>,
+    },
+}
+
+/// InfluxDB line-protocol streaming output (HTTP v1/v2 or UDP).
 pub struct InfluxdbOutput {
-    addr: SocketAddr,
+    target: InfluxTarget,
     /// Buffered lines (joined by `\n` on send).
     buffer: Mutex<Vec<String>>,
     total_buffered: AtomicUsize,
@@ -43,14 +75,20 @@ pub struct InfluxdbOutput {
 }
 
 impl InfluxdbOutput {
-    /// Create an output sending to `addr` (host:port, e.g. `localhost:8089`).
+    /// Create an output sending to `addr` — either an `http(s)://` URL
+    /// (HTTP v1/v2, k6-compatible) or a bare `host:port` (UDP).
     pub fn new(addr: impl Into<String>) -> Result<Self> {
-        let addr: SocketAddr = addr
-            .into()
-            .parse()
-            .map_err(|e| TropelError::Config(format!("invalid influxdb address: {e}")))?;
+        let addr = addr.into();
+        let target = if addr.starts_with("http://") || addr.starts_with("https://") {
+            parse_http_target(&addr)?
+        } else {
+            let sock: SocketAddr = addr
+                .parse()
+                .map_err(|e| TropelError::Config(format!("invalid influxdb address: {e}")))?;
+            InfluxTarget::Udp(sock)
+        };
         Ok(Self {
-            addr,
+            target,
             buffer: Mutex::new(Vec::new()),
             total_buffered: AtomicUsize::new(0),
             tag_policy: TagPolicy::default(),
@@ -127,7 +165,9 @@ impl InfluxdbOutput {
         out
     }
 
-    /// Encode a sample as one line-protocol line and buffer it.
+    /// Encode a sample as one line-protocol line and buffer it. HTTP
+    /// targets carry a nanosecond timestamp (k6 sends `precision=ns`); UDP
+    /// lines carry none (the server assigns arrival time).
     fn buffer(&self, sample: &Sample) {
         // measurement[,tag=val,...] field=value — no stray space between
         // the measurement and the tag set (line protocol is strict).
@@ -147,11 +187,20 @@ impl InfluxdbOutput {
             sample.value.to_string()
         };
         line.push_str(&format!(" value={value}"));
+        if matches!(self.target, InfluxTarget::Http { .. }) {
+            let ns = sample
+                .timestamp
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            line.push_str(&format!(" {ns}"));
+        }
         self.buffer.lock().unwrap().push(line);
         self.total_buffered.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Drain the buffer and send one UDP datagram (lines joined by `\n`).
+    /// Drain the buffer and send to the configured transport (HTTP POST or
+    /// UDP datagrams, chunked to the UDP payload cap).
     async fn flush(&self) -> Result<()> {
         let lines = {
             let mut guard = self.buffer.lock().unwrap();
@@ -163,33 +212,129 @@ impl InfluxdbOutput {
             return Ok(());
         }
 
-        let socket = UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| TropelError::Http(format!("influxdb bind failed: {e}")))?;
-        // Chunk lines into ≤ MAX_DATAGRAM_BYTES datagrams so a large forced
-        // flush never exceeds the UDP payload cap.
-        let mut chunk: Vec<&str> = Vec::new();
-        let mut chunk_len = 0usize;
-        for line in &lines {
-            if !chunk.is_empty() && chunk_len + line.len() + 1 > MAX_DATAGRAM_BYTES {
-                socket
-                    .send_to(chunk.join("\n").as_bytes(), self.addr)
+        match &self.target {
+            InfluxTarget::Udp(addr) => {
+                let socket = UdpSocket::bind("0.0.0.0:0")
                     .await
-                    .map_err(|e| TropelError::Http(format!("influxdb send failed: {e}")))?;
-                chunk.clear();
-                chunk_len = 0;
+                    .map_err(|e| TropelError::Http(format!("influxdb bind failed: {e}")))?;
+                // Chunk lines into ≤ MAX_DATAGRAM_BYTES datagrams so a large
+                // forced flush never exceeds the UDP payload cap.
+                let mut chunk: Vec<&str> = Vec::new();
+                let mut chunk_len = 0usize;
+                for line in &lines {
+                    if !chunk.is_empty() && chunk_len + line.len() + 1 > MAX_DATAGRAM_BYTES {
+                        socket
+                            .send_to(chunk.join("\n").as_bytes(), *addr)
+                            .await
+                            .map_err(|e| TropelError::Http(format!("influxdb send failed: {e}")))?;
+                        chunk.clear();
+                        chunk_len = 0;
+                    }
+                    chunk_len += line.len() + 1;
+                    chunk.push(line);
+                }
+                if !chunk.is_empty() {
+                    socket
+                        .send_to(chunk.join("\n").as_bytes(), *addr)
+                        .await
+                        .map_err(|e| TropelError::Http(format!("influxdb send failed: {e}")))?;
+                }
+                Ok(())
             }
-            chunk_len += line.len() + 1;
-            chunk.push(line);
+            InfluxTarget::Http {
+                base,
+                db,
+                org,
+                bucket,
+                token,
+            } => {
+                let client = reqwest::Client::new();
+                let (url, builder) = if let (Some(org), Some(bucket)) = (org, bucket) {
+                    // v2 write endpoint.
+                    let url = format!(
+                        "{base}/api/v2/write?org={org}&bucket={bucket}&precision=ns"
+                    );
+                    let builder = client.post(&url);
+                    let builder = match token {
+                        Some(t) => builder.header("Authorization", format!("Token {t}")),
+                        None => builder,
+                    };
+                    (url, builder)
+                } else {
+                    // v1 write endpoint (db from URL path or ?db=).
+                    let db = db.as_deref().unwrap_or("k6");
+                    let url = format!("{base}/write?db={db}");
+                    let builder = client.post(&url);
+                    (url, builder)
+                };
+
+                let body = lines.join("\n");
+                let resp = builder
+                    .body(body)
+                    .send()
+                    .await
+                    .map_err(|e| TropelError::Http(format!("influxdb HTTP write to {url} failed: {e}")))?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(TropelError::Http(format!(
+                        "influxdb HTTP write to {url} returned {status}: {}",
+                        text.trim()
+                    )));
+                }
+                Ok(())
+            }
         }
-        if !chunk.is_empty() {
-            socket
-                .send_to(chunk.join("\n").as_bytes(), self.addr)
-                .await
-                .map_err(|e| TropelError::Http(format!("influxdb send failed: {e}")))?;
-        }
-        Ok(())
     }
+}
+
+/// Parse an `http(s)://` InfluxDB URL into an HTTP [`InfluxTarget`].
+///
+/// - v2 when the query carries `org` + `bucket` (token from `token` param
+///   or the `INFLUXDB_V2_TOKEN` env var);
+/// - v1 otherwise, with the db from the first non-empty path segment or a
+///   `db` query param.
+fn parse_http_target(url_str: &str) -> Result<InfluxTarget> {
+    let url = reqwest::Url::parse(url_str)
+        .map_err(|e| TropelError::Config(format!("invalid influxdb URL: {e}")))?;
+    let base = format!(
+        "{}://{}",
+        url.scheme(),
+        url.host_str().unwrap_or("localhost")
+    ) + &url
+        .port()
+        .map(|p| format!(":{p}"))
+        .unwrap_or_default();
+
+    let pairs: std::collections::HashMap<String, String> =
+        url.query_pairs().into_owned().collect();
+    let org = pairs.get("org").cloned().filter(|s| !s.is_empty());
+    let bucket = pairs.get("bucket").cloned().filter(|s| !s.is_empty());
+    if let (Some(org), Some(bucket)) = (&org, &bucket) {
+        let token = pairs.get("token").cloned().or_else(|| {
+            std::env::var("INFLUXDB_V2_TOKEN").ok().filter(|t| !t.is_empty())
+        });
+        return Ok(InfluxTarget::Http {
+            base,
+            db: None,
+            org: Some(org.clone()),
+            bucket: Some(bucket.clone()),
+            token,
+        });
+    }
+
+    // v1: db from path (first non-empty segment) or ?db=.
+    let db = pairs
+        .get("db")
+        .cloned()
+        .or_else(|| url.path_segments().and_then(|mut s| s.find(|p| !p.is_empty())).map(str::to_string));
+    Ok(InfluxTarget::Http {
+        base,
+        db,
+        org: None,
+        bucket: None,
+        token: None,
+    })
 }
 
 #[async_trait]
@@ -252,6 +397,62 @@ mod tests {
     #[test]
     fn rejects_bad_address() {
         assert!(InfluxdbOutput::new("not-an-addr").is_err());
+    }
+
+    #[test]
+    fn parses_http_v2_target() {
+        let output =
+            InfluxdbOutput::new("http://localhost:8086?org=myorg&bucket=mybucket&token=sekret")
+                .unwrap();
+        match &output.target {
+            InfluxTarget::Http {
+                base,
+                org,
+                bucket,
+                token,
+                db,
+            } => {
+                assert_eq!(base, "http://localhost:8086");
+                assert_eq!(org.as_deref(), Some("myorg"));
+                assert_eq!(bucket.as_deref(), Some("mybucket"));
+                assert_eq!(token.as_deref(), Some("sekret"));
+                assert!(db.is_none());
+            }
+            other => panic!("expected HTTP target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_http_v1_target_from_path() {
+        let output = InfluxdbOutput::new("http://localhost:8086/k6db").unwrap();
+        match &output.target {
+            InfluxTarget::Http { base, db, .. } => {
+                assert_eq!(base, "http://localhost:8086");
+                assert_eq!(db.as_deref(), Some("k6db"));
+            }
+            other => panic!("expected HTTP target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_lines_carry_ns_timestamp_udp_lines_do_not() {
+        // HTTP lines append a ns timestamp; UDP lines stay bare.
+        let http = InfluxdbOutput::new("http://localhost:8086?org=o&bucket=b").unwrap();
+        http.buffer(&sample("http_reqs", 1.0, &[]));
+        let line = http.buffer.lock().unwrap().first().unwrap().clone();
+        // line = "http_reqs value=1i <ns>" — exactly 3 whitespace tokens and
+        // the final token is all digits (the ns timestamp).
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(tokens.len(), 3, "metric tags value ns: {line}");
+        assert!(
+            tokens[2].chars().all(|c| c.is_ascii_digit()),
+            "ns timestamp must be numeric: {line}"
+        );
+
+        let udp = InfluxdbOutput::new("127.0.0.1:8089").unwrap();
+        udp.buffer(&sample("http_reqs", 1.0, &[]));
+        let line = udp.buffer.lock().unwrap().first().unwrap().clone();
+        assert_eq!(line, "http_reqs value=1i", "UDP line has no timestamp: {line}");
     }
 
     /// End-to-end: send to a live UDP socket and verify the datagram.

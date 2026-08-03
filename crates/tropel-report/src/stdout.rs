@@ -10,21 +10,47 @@ pub struct StdoutReporter;
 impl StdoutReporter {
     /// Render a Trend metric using the configured `summaryTrendStats` list,
     /// appending to `out` (single trailing newline).
+    ///
+    /// Time-based trends (k6 `contains: "time"`) render in `ms` (values are
+    /// microseconds internally); non-duration trends (byte counts, custom
+    /// metrics, `contains: "default"`) render raw — the old code stamped
+    /// `ms` on every trend, mislabeling non-duration metrics.
     fn render_trend(out: &mut String, line: &str, m: &MetricSummary, stats: &[String]) {
+        let base = m.key.split('{').next().unwrap_or(&m.key);
+        let is_time = crate::json_stream::is_time_metric(base);
+        let unit = if is_time { "ms" } else { "" };
+
         let mut parts: Vec<String> = Vec::new();
         for stat in stats {
             if let Some(v) = trend_stat_value(stat, m) {
                 match stat.trim() {
-                    s if s.starts_with("p(") => {
-                        parts.push(format!("{}={:.0}ms", stat.trim(), v / 1000.0));
-                    }
-                    "avg" | "mean" => parts.push(format!("avg={:.2}ms", v / 1000.0)),
-                    "min" => parts.push(format!("min={:.0}ms", v / 1000.0)),
-                    "max" => parts.push(format!("max={:.0}ms", v / 1000.0)),
+                    s if s.starts_with("p(") => parts.push(format!(
+                        "{}={:.0}{unit}",
+                        stat.trim(),
+                        if is_time { v / 1000.0 } else { v }
+                    )),
+                    "avg" | "mean" => parts.push(format!(
+                        "avg={:.2}{unit}",
+                        if is_time { v / 1000.0 } else { v }
+                    )),
+                    "min" => parts.push(format!(
+                        "min={:.0}{unit}",
+                        if is_time { v / 1000.0 } else { v }
+                    )),
+                    "max" => parts.push(format!(
+                        "max={:.0}{unit}",
+                        if is_time { v / 1000.0 } else { v }
+                    )),
                     "count" => parts.push(format!("count={:.0}", v)),
-                    "sum" => parts.push(format!("sum={:.2}ms", v / 1000.0)),
+                    "sum" => parts.push(format!(
+                        "sum={:.2}{unit}",
+                        if is_time { v / 1000.0 } else { v }
+                    )),
                     "rate" => parts.push(format!("rate={:.4}", v)),
-                    "med" | "median" => parts.push(format!("med={:.0}ms", v / 1000.0)),
+                    "med" | "median" => parts.push(format!(
+                        "med={:.0}{unit}",
+                        if is_time { v / 1000.0 } else { v }
+                    )),
                     _ => parts.push(format!("{}={:.2}", stat.trim(), v)),
                 }
             }
@@ -115,8 +141,9 @@ impl StdoutReporter {
                     || metric.key.starts_with("iterations")
                     || metric.key.starts_with("http_req_failed")
                     || metric.key.starts_with("data_")
+                    || metric.tags.iter().any(|(k, _)| k == "group")
                 {
-                    continue; // Already shown above
+                    continue; // Already shown above or in the per-group breakdown
                 }
                 out.push_str(&format!("    {}  ", metric.key));
                 match metric.metric_type {
@@ -135,7 +162,7 @@ impl StdoutReporter {
                             metric.last, metric.min, metric.max, metric.mean
                         ));
                     }
-                    tropel_metrics::collector::MetricType::Trend => {
+                    tropel_metrics::collector::                    MetricType::Trend => {
                         out.push_str("[Trend]\n");
                         Self::render_trend(&mut out, "", metric, &stats);
                     }
@@ -158,12 +185,15 @@ impl StdoutReporter {
             }
         }
 
-        // Per-group breakdown — series carrying a `group` tag. The runner
-        // tags every request `group=http` by default, so exclude that
-        // constant (the headline already covers overall HTTP); named groups
-        // from `group()`/`pm.group` produce the meaningful rows.
+        // Per-group breakdown — the collector merges all series carrying a
+        // `group` tag into exact per-(metric, group) summaries stored in the
+        // dedicated `result.per_group` field (kept out of `metrics` so
+        // thresholds can't double-count). The runner tags every request
+        // `group=http` by default, so exclude that constant — the headline
+        // already covers overall HTTP; named groups from `group()`/`pm.group`
+        // produce the meaningful rows.
         let grouped_series: Vec<&MetricSummary> = result
-            .metrics
+            .per_group
             .iter()
             .filter(|m| m.tags.iter().any(|(k, v)| k == "group" && v != "http"))
             .collect();

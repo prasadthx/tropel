@@ -34,6 +34,7 @@ fn fixture() -> MetricsResult {
         p99: 900_000,
         last: 0.0,
         rate: 0.0,
+        histogram: None,
     };
 
     let mut result = MetricsResult {
@@ -70,7 +71,6 @@ fn fixture() -> MetricsResult {
         http_req_duration: Some(trend("http_req_duration", vec![], 1_000, 950_000)),
         iteration_duration: Some(trend("iteration_duration", vec![], 1_024, 1_100_000)),
         metrics: vec![
-            trend("group_duration", vec![("group", "checkout")], 500, 700_000),
             MetricSummary {
                 key: "custom_counter".to_string(),
                 tags: vec![],
@@ -86,6 +86,7 @@ fn fixture() -> MetricsResult {
                 p99: 1,
                 last: 0.0,
                 rate: 0.0,
+                histogram: None,
             },
             MetricSummary {
                 key: "custom_gauge".to_string(),
@@ -102,6 +103,7 @@ fn fixture() -> MetricsResult {
                 p99: 9,
                 last: 7.0,
                 rate: 0.0,
+                histogram: None,
             },
         ],
         per_url: vec![
@@ -118,6 +120,15 @@ fn fixture() -> MetricsResult {
                 950_000,
             ),
         ],
+        // Per-group breakdown — the collector merges group-tagged series
+        // into this dedicated field (k6 parity: aggregated per group, not
+        // raw per-(url,status) series).
+        per_group: vec![trend(
+            "group_duration{group=checkout}",
+            vec![("group", "checkout")],
+            500,
+            700_000,
+        )],
     };
     result.metrics.extend(result.per_url.clone());
     result

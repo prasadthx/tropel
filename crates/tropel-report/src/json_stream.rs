@@ -1,19 +1,26 @@
 //! # JSON-stream streaming output
 //!
-//! Appends every sample as one JSON line (NDJSON) to a file while the run
-//! is in progress — the k6 `--out json=file` equivalent. Each line is the
-//! full sample: `metric`, `value`, `timestamp` (RFC 3339), `tags`, and
-//! `sample_type`.
+//! Appends every sample as NDJSON to a file while the run is in progress —
+//! the k6 `--out json=file` equivalent, emitting **k6-compatible records**:
+//!
+//! - a `Metric` definition record (`{"type":"Metric","data":{...}}`) the
+//!   first time each metric is seen, carrying the k6 metric type
+//!   (`counter`/`gauge`/`rate`/`trend`), `contains` (`time` for duration
+//!   metrics, else `default`), and the metric name;
+//! - a `Point` record (`{"type":"Point","data":{...}}`) per sample with
+//!   RFC 3339 (nanosecond) `time`, the `measurement`, `tags`, and the value
+//!   under `fields.value` — exactly the schema k6's JSON output emits.
 //!
 //! Lines are buffered and written every `FLUSH_INTERVAL` (or when the
 //! buffer exceeds `MAX_BUFFERED_SAMPLES`), with a final drain on stream
 //! close. Write failures are logged, never fatal to the run.
 
 use async_trait::async_trait;
+use std::collections::HashSet;
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::broadcast;
 use tropel_core::types::{Sample, SampleType};
 use tropel_core::{Result, TropelError};
@@ -32,6 +39,9 @@ pub struct JsonStreamOutput {
     /// with the Sample type needed since we serialize immediately).
     buffer: Mutex<Vec<String>>,
     total_buffered: AtomicUsize,
+    /// Metric names already emitted as a `Metric` definition record. Each
+    /// metric's definition is written once, before its first `Point`.
+    seen_metrics: Mutex<HashSet<String>>,
 }
 
 impl JsonStreamOutput {
@@ -41,6 +51,7 @@ impl JsonStreamOutput {
             path: path.into(),
             buffer: Mutex::new(Vec::new()),
             total_buffered: AtomicUsize::new(0),
+            seen_metrics: Mutex::new(HashSet::new()),
         }
     }
 
@@ -87,28 +98,55 @@ impl JsonStreamOutput {
         })
     }
 
-    /// Serialize a sample into one NDJSON line and buffer it.
+    /// Serialize a sample into k6-compatible NDJSON lines and buffer them.
+    ///
+    /// Emits the metric's `Metric` definition record the first time the
+    /// metric is seen, then a `Point` record for this sample. The schema
+    /// mirrors k6's `--out json` so consumers (e.g. k6's JSON parser, custom
+    /// dashboards) can read the file unchanged.
     fn buffer(&self, sample: &Sample) {
-        let ts_secs = sample
-            .timestamp
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
-        let line = serde_json::json!({
-            "metric": sample.metric,
-            "value": sample.value,
-            "timestamp": ts_secs,
-            "sample_type": match sample.sample_type {
-                SampleType::Counter => "counter",
-                // Gauge metrics are emitted as Point samples (snapshots).
-                SampleType::Point => "gauge",
-                SampleType::Rate => "rate",
-                SampleType::Trend => "trend",
+        let metric_name = sample.metric.clone();
+        let seen = {
+            let mut seen = self.seen_metrics.lock().unwrap();
+            !seen.insert(metric_name.clone())
+        };
+        if !seen {
+            // k6 Metric definition record — emitted once per metric.
+            let def = serde_json::json!({
+                "type": "Metric",
+                "data": {
+                    "type": k6_metric_type(&sample.sample_type),
+                    "contains": if is_time_metric(&metric_name) {
+                        "time"
+                    } else {
+                        "default"
+                    },
+                    "tainted": null,
+                    "thresholds": [],
+                    "submetrics": null,
+                    "time": k6_timestamp(sample.timestamp),
+                    "name": metric_name,
+                    "tags": null,
+                    "samples": [],
+                },
+            })
+            .to_string();
+            self.buffer.lock().unwrap().push(def);
+            self.total_buffered.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // k6 Point record — one per sample.
+        let point = serde_json::json!({
+            "type": "Point",
+            "data": {
+                "time": k6_timestamp(sample.timestamp),
+                "measurement": sample.metric,
+                "tags": sample.tags,
+                "fields": {"value": sample.value},
             },
-            "tags": sample.tags,
         })
         .to_string();
-        self.buffer.lock().unwrap().push(line);
+        self.buffer.lock().unwrap().push(point);
         self.total_buffered.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -135,6 +173,40 @@ impl JsonStreamOutput {
         }
         Ok(())
     }
+}
+
+/// k6 metric type name for a sample type.
+fn k6_metric_type(sample_type: &SampleType) -> &'static str {
+    match sample_type {
+        SampleType::Counter => "counter",
+        // Gauge metrics are emitted as Point samples (snapshots).
+        SampleType::Point => "gauge",
+        SampleType::Rate => "rate",
+        SampleType::Trend => "trend",
+    }
+}
+
+/// k6 RFC 3339 timestamp (nanosecond precision, UTC), e.g.
+/// `2026-08-03T12:34:56.123456789Z`.
+fn k6_timestamp(t: std::time::SystemTime) -> String {
+    let dt: chrono::DateTime<chrono::Utc> = t.into();
+    dt.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+}
+
+/// True for metrics k6 marks `contains: "time"` (rendered in ms). Duration
+/// trends carry duration suffixes/prefixes; everything else is `default`.
+pub(crate) fn is_time_metric(metric: &str) -> bool {
+    metric.ends_with("duration")
+        || metric.ends_with("_time")
+        || metric.ends_with("_waiting")
+        || metric.ends_with("_receiving")
+        || metric.ends_with("_sending")
+        || metric.ends_with("_connecting")
+        || metric.ends_with("_blocked")
+        || metric.ends_with("_tls_handshaking")
+        || metric.ends_with("_lookup")
+        || metric.contains("ttfb")
+        || metric.contains("latency")
 }
 
 #[async_trait]
@@ -169,12 +241,16 @@ mod tests {
             value,
             tags,
             timestamp: SystemTime::now(),
-            sample_type: SampleType::Trend,
+            sample_type: if metric == "http_reqs" {
+                SampleType::Counter
+            } else {
+                SampleType::Trend
+            },
         }
     }
 
     #[test]
-    fn flush_appends_ndjson() {
+    fn flush_appends_k6_ndjson() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("tropel-json-stream-{}.ndjson", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -187,17 +263,49 @@ mod tests {
         rt.block_on(async {
             output.sample(&[sample("http_reqs", 1.0)]).await.unwrap();
             output.sample(&[sample("http_req_duration", 12.5)]).await.unwrap();
+            output.sample(&[sample("http_req_duration", 14.0)]).await.unwrap();
             output.stop().await.unwrap();
         });
 
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 2, "one JSON line per sample: {content}");
+        // 2 Metric definitions (http_reqs, http_req_duration) + 3 Points.
+        assert_eq!(lines.len(), 5, "defs once + one point per sample: {content}");
+        let mut metric_defs = 0;
+        let mut points = 0;
+        let mut duration_points = 0;
         for line in lines {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
-            assert!(v["metric"].is_string());
-            assert!(v["tags"]["status"] == "200");
+            match v["type"].as_str().unwrap() {
+                "Metric" => {
+                    metric_defs += 1;
+                    let data = &v["data"];
+                    let name = data["name"].as_str().unwrap();
+                    assert!(data["type"].is_string());
+                    assert!(data["time"].is_string(), "RFC3339 time");
+                    if name == "http_req_duration" {
+                        assert_eq!(data["contains"], "time");
+                    } else {
+                        assert_eq!(data["contains"], "default");
+                    }
+                }
+                "Point" => {
+                    points += 1;
+                    let data = &v["data"];
+                    assert!(data["measurement"].is_string());
+                    assert!(data["time"].is_string());
+                    assert!(data["fields"]["value"].is_number());
+                    assert!(data["tags"]["status"] == "200");
+                    if data["measurement"] == "http_req_duration" {
+                        duration_points += 1;
+                    }
+                }
+                other => panic!("unexpected record type {other}"),
+            }
         }
+        assert_eq!(metric_defs, 2);
+        assert_eq!(points, 3);
+        assert_eq!(duration_points, 2, "no duplicate Metric def per metric");
         let _ = std::fs::remove_file(&path);
     }
 
