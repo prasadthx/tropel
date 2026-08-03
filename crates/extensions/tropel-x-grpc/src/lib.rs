@@ -1,9 +1,10 @@
 //! # tropel-x-grpc
 //!
 //! Real gRPC protocol extension for Tropel: loads `.proto` files at runtime
-//! (protox + prost-reflect), executes unary and server-streaming calls via
-//! tonic with a fully dynamic codec (no codegen), and emits the
-//! `grpc_req_duration` metric.
+//! (protox + prost-reflect), executes unary, server-streaming,
+//! client-streaming, and bidi-streaming calls via tonic with a fully dynamic
+//! codec (no codegen), and emits the k6-compatible `grpc_reqs` and
+//! `grpc_req_duration` metrics.
 //!
 //! ## Request contract
 //!
@@ -195,25 +196,52 @@ impl Protocol for GrpcProtocol {
                 ))
             })?;
 
-        // ── Build the input message from the JSON body ──
+        // ── Build the input message(s) from the JSON body ──
         // prost-reflect's canonical JSON support is the serde path:
         // `MessageDescriptor: DeserializeSeed` (JSON → DynamicMessage) and
         // `DynamicMessage: Serialize` (DynamicMessage → JSON). The
         // `transcode_from`/`transcode_to` helpers take concrete `prost::Message`
         // impls, which a dynamic protocol does not have.
+        //
+        // Client-streaming / bidi methods take a JSON **array** of messages
+        // (each element deserialized against the input descriptor); unary and
+        // server-streaming take a single JSON object.
         let input_desc = method.input();
-        let mut input_msg = DynamicMessage::new(input_desc.clone());
+        let stream_in = method.is_client_streaming();
+        let mut input_messages: Vec<DynamicMessage> = Vec::new();
         if let Some(json) = body_to_json(req) {
-            let json_str = serde_json::to_string(&json)
-                .map_err(|e| TropelError::Parse(format!("request body JSON: {e}")))?;
-            let mut de = serde_json::Deserializer::from_str(&json_str);
-            input_msg = input_desc.clone().deserialize(&mut de).map_err(|e| {
-                TropelError::Parse(format!(
-                    "request body is not a valid {}: {}",
-                    input_desc.full_name(),
-                    e
-                ))
-            })?;
+            let parse_json = |v: &serde_json::Value| -> Result<DynamicMessage> {
+                let json_str = serde_json::to_string(v)
+                    .map_err(|e| TropelError::Parse(format!("request body JSON: {e}")))?;
+                let mut de = serde_json::Deserializer::from_str(&json_str);
+                input_desc.clone().deserialize(&mut de).map_err(|e| {
+                    TropelError::Parse(format!(
+                        "request body is not a valid {}: {}",
+                        input_desc.full_name(),
+                        e
+                    ))
+                })
+            };
+            if stream_in {
+                match json {
+                    serde_json::Value::Array(items) => {
+                        for item in items {
+                            input_messages.push(parse_json(&item)?);
+                        }
+                    }
+                    // Explicit `null` behaves like an absent body: empty stream
+                    // (immediate half-close), consistent with the unary case.
+                    serde_json::Value::Null => {}
+                    other => input_messages.push(parse_json(&other)?),
+                }
+            } else {
+                input_messages.push(parse_json(&json)?);
+            }
+        }
+        if input_messages.is_empty() && !stream_in {
+            // Empty body → all-default message (matches the pre-streaming
+            // behaviour of sending a single empty DynamicMessage).
+            input_messages.push(DynamicMessage::new(input_desc.clone()));
         }
 
         // ── Connect ──
@@ -231,18 +259,20 @@ impl Protocol for GrpcProtocol {
             .await
             .map_err(|e| TropelError::Extension(format!("gRPC connect to {host}:{port}: {e}")))?;
 
-        // ── Build the request with metadata from request headers ──
-        let mut tonic_req = TonicRequest::new(input_msg);
+        // ── Build the request metadata from request headers ──
+        // Pseudo-headers (`:...`) and the internal `x-grpc-proto*` headers
+        // (used for proto resolution) are never forwarded as gRPC metadata.
+        let mut metadata = tonic::metadata::MetadataMap::new();
         for (k, v) in &req.headers {
             let lower = k.to_ascii_lowercase();
-            if lower.starts_with(':') {
+            if lower.starts_with(':') || lower.starts_with("x-grpc-proto") {
                 continue;
             }
             if let (Ok(mv), Ok(key)) = (
                 v.parse::<AsciiMetadataValue>(),
                 AsciiMetadataKey::from_bytes(lower.as_bytes()),
             ) {
-                tonic_req.metadata_mut().insert(key, mv);
+                metadata.insert(key, mv);
             }
         }
 
@@ -260,53 +290,65 @@ impl Protocol for GrpcProtocol {
             .await
             .map_err(|e| TropelError::Extension(format!("gRPC channel not ready: {e}")))?;
 
-        // ── Execute (unary or server-streaming) with optional timeout ──
+        // ── Execute: unary / server-streaming / client-streaming / bidi ──
         let mut status_override: Option<GrpcCode> = None;
-        let response_value: serde_json::Value = if method.is_server_streaming() {
-            let fut = client.server_streaming(tonic_req, path, codec);
-            let result = if let Some(t) = deadline {
-                match tokio::time::timeout(t, fut).await {
-                    Ok(r) => r,
-                    Err(_) => Err(Status::deadline_exceeded("gRPC call timed out")),
-                }
-            } else {
-                fut.await
-            };
+        let is_server_streaming = method.is_server_streaming();
+        // prost-reflect has no `is_bidi_streaming()`; bidi means both directions
+        // stream. The client-streaming branch below is therefore only reached
+        // for client-streaming-only methods (is_bidi is checked first).
+        let is_bidi = method.is_client_streaming() && is_server_streaming;
+        let is_client_streaming = method.is_client_streaming() && !is_server_streaming;
+
+        let response_value: serde_json::Value = if is_bidi {
+            let mut tonic_req = TonicRequest::new(tokio_stream::iter(input_messages));
+            *tonic_req.metadata_mut() = metadata.clone();
+            let fut = client.streaming(tonic_req, path, codec);
+            let result = with_timeout(deadline, fut).await;
             match result {
-                Ok(stream) => {
-                    let mut msgs = Vec::new();
-                    let mut stream = stream.into_inner();
-                    loop {
-                        match stream.message().await {
-                            Ok(Some(msg)) => {
-                                if let Ok(v) = serde_json::to_value(&msg) {
-                                    msgs.push(v);
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(e) => {
-                                status_override = Some(e.code());
-                                break;
-                            }
-                        }
-                    }
-                    serde_json::Value::Array(msgs)
+                Ok(stream) => collect_messages(stream.into_inner(), &mut status_override).await,
+                Err(e) => {
+                    status_override = Some(e.code());
+                    serde_json::Value::Null
                 }
+            }
+        } else if is_client_streaming {
+            let mut tonic_req = TonicRequest::new(tokio_stream::iter(input_messages));
+            *tonic_req.metadata_mut() = metadata.clone();
+            let fut = client.client_streaming(tonic_req, path, codec);
+            let result = with_timeout(deadline, fut).await;
+            match result {
+                Ok(resp) => serde_json::to_value(resp.into_inner())
+                    .unwrap_or(serde_json::Value::Null),
+                Err(e) => {
+                    status_override = Some(e.code());
+                    serde_json::Value::Null
+                }
+            }
+        } else if is_server_streaming {
+            let msg = input_messages
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| DynamicMessage::new(input_desc.clone()));
+            let mut tonic_req = TonicRequest::new(msg);
+            *tonic_req.metadata_mut() = metadata.clone();
+            let fut = client.server_streaming(tonic_req, path, codec);
+            let result = with_timeout(deadline, fut).await;
+            match result {
+                Ok(stream) => collect_messages(stream.into_inner(), &mut status_override).await,
                 Err(e) => {
                     status_override = Some(e.code());
                     serde_json::Value::Null
                 }
             }
         } else {
+            let msg = input_messages
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| DynamicMessage::new(input_desc.clone()));
+            let mut tonic_req = TonicRequest::new(msg);
+            *tonic_req.metadata_mut() = metadata.clone();
             let fut = client.unary(tonic_req, path, codec);
-            let result = if let Some(t) = deadline {
-                match tokio::time::timeout(t, fut).await {
-                    Ok(r) => r,
-                    Err(_) => Err(Status::deadline_exceeded("gRPC call timed out")),
-                }
-            } else {
-                fut.await
-            };
+            let result = with_timeout(deadline, fut).await;
             match result {
                 Ok(resp) => serde_json::to_value(resp.into_inner())
                     .unwrap_or(serde_json::Value::Null),
@@ -318,6 +360,9 @@ impl Protocol for GrpcProtocol {
         };
 
         let duration = start.elapsed();
+        // k6 tags gRPC samples with the numeric gRPC code (0 = OK), not an
+        // HTTP status; keep the HTTP mapping only on the response object.
+        let grpc_status = status_override.unwrap_or(GrpcCode::Ok) as i32;
         let (http_status, ok) = match status_override {
             None => (200u16, true),
             Some(code) => (grpc_code_to_http(code), false),
@@ -340,7 +385,7 @@ impl Protocol for GrpcProtocol {
         let mut tags = TagMap::with_capacity(5);
         tags.insert("url", req.url.clone());
         tags.insert("method", format!("{service_full}/{method_name}"));
-        tags.insert("status", http_status.to_string());
+        tags.insert("status", grpc_status.to_string());
         tags.insert("name", format!("{service_full}/{method_name}"));
         tags.insert("group", "grpc");
 
@@ -363,13 +408,6 @@ impl Protocol for GrpcProtocol {
                 sample_type: SampleType::Counter,
             },
             Sample {
-                metric: "grpc_req_failed".into(),
-                value: if ok { 0.0 } else { 1.0 },
-                tags: tags.clone(),
-                timestamp: now,
-                sample_type: SampleType::Rate,
-            },
-            Sample {
                 metric: "data_sent".into(),
                 value: sent,
                 tags: tags.clone(),
@@ -390,6 +428,45 @@ impl Protocol for GrpcProtocol {
             response: Some(response),
         })
     }
+}
+
+/// Await a gRPC call with an optional deadline, mapping timeout to
+/// `DEADLINE_EXCEEDED` (k6's gRPC module times out with that code).
+async fn with_timeout<T>(
+    deadline: Option<std::time::Duration>,
+    fut: impl std::future::Future<Output = std::result::Result<T, Status>>,
+) -> std::result::Result<T, Status> {
+    match deadline {
+        Some(t) => match tokio::time::timeout(t, fut).await {
+            Ok(r) => r,
+            Err(_) => Err(Status::deadline_exceeded("gRPC call timed out")),
+        },
+        None => fut.await,
+    }
+}
+
+/// Drain a tonic response stream into a JSON array, surfacing any terminal
+/// status via `status_override`.
+async fn collect_messages(
+    mut stream: tonic::Streaming<DynamicMessage>,
+    status_override: &mut Option<GrpcCode>,
+) -> serde_json::Value {
+    let mut msgs = Vec::new();
+    loop {
+        match stream.message().await {
+            Ok(Some(msg)) => {
+                if let Ok(v) = serde_json::to_value(&msg) {
+                    msgs.push(v);
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                *status_override = Some(e.code());
+                break;
+            }
+        }
+    }
+    serde_json::Value::Array(msgs)
 }
 
 /// Parse a `/package.Service/Method` path into a `PathAndQuery`.

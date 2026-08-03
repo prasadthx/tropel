@@ -33,6 +33,8 @@ message HelloReply {
 service Greeter {
   rpc SayHello(HelloRequest) returns (HelloReply);
   rpc StreamHello(HelloRequest) returns (stream HelloReply);
+  rpc CollectHellos(stream HelloRequest) returns (HelloReply);
+  rpc Chat(stream HelloRequest) returns (stream HelloReply);
 }
 "#;
 
@@ -97,6 +99,77 @@ impl Service<Request<DynamicMessage>> for StreamHandler {
     }
 }
 
+#[derive(Clone)]
+struct ClientStreamHandler {
+    out_desc: MessageDescriptor,
+}
+
+impl Service<Request<tonic::Streaming<DynamicMessage>>> for ClientStreamHandler {
+    type Response = Response<DynamicMessage>;
+    type Error = Status;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, mut req: Request<tonic::Streaming<DynamicMessage>>) -> Self::Future {
+        let out_desc = self.out_desc.clone();
+        Box::pin(async move {
+            let mut stream = req.into_inner();
+            let mut names = Vec::new();
+            while let Some(msg) = stream.message().await? {
+                if let Some(name) = msg
+                    .get_field_by_name("name")
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                {
+                    names.push(name);
+                }
+            }
+            let mut reply = DynamicMessage::new(out_desc);
+            reply.set_field_by_name(
+                "message",
+                Value::String(format!("collected {}", names.join(","))),
+            );
+            Ok(Response::new(reply))
+        })
+    }
+}
+
+#[derive(Clone)]
+struct BidiHandler {
+    out_desc: MessageDescriptor,
+}
+
+impl Service<Request<tonic::Streaming<DynamicMessage>>> for BidiHandler {
+    type Response =
+        Response<tokio_stream::Iter<std::vec::IntoIter<Result<DynamicMessage, Status>>>>;
+    type Error = Status;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, mut req: Request<tonic::Streaming<DynamicMessage>>) -> Self::Future {
+        let out_desc = self.out_desc.clone();
+        Box::pin(async move {
+            let mut stream = req.into_inner();
+            let mut replies = Vec::new();
+            while let Some(msg) = stream.message().await? {
+                let name = msg
+                    .get_field_by_name("name")
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "?".to_string());
+                let mut reply = DynamicMessage::new(out_desc.clone());
+                reply.set_field_by_name("message", Value::String(format!("echo:{name}")));
+                replies.push(Ok(reply));
+            }
+            Ok(Response::new(tokio_stream::iter(replies)))
+        })
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Dispatcher service: routes /test.Greeter/{Method} to the right handler
 // ══════════════════════════════════════════════════════════════════════
@@ -134,6 +207,19 @@ impl Service<http::Request<Body>> for GreeterService {
                     let codec = tropel_x_grpc::DynamicCodec::new(method.output(), method.input());
                     let mut grpc = tonic::server::Grpc::new(codec);
                     grpc.server_streaming(StreamHandler { out_desc: method.output() }, req).await
+                }
+                "/test.Greeter/CollectHellos" => {
+                    let method = service.methods().find(|m| m.name() == "CollectHellos").unwrap();
+                    let codec = tropel_x_grpc::DynamicCodec::new(method.output(), method.input());
+                    let mut grpc = tonic::server::Grpc::new(codec);
+                    grpc.client_streaming(ClientStreamHandler { out_desc: method.output() }, req)
+                        .await
+                }
+                "/test.Greeter/Chat" => {
+                    let method = service.methods().find(|m| m.name() == "Chat").unwrap();
+                    let codec = tropel_x_grpc::DynamicCodec::new(method.output(), method.input());
+                    let mut grpc = tonic::server::Grpc::new(codec);
+                    grpc.streaming(BidiHandler { out_desc: method.output() }, req).await
                 }
                 _ => {
                     let mut resp = http::Response::new(Body::empty());
@@ -208,10 +294,8 @@ async fn unary_roundtrip() {
         .iter()
         .any(|s| s.metric == "grpc_req_duration"));
     assert!(outcome.samples.iter().any(|s| s.metric == "grpc_reqs"));
-    assert!(outcome
-        .samples
-        .iter()
-        .any(|s| s.metric == "grpc_req_failed" && s.value == 0.0));
+    // k6 parity: the built-in gRPC module has no `grpc_req_failed` metric.
+    assert!(!outcome.samples.iter().any(|s| s.metric == "grpc_req_failed"));
 }
 
 #[tokio::test]
@@ -240,6 +324,54 @@ async fn server_streaming_roundtrip() {
         .samples
         .iter()
         .any(|s| s.metric == "grpc_req_duration"));
+}
+
+#[tokio::test]
+async fn client_streaming_roundtrip() {
+    let pool = tropel_x_grpc::compile_proto(TEST_PROTO, None).unwrap();
+    let addr = spawn_server(pool).await;
+
+    let proto = tropel_x_grpc::GrpcProtocol;
+    let mut req = make_req(format!("grpc://{addr}/test.Greeter/CollectHellos"));
+    req.body = Some(ReqBody::Json(serde_json::json!([
+        {"name": "a"},
+        {"name": "b"},
+        {"name": "c"}
+    ])));
+    let outcome = proto
+        .execute(&req, Some(&serde_json::json!({"proto": TEST_PROTO})))
+        .await
+        .unwrap();
+
+    let resp = outcome.response.unwrap();
+    assert_eq!(resp.status_code, 200, "client-streaming should return HTTP 200");
+    let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+    assert_eq!(body["message"], "collected a,b,c");
+}
+
+#[tokio::test]
+async fn bidi_streaming_roundtrip() {
+    let pool = tropel_x_grpc::compile_proto(TEST_PROTO, None).unwrap();
+    let addr = spawn_server(pool).await;
+
+    let proto = tropel_x_grpc::GrpcProtocol;
+    let mut req = make_req(format!("grpc://{addr}/test.Greeter/Chat"));
+    req.body = Some(ReqBody::Json(serde_json::json!([
+        {"name": "x"},
+        {"name": "y"}
+    ])));
+    let outcome = proto
+        .execute(&req, Some(&serde_json::json!({"proto": TEST_PROTO})))
+        .await
+        .unwrap();
+
+    let resp = outcome.response.unwrap();
+    assert_eq!(resp.status_code, 200, "bidi should return HTTP 200");
+    let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+    let arr = body.as_array().expect("bidi body is a JSON array");
+    assert_eq!(arr.len(), 2, "bidi should echo exactly 2 messages");
+    assert_eq!(arr[0]["message"], "echo:x");
+    assert_eq!(arr[1]["message"], "echo:y");
 }
 
 #[tokio::test]
