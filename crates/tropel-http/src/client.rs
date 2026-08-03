@@ -537,6 +537,17 @@ impl HttpClient {
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
 
+        // Parse Set-Cookie headers into structured cookies so scripts can
+        // read `res.cookies` (pm.response.cookies / k6 res.cookies). The
+        // header may appear multiple times (one per cookie); a HashMap would
+        // collapse them, so we walk `get_all` on the raw header map.
+        let cookies: Vec<Cookie> = response
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| parse_set_cookie(v.to_str().ok()?))
+            .collect();
+
         // ═══════════════════════════════════════════════════════
         // Phase 2: Receive response body
         // ═══════════════════════════════════════════════════════
@@ -625,7 +636,7 @@ impl HttpClient {
             body: body_vec,
             response_time: total_duration,
             timings: Some(timings),
-            cookies: vec![],
+            cookies,
             size,
             request_body_size,
         };
@@ -696,6 +707,57 @@ impl HttpResponse {
         let mut body_bytes = self.body.clone();
         simd_json::serde::from_slice(&mut body_bytes).ok()
     }
+}
+
+/// Parse a single `Set-Cookie` header value into a structured [`Cookie`].
+///
+/// Handles the standard `name=value; Attr=Val; Flag` grammar — name/value are
+/// the bare pair, then optional `Domain`, `Path`, `Expires`, `SameSite`
+/// attributes plus the boolean `HttpOnly` / `Secure` flags. Unknown attributes
+/// are ignored. Returns `None` when the header has no `name=value` pair.
+fn parse_set_cookie(header: &str) -> Option<Cookie> {
+    let mut parts = header.split(';');
+    let pair = parts.next()?.trim();
+    let (name, value) = pair.split_once('=')?;
+
+    let mut cookie = Cookie {
+        name: name.trim().to_string(),
+        value: value.trim().to_string(),
+        domain: None,
+        path: None,
+        http_only: None,
+        secure: None,
+        same_site: None,
+        expires: None,
+    };
+
+    for attr in parts {
+        let attr = attr.trim();
+        if attr.is_empty() {
+            continue;
+        }
+        // Case-insensitive attribute NAMES (Set-Cookie attrs are
+        // case-insensitive per RFC 6265) — but the VALUE keeps its original
+        // case (e.g. SameSite=Lax must not become "lax"). Split the raw attr
+        // on '=' and lowercase only the key for matching.
+        match attr.split_once('=') {
+            Some((key, val)) => match key.trim().to_ascii_lowercase().as_str() {
+                "domain" => cookie.domain = Some(val.trim().trim_matches('"').to_string()),
+                "path" => cookie.path = Some(val.trim().trim_matches('"').to_string()),
+                "expires" => cookie.expires = Some(val.trim().trim_matches('"').to_string()),
+                "samesite" => {
+                    cookie.same_site = Some(val.trim().trim_matches('"').to_string())
+                }
+                _ => {}
+            },
+            None => match attr.to_ascii_lowercase().as_str() {
+                "httponly" => cookie.http_only = Some(true),
+                "secure" => cookie.secure = Some(true),
+                _ => {}
+            },
+        }
+    }
+    Some(cookie)
 }
 
 /// Parse a TLS version string ("1.2", "tls1.2", "1.3", ...) into a reqwest
@@ -899,6 +961,49 @@ mod serde_urlencoded {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn parse_set_cookie_extracts_name_value_and_attrs() {
+        let c = parse_set_cookie(
+            "session=abc123; Path=/; Domain=example.com; HttpOnly; Secure; SameSite=Lax; Expires=Wed, 21 Oct 2026 07:28:00 GMT; Unknown=x",
+        )
+        .unwrap();
+        assert_eq!(c.name, "session");
+        assert_eq!(c.value, "abc123");
+        assert_eq!(c.path.as_deref(), Some("/"));
+        assert_eq!(c.domain.as_deref(), Some("example.com"));
+        assert_eq!(c.http_only, Some(true));
+        assert_eq!(c.secure, Some(true));
+        assert_eq!(c.same_site.as_deref(), Some("Lax"));
+        assert!(c.expires.as_deref().unwrap().starts_with("Wed, 21 Oct"));
+    }
+
+    #[test]
+    fn parse_set_cookie_case_insensitive_attrs_and_quoted_values() {
+        let c = parse_set_cookie("id=7; PATH=\"/app\"; HTTPONLY; sAmEsItE=Strict")
+            .unwrap();
+        assert_eq!(c.name, "id");
+        assert_eq!(c.value, "7");
+        assert_eq!(c.path.as_deref(), Some("/app"));
+        assert_eq!(c.http_only, Some(true));
+        assert_eq!(c.same_site.as_deref(), Some("Strict"));
+    }
+
+    #[test]
+    fn parse_set_cookie_minimal_and_garbage() {
+        // Minimal `name=value` only.
+        let c = parse_set_cookie("token=x").unwrap();
+        assert_eq!(c.name, "token");
+        assert_eq!(c.value, "x");
+        assert!(c.path.is_none() && c.domain.is_none() && c.http_only.is_none());
+        // No `name=value` pair → None. (Note: a leading segment that LOOKS
+        // like an attribute, e.g. "Path=/; HttpOnly", is parsed as the
+        // cookie-pair name="Path" value="/" — RFC 6265 requires the first
+        // segment to be the cookie-pair, so this is only reachable on
+        // malformed headers; the None paths below are the truly invalid ones.)
+        assert!(parse_set_cookie("garbage-without-equals").is_none());
+        assert!(parse_set_cookie("").is_none());
+    }
 
     #[test]
     fn test_parse_duration() {
