@@ -67,7 +67,11 @@ impl Engine {
         let mut http_config = config.http.clone();
         let tls_config = config.tls.clone();
         let mut thresholds = config.thresholds.clone();
-        let data_rows = config.iteration_data.clone();
+        // One shared read-only copy of the iteration dataset; every VU clones
+        // the Arc (not the Vec of rows), so memory is O(dataset) not
+        // O(VUs × dataset). Rows are only cloned individually when an
+        // iteration actually consumes one.
+        let data_rows = std::sync::Arc::new(config.iteration_data.clone());
         let test_start = Instant::now();
 
         // Script-declared load profile (k6 `export const options`). Applied only
@@ -892,7 +896,8 @@ async fn run_scenario_vus(
     http_cfg: HttpConfig,
     tls_cfg: TlsConfig,
     thresholds: HashMap<String, tropel_core::config::ThresholdConfig>,
-    data_rows: Vec<HashMap<String, serde_json::Value>>,
+    data_rows: std::sync::Arc<Vec<HashMap<String, serde_json::Value>>>,
+
     test_start: Instant,
     grpc_protocol: Option<Arc<dyn Protocol>>,
     ws_protocol: Option<Arc<dyn Protocol>>,
@@ -1198,7 +1203,8 @@ async fn run_driver_vus(
     http_cfg: HttpConfig,
     tls_cfg: TlsConfig,
     thresholds: HashMap<String, tropel_core::config::ThresholdConfig>,
-    data_rows: Vec<HashMap<String, serde_json::Value>>,
+    data_rows: std::sync::Arc<Vec<HashMap<String, serde_json::Value>>>,
+
     test_start: Instant,
     input_path: &str,
     registry: Arc<ExtensionRegistry>,

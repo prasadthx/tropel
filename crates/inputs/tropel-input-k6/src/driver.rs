@@ -211,14 +211,18 @@ inventory::submit!(DriverRegistration::new("k6", || Box::new(K6Driver))
 // process (in the init context) and shares it read-only across all VUs. In
 // Tropel each VU owns its own JsContext (thread-per-core), so the "shared"
 // payload lives on the native side: the first VU context that constructs a
-// given SharedArray runs the factory, serializes the result to JSON, and
-// stores it in this process-global cache; every other VU context rebuilds the
-// same read-only view from the cached JSON without re-running the factory.
+// given SharedArray runs the factory, and its parsed elements are stored in
+// this process-global cache as ONE `Arc<Vec<Value>>`. Every other VU context
+// gets only a name + length from the accessor bridges and fetches elements
+// through `__tropel_k6_shared_array_get(name, i)` — no per-VU copy of the
+// array (the old design re-serialized the whole JSON into every context,
+// O(VUs × size)).
 //
 // Keyed by name only — matches k6 (the name is the identity).
-static SHARED_ARRAY_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static SHARED_ARRAY_CACHE: OnceLock<Mutex<HashMap<String, Arc<Vec<serde_json::Value>>>>> =
+    OnceLock::new();
 
-fn shared_array_cache() -> &'static Mutex<HashMap<String, String>> {
+fn shared_array_cache() -> &'static Mutex<HashMap<String, Arc<Vec<serde_json::Value>>>> {
     SHARED_ARRAY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -229,8 +233,13 @@ fn shared_array_cache() -> &'static Mutex<HashMap<String, String>> {
 ///   UTF-8 text, `"b"` mode returns base64-encoded bytes (the shim decodes
 ///   into an ArrayBuffer, matching k6's `open(path, 'b')`). A missing/unreadable
 ///   file throws a JS `Error` (k6 behavior).
-/// - `__tropel_k6_shared_array_get(name)` / `__tropel_k6_shared_array_set(name, json)`
-///   — process-global SharedArray cache.
+/// - `__tropel_k6_shared_array_len(name)` — element count, or `-1` if absent
+///   (the shim runs the factory only when absent).
+/// - `__tropel_k6_shared_array_get(name, i)` — JSON of ONE element, or `""`
+///   when absent/out-of-range (the shim parses just this element on demand,
+///   so no VU context ever materializes the whole array).
+/// - `__tropel_k6_shared_array_set(name, json)` — parse the computed array
+///   ONCE and share it as a process-global `Arc<Vec<Value>>`.
 ///
 /// The bridges must be installed on EVERY k6 context that may evaluate script
 /// code (the per-VU init context AND the throwaway options/handleSummary
@@ -285,25 +294,55 @@ fn register_k6_file_bridges(ctx: &JsContext, script_dir: Option<PathBuf>) {
             ),
         );
 
+        // `len` returns -1 when the name is absent (factory must run) or the
+        // element count when cached — the JS shim decides between the two.
+        let len_prefix = cache_prefix.clone();
+        let _ = globals.set(
+            "__tropel_k6_shared_array_len",
+            Func::from(move |name: String| -> i32 {
+                let key = format!("{}|{}", len_prefix, name);
+                shared_array_cache()
+                    .lock()
+                    .map(|c| c.get(&key).map(|v| v.len() as i32).unwrap_or(-1))
+                    .unwrap_or(-1)
+            }),
+        );
+
+        // Element accessor — returns the JSON encoding of ONE element, or ""
+        // when absent/out-of-range. The JS shim parses just this element on
+        // demand, so no context ever materializes the whole array.
         let get_prefix = cache_prefix.clone();
         let _ = globals.set(
             "__tropel_k6_shared_array_get",
-            Func::from(move |name: String| -> String {
+            Func::from(move |name: String, i: i32| -> String {
                 let key = format!("{}|{}", get_prefix, name);
                 shared_array_cache()
                     .lock()
-                    .map(|c| c.get(&key).cloned().unwrap_or_default())
+                    .map(|c| {
+                        c.get(&key)
+                            .and_then(|v| {
+                                if i >= 0 && (i as usize) < v.len() {
+                                    Some(v[i as usize].to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_default()
+                    })
                     .unwrap_or_default()
             }),
         );
 
+        // Parse the computed array ONCE (first VU) and share it as an Arc.
         let set_prefix = cache_prefix.clone();
         let _ = globals.set(
             "__tropel_k6_shared_array_set",
             Func::from(move |name: String, json: String| {
                 let key = format!("{}|{}", set_prefix, name);
-                if let Ok(mut c) = shared_array_cache().lock() {
-                    c.insert(key, json);
+                if let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(&json) {
+                    if let Ok(mut c) = shared_array_cache().lock() {
+                        c.insert(key, Arc::new(parsed));
+                    }
                 }
             }),
         );

@@ -2,21 +2,24 @@
 // k6 `open()` + `k6/data` SharedArray shim
 //
 // Native bridges (registered by K6DriverInstance):
-//   __tropel_k6_open(path, mode)            -> file contents
+//   __tropel_k6_open(path, mode)                  -> file contents
 //        mode "t" (default) -> UTF-8 string
 //        mode "b"           -> base64-encoded bytes
-//   __tropel_k6_shared_array_get(name)      -> cached JSON string, or "" if absent
-//   __tropel_k6_shared_array_set(name, json)-> store the computed array once
+//   __tropel_k6_shared_array_len(name)            -> element count, or -1 if absent
+//   __tropel_k6_shared_array_get(name, index)     -> JSON of ONE element, or "" if absent/OOB
+//   __tropel_k6_shared_array_set(name, json)      -> store the computed array once
 //
 // k6 semantics implemented here:
 //   - `open()` reads a file relative to the script directory (resolved by the
 //     native bridge) and returns its text; mode 'b' returns an ArrayBuffer.
 //   - `new SharedArray(name, fn)` runs the factory ONCE per process (the first
 //     VU context that constructs it serializes the result into the native
-//     cache); every other VU context rebuilds the same read-only view from the
-//     cached JSON without re-running the factory. The returned view is
-//     read-only and array-like (length, index access, .at(), forEach, map,
-//     iteration), matching k6/data.
+//     cache); every other VU context builds the same read-only view WITHOUT
+//     re-running the factory. The view holds only the name + length and
+//     fetches elements through the native accessor bridge — the full array
+//     exists ONCE natively, not once per VU (no O(VUs × size) copies). The
+//     returned view is read-only and array-like (length, index access, .at(),
+//     forEach, map, iteration), matching k6/data.
 // ══════════════════════════════════════════════════════════════════
 
 // ── open(path, mode) ──
@@ -51,16 +54,15 @@ function SharedArray(name, fn) {
         throw new Error('SharedArray: constructor must receive a factory function');
     }
 
-    var json = '';
-    if (typeof __tropel_k6_shared_array_get === 'function') {
-        json = __tropel_k6_shared_array_get(name) || '';
+    var len = -1;
+    if (typeof __tropel_k6_shared_array_len === 'function') {
+        len = __tropel_k6_shared_array_len(name);
     }
 
-    var data;
-    if (json !== '') {
-        data = JSON.parse(json);
-    } else {
-        data = fn();
+    if (len < 0) {
+        // Absent: first VU runs the factory, normalizes to a plain array and
+        // stores it natively (parsed once, shared as an Arc).
+        var data = fn();
         if (data === null || data === undefined || typeof data.length !== 'number') {
             throw new Error('SharedArray: factory function must return an array-like object');
         }
@@ -73,29 +75,40 @@ function SharedArray(name, fn) {
         if (typeof __tropel_k6_shared_array_set === 'function') {
             __tropel_k6_shared_array_set(name, JSON.stringify(data));
         }
+        len = data.length;
     }
 
-    return new SharedArrayView(data);
+    return new SharedArrayView(name, 0, len);
 }
 
-// Read-only, array-like view over the shared payload.
-// k6 forbids writes to SharedArray data (it is shared across VUs), so every
-// mutator throws.
-function SharedArrayView(data) {
-    this._data = data;
-    this.length = data.length;
+// Read-only, array-like view over the shared payload. Holds only the name,
+// an offset (for slices) and the length — elements are fetched from the
+// native bridge on demand, so each VU does NOT hold a full copy.
+function SharedArrayView(name, offset, length) {
+    this._name = name;
+    this._offset = offset;
+    this.length = length;
 }
+
+// Fetch one element (JSON-encoded) through the native accessor and decode it.
+SharedArrayView.prototype._get = function (index) {
+    var i = Number(index);
+    if (i < 0 || i >= this.length) return undefined;
+    if (typeof __tropel_k6_shared_array_get !== 'function') return undefined;
+    var json = __tropel_k6_shared_array_get(this._name, this._offset + i);
+    if (json === '') return undefined;
+    return JSON.parse(json);
+};
 
 SharedArrayView.prototype.at = function (index) {
     var i = Number(index);
     if (i < 0) i += this.length;
-    if (i < 0 || i >= this.length) return undefined;
-    return this._data[i];
+    return this._get(i);
 };
 
 SharedArrayView.prototype.forEach = function (cb, thisArg) {
     for (var i = 0; i < this.length; i++) {
-        cb.call(thisArg, this._data[i], i, this);
+        cb.call(thisArg, this._get(i), i, this);
     }
 };
 
@@ -105,48 +118,54 @@ SharedArrayView.prototype.map = function (cb, thisArg) {
     // the Proxy, so `sa.map(...)[0]` would be undefined.
     var out = [];
     for (var i = 0; i < this.length; i++) {
-        out.push(cb.call(thisArg, this._data[i], i, this));
+        out.push(cb.call(thisArg, this._get(i), i, this));
     }
     return out;
 };
 
 SharedArrayView.prototype.find = function (cb, thisArg) {
     for (var i = 0; i < this.length; i++) {
-        if (cb.call(thisArg, this._data[i], i, this)) return this._data[i];
+        if (cb.call(thisArg, this._get(i), i, this)) return this._get(i);
     }
     return undefined;
 };
 
 SharedArrayView.prototype.findIndex = function (cb, thisArg) {
     for (var i = 0; i < this.length; i++) {
-        if (cb.call(thisArg, this._data[i], i, this)) return i;
+        if (cb.call(thisArg, this._get(i), i, this)) return i;
     }
     return -1;
 };
 
 SharedArrayView.prototype.includes = function (needle) {
     for (var i = 0; i < this.length; i++) {
-        if (this._data[i] === needle) return true;
+        if (this._get(i) === needle) return true;
     }
     return false;
 };
 
 SharedArrayView.prototype.indexOf = function (needle) {
     for (var i = 0; i < this.length; i++) {
-        if (this._data[i] === needle) return i;
+        if (this._get(i) === needle) return i;
     }
     return -1;
 };
 
 SharedArrayView.prototype.join = function (sep) {
-    return this._data.join(sep === undefined ? ',' : sep);
+    var parts = [];
+    for (var i = 0; i < this.length; i++) {
+        parts.push(this._get(i));
+    }
+    return parts.join(sep === undefined ? ',' : sep);
 };
 
 SharedArrayView.prototype.slice = function (start, end) {
-    var out = this._data.slice(start, end);
-    var view = new SharedArrayView([]);
-    view._data = out;
-    view.length = out.length;
+    var s = start === undefined ? 0 : Number(start);
+    if (s < 0) s = Math.max(this.length + s, 0);
+    var e = end === undefined ? this.length : Number(end);
+    if (e < 0) e = Math.max(this.length + e, 0);
+    var n = Math.max(Math.min(e, this.length) - s, 0);
+    var view = new SharedArrayView(this._name, this._offset + s, n);
     return view;
 };
 
@@ -176,7 +195,7 @@ SharedArrayView.prototype.values = function () {
     var self = this;
     return makeSharedIterator(function () {
         if (i < self.length) {
-            return { value: self._data[i++], done: false };
+            return { value: self._get(i++), done: false };
         }
         return { value: undefined, done: true };
     });
@@ -232,27 +251,28 @@ function base64ToBytes(b64) {
 }
 
 // Register a read-only index proxy so `shared[i]` works and writes throw.
-// The base `SharedArray` (defined above, keyed on the native cache) is
-// wrapped so every constructed view: numeric index access reads `_data`,
-// property reads delegate to the view (methods are bound so `this` stays the
-// view), `_data` is hidden (never expose the raw array — writes would bypass
-// the read-only trap), and writes/deletes throw (k6: data is read-only).
+// Every constructed view: numeric index access reads through `_get` (the
+// native accessor), property reads delegate to the view (methods are bound so
+// `this` stays the view), internal fields (`_name`, `_offset`, `_data`) are
+// hidden, and writes/deletes throw (k6: data is read-only).
 (function installSharedArrayProxy() {
     if (typeof Proxy !== 'function') return;
     var orig = SharedArray;
-    SharedArray = function (name, fn) {
-        var view = orig(name, fn);
+    // Wrap a raw view in the read-only index proxy. Exposed as a function so
+    // `slice()` (which must return a view too) produces the same guarantees
+    // instead of leaking a raw, mutable, index-less view.
+    function wrap(view) {
         return new Proxy(view, {
             get: function (target, prop) {
-                if (prop === '_data') return undefined;
+                if (prop === '_name' || prop === '_offset' || prop === '_data') return undefined;
                 if (typeof prop === 'string' && /^\d+$/.test(prop)) {
-                    return target._data[Number(prop)];
+                    return target._get(Number(prop));
                 }
                 var v = target[prop];
                 return typeof v === 'function' ? v.bind(target) : v;
             },
             has: function (target, prop) {
-                if (prop === '_data') return false;
+                if (prop === '_name' || prop === '_offset' || prop === '_data') return false;
                 if (typeof prop === 'string' && /^\d+$/.test(prop)) {
                     var n = Number(prop);
                     return n >= 0 && n < target.length;
@@ -266,6 +286,15 @@ function base64ToBytes(b64) {
                 throw new Error('SharedArray: data is read-only');
             }
         });
+    }
+    SharedArray = function (name, fn) {
+        return wrap(orig(name, fn));
+    };
+    // slice() returns a view over an offset subrange; wrap it too so numeric
+    // indexing works and writes still throw.
+    var origSlice = SharedArrayView.prototype.slice;
+    SharedArrayView.prototype.slice = function (start, end) {
+        return wrap(origSlice.call(this, start, end));
     };
     SharedArray.prototype = SharedArrayView.prototype;
 })();
