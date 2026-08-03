@@ -262,6 +262,21 @@ mod tests {
         );
         assert!(t1.waiting + t1.receiving > std::time::Duration::ZERO);
         assert!(t1.total >= t1.waiting + t1.receiving);
+        // k6 breakdown invariant: the phases sum to (at most) the total. The
+        // waiting/TTFB phase excludes the connect phases (blocked + dns +
+        // connecting are subtracted from the raw elapsed), so a fresh
+        // connection's breakdown closes the gap to total.
+        let sum1 = t1.blocked + t1.dns + t1.connecting + t1.waiting + t1.receiving;
+        assert!(
+            sum1 <= t1.total,
+            "phase sum must not exceed total: {sum1:?} vs {:?}",
+            t1.total
+        );
+        assert!(
+            t1.total - sum1 < std::time::Duration::from_millis(50),
+            "fresh-connection phases should sum close to total: {sum1:?} vs {:?}",
+            t1.total
+        );
 
         // Second request: pooled keep-alive reuse → no connector call, so the
         // connect phases are exactly zero (matching k6 for reused connections).
@@ -269,6 +284,8 @@ mod tests {
         let t2 = resp2.timings.as_ref().unwrap();
         assert_eq!(t2.blocked + t2.dns + t2.connecting, std::time::Duration::ZERO);
         assert!(t2.waiting + t2.receiving > std::time::Duration::ZERO);
+        let sum2 = t2.blocked + t2.dns + t2.connecting + t2.waiting + t2.receiving;
+        assert!(sum2 <= t2.total, "phase sum must not exceed total");
 
         // Dropping the client closes the pooled socket → server read-loop gets
         // EOF and the task can be awaited without hanging.

@@ -338,10 +338,10 @@ impl HttpClient {
     /// - **dns**: real DNS resolution time
     /// - **connecting**: connector call minus DNS (pure TCP for http; for
     ///   https reqwest folds the TLS handshake into the connector call, so it
-    ///   is included here)
-/// - **waiting** (TTFB): from just before the request is sent to response
-///   headers received. For fresh connections this includes the connect phases
-///   (blocked + dns + connecting); k6's `http_req_waiting` excludes them
+    ///   is included here)    /// - **waiting** (TTFB): from the request being sent to response headers
+    ///   received, EXCLUDING the connection phases (blocked + dns + connecting)
+    ///   — subtracted from the raw elapsed so the breakdown sums to `total`,
+    ///   matching k6's `http_req_waiting` semantics.
     /// - **receiving**: from response headers to full body bytes received
     /// - **total**: entire `execute()` duration
     ///
@@ -617,6 +617,18 @@ impl HttpClient {
             // separately-measured DNS to leave the transport phases.
             timings.connecting = connect_elapsed.saturating_sub(timings.dns);
         }
+
+        // k6 phase semantics: `http_req_waiting` (TTFB) is measured from the
+        // moment the request is fully sent, EXCLUDING the connection phases.
+        // Our `waiting_duration` is stamped just before `client.execute()`,
+        // so for a fresh connection it *includes* blocked + DNS + connecting.
+        // Subtract them so the breakdown sums to `total`:
+        //   total = blocked + dns + connecting + waiting + receiving
+        // (tls_handshaking/sending stay zero — reqwest seals those inside the
+        // connector/request future; see the module docs.) For pooled reuse the
+        // connect phases are zero, so `waiting` is unchanged.
+        let connect_phases = timings.blocked + timings.dns + timings.connecting;
+        timings.waiting = timings.waiting.saturating_sub(connect_phases);
 
         if self.http_debug {
             tracing::info!(
