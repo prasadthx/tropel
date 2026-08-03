@@ -64,8 +64,9 @@ impl Method {
 ///   access (`body_text()` / `body_json()`).
 /// - `Binary`: body kept as raw bytes, surfaced as-is to scripts that want
 ///   binary payloads (base64 etc.).
-/// - `None`: body is discarded entirely — `execute()` skips reading it
-///   (saves bandwidth/memory, pairs with the global `discardResponseBodies`).
+/// - `None`: body is discarded entirely — `execute()` drains it off the wire
+///   (so the pooled connection stays reusable) but stores no bytes. Pairs
+///   with the global `discardResponseBodies`; scripts see an empty body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ResponseType {

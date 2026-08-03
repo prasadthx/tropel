@@ -540,23 +540,47 @@ impl HttpClient {
         // ═══════════════════════════════════════════════════════
         // Phase 2: Receive response body
         // ═══════════════════════════════════════════════════════
-        // The body is skipped when the GLOBAL discard_response_bodies flag is
-        // set OR the per-request k6 `responseType: "none"` is requested — both
-        // save bandwidth/memory; scripts just see an empty body.
+        // The body is drained-but-not-stored when the GLOBAL
+        // discard_response_bodies flag is set OR the per-request k6
+        // `responseType: "none"` is requested — scripts see an empty body,
+        // but the bytes are still read so the pooled connection survives.
         let receiving_start = std::time::Instant::now();
         let discard = self.discard_bodies
             || request.response_type == tropel_core::types::ResponseType::None;
-        let body_vec = if discard {
-            Vec::new()
+        // When the body is discarded (global `discardResponseBodies` or the
+        // per-request k6 `responseType: "none"`), we must STILL read the body
+        // off the wire so reqwest can return the connection to the pool.
+        // Dropping the `Response` unread closes the socket — every request
+        // then opens a fresh TCP connection, the exact opposite of the
+        // pooling these flags are meant to preserve. We drain the body and
+        // throw the bytes away; the drained byte count still feeds
+        // `size`/`data_received` so accounting matches the wire.
+        //
+        // Behavior notes (intended): with discard, `http_req_receiving` and
+        // `data_received` now reflect the real drain time / wire bytes instead
+        // of ~0 — k6 still downloads the body and only skips storing it. And
+        // a server that streams forever now fails at the request timeout
+        // (chunk error) instead of silently succeeding with an empty body,
+        // which is more correct.
+        let (body_vec, size) = if discard {
+            let mut drained: u64 = 0;
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|e| TropelError::Http(format!("Failed to drain response body: {}", e)))?
+            {
+                drained += chunk.len() as u64;
+            }
+            (Vec::new(), drained)
         } else {
-            response
+            let body = response
                 .bytes()
                 .await
                 .map_err(|e| TropelError::Http(format!("Failed to read response body: {}", e)))?
-                .to_vec()
+                .to_vec();
+            (body.clone(), body.len() as u64)
         };
         let receiving_duration = receiving_start.elapsed();
-        let size = body_vec.len() as u64;
 
         let total_duration = total_start.elapsed();
 
@@ -1040,6 +1064,79 @@ mod tests {
         assert_eq!(resp.status_code, 302, "redirect must NOT be followed");
 
         server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn discarded_body_still_reuses_pooled_connection() {
+        // Regression for TROPEL_TODO_V2: when discardResponseBodies (or
+        // responseType: "none") was set, execute() left the body unread and
+        // dropped the Response — reqwest then closed the socket, so every
+        // request opened a fresh TCP connection (the opposite of pooling).
+        // With the drain fix, N sequential requests must ride ONE connection.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let connections_srv = connections.clone();
+
+        // Keep-alive server that counts every accepted TCP connection and
+        // serves a read-loop (like the subtimings test) so pooled requests
+        // can reuse the same socket.
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                connections_srv.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = sock.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        sock.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+                        )
+                        .await
+                        .unwrap();
+                    }
+                });
+            }
+        });
+
+        let cfg = HttpConfig::default();
+        let client = HttpClient::new(&cfg).unwrap();
+        let req = Request {
+            url: format!("http://{}/", addr),
+            method: Method::GET,
+            response_type: tropel_core::types::ResponseType::None,
+            ..Default::default()
+        };
+
+        // Three requests with discarded bodies. Each must return 200 with an
+        // EMPTY body (the drain discards the bytes) — and because the body is
+        // fully drained, reqwest returns the connection to the pool.
+        for i in 0..3 {
+            let resp = client.execute(&req, None).await.unwrap();
+            assert_eq!(resp.status_code, 200, "request {} failed", i);
+            assert!(resp.body.is_empty(), "discarded body must be empty");
+            // The body is drained, not skipped: size/data_received still count
+            // the wire bytes (Content-Length is 2 here) even though the body
+            // is empty.
+            assert_eq!(resp.size, 2, "drained bytes must still feed size");
+        }
+
+        // Give the server a moment to register any extra connects, then
+        // assert the pool was reused: exactly ONE TCP connection for 3
+        // requests. (Before the fix this was 3 — one reconnect per request.)
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        server.abort();
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            1,
+            "discarded bodies must not tear down the pooled connection"
+        );
     }
 }
 
