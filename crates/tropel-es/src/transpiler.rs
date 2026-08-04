@@ -12,10 +12,20 @@
 //!    `export` are legal).
 //! 2. **Transform** with `oxc_transformer`'s TypeScript pass — removes
 //!    interfaces, type aliases, param/return/variable annotations, generics,
-//!    `as` casts, `import type`, and lowers `enum` to runtime JS. Exports are
-//!    preserved.
+//!    `as` casts, `import type`, and lowers `enum` to runtime JS. Legacy
+//!    (`experimentalDecorators`) decorators are ALSO lowered — see
+//!    [`decorator_options`]. Exports are preserved.
 //! 3. **Codegen** with `oxc_codegen` to plain JavaScript.
-//! 4. Optionally strip `export` keywords (script-mode eval).
+//! 4. If the transform emitted `babelHelpers.*` calls (decorator lowering),
+//!    prepend a minimal [`BABEL_HELPERS_SHIM`] so the output runs standalone
+//!    in QuickJS.
+//! 5. Optionally strip `export` keywords (script-mode eval).
+//!
+//! Diagnostics are classified by severity: **recoverable** ones (oxc's
+//! parser recovers and still produces a valid AST) are logged as warnings
+//! and the pipeline continues; only **Error**-severity diagnostics or a
+//! parser panic abort. This keeps the gate honest — a stray TS warning no
+//! longer kills a script that oxc handles fine.
 //!
 //! Two public entry points mirror the old API:
 //! - [`typescript_to_javascript`] — exports stripped (script-mode eval).
@@ -24,10 +34,13 @@
 
 use oxc_allocator::Allocator;
 use oxc_codegen::Codegen;
+use oxc_diagnostics::Severity;
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
-use oxc_transformer::{TransformOptions, Transformer};
+use oxc_transformer::{
+    DecoratorOptions, HelperLoaderMode, HelperLoaderOptions, TransformOptions, Transformer,
+};
 use regex::Regex;
 
 /// Transpile TypeScript source code to plain JavaScript.
@@ -52,7 +65,8 @@ pub fn typescript_to_javascript_keep_exports(
     transpile_typescript(source, filename)
 }
 
-/// The shared oxc pipeline: parse → transform (strip TS) → codegen.
+/// The shared oxc pipeline: parse → transform (strip TS + lower decorators)
+/// → codegen → prepend the decorator helper shim when needed.
 fn transpile_typescript(source: &str, filename: &str) -> anyhow::Result<String> {
     let allocator = Allocator::default();
 
@@ -65,11 +79,24 @@ fn transpile_typescript(source: &str, filename: &str) -> anyhow::Result<String> 
     };
 
     let parser_return = Parser::new(&allocator, source, source_type).parse();
-    if parser_return.panicked || !parser_return.errors.is_empty() {
+    if parser_return.panicked {
         return Err(anyhow::anyhow!(
-            "TypeScript parse error: {}",
+            "TypeScript parse failed: {}",
             format_diagnostics(&parser_return.errors)
         ));
+    }
+    // Recoverable diagnostics: oxc recovers and still yields a valid AST.
+    // The old gate aborted on ANY diagnostic (even a warning), which killed
+    // scripts oxc handles fine — warn and continue instead, aborting only on
+    // genuine Error-severity diagnostics.
+    if let Some(err) = parser_return.errors.iter().find(|d| d.severity == Severity::Error) {
+        return Err(anyhow::anyhow!(
+            "TypeScript parse error: {}",
+            format_diagnostics(&[err.clone()])
+        ));
+    }
+    for d in &parser_return.errors {
+        tracing::warn!("TypeScript parse diagnostic (recoverable): {d}");
     }
 
     let mut program = parser_return.program;
@@ -82,19 +109,73 @@ fn transpile_typescript(source: &str, filename: &str) -> anyhow::Result<String> 
         .semantic;
     let scoping = semantic.into_scoping();
 
-    let options = TransformOptions::default();
+    let options = decorator_options();
     let transformer = Transformer::new(&allocator, std::path::Path::new(filename), &options);
     let transform_return = transformer.build_with_scoping(scoping, &mut program);
-    if !transform_return.errors.is_empty() {
+    if let Some(err) = transform_return.errors.iter().find(|d| d.severity == Severity::Error) {
         return Err(anyhow::anyhow!(
             "TypeScript transform error: {}",
-            format_diagnostics(&transform_return.errors)
+            format_diagnostics(&[err.clone()])
         ));
+    }
+    for d in &transform_return.errors {
+        tracing::warn!("TypeScript transform diagnostic (recoverable): {d}");
     }
 
     let codegen_return = Codegen::new().build(&program);
-    Ok(codegen_return.code)
+    let code = codegen_return.code;
+
+    // Decorator lowering emits `babelHelpers.decorate(...)` /
+    // `babelHelpers.decorateParam(...)` (External helper mode). QuickJS has no
+    // such global, so prepend the minimal shim whenever the output references
+    // it. Non-decorated output is untouched.
+    let code = if code.contains("babelHelpers.") {
+        format!("{BABEL_HELPERS_SHIM}\n{code}")
+    } else {
+        code
+    };
+
+    Ok(code)
 }
+
+/// Transform options: strip TypeScript AND lower legacy (`experimentalDecorators`)
+/// decorators so QuickJS can eval the output. External helper mode makes oxc
+/// emit `babelHelpers.decorate(...)` calls (no `@oxc-project/runtime` import,
+/// which QuickJS can't resolve); the shim provides those helpers.
+fn decorator_options() -> TransformOptions {
+    TransformOptions {
+        decorator: DecoratorOptions {
+            legacy: true,
+            emit_decorator_metadata: false,
+        },
+        helper_loader: HelperLoaderOptions {
+            mode: HelperLoaderMode::External,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// Minimal `babelHelpers` shim for oxc's legacy-decorator lowering.
+///
+/// oxc emits the canonical TypeScript `__decorate`/`__param` pattern under
+/// the `babelHelpers` namespace: class decorators call
+/// `babelHelpers.decorate([...], Ctor)`, method/param decorators call
+/// `babelHelpers.decorate([...], proto, "name", null)` with
+/// `babelHelpers.decorateParam(i, fn)` embedded in the array. The
+/// implementations below are the standard Babel/TS legacy helpers (behavior
+/// verified against oxc 0.128 output).
+const BABEL_HELPERS_SHIM: &str = r#"var babelHelpers = babelHelpers || {};
+babelHelpers.decorate = function (decorators, target, key, desc) {
+  var c = arguments.length, r = c < 3 ? target : desc === null ? desc = Object.getOwnPropertyDescriptor(target, key) : desc, d;
+  if (typeof Reflect === "object" && typeof Reflect.decorate === "function") r = Reflect.decorate(decorators, target, key, desc);
+  else for (var i = decorators.length - 1; i >= 0; i--) if (d = decorators[i]) r = (c < 3 ? d(r) : c > 3 ? d(target, key, r) : d(target, key)) || r;
+  return c > 3 && r && Object.defineProperty(target, key, r), r;
+};
+babelHelpers.decorateParam = function (paramIndex, decorator) {
+  return function (target, key) { decorator(target, key, paramIndex); };
+};
+"#;
 
 /// Render oxc diagnostics to a single-line message (no ANSI).
 fn format_diagnostics(diagnostics: &[oxc_diagnostics::OxcDiagnostic]) -> String {
@@ -534,6 +615,68 @@ mod tests {
         let js = typescript_to_javascript_keep_exports(ts, "script.ts").unwrap();
         assert!(js.contains("export const options"), "got: {js}");
         assert!(js.contains("export default function"), "got: {js}");
+    }
+
+    // --- Decorator lowering (the point this file previously missed) ---
+
+    #[test]
+    fn test_legacy_class_decorator_lowered() {
+        // Legacy decorators used to pass through `@sealed` verbatim, which
+        // QuickJS can't eval. Now they lower to babelHelpers.decorate and the
+        // shim is prepended.
+        let ts = r#"
+            function sealed(constructor: Function) { Object.freeze(constructor); }
+            @sealed
+            class Greeter {
+                greeting: string;
+                constructor(message: string) { this.greeting = message; }
+                greet() { return "Hello, " + this.greeting; }
+            }
+            export default function() { return new Greeter("world").greet(); }
+        "#;
+        let js = strip_types(ts);
+        // No raw decorator syntax left — QuickJS would choke on it.
+        assert!(!js.contains("@sealed"), "raw decorator survived: {js}");
+        // Lowered to the helper call with the shim present.
+        assert!(
+            js.contains("babelHelpers.decorate([sealed], Greeter)"),
+            "decorator not lowered: {js}"
+        );
+        assert!(js.contains("var babelHelpers"), "shim not prepended: {js}");
+        // The shim must come BEFORE the use.
+        assert!(
+            js.find("var babelHelpers").unwrap() < js.find("babelHelpers.decorate").unwrap(),
+            "shim must precede use"
+        );
+    }
+
+    #[test]
+    fn test_legacy_method_and_param_decorators_lowered() {
+        let ts = r#"
+            function logMethod(target: any, key: string, desc: PropertyDescriptor) { return desc; }
+            function logParam(target: any, key: string, index: number) {}
+            class Greeter {
+                greeting: string;
+                constructor(message: string) { this.greeting = message; }
+                @logMethod
+                greet(@logParam name: string) { return "Hello, " + name; }
+            }
+            export default function() { return new Greeter("world").greet(); }
+        "#;
+        let js = strip_types(ts);
+        assert!(!js.contains("@logMethod") && !js.contains("@logParam"), "raw decorators: {js}");
+        assert!(js.contains("babelHelpers.decorateParam"), "param decorator not lowered: {js}");
+        assert!(js.contains("var babelHelpers"), "shim not prepended: {js}");
+    }
+
+    #[test]
+    fn test_no_decorators_means_no_shim() {
+        // A plain script must not grow the babelHelpers shim.
+        let ts = r#"
+            export default function() { return 42; }
+        "#;
+        let js = strip_types(ts);
+        assert!(!js.contains("babelHelpers"), "unexpected shim in plain output: {js}");
     }
 
     /// Test helper: strip types + exports (script mode).
