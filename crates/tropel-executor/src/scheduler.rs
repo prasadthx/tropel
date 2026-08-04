@@ -760,6 +760,60 @@ impl VUScheduler {
         tracing::info!("Shared iterations finished");
     }
 
+    /// Grow the arrival-rate VU pool toward `max_vus` based on queued-token
+    /// PRESSURE, not the token-add cadence.
+    ///
+    /// The original code only grew while a token was being ADDED (inside the
+    /// `actual_add > 0` block) and by at most `to_add` (usually 1 per tick) —
+    /// under slow latency the backlog built up faster than the pool, and once
+    /// the bucket was FULL (`capacity == 0` → `actual_add == 0`) the pool
+    /// could never grow again even though iterations were dropping. Now:
+    /// whenever tokens are queued and no VU is idle to consume them, grow by
+    /// the queued backlog (clamped to max_vus and a per-tick burst cap — each
+    /// spawn creates a VU with its own JS context + client, so spawning the
+    /// whole backlog at once would be a thundering herd; converging over a
+    /// couple of 1ms ticks is just as fast). Re-checked every 1ms tick.
+    ///
+    /// Returns the number of VUs spawned.
+    fn grow_arrival_pool<F>(
+        &self,
+        run_vu: &F,
+        handles: &mut Vec<tokio::task::JoinHandle<()>>,
+        current_vus: &mut u32,
+        max_vus: u32,
+        log_label: &str,
+        elapsed_secs: f64,
+    ) -> u32
+    where
+        F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
+    {
+        let queued = self.arrival_tokens.load(Ordering::Relaxed);
+        let idle = self.idle_vus.load(Ordering::Relaxed);
+        if queued == 0 || idle != 0 || *current_vus >= max_vus {
+            return 0;
+        }
+        let grow_cap = (max_vus - *current_vus) as u64;
+        const MAX_SPAWN_PER_TICK: u64 = 32;
+        let grow_by = queued.min(grow_cap).min(MAX_SPAWN_PER_TICK) as u32;
+        if grow_by == 0 {
+            return 0;
+        }
+        for vu_id in *current_vus..*current_vus + grow_by {
+            let handle = run_vu(self.shared_clone(), vu_id);
+            handles.push(handle);
+        }
+        tracing::debug!(
+            "{}: VU pool {} → {} (queued={}, t={:.1}s)",
+            log_label,
+            *current_vus,
+            *current_vus + grow_by,
+            queued,
+            elapsed_secs
+        );
+        *current_vus += grow_by;
+        grow_by
+    }
+
     /// Run with constant arrival rate.
     ///
     /// Uses a time-based token bucket (no 1ms timer floor — resilient at high rates)
@@ -815,27 +869,6 @@ impl VUScheduler {
                     self.arrival_tokens.fetch_add(actual_add, Ordering::Relaxed);
                     // Wake ALL waiters — multiple VUs may be waiting
                     self.arrival_notify.notify_waiters();
-
-                    // Grow the VU pool if the current pool is saturated
-                    // (no idle VUs) and we haven't reached max_vus yet.
-                    let idle = self.idle_vus.load(Ordering::Relaxed);
-                    if idle == 0 && current_vus < max_vus {
-                        let grow_cap = (max_vus - current_vus) as u64;
-                        let grow_by = to_add.min(grow_cap) as u32;
-                        if grow_by > 0 {
-                            for vu_id in current_vus..current_vus + grow_by {
-                                let handle = run_vu(self.shared_clone(), vu_id);
-                                handles.push(handle);
-                            }
-                            tracing::debug!(
-                                "Arrival-rate: VU pool {} → {} (rate={}/s)",
-                                current_vus,
-                                current_vus + grow_by,
-                                rate
-                            );
-                            current_vus += grow_by;
-                        }
-                    }
                 }
 
                 // Dropped iterations: tokens we couldn't add because the bucket
@@ -846,6 +879,18 @@ impl VUScheduler {
                     dropped.fetch_add(overflow, Ordering::Relaxed);
                 }
             }
+
+            // Grow the VU pool based on queued-token PRESSURE (see
+            // grow_arrival_pool) — decoupled from the token-add cadence so a
+            // saturated bucket can never stall growth.
+            self.grow_arrival_pool(
+                run_vu,
+                &mut handles,
+                &mut current_vus,
+                max_vus,
+                "Arrival-rate",
+                elapsed_secs,
+            );
 
             last_target = target_tokens;
 
@@ -985,26 +1030,6 @@ impl VUScheduler {
                 if actual_add > 0 {
                     self.arrival_tokens.fetch_add(actual_add, Ordering::Relaxed);
                     self.arrival_notify.notify_waiters();
-
-                    // Grow VU pool if saturated
-                    let idle = self.idle_vus.load(Ordering::Relaxed);
-                    if idle == 0 && current_vus < max_vus {
-                        let grow_cap = (max_vus - current_vus) as u64;
-                        let grow_by = to_add.min(grow_cap) as u32;
-                        if grow_by > 0 {
-                            for vu_id in current_vus..current_vus + grow_by {
-                                let handle = run_vu(self.shared_clone(), vu_id);
-                                handles.push(handle);
-                            }
-                            tracing::debug!(
-                                "Ramping arrival-rate: VU pool {} → {} at t={:.1}s",
-                                current_vus,
-                                current_vus + grow_by,
-                                elapsed_secs
-                            );
-                            current_vus += grow_by;
-                        }
-                    }
                 }
 
                 let overflow = to_add.saturating_sub(capacity);
@@ -1012,6 +1037,17 @@ impl VUScheduler {
                     dropped.fetch_add(overflow, Ordering::Relaxed);
                 }
             }
+
+            // Same queued-token-pressure growth as run_arrival_rate (see
+            // grow_arrival_pool).
+            self.grow_arrival_pool(
+                run_vu,
+                &mut handles,
+                &mut current_vus,
+                max_vus,
+                "Ramping arrival-rate",
+                elapsed_secs,
+            );
 
             last_target = target;
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1513,6 +1549,112 @@ mod tests {
         sched2.set_ramp_down_target(0, 1);
         assert!(sched2.try_claim_ramp_down(1).await);
         assert_eq!(sched2.control_spawned.load(Ordering::Acquire), 0);
+    }
+
+    /// Fake VU body for the arrival-rate pool tests: marks itself idle, waits
+    /// for an arrival token (or stop), then simulates `latency` of work per
+    /// iteration — mirroring the real run_vu_loop arrival branch.
+    fn arrival_test_vu(sched: Arc<VUScheduler>, latency: Duration) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let arrival_notify = sched.arrival_notify();
+            let stop = sched.stop_signal();
+            loop {
+                if sched.is_stop_requested() || sched.is_force_stop_requested() {
+                    break;
+                }
+                sched.mark_idle();
+                let mut got_token = false;
+                loop {
+                    if sched.is_stop_requested() || sched.is_force_stop_requested() {
+                        break;
+                    }
+                    if sched.try_acquire_arrival_token() {
+                        got_token = true;
+                        break;
+                    }
+                    tokio::select! {
+                        _ = arrival_notify.notified() => {}
+                        _ = stop.notified() => {}
+                    }
+                }
+                sched.mark_busy();
+                if !got_token {
+                    break;
+                }
+                // Simulated per-iteration latency.
+                tokio::time::sleep(latency).await;
+            }
+        })
+    }
+
+    /// Locked: 20/s with 10 pre-allocated VUs at 300ms latency must NEVER
+    /// drop iterations — 10 VUs can sustain ~33/s, so the pool easily keeps
+    /// up. Guards against regressions in the token bucket / growth path.
+    #[tokio::test]
+    async fn arrival_rate_never_drops_with_10_vus_at_300ms() {
+        let sched = VUScheduler::new(&ExecutionConfig::ConstantArrivalRate {
+            rate: 20.0,
+            time_unit: "1s".to_string(),
+            duration: "5s".to_string(),
+            pre_alloc_vus: 10,
+            max_vus: 50,
+            graceful_stop: Some("2s".to_string()),
+            think_time: Default::default(),
+        });
+        let run_vu = |sched: Arc<VUScheduler>, _vu_id: u32| {
+            arrival_test_vu(sched, Duration::from_millis(300))
+        };
+        sched
+            .run_arrival_rate(
+                20.0,
+                10,
+                50,
+                Duration::from_secs(5),
+                Duration::from_secs(2),
+                &run_vu,
+            )
+            .await;
+        let dropped = sched.take_dropped_iterations();
+        assert_eq!(
+            dropped, 0,
+            "20/s with 10 pre-allocated VUs at 300ms latency must never drop"
+        );
+    }
+
+    /// Locked: 100/s with only 10 pre-allocated VUs at 300ms latency — the
+    /// pool MUST grow toward max_vus (~30 VUs needed) or the bucket saturates
+    /// and iterations drop. The old growth code (gated on token-add, by at
+    /// most `to_add`) stopped growing entirely once the bucket was full;
+    /// queued-token-pressure growth must keep up.
+    #[tokio::test]
+    async fn arrival_rate_grows_pool_to_keep_up_with_latency() {
+        let sched = VUScheduler::new(&ExecutionConfig::ConstantArrivalRate {
+            rate: 100.0,
+            time_unit: "1s".to_string(),
+            duration: "5s".to_string(),
+            pre_alloc_vus: 10,
+            max_vus: 50,
+            graceful_stop: Some("2s".to_string()),
+            think_time: Default::default(),
+        });
+        let run_vu = |sched: Arc<VUScheduler>, _vu_id: u32| {
+            arrival_test_vu(sched, Duration::from_millis(300))
+        };
+        sched
+            .run_arrival_rate(
+                100.0,
+                10,
+                50,
+                Duration::from_secs(5),
+                Duration::from_secs(2),
+                &run_vu,
+            )
+            .await;
+        let dropped = sched.take_dropped_iterations();
+        assert_eq!(
+            dropped, 0,
+            "pool must grow (10 pre-alloc VUs × 300ms ≈ 33/s cap) so 100/s never drops"
+        );
     }
 
     /// Locked: peak_vus() reports the PRE-ALLOCATED peak per executor type
