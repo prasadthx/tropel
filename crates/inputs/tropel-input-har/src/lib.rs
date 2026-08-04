@@ -15,7 +15,7 @@
 //! |-----------|---------------|
 //! | `entry.request.url` | `request.url` (kept verbatim — already contains the query string) |
 //! | `entry.request.method` | `request.method` |
-//! | `entry.request.headers` | `request.headers` (duplicates combined with `, `) |
+//! | `entry.request.headers` | `request.headers` (duplicates combined with `, `; `Cookie` joins with `; ` per RFC 6265) |
 //! | `entry.request.postData.text` | `request.body` (preferred over `params`; base64 decoded when `encoding` is set) |
 //!
 //! ## Resource filtering
@@ -294,7 +294,7 @@ fn har_entry_to_item(entry: HarEntry, index: usize) -> ScenarioItem {
 
     let item_name = generate_item_name(&url, index);
 
-    let headers = merge_pairs(entry.request.headers.into_iter().map(|h| (h.name, h.value)));
+    let headers = merge_headers(entry.request.headers.into_iter().map(|h| (h.name, h.value)));
 
     // The recorded URL already carries the query string. Populating
     // query_params as well would make the HTTP layer re-append it
@@ -369,10 +369,15 @@ fn build_body(pd: HarPostData) -> Body {
     let has_text = !pd.text.trim().is_empty();
 
     if mime.contains("json") {
-        // Parse JSON text into serde_json::Value for Body::Json
-        let json_val =
-            serde_json::from_str(&pd.text).unwrap_or(serde_json::Value::String(pd.text));
-        Body::Json(json_val)
+        // Parse JSON text into serde_json::Value for Body::Json. If the text
+        // is NOT valid JSON (a browser may record a text/plain-ish body under
+        // a *json* mime), fall back to Body::Raw so the body is sent verbatim
+        // — wrapping it as Value::String would re-quote it on the wire
+        // (`hello` → `"hello"`), changing the payload.
+        match serde_json::from_str(&pd.text) {
+            Ok(v) => Body::Json(v),
+            Err(_) => Body::Raw(pd.text),
+        }
     } else if mime.contains("x-www-form-urlencoded") {
         if has_text {
             // Faithful replay: the encoded body as recorded (content-type
@@ -409,6 +414,30 @@ fn merge_pairs<I: Iterator<Item = (String, String)>>(pairs: I) -> HashMap<String
         match map.get_mut(&k) {
             Some(existing) => {
                 existing.push_str(", ");
+                existing.push_str(&v);
+            }
+            None => {
+                map.insert(k, v);
+            }
+        }
+    }
+    map
+}
+
+/// Combine duplicate header lines into one value per name.
+///
+/// Most headers join with `, ` (RFC 9110 field-line combination), but the
+/// `Cookie` header MUST join with `; ` per RFC 6265 §5.4 — a `, `-joined
+/// value is a single cookie with a comma in it, not two cookies, and servers
+/// (and the request's own cookie jar) would mis-read it. `Cookie` matching is
+/// case-insensitive per HTTP semantics.
+fn merge_headers<I: Iterator<Item = (String, String)>>(pairs: I) -> HashMap<String, String> {
+    let mut map: HashMap<String, String> = HashMap::new();
+    for (k, v) in pairs {
+        let is_cookie = k.eq_ignore_ascii_case("cookie");
+        match map.get_mut(&k) {
+            Some(existing) => {
+                existing.push_str(if is_cookie { "; " } else { ", " });
                 existing.push_str(&v);
             }
             None => {
@@ -636,6 +665,41 @@ mod tests {
     }
 
     #[test]
+    fn test_non_json_text_under_json_mime_sent_verbatim() {
+        // A browser may record a non-JSON body under a *json* mime (e.g. a
+        // stale Content-Type header). Wrapping it as Body::Json(Value::String)
+        // would re-quote the text on the wire (`hello` → `"hello"`). It must
+        // be sent verbatim as Body::Raw.
+        let adapter = HarInputAdapter;
+        let data = br#"{
+            "log": {
+                "version": "1.2",
+                "entries": [
+                    {
+                        "request": {
+                            "method": "POST",
+                            "url": "https://api.example.com/echo",
+                            "headers": [],
+                            "queryString": [],
+                            "postData": {
+                                "mimeType": "application/json",
+                                "text": "this is not json, just text"
+                            }
+                        },
+                        "response": {"status": 200, "statusText": "OK"}
+                    }
+                ]
+            }
+        }"#;
+        let scenario = adapter.parse(data).unwrap();
+        let req = scenario.items[0].request.as_ref().unwrap();
+        match req.body.as_ref().unwrap() {
+            Body::Raw(t) => assert_eq!(t, "this is not json, just text"),
+            other => panic!("Expected Body::Raw verbatim, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_base64_postdata_decoded() {
         let adapter = HarInputAdapter;
         let encoded = base64::engine::general_purpose::STANDARD.encode("hello bytes");
@@ -721,6 +785,40 @@ mod tests {
             req.query_params.is_empty(),
             "query_params must stay empty when the query is folded into the URL"
         );
+    }
+
+    #[test]
+    fn test_duplicate_cookie_headers_joined_with_semicolon() {
+        // RFC 6265 §5.4: duplicate Cookie headers must join with `; `, not
+        // `, ` — a comma-joined value would read as ONE cookie containing a
+        // comma, not two cookies. Matching is case-insensitive.
+        let adapter = HarInputAdapter;
+        let data = br#"{
+            "log": {
+                "version": "1.2",
+                "entries": [
+                    {
+                        "request": {
+                            "method": "GET",
+                            "url": "https://api.example.com/",
+                            "headers": [
+                                {"name": "Cookie", "value": "session=abc"},
+                                {"name": "Cookie", "value": "theme=dark"},
+                                {"name": "X-Trace", "value": "a"},
+                                {"name": "X-Trace", "value": "b"}
+                            ],
+                            "queryString": []
+                        },
+                        "response": {"status": 200, "statusText": "OK"}
+                    }
+                ]
+            }
+        }"#;
+        let scenario = adapter.parse(data).unwrap();
+        let req = scenario.items[0].request.as_ref().unwrap();
+        assert_eq!(req.headers.get("Cookie").unwrap(), "session=abc; theme=dark");
+        // Non-Cookie duplicates still join with `, `.
+        assert_eq!(req.headers.get("X-Trace").unwrap(), "a, b");
     }
 
     #[test]
