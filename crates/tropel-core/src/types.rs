@@ -1,5 +1,6 @@
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -497,14 +498,20 @@ impl<'de> Deserialize<'de> for TagMap {
 }
 
 /// A single metric sample emitted during execution.
+///
+/// `metric` is a `Cow<'static, str>` so the ~12 static names emitted per
+/// request ("http_req_duration", "http_reqs", …) are zero-alloc
+/// `Cow::Borrowed` — no per-sample `String` churn on the hot path. `tags` is
+/// an `Arc<TagMap>` so the repeated `tags.clone()` calls per request (one per
+/// sample) become Arc ref-count bumps instead of full FxHashMap copies.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sample {
     /// Metric name (e.g. "http_req_duration", "checks").
-    pub metric: String,
+    pub metric: Cow<'static, str>,
     /// Metric value.
     pub value: f64,
     /// Tags (e.g. url, method, status_code, name).
-    pub tags: TagMap,
+    pub tags: Arc<TagMap>,
     /// Timestamp.
     pub timestamp: SystemTime,
     /// Sample type.

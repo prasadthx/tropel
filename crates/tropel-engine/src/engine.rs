@@ -1105,7 +1105,7 @@ async fn run_scenario_vus(
                     let iter_dur = iter_start_time.elapsed();
                     let mut iter_samples = iter_result.samples;
                     let now = std::time::SystemTime::now();
-                    let empty_tags = TagMap::new();
+                    let empty_tags = Arc::new(TagMap::new());
                     iter_samples.push(Sample { metric: "iterations".into(), value: 1.0, tags: empty_tags.clone(), timestamp: now, sample_type: tropel_core::types::SampleType::Counter });
                     iter_samples.push(Sample { metric: "iteration_duration".into(), value: iter_dur.as_micros() as f64, tags: empty_tags, timestamp: now, sample_type: tropel_core::types::SampleType::Trend });
                     // Merge per-scenario tags into every sample so tag-scoped
@@ -1176,7 +1176,7 @@ async fn run_scenario_vus(
                 .record(&Sample {
                     metric: "dropped_iterations".into(),
                     value: dropped as f64,
-                    tags: dropped_tags,
+                    tags: Arc::new(dropped_tags),
                     timestamp: std::time::SystemTime::now(),
                     sample_type: tropel_core::types::SampleType::Counter,
                 })
@@ -1490,7 +1490,7 @@ async fn run_driver_vus(
 
                     let iter_dur = iter_start_time.elapsed();
                     let now = std::time::SystemTime::now();
-                    let empty_tags = TagMap::new();
+                    let empty_tags = Arc::new(TagMap::new());
                     let mut iter_samples = vec![
                         Sample { metric: "iterations".into(), value: 1.0, tags: empty_tags.clone(), timestamp: now, sample_type: tropel_core::types::SampleType::Counter },
                         Sample { metric: "iteration_duration".into(), value: iter_dur.as_micros() as f64, tags: empty_tags, timestamp: now, sample_type: tropel_core::types::SampleType::Trend },
@@ -1551,7 +1551,7 @@ async fn run_driver_vus(
                 .record(&Sample {
                     metric: "dropped_iterations".into(),
                     value: dropped as f64,
-                    tags: dropped_tags,
+                    tags: Arc::new(dropped_tags),
                     timestamp: std::time::SystemTime::now(),
                     sample_type: tropel_core::types::SampleType::Counter,
                 })
@@ -1642,7 +1642,9 @@ fn merge_scenario_tags(samples: &mut [Sample], tags: &HashMap<String, String>) {
     }
     for sample in samples.iter_mut() {
         for (k, v) in tags {
-            sample.tags.insert(k.clone(), v.clone());
+            // tags is Arc<TagMap> — mutate through make_mut (cheap here: the
+            // fresh per-request Arc has refcount 1).
+            Arc::make_mut(&mut sample.tags).insert(k.clone(), v.clone());
         }
     }
 }
@@ -1671,6 +1673,7 @@ async fn utils_emit_vus_metrics(
     for (k, v) in sc_tags {
         vus_tags.insert(k.clone(), v.clone());
     }
+    let vus_tags = Arc::new(vus_tags);
     metrics
         .record_batch(&[
             Sample {
@@ -1788,39 +1791,39 @@ async fn create_vu_js_context(
         }
     };
 
-    let js_libraries: [(&str, &str); 2] = [
-        ("pm-api", include_str!("../../../js/pm-api/pm.js")),
-        ("chai-shim", include_str!("../../../js/chai/chai-shim.js")),
-    ];
-
-    let lodash_code: &str = include_str!("../../../js/lodash/lodash-shim.js");
-    let cryptojs_code: &str = include_str!("../../../js/cryptojs-shim/cryptojs.js");
-    let exec_code: &str = include_str!("../../../js/exec/exec.js");
-
-    for (name, code) in &js_libraries {
-        if let Err(e) = ctx.bootstrap_library(code).await {
-            tracing::warn!(
-                "VU {}: Failed to bootstrap JS library '{}': {}",
-                vu_id,
-                name,
-                e
-            );
-        }
-    }
-
-    for (name, code) in &[
-        ("lodash-shim", lodash_code),
-        ("cryptojs-shim", cryptojs_code),
-        ("exec-shim", exec_code),
-    ] {
-        if let Err(e) = ctx.bootstrap_library(code).await {
-            tracing::warn!(
-                "VU {}: Failed to bootstrap JS library '{}': {}",
-                vu_id,
-                name,
-                e
-            );
-        }
+    // All shim libraries are concatenated at COMPILE TIME (concat!) into a
+    // single &'static str and evaluated with ONE bootstrap eval per VU. Each
+    // separate bootstrap_library() call resets the JS interrupt timer, parses
+    // the source, and pumps the promise queue, so N calls cost N × that
+    // overhead. The shim sources are static include_str! strings byte-identical
+    // for every VU, so one combined eval is semantically equivalent while
+    // cutting the per-VU bootstrap cost ~5× and allocating nothing at runtime.
+    // (rquickjs 0.12 exposes no public script-bytecode API to share compiled
+    // shims across VU contexts — only Module bytecode, which doesn't apply to
+    // plain-script shims — so a single compile-time-bundled eval is the safe,
+    // verifiable win.)
+    const JS_SHIM_BUNDLE: &str = concat!(
+        "// ==== shim: pm-api ====\n",
+        include_str!("../../../js/pm-api/pm.js"),
+        "\n",
+        "// ==== shim: chai-shim ====\n",
+        include_str!("../../../js/chai/chai-shim.js"),
+        "\n",
+        "// ==== shim: lodash-shim ====\n",
+        include_str!("../../../js/lodash/lodash-shim.js"),
+        "\n",
+        "// ==== shim: cryptojs-shim ====\n",
+        include_str!("../../../js/cryptojs-shim/cryptojs.js"),
+        "\n",
+        "// ==== shim: exec-shim ====\n",
+        include_str!("../../../js/exec/exec.js"),
+    );
+    if let Err(e) = ctx.bootstrap_library(JS_SHIM_BUNDLE).await {
+        tracing::warn!(
+            "VU {}: Failed to bootstrap JS shim bundle: {}",
+            vu_id,
+            e
+        );
     }
 
     if let Err(e) = tropel_native::install_all(&ctx).await {

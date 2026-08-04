@@ -148,9 +148,9 @@ impl VuContext {
     /// Record a metric sample.
     pub fn emit_sample(&mut self, metric: &str, value: f64, tags: tropel_core::types::TagMap) {
         self.samples.push(Sample {
-            metric: metric.to_string(),
+            metric: std::borrow::Cow::Owned(metric.to_string()),
             value,
-            tags,
+            tags: std::sync::Arc::new(tags),
             timestamp: std::time::SystemTime::now(),
             sample_type: tropel_core::types::SampleType::Point,
         });

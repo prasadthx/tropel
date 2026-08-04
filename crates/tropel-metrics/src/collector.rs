@@ -514,9 +514,14 @@ impl Aggregator {
         });
         metric_set.record(sample.value, &sample.sample_type);
 
-        // Update totals
-        let total = self.totals.entry(sample.metric).or_insert(0.0);
-        *total += sample.value;
+        // Update totals — zero-alloc on the hot path: `get_mut` with a &str
+        // borrow (String: Borrow<str>), only allocating on first sight of a
+        // metric name.
+        if let Some(total) = self.totals.get_mut(sample.metric.as_ref()) {
+            *total += sample.value;
+        } else {
+            self.totals.insert(sample.metric.into_owned(), sample.value);
+        }
     }
 
     fn build_results(&mut self) -> MetricsResult {

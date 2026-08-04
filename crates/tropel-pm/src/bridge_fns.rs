@@ -461,9 +461,9 @@ impl PmBridge {
                         tags.insert("group_path", path.clone());
                     }
                     st.samples.push(tropel_core::types::Sample {
-                        metric: "group_duration".to_string(),
+                        metric: "group_duration".into(),
                         value: duration_micros as f64,
-                        tags,
+                        tags: Arc::new(tags),
                         timestamp: std::time::SystemTime::now(),
                         sample_type: tropel_core::types::SampleType::Trend,
                     });
@@ -487,9 +487,9 @@ impl PmBridge {
                         _ => tropel_core::types::SampleType::Trend,
                     };
                     st.samples.push(tropel_core::types::Sample {
-                        metric: name,
+                        metric: name.into(),
                         value,
-                        tags: tropel_core::types::TagMap::new(),
+                        tags: Arc::new(tropel_core::types::TagMap::new()),
                         timestamp: std::time::SystemTime::now(),
                         sample_type,
                     });
@@ -535,9 +535,9 @@ impl PmBridge {
                         };
 
                         st.samples.push(tropel_core::types::Sample {
-                            metric: name,
+                            metric: name.into(),
                             value,
-                            tags,
+                            tags: Arc::new(tags),
                             timestamp: std::time::SystemTime::now(),
                             sample_type,
                         });

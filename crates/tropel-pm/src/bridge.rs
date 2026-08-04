@@ -117,9 +117,9 @@ impl PmState {
         }
 
         self.samples.push(Sample {
-            metric: "checks".to_string(),
+            metric: "checks".into(),
             value: if passed { 1.0 } else { 0.0 },
-            tags: TagMap::from_pairs([("check", name.to_string())]),
+            tags: Arc::new(TagMap::from_pairs([("check", name.to_string())])),
             timestamp: std::time::SystemTime::now(),
             sample_type: tropel_core::types::SampleType::Rate,
         });

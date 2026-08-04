@@ -229,6 +229,7 @@ impl Protocol for WebSocketProtocol {
         tags.insert("status", session_status.to_string());
         tags.insert("name", req.url.clone());
         tags.insert("group", "ws");
+        let tags = std::sync::Arc::new(tags);
 
         let samples = vec![
             Sample {

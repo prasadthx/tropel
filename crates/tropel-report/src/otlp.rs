@@ -117,11 +117,11 @@ impl OtlpOutput {
     }
 
     fn buffer(&self, mut sample: Sample) {
-        sample.tags = self.tag_policy.apply(&sample.tags);
+        sample.tags = std::sync::Arc::new(self.tag_policy.apply(&sample.tags));
         self.metrics
             .lock()
             .unwrap()
-            .entry(sample.metric.clone())
+            .entry(sample.metric.to_string())
             .or_default()
             .push(sample);
         self.total_buffered.fetch_add(1, Ordering::Relaxed);
@@ -329,9 +329,9 @@ mod tests {
         tags: TagMap,
     ) -> Sample {
         Sample {
-            metric: metric.to_string(),
+            metric: std::borrow::Cow::Owned(metric.to_string()),
             value,
-            tags,
+            tags: std::sync::Arc::new(tags),
             timestamp: SystemTime::now(),
             sample_type,
         }

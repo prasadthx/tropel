@@ -407,6 +407,7 @@ fn http_request_host(
         tags.insert("status", resp.status_code.to_string());
         tags.insert("name", req.url.clone());
         tags.insert("group", "http");
+        let tags = Arc::new(tags);
 
         let data_sent = req
             .body
@@ -518,9 +519,9 @@ fn metric_add_host(
         _ => SampleType::Point,
     };
     caller.data_mut().samples.push(Sample {
-        metric: name,
+        metric: name.into(),
         value,
-        tags,
+        tags: Arc::new(tags),
         timestamp: SystemTime::now(),
         sample_type,
     });
@@ -669,7 +670,7 @@ mod tests {
 
         inst.run_iteration(&mut ctx).await.expect("iteration must succeed");
 
-        let names: Vec<&str> = ctx.samples.iter().map(|s| s.metric.as_str()).collect();
+        let names: Vec<&str> = ctx.samples.iter().map(|s| s.metric.as_ref()).collect();
         assert!(
             names.contains(&"http_req_duration"),
             "http_req_duration missing: {:?}",

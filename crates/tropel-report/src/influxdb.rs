@@ -367,9 +367,9 @@ mod tests {
             map.insert((*k).to_string(), (*v).to_string());
         }
         Sample {
-            metric: metric.to_string(),
+            metric: std::borrow::Cow::Owned(metric.to_string()),
             value,
-            tags: map,
+            tags: std::sync::Arc::new(map),
             timestamp: SystemTime::now(),
             sample_type: SampleType::Trend,
         }

@@ -45,7 +45,10 @@ impl Drop for VuLease {
 
 /// Controls the lifecycle of VUs during a load test.
 pub struct VUScheduler {
-    config: ExecutionConfig,
+    /// Shared execution config — wrapped in `Arc` so `shared_clone()` (called
+    /// once per VU task) is a refcount bump instead of a full deep clone of
+    /// the whole config (thresholds, env, tags, …) for every VU.
+    config: Arc<ExecutionConfig>,
     /// Lock-free active-VU counter. Atomic so sync JS bridge closures
     /// (inside ctx.with) can read `exec.instance.vusActive` without awaiting
     /// an async mutex — the tokio Mutex made that impossible.
@@ -108,7 +111,7 @@ impl VUScheduler {
     /// Create a new VU scheduler from config.
     pub fn new(config: &ExecutionConfig) -> Self {
         Self {
-            config: config.clone(),
+            config: Arc::new(config.clone()),
             active_vus: Arc::new(AtomicU32::new(0)),
             total_iterations: Arc::new(AtomicU64::new(0)),
             claimed_iterations: Arc::new(AtomicU64::new(0)),
@@ -242,8 +245,8 @@ impl VUScheduler {
 
     /// Whether this scheduler is in arrival-rate mode.
     pub fn is_arrival_rate(&self) -> bool {
-        matches!(self.config, ExecutionConfig::ConstantArrivalRate { .. })
-            || matches!(self.config, ExecutionConfig::RampingArrivalRate { .. })
+        matches!(self.config.as_ref(), ExecutionConfig::ConstantArrivalRate { .. })
+            || matches!(self.config.as_ref(), ExecutionConfig::RampingArrivalRate { .. })
     }
 
     /// Mark a VU as idle (waiting for an arrival token).
@@ -316,7 +319,7 @@ impl VUScheduler {
     /// mid-iteration at any instant. Backs the `vus_max` metric (k6 emits the
     /// configured peak, not a sampled current active count).
     pub fn peak_vus(&self) -> u32 {
-        match &self.config {
+        match self.config.as_ref() {
             ExecutionConfig::ConstantVus { vus, .. } => *vus,
             ExecutionConfig::RampingVus {
                 stages,
@@ -383,7 +386,7 @@ impl VUScheduler {
     where
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
-        match &self.config {
+        match self.config.as_ref() {
             ExecutionConfig::ConstantVus {
                 vus,
                 duration,
@@ -694,7 +697,7 @@ impl VUScheduler {
         F: Fn(Arc<VUScheduler>, u32) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
         // For simplicity, use a fixed set of VUs and shared iteration counter
-        let vus = match &self.config {
+        let vus = match self.config.as_ref() {
             ExecutionConfig::SharedIterations { vus, .. } => *vus,
             _ => 1,
         };

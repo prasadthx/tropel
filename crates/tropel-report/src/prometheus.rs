@@ -407,9 +407,9 @@ mod tests {
 
     fn sample_typed(metric: &str, value: f64, tags: TagMap, sample_type: SampleType) -> Sample {
         Sample {
-            metric: metric.to_string(),
+            metric: std::borrow::Cow::Owned(metric.to_string()),
             value,
-            tags,
+            tags: std::sync::Arc::new(tags),
             timestamp: SystemTime::now(),
             sample_type,
         }

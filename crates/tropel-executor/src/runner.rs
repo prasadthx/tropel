@@ -296,15 +296,15 @@ impl VURunner {
                                         item.name,
                                         e
                                     );
-                                    let err_tags = TagMap::from_pairs([
+                                    let err_tags = Arc::new(TagMap::from_pairs([
                                         ("url", resolved_url.clone()),
                                         ("method", request.method.to_string()),
                                         ("name", item.name.clone()),
                                         ("error", e.to_string()),
-                                    ]);
+                                    ]));
                                     let now = std::time::SystemTime::now();
                                     result.samples.push(tropel_core::types::Sample {
-                                        metric: "errors".to_string(),
+                                        metric: "errors".into(),
                                         value: 1.0,
                                         tags: err_tags,
                                         timestamp: now,
@@ -343,15 +343,15 @@ impl VURunner {
                                         item.name,
                                         e
                                     );
-                                    let err_tags = TagMap::from_pairs([
+                                    let err_tags = Arc::new(TagMap::from_pairs([
                                         ("url", resolved_url.clone()),
                                         ("method", request.method.to_string()),
                                         ("name", item.name.clone()),
                                         ("error", e.to_string()),
-                                    ]);
+                                    ]));
                                     let now = std::time::SystemTime::now();
                                     result.samples.push(tropel_core::types::Sample {
-                                        metric: "errors".to_string(),
+                                        metric: "errors".into(),
                                         value: 1.0,
                                         tags: err_tags,
                                         timestamp: now,
@@ -406,12 +406,15 @@ impl VURunner {
                             tags.insert("status", http_response.status_code.to_string());
                             tags.insert("name", resolved_req.url.clone());
                             tags.insert("group", "http");
+                            // Share one Arc so all ~12 per-request samples bump a
+                            // refcount instead of copying the whole map.
+                            let tags = Arc::new(tags);
 
                             let now = std::time::SystemTime::now();
 
                             // http_req_duration (Trend)
                             result.samples.push(Sample {
-                                metric: "http_req_duration".to_string(),
+                                metric: "http_req_duration".into(),
                                 value: duration.as_micros() as f64,
                                 tags: tags.clone(),
                                 timestamp: now,
@@ -420,7 +423,7 @@ impl VURunner {
 
                             // http_reqs (Counter)
                             result.samples.push(Sample {
-                                metric: "http_reqs".to_string(),
+                                metric: "http_reqs".into(),
                                 value: 1.0,
                                 tags: tags.clone(),
                                 timestamp: now,
@@ -433,7 +436,7 @@ impl VURunner {
                                 &self.expected_statuses,
                             );
                             result.samples.push(Sample {
-                                metric: "http_req_failed".to_string(),
+                                metric: "http_req_failed".into(),
                                 value: if is_failed { 1.0 } else { 0.0 },
                                 tags: tags.clone(),
                                 timestamp: now,
@@ -442,7 +445,7 @@ impl VURunner {
 
                             // data_received (Counter) — response body bytes
                             result.samples.push(Sample {
-                                metric: "data_received".to_string(),
+                                metric: "data_received".into(),
                                 value: http_response.size as f64,
                                 tags: tags.clone(),
                                 timestamp: now,
@@ -451,7 +454,7 @@ impl VURunner {
 
                             // data_sent (Counter) — request body bytes
                             result.samples.push(Sample {
-                                metric: "data_sent".to_string(),
+                                metric: "data_sent".into(),
                                 value: http_response.request_body_size as f64,
                                 tags: tags.clone(),
                                 timestamp: now,
@@ -484,7 +487,7 @@ impl VURunner {
                                 let sub_tags = tags.clone();
                                 for (metric_name, dur) in &sub_timing_metrics {
                                     result.samples.push(Sample {
-                                        metric: metric_name.to_string(),
+                                        metric: (*metric_name).into(),
                                         value: dur.as_micros() as f64,
                                         tags: sub_tags.clone(),
                                         timestamp: now,
@@ -500,15 +503,15 @@ impl VURunner {
                                 item.name,
                                 e
                             );
-                            let err_tags = TagMap::from_pairs([
+                            let err_tags = Arc::new(TagMap::from_pairs([
                                 ("url", resolved_url.clone()),
                                 ("method", request.method.to_string()),
                                 ("name", item.name.clone()),
                                 ("error", e.to_string()),
-                            ]);
+                            ]));
                             let now = std::time::SystemTime::now();
                             result.samples.push(tropel_core::types::Sample {
-                                metric: "errors".to_string(),
+                                metric: "errors".into(),
                                 value: 1.0,
                                 tags: err_tags.clone(),
                                 timestamp: now,
@@ -516,7 +519,7 @@ impl VURunner {
                             });
                             // Connection errors always count as failed requests
                             result.samples.push(tropel_core::types::Sample {
-                                metric: "http_req_failed".to_string(),
+                                metric: "http_req_failed".into(),
                                 value: 1.0,
                                 tags: err_tags,
                                 timestamp: now,

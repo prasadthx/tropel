@@ -10,6 +10,7 @@
 //! without affecting the VU hot path.
 
 use async_trait::async_trait;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tropel_core::types::{Sample, TagMap};
@@ -171,7 +172,11 @@ struct LiveState {
     last_print: Instant,
     rolling_count: u64,
     rolling_max: f64,
-    rolling_p95: Vec<u64>,
+    /// Rolling window of `http_req_duration` (μs) for the live p95. A
+    /// `VecDeque` so evicting the oldest sample is O(1) — the previous `Vec`
+    /// did `remove(0)`, shifting up to 5000 elements per sample on the hot
+    /// path (~4 GB/s of memmove at 100k samples/s).
+    rolling_p95: VecDeque<u64>,
 }
 
 impl LiveState {
@@ -184,12 +189,14 @@ impl LiveState {
             last_print: Instant::now(),
             rolling_count: 0,
             rolling_max: 0.0,
-            rolling_p95: Vec::with_capacity(1024),
+            // Match the window bound exactly so the deque never reallocates
+            // as it grows from 1024 up to the 5000-sample cap.
+            rolling_p95: VecDeque::with_capacity(5000),
         }
     }
 
     fn record(&mut self, sample: &Sample) {
-        match sample.metric.as_str() {
+        match sample.metric.as_ref() {
             "http_reqs" => {
                 self.total_reqs += 1;
             }
@@ -208,9 +215,9 @@ impl LiveState {
                 if val_ms > self.rolling_max {
                     self.rolling_max = val_ms;
                 }
-                self.rolling_p95.push(sample.value as u64);
+                self.rolling_p95.push_back(sample.value as u64);
                 if self.rolling_p95.len() > 5000 {
-                    self.rolling_p95.remove(0);
+                    self.rolling_p95.pop_front();
                 }
             }
             _ => {}
@@ -221,7 +228,7 @@ impl LiveState {
         if self.rolling_p95.is_empty() {
             return 0.0;
         }
-        let mut sorted = self.rolling_p95.clone();
+        let mut sorted: Vec<u64> = self.rolling_p95.iter().copied().collect();
         sorted.sort_unstable();
         let idx = (sorted.len() as f64 * 0.95) as usize;
         sorted.get(idx).copied().unwrap_or(0) as f64 / 1000.0

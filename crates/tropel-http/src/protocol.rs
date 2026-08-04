@@ -73,9 +73,9 @@ impl HttpProtocol {
         tags.insert("group", "http");
 
         let sample = Sample {
-            metric: "http_req_duration".to_string(),
+            metric: "http_req_duration".into(),
             value: duration.as_micros() as f64, // microseconds (histogram records in μs)
-            tags,
+            tags: std::sync::Arc::new(tags),
             timestamp: std::time::SystemTime::now(),
             sample_type: SampleType::Trend,
         };

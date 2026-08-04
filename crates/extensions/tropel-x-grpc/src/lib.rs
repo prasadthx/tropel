@@ -388,6 +388,7 @@ impl Protocol for GrpcProtocol {
         tags.insert("status", grpc_status.to_string());
         tags.insert("name", format!("{service_full}/{method_name}"));
         tags.insert("group", "grpc");
+        let tags = std::sync::Arc::new(tags);
 
         let sent = body_to_json(req)
             .map(|v| serde_json::to_vec(&v).map(|b| b.len() as f64).unwrap_or(0.0))

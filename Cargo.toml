@@ -48,7 +48,7 @@ reqwest = { version = "0.13.4", default-features = false, features = ["rustls", 
 tower = { version = "0.5.3", default-features = false }
 
 # Serialization
-serde = { version = "1.0.229", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.151"
 
 # Fast JSON parsing (≈2-4× faster than serde_json for response bodies)

@@ -485,7 +485,7 @@ fn push_http_samples(
     sent: usize,
 ) {
     let now = SystemTime::now();
-    let tags = http_tags(req, &status_code.to_string());
+    let tags = Arc::new(http_tags(req, &status_code.to_string()));
 
     let is_failed = !(200..400).contains(&status_code);
     let mut v = sink.lock().unwrap();
@@ -555,7 +555,7 @@ fn try_send_cmd(
 /// the declarative runner's error branch and k6 semantics.
 fn push_http_failure(sink: &Mutex<Vec<Sample>>, req: &Request) {
     let now = SystemTime::now();
-    let tags = http_tags(req, "0");
+    let tags = Arc::new(http_tags(req, "0"));
 
     let mut v = sink.lock().unwrap();
     v.push(Sample {
@@ -920,7 +920,7 @@ impl K6DriverInstance {
                     v.push(Sample {
                         metric: "checks".into(),
                         value: if passed { 1.0 } else { 0.0 },
-                        tags,
+                        tags: Arc::new(tags),
                         timestamp: now,
                         sample_type: SampleType::Rate,
                     });
@@ -948,9 +948,9 @@ impl K6DriverInstance {
                         };
                         let mut v = sink_metric.lock().unwrap();
                         v.push(Sample {
-                            metric: name,
+                            metric: name.into(),
                             value,
-                            tags,
+                            tags: Arc::new(tags),
                             timestamp: SystemTime::now(),
                             sample_type,
                         });
@@ -1010,7 +1010,7 @@ impl K6DriverInstance {
                     v.push(Sample {
                         metric: "group_duration".into(),
                         value: duration_ms * 1000.0, // μs, consistent with other Trends
-                        tags,
+                        tags: Arc::new(tags),
                         timestamp: SystemTime::now(),
                         sample_type: SampleType::Trend,
                     });
@@ -1395,6 +1395,7 @@ impl K6DriverInstance {
                         tags.insert("status", String::from("101"));
                         tags.insert("name", session.url.clone());
                         tags.insert("group", String::from("ws"));
+                        let tags = Arc::new(tags);
 
                         let msgs_sent = session.msgs_sent.load(Ordering::Relaxed);
                         let bytes_sent = session.bytes_sent.load(Ordering::Relaxed);
@@ -1990,28 +1991,47 @@ fn is_typescript_ext(path: &Path) -> bool {
 
 /// Bootstrap vendored JS libraries into a fresh context.
 /// Mirrors the engine's `create_vu_js_context()` setup.
-async fn bootstrap_js_libs(ctx: &JsContext) -> Result<()> {
-    // Phase 1: Base shim libraries (no native dependencies)
-    let base_libraries: [(&str, &str); 4] = [
-        (
-            "chai-shim",
-            include_str!("../../../../js/chai/chai-shim.js"),
-        ),
-        (
-            "lodash-shim",
-            include_str!("../../../../js/lodash/lodash-shim.js"),
-        ),
-        (
-            "cryptojs-shim",
-            include_str!("../../../../js/cryptojs-shim/cryptojs.js"),
-        ),
-        ("exec-shim", include_str!("../../../../js/exec/exec.js")),
-    ];
+/// Base shim libraries (no native dependencies) concatenated at COMPILE TIME
+/// (concat!) into one bundle evaluated with a single bootstrap eval per VU.
+/// Each separate bootstrap_library() call resets the JS interrupt timer,
+/// parses the source, and pumps the promise queue, so one eval per phase cuts
+/// the per-VU bootstrap overhead ~4× with zero runtime allocation. (rquickjs
+/// 0.12 exposes no public script-bytecode API to share compiled shims across
+/// VU contexts, so a single eval per phase is the safe win.)
+const K6_BASE_SHIM_BUNDLE: &str = concat!(
+    "// ==== shim: chai-shim ====\n",
+    include_str!("../../../../js/chai/chai-shim.js"),
+    "\n",
+    "// ==== shim: lodash-shim ====\n",
+    include_str!("../../../../js/lodash/lodash-shim.js"),
+    "\n",
+    "// ==== shim: cryptojs-shim ====\n",
+    include_str!("../../../../js/cryptojs-shim/cryptojs.js"),
+    "\n",
+    "// ==== shim: exec-shim ====\n",
+    include_str!("../../../../js/exec/exec.js"),
+);
 
-    for (name, code) in &base_libraries {
-        if let Err(e) = ctx.bootstrap_library(code).await {
-            tracing::warn!("Failed to bootstrap JS library '{}': {}", name, e);
-        }
+/// Native-dependent shim libraries (pm-api, sleep, k6-shim, open/SharedArray)
+/// concatenated at COMPILE TIME into one bundle (see K6_BASE_SHIM_BUNDLE).
+const K6_NATIVE_SHIM_BUNDLE: &str = concat!(
+    "// ==== shim: pm-api ====\n",
+    include_str!("../../../../js/pm-api/pm.js"),
+    "\n",
+    "// ==== shim: sleep-shim ====\n",
+    include_str!("../../../../js/k6-shim/sleep-shim.js"),
+    "\n",
+    "// ==== shim: k6-shim ====\n",
+    include_str!("../../../../js/k6-shim/k6-shim.js"),
+    "\n",
+    "// ==== shim: open-data-shim ====\n",
+    include_str!("../../../../js/k6-shim/open-data-shim.js"),
+);
+
+async fn bootstrap_js_libs(ctx: &JsContext) -> Result<()> {
+    // Phase 1: Base shim libraries (no native dependencies) — single eval.
+    if let Err(e) = ctx.bootstrap_library(K6_BASE_SHIM_BUNDLE).await {
+        tracing::warn!("Failed to bootstrap JS base shim bundle: {}", e);
     }
 
     // Phase 2: Install native module functions (needed by pm-api and k6-shim)
@@ -2019,18 +2039,13 @@ async fn bootstrap_js_libs(ctx: &JsContext) -> Result<()> {
         tracing::warn!("Failed to install native modules: {}", e);
     }
 
-    // Phase 3: Bootstrapping libraries that depend on native functions
-    let native_dependent_libraries: [(&str, &str); 4] = [
-        ("pm-api", include_str!("../../../../js/pm-api/pm.js")),
-        ("sleep-shim", SLEEP_SHIM),
-        ("k6-shim", include_str!("../../../../js/k6-shim/k6-shim.js")),
-        ("open-data-shim", OPEN_DATA_SHIM),
-    ];
-
-    for (name, code) in &native_dependent_libraries {
-        if let Err(e) = ctx.bootstrap_library(code).await {
-            tracing::warn!("Failed to bootstrap JS library '{}': {}", name, e);
-        }
+    // Phase 3: Bootstrapping libraries that depend on native functions —
+    // single eval (same rationale as phase 1).
+    if let Err(e) = ctx.bootstrap_library(K6_NATIVE_SHIM_BUNDLE).await {
+        tracing::warn!(
+            "Failed to bootstrap JS native-dependent shim bundle: {}",
+            e
+        );
     }
 
     // Install __tropel_native_sleep (blocks the OS thread, safe under thread-per-core)
@@ -2046,21 +2061,13 @@ async fn bootstrap_js_libs(ctx: &JsContext) -> Result<()> {
         );
     });
 
-    // Eval the sleep(seconds) wrapper (sits behind native_sleep)
-    let _ = ctx.eval(SLEEP_SHIM).await;
-
+    // The sleep(seconds) wrapper is included in K6_NATIVE_SHIM_BUNDLE above
+    // (js/k6-shim/sleep-shim.js), which is evaluated BEFORE __tropel_native_sleep
+    // is installed in the with_ctx block above this comment. That ordering is
+    // safe because the shim only dereferences `typeof __tropel_native_sleep` at
+    // call time (inside sleep()), never at eval time.
     Ok(())
 }
-
-const SLEEP_SHIM: &str = r#"
-if (typeof sleep === 'undefined') {
-  function sleep(seconds) {
-    if (typeof __tropel_native_sleep === 'function') {
-      __tropel_native_sleep(seconds * 1000);
-    }
-  }
-}
-"#;
 
 /// Parse a headers JSON string into a `HashMap`, accepting both the plain
 /// object form (`{"k":"v"}`) and the Postman/array form

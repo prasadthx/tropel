@@ -108,7 +108,7 @@ impl JsonStreamOutput {
         let metric_name = sample.metric.clone();
         let seen = {
             let mut seen = self.seen_metrics.lock().unwrap();
-            !seen.insert(metric_name.clone())
+            !seen.insert(metric_name.to_string())
         };
         if !seen {
             // k6 Metric definition record — emitted once per metric.
@@ -237,9 +237,9 @@ mod tests {
         let mut tags = TagMap::new();
         tags.insert("status", "200");
         Sample {
-            metric: metric.to_string(),
+            metric: std::borrow::Cow::Owned(metric.to_string()),
             value,
-            tags,
+            tags: std::sync::Arc::new(tags),
             timestamp: SystemTime::now(),
             sample_type: if metric == "http_reqs" {
                 SampleType::Counter

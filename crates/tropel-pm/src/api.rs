@@ -1,6 +1,7 @@
 use crate::bridge::SharedPmState;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tropel_core::types::{Response, TagMap};
 
 /// The pm.* API surface exposed to JS scripts.
@@ -237,9 +238,9 @@ impl PmApi {
             tags.insert("group_path".to_string(), path.clone());
         }
         state.samples.push(tropel_core::types::Sample {
-            metric: "group_duration".to_string(),
+            metric: "group_duration".into(),
             value: duration_micros as f64,
-            tags: TagMap::from_pairs(tags),
+            tags: Arc::new(TagMap::from_pairs(tags)),
             timestamp: std::time::SystemTime::now(),
             sample_type: tropel_core::types::SampleType::Trend,
         });
@@ -259,9 +260,9 @@ impl PmApi {
     pub fn emit_metric(&self, metric: &str, value: f64, tags: HashMap<String, String>) {
         let mut state = self.state.lock().unwrap();
         state.samples.push(tropel_core::types::Sample {
-            metric: metric.to_string(),
+            metric: std::borrow::Cow::Owned(metric.to_string()),
             value,
-            tags: TagMap::from_pairs(tags),
+            tags: Arc::new(TagMap::from_pairs(tags)),
             timestamp: std::time::SystemTime::now(),
             sample_type: tropel_core::types::SampleType::Point,
         });
