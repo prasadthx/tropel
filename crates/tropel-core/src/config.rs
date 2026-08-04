@@ -569,6 +569,11 @@ pub struct HttpConfig {
     pub discard_response_bodies: bool,
     /// Max redirects to follow.
     pub max_redirects: u32,
+    /// Disable redirect following entirely (`--no-redirects`). When true the
+    /// 3xx response is returned as-is and no redirect hops are captured.
+    /// k6 always follows redirects; this flag lets Tropel opt out.
+    #[serde(default)]
+    pub no_redirects: bool,
     /// Optional fixed ceiling for the latency histogram, in MICROseconds.
     /// `None` (default) uses hdrhistogram auto-resize — no ceiling, so very
     /// slow requests are recorded exactly instead of being clipped at 60 s.
@@ -645,6 +650,7 @@ impl Default for HttpConfig {
             user_agent: "Tropel/0.1.0".to_string(),
             decompress: true,
             max_redirects: 10,
+            no_redirects: false,
             discard_response_bodies: false,
             histogram_max_micros: None,
             dns_ttl: None,

@@ -440,6 +440,7 @@ impl Protocol for GrpcProtocol {
         // ── Build the outcome: response + samples ──
         let body_bytes = serde_json::to_vec(&response_value).unwrap_or_default();
         let response = Response {
+            url: req.url.clone(),
             status_code: http_status,
             status_text: if ok { "OK".into() } else { "ERROR".into() },
             headers: HashMap::new(),
@@ -448,6 +449,7 @@ impl Protocol for GrpcProtocol {
             timings: None,
             cookies: vec![],
             size: body_bytes.len() as u64,
+            redirects: vec![],
         };
 
         let now = std::time::SystemTime::now();

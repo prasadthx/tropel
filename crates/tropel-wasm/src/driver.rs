@@ -384,64 +384,78 @@ fn http_request_host(
         }
     };
 
-    // Record standard samples (mirrors the declarative runner's tags).
+    // Record standard samples (mirrors the declarative runner's tags) for
+    // EVERY redirect hop plus the final response — k6 parity: a 302 chain
+    // counts as hops + 1 requests, not just the final. The final response's
+    // URL/status is what the script sees; each hop gets its own sample set.
     {
-        let now = SystemTime::now();
-        let mut tags = TagMap::with_capacity(5);
-        tags.insert("url", req.url.clone());
-        tags.insert("method", req.method.to_string());
-        tags.insert("status", resp.status_code.to_string());
-        tags.insert("name", req.url.clone());
-        tags.insert("group", "http");
-        let tags = Arc::new(tags);
-
         let data_sent = req
             .body
             .as_ref()
             .map(Body::encoded_len)
             .unwrap_or(0) as f64;
-
         let samples = &mut caller.data_mut().samples;
-        samples.push(Sample {
-            metric: "http_req_duration".into(),
-            value: resp.response_time.as_micros() as f64,
-            tags: tags.clone(),
-            timestamp: now,
-            sample_type: SampleType::Trend,
-        });
-        samples.push(Sample {
-            metric: "http_reqs".into(),
-            value: 1.0,
-            tags: tags.clone(),
-            timestamp: now,
-            sample_type: SampleType::Counter,
-        });
-        // http_req_failed: k6's default semantics (2xx-3xx = success). The
-        // declarative runner instead consults the configurable
-        // expectedStatuses; the WASM driver has no config channel, so it
-        // deliberately matches the k6 default.
-        let is_failed = !(200..400).contains(&resp.status_code);
-        samples.push(Sample {
-            metric: "http_req_failed".into(),
-            value: if is_failed { 1.0 } else { 0.0 },
-            tags: tags.clone(),
-            timestamp: now,
-            sample_type: SampleType::Rate,
-        });
-        samples.push(Sample {
-            metric: "data_received".into(),
-            value: resp.size as f64,
-            tags: tags.clone(),
-            timestamp: now,
-            sample_type: SampleType::Counter,
-        });
-        samples.push(Sample {
-            metric: "data_sent".into(),
-            value: data_sent,
-            tags,
-            timestamp: now,
-            sample_type: SampleType::Counter,
-        });
+        let chain = resp
+            .redirects
+            .iter()
+            .chain(std::iter::once(&resp));
+        for hop in chain {
+            let now = SystemTime::now();
+            let mut tags = TagMap::with_capacity(5);
+            tags.insert("url", hop.url.clone());
+            tags.insert("method", req.method.to_string());
+            tags.insert("status", hop.status_code.to_string());
+            tags.insert("name", hop.url.clone());
+            tags.insert("group", "http");
+            let tags = Arc::new(tags);
+
+            samples.push(Sample {
+                metric: "http_req_duration".into(),
+                value: hop.response_time.as_micros() as f64,
+                tags: tags.clone(),
+                timestamp: now,
+                sample_type: SampleType::Trend,
+            });
+            samples.push(Sample {
+                metric: "http_reqs".into(),
+                value: 1.0,
+                tags: tags.clone(),
+                timestamp: now,
+                sample_type: SampleType::Counter,
+            });
+            // http_req_failed: k6's default semantics (2xx-3xx = success).
+            // The declarative runner instead consults the configurable
+            // expectedStatuses; the WASM driver has no config channel, so it
+            // deliberately matches the k6 default.
+            let is_failed = !(200..400).contains(&hop.status_code);
+            samples.push(Sample {
+                metric: "http_req_failed".into(),
+                value: if is_failed { 1.0 } else { 0.0 },
+                tags: tags.clone(),
+                timestamp: now,
+                sample_type: SampleType::Rate,
+            });
+            samples.push(Sample {
+                metric: "data_received".into(),
+                value: hop.size as f64,
+                tags: tags.clone(),
+                timestamp: now,
+                sample_type: SampleType::Counter,
+            });
+            // data_sent only on the FINAL response (the one carrying the
+            // redirects chain) — redirect hops carry no request body.
+            samples.push(Sample {
+                metric: "data_sent".into(),
+                value: if std::ptr::eq(hop, &resp) {
+                    data_sent
+                } else {
+                    0.0
+                },
+                tags,
+                timestamp: now,
+                sample_type: SampleType::Counter,
+            });
+        }
     }
 
     let resp_json = serde_json::json!({
@@ -589,8 +603,9 @@ mod tests {
 
     #[async_trait]
     impl DriverHttpClient for StubClient {
-        async fn execute(&self, _req: &Request) -> Result<Response> {
+        async fn execute(&self, req: &Request) -> Result<Response> {
             Ok(Response {
+                url: req.url.clone(),
                 status_code: 200,
                 status_text: "OK".into(),
                 headers: HashMap::new(),
@@ -599,6 +614,7 @@ mod tests {
                 timings: None,
                 cookies: vec![],
                 size: 5,
+                redirects: vec![],
             })
         }
     }

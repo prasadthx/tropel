@@ -290,7 +290,23 @@ impl HttpClient {
     /// refactor that shares one client across threads must build outside the
     /// lock instead.
     fn select_client(&self, request: &Request) -> Result<reqwest::Client> {
-        let follow = request.follow_redirects;
+        self.select_client_with_follow(request, request.follow_redirects)
+    }
+
+    /// Like [`select_client`], but with an explicit follow decision. Used by
+    /// `execute()` for manual redirect following: when Tropel follows
+    /// redirects ITSELF (k6 parity — every hop counts as a request), it needs
+    /// a `Policy::none()` client so reqwest never auto-follows behind its
+    /// back; the no-redirect twin provides exactly that.
+    fn select_client_with_follow(
+        &self,
+        request: &Request,
+        follow: bool,
+    ) -> Result<reqwest::Client> {
+        // `--no-redirects` (HttpConfig.no_redirects) forces no-follow for
+        // EVERY request, regardless of the per-request flag: the 3xx is
+        // returned as-is (k6 always follows; this opt-out is a Tropel extra).
+        let follow = follow && !self.config.no_redirects;
         match &request.certificate {
             Some(cert) => {
                 let cert_path = cert.cert.as_deref().ok_or_else(|| {
@@ -360,8 +376,6 @@ impl HttpClient {
         if let Some(limiter) = &self.rps {
             limiter.acquire().await;
         }
-        let total_start = std::time::Instant::now();
-        crate::subtimings::begin_request(total_start);
 
         // Serialize the request body ONCE. The resulting bytes feed BOTH the
         // data_sent accounting (exact wire size) and the reqwest body — the
@@ -391,85 +405,145 @@ impl HttpClient {
             None
         };
 
-        // Per-request overrides (mTLS identity, follow_redirects) are baked
-        // into the reqwest client at build time, so select the right client
-        // for THIS request before building the RequestBuilder.
-        let client = self.select_client(request)?;
-
-        let mut req_builder = match request.method {
-            Method::GET => client.get(&request.url),
-            Method::POST => {
-                let rb = client.post(&request.url);
-                if let Some(bytes) = &body_bytes {
-                    rb.body(reqwest::Body::from(bytes.clone()))
-                } else {
-                    rb
-                }
-            }
-            Method::PUT => {
-                let rb = client.put(&request.url);
-                if let Some(bytes) = &body_bytes {
-                    rb.body(reqwest::Body::from(bytes.clone()))
-                } else {
-                    rb
-                }
-            }
-            Method::PATCH => {
-                let rb = client.patch(&request.url);
-                if let Some(bytes) = &body_bytes {
-                    rb.body(reqwest::Body::from(bytes.clone()))
-                } else {
-                    rb
-                }
-            }
-            Method::DELETE => client.delete(&request.url),
-            Method::HEAD => client.head(&request.url),
-            Method::OPTIONS => client.request(reqwest::Method::OPTIONS, &request.url),
-            Method::TRACE => client.request(reqwest::Method::TRACE, &request.url),
-            Method::CONNECT => {
-                return Err(TropelError::Http("CONNECT method not supported".into()));
-            }
+        // ── Redirect handling — k6 parity ──
+        // k6 counts EVERY redirect hop as its own request (the test.k6.io 302
+        // chain produced 136 http_reqs for 68 iterations; Tropel recorded only
+        // the final 64). We therefore follow redirects MANUALLY: each 3xx hop
+        // becomes its own HttpResponse collected into `redirects`, and the
+        // returned response is the FINAL one (what scripts see via
+        // pm.response / res), with `redirects` attached for per-hop sample
+        // emission by callers.
+        //
+        // `--no-redirects` (HttpConfig.no_redirects) disables following
+        // entirely: the 3xx response is returned as-is with no hops captured
+        // — an option k6 itself lacks (it always follows up to maxRedirects).
+        let manual_follow = request.follow_redirects
+            && !self.config.no_redirects
+            && self.config.max_redirects > 0;
+        let client = if manual_follow {
+            // Manual following needs a Policy::none() client so reqwest never
+            // auto-follows behind our back (the no-redirect twin).
+            self.select_client_with_follow(request, false)?
+        } else {
+            self.select_client(request)?
         };
+        let max_hops = if manual_follow {
+            self.config.max_redirects as usize
+        } else {
+            0
+        };
+        let mut redirects: Vec<HttpResponse> = Vec::new();
+        let mut current_url = request.url.clone();
+        let mut current_method = request.method.clone();
+        let mut current_body: Option<Vec<u8>> = body_bytes.clone();
+        let mut hop_index: usize = 0;
+        // Set when the previous hop redirected to a DIFFERENT origin: the
+        // next hop must not carry credentials (Authorization/Cookie/…),
+        // matching reqwest's and k6's redirect policies.
+        let mut strip_sensitive = false;
 
-        // Add headers
-        if let Some(content_type) = multipart_content_type {
-            if !request
-                .headers
-                .keys()
-                .any(|k| k.eq_ignore_ascii_case("content-type"))
-            {
-                req_builder = req_builder.header("Content-Type", content_type);
+        loop {
+            let hop_start = std::time::Instant::now();
+            crate::subtimings::begin_request(hop_start);
+
+            // Build the reqwest request for THIS hop (URL/method/body may
+            // have been rewritten by a redirect).
+            let mut req_builder = match current_method {
+                Method::GET => client.get(&current_url),
+                Method::POST => {
+                    let rb = client.post(&current_url);
+                    if let Some(bytes) = &current_body {
+                        rb.body(reqwest::Body::from(bytes.clone()))
+                    } else {
+                        rb
+                    }
+                }
+                Method::PUT => {
+                    let rb = client.put(&current_url);
+                    if let Some(bytes) = &current_body {
+                        rb.body(reqwest::Body::from(bytes.clone()))
+                    } else {
+                        rb
+                    }
+                }
+                Method::PATCH => {
+                    let rb = client.patch(&current_url);
+                    if let Some(bytes) = &current_body {
+                        rb.body(reqwest::Body::from(bytes.clone()))
+                    } else {
+                        rb
+                    }
+                }
+                Method::DELETE => client.delete(&current_url),
+                Method::HEAD => client.head(&current_url),
+                Method::OPTIONS => client.request(reqwest::Method::OPTIONS, &current_url),
+                Method::TRACE => client.request(reqwest::Method::TRACE, &current_url),
+                Method::CONNECT => {
+                    return Err(TropelError::Http("CONNECT method not supported".into()));
+                }
+            };
+
+            // Add headers
+            if let Some(content_type) = &multipart_content_type {
+                if !request
+                    .headers
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case("content-type"))
+                {
+                    req_builder = req_builder.header("Content-Type", content_type);
+                }
             }
-        }
-        for (key, value) in &request.headers {
-            req_builder = req_builder.header(key.as_str(), value.as_str());
-        }
+            for (key, value) in &request.headers {
+                // Cross-origin redirect hops must not leak credentials to
+                // another origin (reqwest's redirect policy strips
+                // Authorization/Cookie/etc on origin change).
+                if strip_sensitive
+                    && matches!(
+                        key.to_ascii_lowercase().as_str(),
+                        "authorization"
+                            | "cookie"
+                            | "cookie2"
+                            | "proxy-authorization"
+                            | "www-authenticate"
+                    )
+                {
+                    continue;
+                }
+                req_builder = req_builder.header(key.as_str(), value.as_str());
+            }
 
-        // Add query parameters
-        if !request.query_params.is_empty() {
-            req_builder = req_builder.query(&request.query_params);
-        }
+            // Add query parameters
+            if !request.query_params.is_empty() {
+                req_builder = req_builder.query(&request.query_params);
+            }
 
-        // Set timeout (client-level timeout is already set, request can override shorter)
-        if let Some(timeout) = request.timeout {
-            req_builder = req_builder.timeout(timeout);
-        }
+            // Set timeout (client-level timeout is already set, request can override shorter)
+            if let Some(timeout) = request.timeout {
+                req_builder = req_builder.timeout(timeout);
+            }
 
-        // Build the request, then apply auth IN PLACE. Signers need the final
-        // method/URL/body (SigV4, OAuth1, Hawk), which a RequestBuilder cannot
-        // expose, so the auth happens on the built Request.
-        let mut built_request = req_builder.build().map_err(|e| {
-            TropelError::Http(format!("Failed to build request: {}", e))
-        })?;
-        if let Some(signer) = signer {
-            signer
-                .sign(&mut built_request)
-                .map_err(|e| TropelError::Http(format!("Auth signing failed: {}", e)))?;
-        }
+            // Build the request, then apply auth IN PLACE. Signers need the
+            // final method/URL/body (SigV4, OAuth1, Hawk), which a
+            // RequestBuilder cannot expose, so the auth happens on the built
+            // Request. Auth is applied ONLY to the first hop: signing the
+            // redirect target would be wrong (the signature is for the
+            // original URL). reqwest strips Authorization on cross-origin
+            // redirects; same-origin hops keep whatever hop 0 carried.
+            let mut built_request = req_builder.build().map_err(|e| {
+                TropelError::Http(format!("Failed to build request: {}", e))
+            })?;
+            if hop_index == 0 {
+                if let Some(signer) = signer {
+                    signer
+                        .sign(&mut built_request)
+                        .map_err(|e| TropelError::Http(format!("Auth signing failed: {}", e)))?;
+                }
+            }
 
-        // Keep a clone for the Digest challenge-response retry below. For all
-        // other signers `challenge_response` returns None and this is unused.
-        let retry_request = built_request.try_clone();
+            // Keep a clone for the Digest challenge-response retry below. For
+            // all other signers `challenge_response` returns None and this is
+            // unused.
+            let retry_request = built_request.try_clone();
 
         // ═══════════════════════════════════════════════════════
         // Phase 1: Send request → receive response head (TTFB)
@@ -550,6 +624,109 @@ impl HttpClient {
             .filter_map(|v| parse_set_cookie(v.to_str().ok()?))
             .collect();
 
+        // ── Redirect hop? ──
+        // k6 parity: every redirect hop is its own request. When the response
+        // is a 3xx with a Location header (and hops remain), capture it as a
+        // hop response, resolve the next URL, rewrite method/body per RFC
+        // 7231, and loop to send the next hop.
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let is_redirect = matches!(status_code, 301 | 302 | 303 | 307 | 308);
+        if manual_follow && redirects.len() < max_hops && is_redirect {
+            if let Some(location) = location {
+                // Capture the hop as its own response (own duration). The
+                // body is the usually-tiny redirect body — drain it so the
+                // connection returns to the pool.
+                let mut hop_body: Vec<u8> = Vec::new();
+                while let Some(chunk) = response
+                    .chunk()
+                    .await
+                    .map_err(|e| TropelError::Http(format!("Failed to read redirect body: {}", e)))?
+                {
+                    hop_body.extend_from_slice(&chunk);
+                }
+                let hop_total = hop_start.elapsed();
+                let hop_phases = crate::subtimings::take_slot();
+                let mut hop_timings =
+                    Timings::from_measured(waiting_duration, Duration::ZERO, hop_total);
+                if let (Some(request_start), Some(connect_start), Some(connect_elapsed)) = (
+                    hop_phases.request_start,
+                    hop_phases.connect_start,
+                    hop_phases.connect_elapsed,
+                ) {
+                    hop_timings.blocked = connect_start.saturating_duration_since(request_start);
+                    hop_timings.dns = hop_phases.dns_elapsed.unwrap_or_default();
+                    hop_timings.connecting = connect_elapsed.saturating_sub(hop_timings.dns);
+                }
+                let hop_connect = hop_timings.blocked + hop_timings.dns + hop_timings.connecting;
+                hop_timings.waiting = hop_timings.waiting.saturating_sub(hop_connect);
+
+                // `size` counts the drained hop body bytes so data_received
+                // per hop matches the wire (k6 counts per-request
+                // data_received).
+                let hop_size = hop_body.len() as u64;
+                redirects.push(HttpResponse {
+                    url: current_url.clone(),
+                    status_code,
+                    status_text,
+                    headers,
+                    body: hop_body,
+                    response_time: hop_total,
+                    timings: Some(hop_timings),
+                    cookies,
+                    size: hop_size,
+                    request_body_size: 0,
+                    redirects: Vec::new(),
+                });
+
+                // Resolve the Location header against the current URL.
+                let base = reqwest::Url::parse(&current_url).map_err(|e| {
+                    TropelError::Http(format!("Invalid request URL '{}': {}", current_url, e))
+                })?;
+                let next = base.join(&location).map_err(|e| {
+                    TropelError::Http(format!("Invalid redirect Location '{}': {}", location, e))
+                })?;
+
+                // Cross-origin redirect → drop credentials for the next hop.
+                let cur = reqwest::Url::parse(&current_url).ok();
+                let same_origin = match &cur {
+                    Some(c) => {
+                        c.scheme() == next.scheme()
+                            && c.host_str() == next.host_str()
+                            && c.port_or_known_default() == next.port_or_known_default()
+                    }
+                    None => false,
+                };
+                if !same_origin {
+                    strip_sensitive = true;
+                }
+
+                // RFC 7231 method rewrite (matches reqwest/k6):
+                //   303 → GET (drop body), except HEAD stays HEAD
+                //   301/302 → GET only for POST (drop body)
+                //   307/308 → keep method and body
+                match status_code {
+                    303 if current_method != Method::HEAD => {
+                        current_method = Method::GET;
+                        current_body = None;
+                    }
+                    301 | 302 if current_method == Method::POST => {
+                        current_method = Method::GET;
+                        current_body = None;
+                    }
+                    _ => {}
+                }
+
+                tracing::debug!("Redirect {}: {} -> {}", status_code, current_url, next);
+                current_url = next.to_string();
+                hop_index += 1;
+                continue;
+            }
+        }
+
         // ═══════════════════════════════════════════════════════
         // Phase 2: Receive response body
         // ═══════════════════════════════════════════════════════
@@ -595,7 +772,10 @@ impl HttpClient {
         };
         let receiving_duration = receiving_start.elapsed();
 
-        let total_duration = total_start.elapsed();
+        // The FINAL hop's own duration (k6 reports the last hop's time in its
+        // final http_req_duration sample; the whole-chain wall time lives in
+        // iteration_duration, so don't double-count the redirect hops here).
+        let total_duration = hop_start.elapsed();
 
         // Build sub-timings from the real phases recorded by the
         // `dns_resolver` and `connector_layer` hooks (thread-local slot).
@@ -636,7 +816,7 @@ impl HttpClient {
             tracing::info!(
                 "HTTP <<< {:?} {} -> {} ({} bytes in {:.2?})",
                 request.method,
-                request.url,
+                current_url,
                 status_code,
                 size,
                 total_duration
@@ -644,6 +824,7 @@ impl HttpClient {
         }
 
         let response = HttpResponse {
+            url: current_url,
             status_code,
             status_text,
             headers,
@@ -653,9 +834,14 @@ impl HttpClient {
             cookies,
             size,
             request_body_size,
+            // Every intermediate redirect hop, in order — callers emit one
+            // http_req_* sample set per hop (k6 parity: a 302 chain counts
+            // as hops + 1 requests, not just the final).
+            redirects,
         };
 
-        Ok(response)
+        return Ok(response);
+        } // end redirect-follow loop
     }
 
     /// Get an auth signer based on the auth config.
@@ -673,6 +859,10 @@ impl HttpClient {
 /// Body text and JSON are NOT eagerly parsed — see `body_text()` / `body_json()`.
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
+    /// The URL that produced THIS response. For a redirect chain, each hop
+    /// carries its own URL; the final response carries the final URL (what
+    /// scripts see via pm.response / res).
+    pub url: String,
     pub status_code: u16,
     pub status_text: String,
     pub headers: HashMap<String, String>,
@@ -683,11 +873,17 @@ pub struct HttpResponse {
     pub size: u64,
     /// Number of bytes sent in the request body (for data_sent tracking).
     pub request_body_size: u64,
+    /// Intermediate redirect hops, in order, each captured as its own
+    /// request (k6 parity). Empty when the request did not redirect (or
+    /// `follow_redirects` / `--no-redirects` disabled following). Callers
+    /// emit one http_req_* sample set PER hop plus the final response.
+    pub redirects: Vec<HttpResponse>,
 }
 
 impl From<&HttpResponse> for tropel_core::types::Response {
     fn from(resp: &HttpResponse) -> Self {
         tropel_core::types::Response {
+            url: resp.url.clone(),
             status_code: resp.status_code,
             status_text: resp.status_text.clone(),
             headers: resp.headers.clone(),
@@ -696,6 +892,9 @@ impl From<&HttpResponse> for tropel_core::types::Response {
             timings: resp.timings.clone(),
             cookies: resp.cookies.clone(),
             size: resp.size,
+            // Recursively convert the redirect chain so DriverHttpClient / k6
+            // driver / pm.response all see per-hop requests (k6 parity).
+            redirects: resp.redirects.iter().map(Response::from).collect(),
         }
     }
 }

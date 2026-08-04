@@ -139,6 +139,14 @@ pub enum Commands {
         #[arg(long = "http-debug")]
         http_debug: bool,
 
+        /// Never follow redirects: each 3xx response is returned to the
+        /// script as-is and every redirect hop is counted as a request
+        /// (default) — with this flag the 3xx itself IS the final response.
+        /// k6 always follows redirects (up to maxRedirects); this opt-out
+        /// is a Tropel extra.
+        #[arg(long = "no-redirects")]
+        no_redirects: bool,
+
         /// Run mode: constant-vus, ramping-vus, shared-iterations, arrival-rate
         /// (optional — when absent, a k6 script's own `export const options`
         /// drives the load profile; passing this flag makes the CLI profile win)
@@ -351,6 +359,7 @@ async fn run_command(cli: Cli) -> Result<()> {
         insecure,
         verbose: _,
         http_debug,
+        no_redirects,
         mode,
         stages,
         iterations,
@@ -392,6 +401,7 @@ async fn run_command(cli: Cli) -> Result<()> {
     let thresholds = threshold.clone();
     let insecure = *insecure;
     let http_debug = *http_debug;
+    let no_redirects = *no_redirects;
     // `mode` is now optional so we can tell whether the user explicitly chose
     // a load profile (mode/vus/duration/stages/iterations flags). When none of
     // them are set, a k6 script's own `export const options` may drive the run.
@@ -526,9 +536,11 @@ async fn run_command(cli: Cli) -> Result<()> {
     };
 
     // The config-file / K6_* overlay may replace `config.http` wholesale, so
-    // the explicit CLI --http-debug flag is applied AFTER the overlay to make
-    // sure it always wins (regardless of what the overlay set).
+    // the explicit CLI --http-debug / --no-redirects flags are applied AFTER
+    // the overlay to make sure they always win (regardless of what the
+    // overlay set).
     config.http.http_debug = http_debug;
+    config.http.no_redirects = no_redirects;
 
     // ── Apply the overlay (CLI flags win; overlay fills gaps) ──
     // Compute BEFORE the &mut borrow (CLI --data-file already loaded

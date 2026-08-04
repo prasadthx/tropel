@@ -214,6 +214,11 @@ impl Body {
 /// the body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
+    /// The URL that produced THIS response. For a redirect chain each hop
+    /// carries its own URL; the final response carries the final URL (what
+    /// scripts see via pm.response / k6 res.url).
+    #[serde(default)]
+    pub url: String,
     pub status_code: u16,
     pub status_text: String,
     pub headers: HashMap<String, String>,
@@ -222,6 +227,12 @@ pub struct Response {
     pub timings: Option<Timings>,
     pub cookies: Vec<Cookie>,
     pub size: u64,
+    /// Intermediate redirect hops, in order, each captured as its own
+    /// request (k6 parity: a 302 chain counts as hops + 1 requests, not
+    /// just the final). Empty when the request did not redirect. Callers
+    /// emit one http_req_* sample set PER hop plus the final response.
+    #[serde(default)]
+    pub redirects: Vec<Response>,
 }
 
 impl Response {

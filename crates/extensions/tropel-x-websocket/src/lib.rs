@@ -203,6 +203,7 @@ impl Protocol for WebSocketProtocol {
         // ── Build the response for pm.response ──
         let body = serde_json::to_vec(&received).unwrap_or_default();
         let response = Response {
+            url: req.url.clone(),
             status_code: session_status,
             status_text: if ok {
                 "Switching Protocols".into()
@@ -219,6 +220,7 @@ impl Protocol for WebSocketProtocol {
             timings: None,
             cookies: vec![],
             size: body.len() as u64,
+            redirects: vec![],
         };
 
         // ── Metrics ──

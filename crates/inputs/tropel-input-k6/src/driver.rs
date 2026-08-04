@@ -51,7 +51,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tropel_js::JsContext;
-use tropel_sdk::{Body, Method, Request, Sample, SampleType, TagMap};
+use tropel_sdk::{Body, Method, Request, Response, Sample, SampleType, TagMap};
 use tropel_sdk::{Driver, DriverDeclaredOptions, DriverInstance, DriverRegistration, VuContext};
 use tropel_sdk::{Result, TropelError};
 
@@ -469,11 +469,16 @@ unsafe impl Sync for K6DriverInstance {}
 
 /// Build the standard http_req_* tag set (url/method/status/name/group).
 fn http_tags(req: &Request, status: &str) -> TagMap {
+    http_tags_for(&req.url, &req.method.to_string(), status)
+}
+
+/// [`http_tags`] with explicit URL/method (redirect hops reuse it).
+fn http_tags_for(url: &str, method: &str, status: &str) -> TagMap {
     let mut tags = TagMap::with_capacity(5);
-    tags.insert("url", req.url.clone());
-    tags.insert("method", req.method.to_string());
+    tags.insert("url", url.to_string());
+    tags.insert("method", method.to_string());
     tags.insert("status", status.to_string());
-    tags.insert("name", req.url.clone());
+    tags.insert("name", url.to_string());
     tags.insert("group", "http");
     tags
 }
@@ -491,8 +496,48 @@ fn push_http_samples(
     size: u64,
     sent: usize,
 ) {
+    push_http_samples_for(
+        sink,
+        &req.url,
+        &req.method.to_string(),
+        status_code,
+        duration,
+        size,
+        sent,
+    );
+}
+
+/// Record http_req_* samples for EVERY redirect hop of a response (k6
+/// parity: each hop is its own request — the test.k6.io 302 chain counted
+/// 136 http_reqs for 68 iterations while Tropel recorded only the final
+/// 64). Called BEFORE the final response's samples so hop order matches k6.
+fn push_redirect_hops(sink: &Mutex<Vec<Sample>>, resp: &Response, method: &str) {
+    for hop in &resp.redirects {
+        push_http_samples_for(
+            sink,
+            &hop.url,
+            method,
+            hop.status_code,
+            hop.response_time,
+            hop.size,
+            0, // redirect hops carry no request body
+        );
+    }
+}
+
+/// Implementation of [`push_http_samples`] with an explicit URL/method so
+/// redirect hops (different URL, same method) reuse the same emitter.
+fn push_http_samples_for(
+    sink: &Mutex<Vec<Sample>>,
+    url: &str,
+    method: &str,
+    status_code: u16,
+    duration: Duration,
+    size: u64,
+    sent: usize,
+) {
     let now = SystemTime::now();
-    let tags = Arc::new(http_tags(req, &status_code.to_string()));
+    let tags = Arc::new(http_tags_for(url, method, &status_code.to_string()));
 
     let is_failed = !(200..400).contains(&status_code);
     let mut v = sink.lock().unwrap();
@@ -740,6 +785,10 @@ impl K6DriverInstance {
                                     .as_ref()
                                     .map(Body::encoded_len)
                                     .unwrap_or(0);
+                                // k6 parity: every redirect hop counts as its
+                                // own request (test.k6.io 302 chain = 2 reqs
+                                // per iteration, not 1).
+                                push_redirect_hops(&sink, &resp, &req.method.to_string());
                                 push_http_samples(
                                     &sink,
                                     &req,
@@ -838,8 +887,7 @@ impl K6DriverInstance {
                             response_type: tropel_sdk::ResponseType::from_k6(response_type),
                         };
                         let http_client = http_for_io.clone();
-                        async move {
-                            let resp = http_client.execute(&req).await;
+                        async move {                                let resp = http_client.execute(&req).await;
                             (key, req, resp)
                         }
                     });
@@ -868,6 +916,10 @@ impl K6DriverInstance {
                                         .as_ref()
                                         .map(Body::encoded_len)
                                         .unwrap_or(0);
+                                    // k6 parity: every redirect hop counts as
+                                    // its own request, same as the single-
+                                    // request path.
+                                    push_redirect_hops(&batch_sink, &resp, &req.method.to_string());
                                     push_http_samples(
                                         &batch_sink,
                                         &req,

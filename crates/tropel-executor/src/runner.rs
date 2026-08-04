@@ -370,100 +370,114 @@ impl VURunner {
                                 state.response = Some(pm_response);
                             }
 
-                            // Build tags for all request-level metrics
-                            let mut tags = TagMap::with_capacity(5);
-                            tags.insert("url", resolved_req.url.clone());
-                            tags.insert("method", resolved_req.method.to_string());
-                            tags.insert("status", http_response.status_code.to_string());
-                            tags.insert("name", resolved_req.url.clone());
-                            tags.insert("group", "http");
-                            // Share one Arc so all ~12 per-request samples bump a
-                            // refcount instead of copying the whole map.
-                            let tags = Arc::new(tags);
+                            // Emit samples for EVERY redirect hop plus the final
+                            // response (k6 parity: a 302 chain counts as hops + 1
+                            // requests, not just the final — the earlier
+                            // k6_sample_basic comparison showed 136 reqs for 68
+                            // iterations while Tropel recorded 64). The final
+                            // response's URL/status/body is what pm.response
+                            // exposes; each hop gets its own sample set.
+                            let chain = http_response
+                                .redirects
+                                .iter()
+                                .chain(std::iter::once(&http_response));
+                            for resp in chain {
+                                // Build tags for all request-level metrics
+                                let mut tags = TagMap::with_capacity(5);
+                                tags.insert("url", resp.url.clone());
+                                tags.insert("method", resolved_req.method.to_string());
+                                tags.insert("status", resp.status_code.to_string());
+                                tags.insert("name", resp.url.clone());
+                                tags.insert("group", "http");
+                                // Share one Arc so all ~12 per-request samples bump a
+                                // refcount instead of copying the whole map.
+                                let tags = Arc::new(tags);
 
-                            let now = std::time::SystemTime::now();
+                                let now = std::time::SystemTime::now();
 
-                            // http_req_duration (Trend)
-                            result.samples.push(Sample {
-                                metric: "http_req_duration".into(),
-                                value: duration.as_micros() as f64,
-                                tags: tags.clone(),
-                                timestamp: now,
-                                sample_type: SampleType::Trend,
-                            });
+                                // http_req_duration (Trend) — this hop's own time
+                                result.samples.push(Sample {
+                                    metric: "http_req_duration".into(),
+                                    value: resp.response_time.as_micros() as f64,
+                                    tags: tags.clone(),
+                                    timestamp: now,
+                                    sample_type: SampleType::Trend,
+                                });
 
-                            // http_reqs (Counter)
-                            result.samples.push(Sample {
-                                metric: "http_reqs".into(),
-                                value: 1.0,
-                                tags: tags.clone(),
-                                timestamp: now,
-                                sample_type: SampleType::Counter,
-                            });
+                                // http_reqs (Counter)
+                                result.samples.push(Sample {
+                                    metric: "http_reqs".into(),
+                                    value: 1.0,
+                                    tags: tags.clone(),
+                                    timestamp: now,
+                                    sample_type: SampleType::Counter,
+                                });
 
-                            // http_req_failed (Rate) — true when status not in expected list
-                            let is_failed = !tropel_core::config::status_is_expected(
-                                http_response.status_code,
-                                &self.expected_statuses,
-                            );
-                            result.samples.push(Sample {
-                                metric: "http_req_failed".into(),
-                                value: if is_failed { 1.0 } else { 0.0 },
-                                tags: tags.clone(),
-                                timestamp: now,
-                                sample_type: SampleType::Rate,
-                            });
+                                // http_req_failed (Rate) — true when status not in expected list
+                                let is_failed = !tropel_core::config::status_is_expected(
+                                    resp.status_code,
+                                    &self.expected_statuses,
+                                );
+                                result.samples.push(Sample {
+                                    metric: "http_req_failed".into(),
+                                    value: if is_failed { 1.0 } else { 0.0 },
+                                    tags: tags.clone(),
+                                    timestamp: now,
+                                    sample_type: SampleType::Rate,
+                                });
 
-                            // data_received (Counter) — response body bytes
-                            result.samples.push(Sample {
-                                metric: "data_received".into(),
-                                value: http_response.size as f64,
-                                tags: tags.clone(),
-                                timestamp: now,
-                                sample_type: SampleType::Counter,
-                            });
+                                // data_received (Counter) — response body bytes
+                                result.samples.push(Sample {
+                                    metric: "data_received".into(),
+                                    value: resp.size as f64,
+                                    tags: tags.clone(),
+                                    timestamp: now,
+                                    sample_type: SampleType::Counter,
+                                });
 
-                            // data_sent (Counter) — request body bytes
-                            result.samples.push(Sample {
-                                metric: "data_sent".into(),
-                                value: http_response.request_body_size as f64,
-                                tags: tags.clone(),
-                                timestamp: now,
-                                sample_type: SampleType::Counter,
-                            });
+                                // data_sent (Counter) — request body bytes
+                                result.samples.push(Sample {
+                                    metric: "data_sent".into(),
+                                    value: resp.request_body_size as f64,
+                                    tags: tags.clone(),
+                                    timestamp: now,
+                                    sample_type: SampleType::Counter,
+                                });
 
-                            // ═══════════════════════════════════════════════
-                            // HTTP sub-timing metrics (Trend, all in μs)
-                            // ═══════════════════════════════════════════════
-                            // These match k6's http_req_* sub-timing metrics.
-                            // http_req_dns is a Tropel extra (k6 folds DNS into
-                            // http_req_blocked). blocked/dns/connecting are
-                            // REAL (from reqwest's dns_resolver +
-                            // connector_layer hooks);
-                            // tls_handshaking/sending are always ZERO (folded
-                            // into connecting / waiting by reqwest). waiting
-                            // (TTFB) and receiving are always measured.
-                            // Note: on a pooled keep-alive reuse no connector
-                            // call happens, so blocked/dns/connecting are 0.
-                            if let Some(timings) = &http_response.timings {
-                                let sub_timing_metrics = [
-                                    ("http_req_blocked", timings.blocked),
-                                    ("http_req_dns", timings.dns),
-                                    ("http_req_connecting", timings.connecting),
-                                    ("http_req_tls_handshaking", timings.tls_handshaking),
-                                    ("http_req_sending", timings.sending),
-                                    ("http_req_waiting", timings.waiting),
-                                    ("http_req_receiving", timings.receiving),
-                                ];
-                                let sub_tags = tags.clone();
-                                for (metric_name, dur) in &sub_timing_metrics {
-                                    result.samples.push(Sample {
-                                        metric: (*metric_name).into(),
-                                        value: dur.as_micros() as f64,
-                                        tags: sub_tags.clone(),
-                                        timestamp: now,
-                                        sample_type: SampleType::Trend,
-                                    });
+                                // ═══════════════════════════════════════
+                                // HTTP sub-timing metrics (Trend, all in μs)
+                                // ═══════════════════════════════════════
+                                // These match k6's http_req_* sub-timing
+                                // metrics. http_req_dns is a Tropel extra (k6
+                                // folds DNS into http_req_blocked).
+                                // blocked/dns/connecting are REAL (from
+                                // reqwest's dns_resolver + connector_layer
+                                // hooks); tls_handshaking/sending are always
+                                // ZERO (folded into connecting / waiting by
+                                // reqwest). waiting (TTFB) and receiving are
+                                // always measured. Note: on a pooled keep-alive
+                                // reuse no connector call happens, so
+                                // blocked/dns/connecting are 0.
+                                if let Some(timings) = &resp.timings {
+                                    let sub_timing_metrics = [
+                                        ("http_req_blocked", timings.blocked),
+                                        ("http_req_dns", timings.dns),
+                                        ("http_req_connecting", timings.connecting),
+                                        ("http_req_tls_handshaking", timings.tls_handshaking),
+                                        ("http_req_sending", timings.sending),
+                                        ("http_req_waiting", timings.waiting),
+                                        ("http_req_receiving", timings.receiving),
+                                    ];
+                                    let sub_tags = tags.clone();
+                                    for (metric_name, dur) in &sub_timing_metrics {
+                                        result.samples.push(Sample {
+                                            metric: (*metric_name).into(),
+                                            value: dur.as_micros() as f64,
+                                            tags: sub_tags.clone(),
+                                            timestamp: now,
+                                            sample_type: SampleType::Trend,
+                                        });
+                                    }
                                 }
                             }
                         }
