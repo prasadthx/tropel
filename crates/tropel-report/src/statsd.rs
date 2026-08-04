@@ -121,10 +121,18 @@ impl StatsdOutput {
             SampleType::Counter | SampleType::Rate => "c",
             SampleType::Trend | SampleType::Point => "g",
         };
-        let mut line = format!("{}:{}|{}", sample.metric, sample.value, stype);
+        // Sanitize: a raw `:`, `|`, `,`, or `#` in the metric name or a tag
+        // key/value would break the `metric:value|type|#k:v,k:v` line into a
+        // corrupt (or multi-line) datagram that the agent mis-parses.
+        // Reserved chars become `_` (Datadog's documented convention).
+        let metric = sanitize_component(&sample.metric);
+        let mut line = format!("{}:{}|{}", metric, sample.value, stype);
         let tags = self.tag_policy.apply(&sample.tags);
         if !tags.is_empty() {
-            let tag_list: Vec<String> = tags.iter().map(|(k, v)| format!("{k}:{v}")).collect();
+            let tag_list: Vec<String> = tags
+                .iter()
+                .map(|(k, v)| format!("{}:{}", sanitize_component(k), sanitize_component(v)))
+                .collect();
             line.push_str(&format!("|#{}", tag_list.join(",")));
         }
         self.buffer.lock().unwrap().push(line);
@@ -172,6 +180,19 @@ impl StatsdOutput {
         }
         Ok(())
     }
+}
+
+/// Replace StatsD/Datadog reserved characters in a metric name or tag
+/// key/value with `_`. The line format is `metric:value|type|#k:v,k:v`, so a
+/// raw `:`, `|`, `,`, or `#` corrupts the datagram (or silently splits it
+/// into bogus metrics). `@` is additionally reserved as the DogStatsD
+/// sample-rate delimiter (`|@0.5`) — we never emit sample rate, but a
+/// literal `@` in a name/value would be misread by a DogStatsD agent as a
+/// rate marker.
+fn sanitize_component(s: &str) -> String {
+    s.chars()
+        .map(|c| if matches!(c, ':' | '|' | ',' | '#' | '@') { '_' } else { c })
+        .collect()
 }
 
 #[async_trait]
@@ -223,6 +244,33 @@ mod tests {
     #[test]
     fn rejects_bad_address() {
         assert!(StatsdOutput::new("not-an-addr").is_err());
+    }
+
+    #[test]
+    fn sanitizes_reserved_chars_in_metric_and_tags() {
+        // A raw `:`, `|`, `,`, `#`, or `@` in the metric name or a tag value
+        // would break the `metric:value|type|#k:v,k:v` line into a corrupt
+        // datagram (or be misread as a sample rate). All must become `_` —
+        // note the `:` inside `https://` is sanitized too.
+        let output = StatsdOutput::new("127.0.0.1:8125").unwrap();
+        let mut tags = TagMap::new();
+        tags.insert("url", "https://x/y?a=1|b,c#d@0.5");
+        let mut s = sample("http_req_duration|weird:name", 1.0, SampleType::Trend);
+        s.tags = std::sync::Arc::new(tags);
+        output.buffer(&s);
+        let lines = output.buffer.lock().unwrap().clone();
+        assert_eq!(
+            lines[0],
+            "http_req_duration_weird_name:1|g|#url:https_//x/y?a=1_b_c_d_0.5"
+        );
+    }
+
+    #[test]
+    fn clean_components_untouched() {
+        // Sanitization must be a no-op for already-clean names/values.
+        assert_eq!(sanitize_component("http_req_duration"), "http_req_duration");
+        assert_eq!(sanitize_component("GET"), "GET");
+        assert_eq!(sanitize_component("a_b-c.d"), "a_b-c.d");
     }
 
     /// End-to-end: send to a live UDP socket and verify the datagram.

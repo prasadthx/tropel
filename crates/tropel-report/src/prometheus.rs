@@ -74,7 +74,10 @@ struct SeriesAgg {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SeriesKey {
     metric: String,
-    /// Sorted label pairs (including `__name__` = metric as the first entry).
+    /// Sorted label pairs including `__name__` = metric. `__name__` is NOT
+    /// hardcoded first — it is part of the sort, because a tag whose name
+    /// byte-sorts before it (e.g. `__custom`, `_a`) must precede it for the
+    /// label set to be in canonical Prometheus order (sorted by name).
     labels: Vec<(String, String)>,
 }
 
@@ -85,8 +88,8 @@ impl SeriesKey {
             .filter(|(k, _)| k != &"__name__") // avoid duplicate __name__ label
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
+        labels.push(("__name__".to_string(), metric.to_string()));
         labels.sort();
-        labels.insert(0, ("__name__".to_string(), metric.to_string()));
         Self {
             metric: metric.to_string(),
             labels,
@@ -297,16 +300,23 @@ fn expand_series(
             vec![(key.clone(), vec![(agg.last, ts_ms)])]
         }
         SampleType::Trend => {
-            // `{metric}_count` — labels share everything except __name__.
+            // `{metric}_count` — labels share everything except __name__,
+            // whose VALUE becomes `{metric}_count`. The label can sit anywhere
+            // in the sorted set (a `__custom` tag sorts before it), so locate
+            // it by name rather than assuming index 0.
             let mut count_labels = key.labels.clone();
-            count_labels[0].1 = format!("{}_count", key.metric);
+            if let Some(entry) = count_labels.iter_mut().find(|(n, _)| n == "__name__") {
+                entry.1 = format!("{}_count", key.metric);
+            }
             let count_key = SeriesKey {
                 metric: format!("{}_count", key.metric),
                 labels: count_labels,
             };
-            // `{metric}_sum` — labels share everything except __name__.
+            // `{metric}_sum` — same, with the sum value.
             let mut sum_labels = key.labels.clone();
-            sum_labels[0].1 = format!("{}_sum", key.metric);
+            if let Some(entry) = sum_labels.iter_mut().find(|(n, _)| n == "__name__") {
+                entry.1 = format!("{}_sum", key.metric);
+            }
             let sum_key = SeriesKey {
                 metric: format!("{}_sum", key.metric),
                 labels: sum_labels,
@@ -587,12 +597,80 @@ mod tests {
         assert!(found_count.is_some(), "_count sub-series missing");
         assert!(found_sum.is_some(), "_sum sub-series missing");
 
-        // Counter http_reqs → single series, sum, just __name__ label.
+        // Counter http_reqs → single series, sum, just the __name__ label.
+        // (The metric name lives in the __name__ VALUE — comparing label
+        // NAMES to "http_reqs" would never match, so the series went
+        // unverified before.)
+        let mut found_counter = false;
         for (labels, samples) in &decoded {
-            if labels.iter().any(|(k, _)| k == "http_reqs") {
-                assert_eq!(labels.len(), 1);
+            if labels
+                .iter()
+                .find(|(n, _)| n == "__name__")
+                .is_some_and(|(_, v)| v == "http_reqs")
+            {
+                assert_eq!(labels.len(), 1, "counter series must have only __name__");
                 assert_eq!(samples, &vec![(1.0, 1000)]);
+                found_counter = true;
             }
+        }
+        assert!(found_counter, "http_reqs counter series missing from output");
+    }
+
+    #[test]
+    fn name_label_sorted_with_tags_not_hardcoded_first() {
+        // `__name__` used to be inserted at index 0 AFTER sorting the tags, so
+        // a tag that byte-sorts before `__name__` (e.g. `__custom`, `_a`) sat
+        // AFTER it — a non-canonical label set. All labels including
+        // `__name__` must be sorted together.
+        let mut tags = TagMap::new();
+        tags.insert("__custom", "v");
+        tags.insert("zebra", "z");
+        let key = SeriesKey::from_parts("http_reqs", &tags);
+        assert_eq!(
+            key.labels,
+            vec![
+                ("__custom".to_string(), "v".to_string()),
+                ("__name__".to_string(), "http_reqs".to_string()),
+                ("zebra".to_string(), "z".to_string()),
+            ],
+            "labels must be in canonical sorted order with __name__ among them"
+        );
+    }
+
+    #[test]
+    fn trend_expansion_finds_name_label_not_at_index_zero() {
+        // expand_series previously rewrote labels[0] assuming __name__ was
+        // first. With a `__custom` tag it is NOT first — the __name__ entry
+        // must be found by name and its value rewritten for the _count/_sum
+        // sub-series.
+        let mut tags = TagMap::new();
+        tags.insert("__custom", "v");
+        let key = SeriesKey::from_parts("http_req_duration", &tags);
+        let agg = SeriesAgg {
+            sample_type: SampleType::Trend,
+            count: 3,
+            sum: 45.0,
+            last: 45.0,
+        };
+        let expanded = expand_series(&key, &agg, 1000);
+        assert_eq!(expanded.len(), 2);
+        for (k, samples) in &expanded {
+            // __custom tag survives on the sub-series.
+            assert!(k.labels.iter().any(|(n, v)| n == "__custom" && v == "v"));
+            // __name__ value is the suffixed metric name, wherever it sits.
+            let name_val = k
+                .labels
+                .iter()
+                .find(|(n, _)| n == "__name__")
+                .map(|(_, v)| v.as_str())
+                .unwrap();
+            assert!(
+                name_val == "http_req_duration_count"
+                    || name_val == "http_req_duration_sum",
+                "unexpected __name__ value {name_val}"
+            );
+            // One sample per sub-series at flush time.
+            assert_eq!(samples.len(), 1);
         }
     }
 
