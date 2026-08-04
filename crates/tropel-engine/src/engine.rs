@@ -5,16 +5,15 @@ use crate::vu_loop::{parse_duration_str, run_driver_vus, run_scenario_vus};
 use crate::worker::VUWorkerPool;
 
 /// One entry of the per-scenario config list threaded into `run_scenario_vus`.
-/// (name, execution, env, tags, start_delay, input_path, exec_name)
-type ScenarioConfigTuple = (
-    String,
-    ExecutionConfig,
-    HashMap<String, String>,
-    HashMap<String, String>,
-    Duration,
-    String,
-    Option<String>,
-);
+struct ScenarioConfigTuple {
+    name: String,
+    execution: ExecutionConfig,
+    env: HashMap<String, String>,
+    tags: HashMap<String, String>,
+    start_delay: Duration,
+    input_path: String,
+    exec: Option<String>,
+}
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -281,21 +280,20 @@ impl Engine {
         }        // Build scenario configs. Script-declared scenarios/execution (from a
         // k6 `export const options`) take precedence over the default profile
         // but not over explicit user config (execution_explicit check above).
-        // Tuple: (name, execution, env, tags, start_delay, input_path).
         let scenario_configs: Vec<ScenarioConfigTuple> = if let Some(scs) = declared_scenarios {
             scs.iter()
                 .map(|(name, sc)| {
                     let start_delay = parse_duration_str(&sc.start_time).unwrap_or(Duration::ZERO);
                     let input_path = sc.input.clone().unwrap_or_else(|| config.input.clone());
-                    (
-                        name.clone(),
-                        sc.execution.clone(),
-                        sc.env.clone(),
-                        sc.tags.clone(),
+                    ScenarioConfigTuple {
+                        name: name.clone(),
+                        execution: sc.execution.clone(),
+                        env: sc.env.clone(),
+                        tags: sc.tags.clone(),
                         start_delay,
                         input_path,
-                        sc.exec.clone(),
-                    )
+                        exec: sc.exec.clone(),
+                    }
                 })
                 .collect()
         } else if !config.scenarios.is_empty() {
@@ -305,29 +303,29 @@ impl Engine {
                 .map(|(name, sc)| {
                     let start_delay = parse_duration_str(&sc.start_time).unwrap_or(Duration::ZERO);
                     let input_path = sc.input.clone().unwrap_or_else(|| config.input.clone());
-                    (
-                        name.clone(),
-                        sc.execution.clone(),
-                        sc.env.clone(),
-                        sc.tags.clone(),
+                    ScenarioConfigTuple {
+                        name: name.clone(),
+                        execution: sc.execution.clone(),
+                        env: sc.env.clone(),
+                        tags: sc.tags.clone(),
                         start_delay,
                         input_path,
-                        sc.exec.clone(),
-                    )
+                        exec: sc.exec.clone(),
+                    }
                 })
                 .collect()
         } else {
             let exec = declared_execution.unwrap_or_else(|| config.execution.clone());
             vec![
-                (
-                    "default".to_string(),
-                    exec,
-                    HashMap::new(),
-                    HashMap::new(),
-                    Duration::ZERO,
-                    config.input.clone(),
-                    None,
-                )
+                ScenarioConfigTuple {
+                    name: "default".to_string(),
+                    execution: exec,
+                    env: HashMap::new(),
+                    tags: HashMap::new(),
+                    start_delay: Duration::ZERO,
+                    input_path: config.input.clone(),
+                    exec: None,
+                }
             ]
         };
 
@@ -356,12 +354,11 @@ impl Engine {
         };
         let scenario_configs: Vec<ScenarioConfigTuple> = scenario_configs
             .into_iter()
-            .map(|(name, exec, env, tags, delay, input, exec_fn)| {
-                let exec = match &segment {
-                    Some(seg) => seg.apply(&exec),
-                    None => exec,
-                };
-                (name, exec, env, tags, delay, input, exec_fn)
+            .map(|mut sc| {
+                if let Some(seg) = &segment {
+                    sc.execution = seg.apply(&sc.execution);
+                }
+                sc
             })
             .collect();
 
@@ -371,16 +368,14 @@ impl Engine {
         );
         let mut scenario_handles = Vec::new();
 
-        for (scenario_name, exec_cfg, sc_env, sc_tags, start_delay, input_path, sc_exec) in
-            &scenario_configs
-        {
-            let sc_name = scenario_name.clone();
-            let exec_cfg = exec_cfg.clone();
-            let sc_env = sc_env.clone();
-            let sc_tags = sc_tags.clone();
-            let input_path = input_path.clone();
-            let sc_exec = sc_exec.clone();
-            let start_delay = *start_delay;
+        for sc in &scenario_configs {
+            let sc_name = sc.name.clone();
+            let exec_cfg = sc.execution.clone();
+            let sc_env = sc.env.clone();
+            let sc_tags = sc.tags.clone();
+            let input_path = sc.input_path.clone();
+            let sc_exec = sc.exec.clone();
+            let start_delay = sc.start_delay;
             let metrics = metrics.clone();
             let pool = pool.clone();
             let http_cfg = http_config.clone();

@@ -29,4 +29,5 @@ md-5.workspace = true
 hmac.workspace = true
 hex.workspace = true
 percent-encoding.workspace = true
+serde_urlencoded.workspace = true
 indexmap.workspace = true

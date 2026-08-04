@@ -86,6 +86,7 @@ cbc = "0.2.1"
 base64 = "0.23.0"
 hex = "0.4.3"
 percent-encoding = "2.3.2"
+serde_urlencoded = "0.7"
 
 # UUID / random
 uuid = { version = "1.24.0", features = ["v4"] }

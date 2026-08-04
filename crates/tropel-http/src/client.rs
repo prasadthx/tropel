@@ -917,32 +917,6 @@ pub(crate) fn parse_duration(s: &str) -> Result<Duration> {
     tropel_core::parse_duration(s)
 }
 
-/// Re-export serde_urlencoded for form body encoding.
-mod serde_urlencoded {
-
-    pub fn to_string(pairs: Vec<(String, String)>) -> Result<String, std::convert::Infallible> {
-        let encoded: Vec<String> = pairs
-            .iter()
-            .map(|(k, v)| {
-                let k = urlencoding(k);
-                let v = urlencoding(v);
-                format!("{}={}", k, v)
-            })
-            .collect();
-        Ok(encoded.join("&"))
-    }
-
-    fn urlencoding(s: &str) -> String {
-        s.chars()
-            .map(|c| match c {
-                'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-                ' ' => "+".to_string(),
-                _ => format!("%{:02X}", c as u8),
-            })
-            .collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1014,7 +988,7 @@ mod tests {
 
     #[test]
     fn test_form_urlencoding() {
-        let result = super::serde_urlencoded::to_string(vec![
+        let result = serde_urlencoded::to_string(vec![
             ("key".to_string(), "value".to_string()),
             ("name".to_string(), "hello world".to_string()),
         ])
