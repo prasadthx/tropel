@@ -455,11 +455,22 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
                 url.clone()
             };
 
-            // Build request body
-            let body = operation
-                .request_body
-                .as_ref()
-                .and_then(build_request_body);
+            // Build request body (plus its media type — the http client only
+            // auto-sets Content-Type for multipart, so a raw XML/text body
+            // would otherwise go out headerless and get 415'd).
+            let (body, body_content_type) =
+                match operation.request_body.as_ref().and_then(build_request_body) {
+                    Some((b, ct)) => (Some(b), Some(ct)),
+                    None => (None, None),
+                };
+            if let Some(ct) = body_content_type {
+                let has_ct = headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+                if !has_ct {
+                    headers.insert("Content-Type".to_string(), ct);
+                }
+            }
 
             // Resolve auth
             let auth = resolve_auth(operation, &global_security, &doc.components);
@@ -946,7 +957,11 @@ fn extract_param_value(param: &OasParameter) -> String {
         return value_to_string(example);
     }
     if let Some(ref examples) = param.examples {
-        if let Some((_, ex)) = examples.iter().next() {
+        // Deterministic pick: HashMap iteration order is unstable, so sort the
+        // example names and take the first.
+        let mut example_keys: Vec<&String> = examples.keys().collect();
+        example_keys.sort();
+        if let Some(ex) = example_keys.first().and_then(|k| examples.get(*k)) {
             if let Some(ref val) = ex.value {
                 return value_to_string(val);
             }
@@ -994,14 +1009,22 @@ fn value_to_string(val: &serde_json::Value) -> String {
 }
 
 /// Build a Request body from an OpenAPI Request Body object.
-fn build_request_body(rb: &OasRequestBody) -> Option<Body> {
+///
+/// Returns `(body, media_type)` — the media type is threaded back to the
+/// caller so it can set a `Content-Type` header (the http client only
+/// auto-sets one for multipart, so raw XML/text bodies would otherwise go
+/// out headerless).
+fn build_request_body(rb: &OasRequestBody) -> Option<(Body, String)> {
     // Prefer application/json
     if let Some(mt) = rb.content.get("application/json") {
         let json_val = mt
             .example
             .clone()
             .or_else(|| generate_schema_example(mt.schema.as_ref()));
-        return Some(json_val.map_or(Body::Json(serde_json::Value::Null), Body::Json));
+        return Some((
+            json_val.map_or(Body::Json(serde_json::Value::Null), Body::Json),
+            "application/json".to_string(),
+        ));
     }
 
     // Then application/x-www-form-urlencoded
@@ -1009,7 +1032,12 @@ fn build_request_body(rb: &OasRequestBody) -> Option<Body> {
         if let Some(ref schema) = mt.schema {
             let mut map = HashMap::new();
             if let Some(ref props) = schema.properties {
-                for (name, prop_schema) in props {
+                // Sort property keys — HashMap iteration order is unstable,
+                // so form bodies must be identical across runs.
+                let mut keys: Vec<&String> = props.keys().collect();
+                keys.sort();
+                for name in keys {
+                    let prop_schema = &props[name];
                     let val = prop_schema
                         .example
                         .clone()
@@ -1019,7 +1047,10 @@ fn build_request_body(rb: &OasRequestBody) -> Option<Body> {
                     map.insert(name.clone(), val);
                 }
             }
-            return Some(Body::UrlEncoded(map));
+            return Some((
+                Body::UrlEncoded(map),
+                "application/x-www-form-urlencoded".to_string(),
+            ));
         }
         return None;
     }
@@ -1029,7 +1060,11 @@ fn build_request_body(rb: &OasRequestBody) -> Option<Body> {
         if let Some(ref schema) = mt.schema {
             let mut map = HashMap::new();
             if let Some(ref props) = schema.properties {
-                for (name, prop_schema) in props {
+                // Sort property keys for deterministic form bodies.
+                let mut keys: Vec<&String> = props.keys().collect();
+                keys.sort();
+                for name in keys {
+                    let prop_schema = &props[name];
                     let val = prop_schema
                         .example
                         .clone()
@@ -1039,18 +1074,41 @@ fn build_request_body(rb: &OasRequestBody) -> Option<Body> {
                     map.insert(name.clone(), val);
                 }
             }
-            return Some(Body::FormData(map));
+            return Some((Body::FormData(map), "multipart/form-data".to_string()));
         }
         return None;
     }
 
-    // Fallback: take any content type
-    if let Some((_, mt)) = rb.content.iter().next() {
-        let json_val = mt
+    // Fallback: take any content type, deterministically. HashMap iteration
+    // order is unstable across runs — a spec offering several media types
+    // must produce the same request body every parse. Keys are sorted and the
+    // first is chosen.
+    let mut content_keys: Vec<&String> = rb.content.keys().collect();
+    content_keys.sort();
+    if let Some(content_type) = content_keys.first() {
+        let mt = &rb.content[*content_type];
+        let example = mt
             .example
             .clone()
             .or_else(|| generate_schema_example(mt.schema.as_ref()));
-        return Some(json_val.map_or(Body::Raw(String::new()), Body::Json));
+        // Type the body by the ACTUAL media type. Only *json* content becomes
+        // Body::Json — wrapping an XML/text/octet-stream example as Json would
+        // serialize it as a JSON value (an XML string becomes a quoted JSON
+        // string; an XML object becomes a JSON object), corrupting the
+        // payload. Everything else goes out as Body::Raw (verbatim string
+        // example, else the generated value stringified).
+        if content_type.to_lowercase().contains("json") {
+            return Some((
+                example.map_or(Body::Json(serde_json::Value::Null), Body::Json),
+                content_type.to_string(),
+            ));
+        }
+        let raw = match example {
+            Some(serde_json::Value::String(s)) => s,
+            Some(v) => v.to_string(),
+            None => String::new(),
+        };
+        return Some((Body::Raw(raw), content_type.to_string()));
     }
 
     None
@@ -1071,8 +1129,13 @@ fn generate_schema_example(schema: Option<&OasSchema>) -> Option<serde_json::Val
         Some("object") => {
             let mut obj = serde_json::Map::new();
             if let Some(ref props) = schema.properties {
-                for (name, prop_schema) in props {
-                    let val = generate_schema_example(Some(prop_schema))
+                // Sort property keys — HashMap iteration order is unstable, so
+                // the generated JSON object must have the same key order on
+                // every parse (byte-identical request bodies across runs).
+                let mut keys: Vec<&String> = props.keys().collect();
+                keys.sort();
+                for name in keys {
+                    let val = generate_schema_example(Some(&props[name]))
                         .unwrap_or(serde_json::Value::Null);
                     obj.insert(name.clone(), val);
                 }
@@ -1125,9 +1188,13 @@ fn resolve_auth(
         return None;
     }
 
-    // Take the first security requirement
+    // Take the first security requirement; pick its scheme deterministically
+    // (HashMap iteration order is unstable — sorting keeps the generated auth
+    // identical across runs).
     let first_sec = &sec_requirements[0];
-    let (scheme_name, _scopes) = first_sec.iter().next()?;
+    let mut scheme_names: Vec<&String> = first_sec.keys().collect();
+    scheme_names.sort();
+    let scheme_name = *scheme_names.first()?;
 
     // Look up the scheme in components
     let schemes = components
@@ -1538,6 +1605,239 @@ mod tests {
         let scenario = adapter.parse(data).unwrap();
         assert_eq!(scenario.items.len(), 1);
         assert_eq!(scenario.items[0].name, "activeOp");
+    }
+
+    #[test]
+    fn test_xml_body_is_raw_not_json() {
+        // An application/xml request body was previously wrapped as
+        // Body::Json (serializing the XML string as a quoted JSON string /
+        // the object as JSON), corrupting the payload. It must go out as
+        // Body::Raw verbatim.
+        let adapter = OpenApiInputAdapter;
+        let data = br##"{
+            "openapi": "3.0.0",
+            "info": {"title": "XML API", "version": "1.0"},
+            "paths": {
+                "/widgets": {
+                    "post": {
+                        "operationId": "createWidget",
+                        "requestBody": {
+                            "content": {
+                                "application/xml": {
+                                    "schema": {"type": "object"},
+                                    "example": "<widget><name>bolt</name></widget>"
+                                }
+                            }
+                        },
+                        "responses": {"201": {"description": "Created"}}
+                    }
+                }
+            }
+        }"##;
+        let scenario = adapter.parse(data).unwrap();
+        let req = scenario.items[0].request.as_ref().unwrap();
+        match req.body.as_ref().unwrap() {
+            Body::Raw(t) => assert_eq!(t, "<widget><name>bolt</name></widget>"),
+            other => panic!("Expected Body::Raw XML, got {:?}", other),
+        }
+        // The media type must be threaded into a Content-Type header — the
+        // http client only auto-sets one for multipart, so without this the
+        // raw XML body would go out headerless and get 415'd.
+        assert_eq!(
+            req.headers.get("Content-Type").map(|s| s.as_str()),
+            Some("application/xml")
+        );
+    }
+
+    #[test]
+    fn test_json_body_content_type_header() {
+        // The application/json media type must also surface as a header.
+        let adapter = OpenApiInputAdapter;
+        let data = br##"{
+            "openapi": "3.0.0",
+            "info": {"title": "JsonCT", "version": "1.0"},
+            "paths": {
+                "/pets": {
+                    "post": {
+                        "operationId": "createPet",
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"type": "object", "properties": {"name": {"type": "string"}}},
+                                    "example": {"name": "Rex"}
+                                }
+                            }
+                        },
+                        "responses": {"201": {"description": "Created"}}
+                    }
+                }
+            }
+        }"##;
+        let scenario = adapter.parse(data).unwrap();
+        let req = scenario.items[0].request.as_ref().unwrap();
+        assert_eq!(
+            req.headers.get("Content-Type").map(|s| s.as_str()),
+            Some("application/json")
+        );
+    }
+
+    #[test]
+    fn test_explicit_content_type_header_wins() {
+        // A spec that declares Content-Type as a header parameter must not be
+        // overridden by the requestBody media type.
+        let adapter = OpenApiInputAdapter;
+        let data = br##"{
+            "openapi": "3.0.0",
+            "info": {"title": "ExplicitCT", "version": "1.0"},
+            "paths": {
+                "/pets": {
+                    "post": {
+                        "operationId": "createPet",
+                        "parameters": [
+                            {"name": "Content-Type", "in": "header", "schema": {"type": "string"}, "example": "application/vnd.api+json"}
+                        ],
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"type": "object"},
+                                    "example": {"name": "Rex"}
+                                }
+                            }
+                        },
+                        "responses": {"201": {"description": "Created"}}
+                    }
+                }
+            }
+        }"##;
+        let scenario = adapter.parse(data).unwrap();
+        let req = scenario.items[0].request.as_ref().unwrap();
+        assert_eq!(
+            req.headers.get("Content-Type").map(|s| s.as_str()),
+            Some("application/vnd.api+json"),
+            "explicit header must not be overridden by media type"
+        );
+    }
+
+    #[test]
+    fn test_object_body_key_order_deterministic() {
+        // generate_schema_example previously iterated schema.properties
+        // (HashMap) directly — JSON key order in generated bodies varied per
+        // run. Two parses of the same spec must produce byte-identical JSON.
+        let adapter = OpenApiInputAdapter;
+        let spec = br##"{
+            "openapi": "3.0.0",
+            "info": {"title": "Det", "version": "1.0"},
+            "paths": {
+                "/things": {
+                    "post": {
+                        "operationId": "createThing",
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "zebra": {"type": "string"},
+                                            "alpha": {"type": "string"},
+                                            "mid": {"type": "integer"}
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {"201": {"description": "Created"}}
+                    }
+                }
+            }
+        }"##;
+        let scenario = adapter.parse(spec).unwrap();
+        let req = scenario.items[0].request.as_ref().unwrap();
+        match req.body.as_ref().unwrap() {
+            Body::Json(v) => {
+                // Assert the EXACT sorted order, not just cross-run equality:
+                // serde_json's default Map is BTreeMap-backed and serializes
+                // keys alphabetically regardless of insertion order, so a
+                // weaker "same across two runs" assertion would pass even if
+                // the sort fix were removed. Insertion order (what the sort
+                // controls) must be alpha, mid, zebra — this pins the sort
+                // for any consumer that iterates the object directly or
+                // enables serde_json's preserve_order feature.
+                assert_eq!(
+                    serde_json::to_string(v).unwrap(),
+                    r#"{"alpha":"string","mid":1,"zebra":"string"}"#,
+                    "generated JSON body must have sorted property keys"
+                );
+            }
+            other => panic!("Expected Body::Json, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_fallback_content_type_deterministic() {
+        // A requestBody offering several media types must pick the same one
+        // on every parse — HashMap iteration order is unstable, so the pick
+        // is key-sorted (application/xml < text/plain).
+        let adapter = OpenApiInputAdapter;
+        let data = br##"{
+            "openapi": "3.0.0",
+            "info": {"title": "MultiContent", "version": "1.0"},
+            "paths": {
+                "/echo": {
+                    "post": {
+                        "operationId": "echo",
+                        "requestBody": {
+                            "content": {
+                                "text/plain": {"schema": {"type": "string"}, "example": "plain"},
+                                "application/xml": {"schema": {"type": "string"}, "example": "<a/>"}
+                            }
+                        },
+                        "responses": {"200": {"description": "OK"}}
+                    }
+                }
+            }
+        }"##;
+        let scenario = adapter.parse(data).unwrap();
+        let req = scenario.items[0].request.as_ref().unwrap();
+        match req.body.as_ref().unwrap() {
+            Body::Raw(t) => assert_eq!(t, "<a/>", "sorted-first content type must win"),
+            other => panic!("Expected Body::Raw, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_param_examples_deterministic() {
+        // Multiple named examples on a parameter — sorted-first must win so
+        // generated requests are stable across runs.
+        let adapter = OpenApiInputAdapter;
+        let data = br##"{
+            "openapi": "3.0.0",
+            "info": {"title": "Ex", "version": "1.0"},
+            "paths": {
+                "/pets": {
+                    "get": {
+                        "operationId": "listPets",
+                        "parameters": [
+                            {
+                                "name": "status",
+                                "in": "query",
+                                "examples": {
+                                    "zzz": {"value": "zzz-value"},
+                                    "aaa": {"value": "aaa-value"}
+                                }
+                            }
+                        ],
+                        "responses": {"200": {"description": "OK"}}
+                    }
+                }
+            }
+        }"##;
+        let scenario = adapter.parse(data).unwrap();
+        let req = scenario.items[0].request.as_ref().unwrap();
+        assert_eq!(
+            req.query_params.get("status").unwrap(),
+            "aaa-value",
+            "sorted-first example must win"
+        );
     }
 
     #[test]
