@@ -36,6 +36,17 @@ use tropel_sdk::{InputAdapter, InputAdapterRegistration};
 use tropel_sdk::{Result, TropelError};
 use tropel_sdk::{Scenario, ScenarioInfo, ScenarioItem};
 
+/// Parse an OpenAPI document as JSON, falling back to YAML (OpenAPI specs
+/// are commonly authored in YAML). Returns the document as a `Value` tree
+/// or `None` when it is neither valid JSON nor valid YAML.
+fn parse_doc(bytes: &[u8]) -> Option<Value> {
+    if let Ok(v) = serde_json::from_slice(bytes) {
+        return Some(v);
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    yaml_serde::from_str::<Value>(text).ok()
+}
+
 // ── OpenAPI 3.x data model (minimal — only what we need) ────────
 
 /// OpenAPI 3.x root document.
@@ -330,11 +341,11 @@ impl InputAdapter for OpenApiInputAdapter {
     }
 
     fn detect(&self, bytes: &[u8]) -> bool {
-        // Structural detection: a spec is JSON with a top-level `openapi`
-        // (3.x) or `swagger` (2.0) version string plus `info` and `paths`.
-        // No substring matching — a HAR capture or Postman export may
-        // mention these words in content and must not be detected.
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        // Structural detection: a spec (JSON or YAML) with a top-level
+        // `openapi` (3.x) or `swagger` (2.0) version string plus `info` and
+        // `paths`. No substring matching — a HAR capture or Postman export
+        // may mention these words in content and must not be detected.
+        let Some(value) = parse_doc(bytes) else {
             return false;
         };
         if !value.is_object() {
@@ -352,10 +363,12 @@ impl InputAdapter for OpenApiInputAdapter {
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Scenario> {
-        // 1. Parse into a Value tree so we can normalize + resolve refs
-        //    before the typed (serde) model, which hard-fails on $ref.
-        let mut doc: Value = serde_json::from_slice(bytes)
-            .map_err(|e| TropelError::Parse(format!("Failed to parse OpenAPI spec: {}", e)))?;
+        // 1. Parse into a Value tree (JSON or YAML) so we can normalize +
+        //    resolve refs before the typed (serde) model, which hard-fails
+        //    on $ref.
+        let mut doc: Value = parse_doc(bytes).ok_or_else(|| {
+            TropelError::Parse("Failed to parse OpenAPI spec: not valid JSON or YAML".into())
+        })?;
 
         // 2. Swagger 2.0 → normalize to an OpenAPI 3.x-shaped document.
         if is_swagger2(&doc) {
@@ -1257,6 +1270,83 @@ mod tests {
             "paths": {}
         }"#;
         assert!(adapter.detect(data));
+    }
+
+    #[test]
+    fn test_yaml_spec_parse_and_detect() {
+        // OpenAPI specs are commonly authored as YAML — detect + parse must
+        // accept them, not just JSON.
+        let adapter = OpenApiInputAdapter;
+        let yaml = br#"
+openapi: 3.0.3
+info:
+  title: YAML API
+  version: 1.0.0
+servers:
+  - url: https://api.example.com
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+          example: 5
+      responses:
+        '200':
+          description: OK
+"#;
+        assert!(adapter.detect(yaml), "YAML spec must be detected");
+        let scenario = adapter.parse(yaml).unwrap();
+        assert_eq!(scenario.info.name, "YAML API");
+        assert_eq!(scenario.items.len(), 1);
+        let req = scenario.items[0].request.as_ref().unwrap();
+        assert_eq!(req.url, "https://api.example.com/pets");
+        assert_eq!(req.query_params.get("limit").unwrap(), "5");
+    }
+
+    #[test]
+    fn test_yaml_spec_with_components_refs() {
+        // $ref + quoted keys ('200') + components must survive the YAML →
+        // Value → typed-model path.
+        let adapter = OpenApiInputAdapter;
+        let yaml = br#"
+openapi: 3.0.3
+info:
+  title: RefYaml
+  version: 1.0.0
+paths:
+  /posts:
+    get:
+      operationId: listPosts
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Post'
+components:
+  schemas:
+    Post:
+      type: object
+      properties:
+        id:
+          type: integer
+"#;
+        let scenario = adapter.parse(yaml).unwrap();
+        assert_eq!(scenario.items.len(), 1);
+        assert_eq!(scenario.items[0].name, "listPosts");
+    }
+
+    #[test]
+    fn test_yaml_not_json_not_detected() {
+        let adapter = OpenApiInputAdapter;
+        // A YAML file that is not an OpenAPI spec must not be detected.
+        let yaml = b"foo: bar\nbaz: [1, 2]\n";
+        assert!(!adapter.detect(yaml));
     }
 
     #[test]

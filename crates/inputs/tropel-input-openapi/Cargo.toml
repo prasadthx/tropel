@@ -12,4 +12,5 @@ tropel-sdk.workspace = true
 inventory.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+yaml_serde = "0.10.4"
 tracing.workspace = true

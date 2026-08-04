@@ -627,8 +627,20 @@ impl DriverInstance for K6DriverInstance {
 
         // Drain samples recorded by the native bridge closures during this
         // iteration (http_req_*, checks, custom metrics) into the VuContext
-        // for the engine's metrics pipeline.
-        let bridge_samples = std::mem::take(&mut *self.sample_sink.lock().unwrap());
+        // for the engine's metrics pipeline. k6 tags EVERY sample with the
+        // active scenario name (this is what makes scenario-scoped thresholds
+        // like `http_req_duration{scenario:api_load}` resolve) — stamp it on
+        // the drained samples so they match k6 semantics.
+        let mut bridge_samples = std::mem::take(&mut *self.sample_sink.lock().unwrap());
+        if !ctx.scenario_name.is_empty() {
+            let scenario = ctx.scenario_name.clone();
+            for s in &mut bridge_samples {
+                let tags = std::sync::Arc::make_mut(&mut s.tags);
+                if tags.get("scenario").is_none() {
+                    tags.insert("scenario", scenario.clone());
+                }
+            }
+        }
         ctx.samples.extend(bridge_samples);
 
         // Surface test.abort() to the engine so the run stops cleanly.
@@ -1784,6 +1796,12 @@ async fn eval_module_export_json(
     js_ctx.bootstrap_library(OPEN_DATA_SHIM).await.map_err(|e| {
         TropelError::Other(format!("k6 open/SharedArray shim bootstrap failed: {}", e))
     })?;
+    // The k6 shim libs (Rate/check/http/…) must be present: options blocks
+    // commonly run k6 API at module top level (e.g. `new Rate('errors')`),
+    // which threw QuickJS exceptions when the shim was missing.
+    bootstrap_js_libs(&js_ctx).await.map_err(|e| {
+        TropelError::Other(format!("k6 shim bootstrap failed for options eval: {}", e))
+    })?;
 
     // Minimal globals a k6 script may reference while building its options.
     // `__ENV` carries the job's env vars so options computed from them
@@ -1834,6 +1852,11 @@ async fn eval_module_handle_summary(
     );
     js_ctx.bootstrap_library(OPEN_DATA_SHIM).await.map_err(|e| {
         TropelError::Other(format!("k6 open/SharedArray shim bootstrap failed: {}", e))
+    })?;
+    // Same k6-shim requirement as the options eval: a script that touches
+    // k6 API at module top level must not throw while handleSummary is read.
+    bootstrap_js_libs(&js_ctx).await.map_err(|e| {
+        TropelError::Other(format!("k6 shim bootstrap failed for handleSummary eval: {}", e))
     })?;
 
     // Minimal globals a k6 script may reference while building its summary.

@@ -431,12 +431,27 @@ fn build_threshold(
     }
 }
 
+/// Duration metrics recorded by Tropel in MICROSECONDS (µs). k6 thresholds
+/// on these are in MILLISECONDS (k6's native unit), so a `p(95)<500` means
+/// 500 ms = 500 000 µs. Without scaling, `http_req_duration.p95 < 500`
+/// compared 500 against µs values (e.g. 292 607 µs) and every duration
+/// threshold failed ~1000×.
+const DURATION_METRICS: [&str; 6] = [
+    "http_req_duration",
+    "iteration_duration",
+    "group_duration",
+    "ws_req_duration",
+    "ws_connecting",
+    "ws_session_duration",
+];
+
 /// Translate a k6 threshold expression (`p(95)<500`, `avg<200`, `rate<0.01`)
-/// into Tropel's `metric.stat op value` form (e.g. `http_req_duration.p95 < 500`).
+/// into Tropel's `metric.stat op value` form (e.g. `http_req_duration.p95 < 500000`).
 ///
 /// k6 expresses the metric via the map key; Tropel's evaluator wants a fully
-/// qualified reference. Expressions that already carry a metric name (or use
-/// syntax we don't recognize) are passed through unchanged — compound
+/// qualified reference. Duration-metric values are scaled ms → µs to match
+/// Tropel's internal unit. Expressions that already carry a metric name (or
+/// use syntax we don't recognize) are passed through unchanged — compound
 /// expressions (`&&`/`||`) are logged loudly because the evaluator cannot
 /// parse them and would otherwise report them as silently passing.
 fn translate_k6_expression(metric: &str, expr: &str) -> String {
@@ -447,7 +462,28 @@ fn translate_k6_expression(metric: &str, expr: &str) -> String {
     if let Some(caps) = re.captures(expr) {
         let stat = &caps[1];
         let op = &caps[2];
-        let val = &caps[3];
+        let val: f64 = caps[3].parse().unwrap_or(0.0);
+        // ms → µs for duration metrics (k6 writes these thresholds in ms).
+        // EXCEPT `count` — the sample count is unitless, so `count>100` must
+        // stay `> 100`, not `> 100000`.
+        //
+        // The metric key may carry a tag filter
+        // (`http_req_duration{scenario:api_load}`) — strip `{…}` before the
+        // membership check, otherwise scoped duration thresholds were never
+        // scaled and compared ms values against µs samples (~1000× off).
+        let is_count = stat == "count";
+        let base = metric.split('{').next().unwrap_or(metric);
+        let val = if DURATION_METRICS.contains(&base) && !is_count {
+            val * 1000.0
+        } else {
+            val
+        };
+        // Trim trailing ".0" so integers stay readable (500000.0 → "500000").
+        let val_str = if val.fract() == 0.0 {
+            format!("{:.0}", val)
+        } else {
+            val.to_string()
+        };
         let suffix = match stat {
             s if s.starts_with("p(") => {
                 // p(95) → .p95; map unsupported buckets to the nearest supported
@@ -464,7 +500,7 @@ fn translate_k6_expression(metric: &str, expr: &str) -> String {
             // avg / min / max / count / sum / rate map 1:1 onto evaluator stats
             other => format!(".{other}"),
         };
-        return format!("{metric}{suffix} {op} {val}");
+        return format!("{metric}{suffix} {op} {val_str}");
     }
     if expr.contains("&&") || expr.contains("||") {
         tracing::warn!(
@@ -587,14 +623,60 @@ mod tests {
         let opts = parse(r#"{"thresholds": {"http_req_duration": ["p(95)<500", "avg<200"]}}"#);
         let thresholds = opts.convert_thresholds();
         assert_eq!(thresholds.len(), 2);
+        // Duration metrics are recorded in µs internally; k6 thresholds are
+        // ms, so they are scaled ×1000 during translation.
         assert_eq!(
             thresholds.get("http_req_duration").unwrap().expression,
-            "http_req_duration.p95 < 500"
+            "http_req_duration.p95 < 500000"
         );
         assert_eq!(
             thresholds.get("http_req_duration#1").unwrap().expression,
-            "http_req_duration.avg < 200"
+            "http_req_duration.avg < 200000"
         );
+    }
+
+    #[test]
+    fn test_threshold_non_duration_not_scaled() {
+        // Rate/counter thresholds keep their raw value.
+        let opts = parse(
+            r#"{"thresholds": {"http_req_failed": ["rate<0.01"], "http_reqs": ["count>100"]}}"#,
+        );
+        let thresholds = opts.convert_thresholds();
+        assert_eq!(
+            thresholds.get("http_req_failed").unwrap().expression,
+            "http_req_failed.rate < 0.01"
+        );
+        assert_eq!(
+            thresholds.get("http_reqs").unwrap().expression,
+            "http_reqs.count > 100"
+        );
+    }
+
+    #[test]
+    fn test_duration_threshold_fraction_scaled() {
+        let expr = translate_k6_expression("http_req_duration", "avg<1.5");
+        assert_eq!(expr, "http_req_duration.avg < 1500");
+    }
+
+    #[test]
+    fn test_duration_threshold_tag_scoped_scaled() {
+        // Tag-scoped duration thresholds must be scaled too — the key
+        // carries a `{scenario:…}` filter that must not defeat the µs check.
+        let expr = translate_k6_expression(
+            "http_req_duration{scenario:api_load}",
+            "p(95)<300",
+        );
+        assert_eq!(expr, "http_req_duration{scenario:api_load}.p95 < 300000");
+    }
+
+    #[test]
+    fn test_duration_count_not_scaled() {
+        // `count` is unitless even on duration metrics — must not be ×1000.
+        let expr = translate_k6_expression("http_req_duration", "count>100");
+        assert_eq!(expr, "http_req_duration.count > 100");
+        // Non-duration metrics unaffected.
+        let expr = translate_k6_expression("http_reqs", "count>100");
+        assert_eq!(expr, "http_reqs.count > 100");
     }
 
     #[test]
@@ -604,7 +686,8 @@ mod tests {
         );
         let thresholds = opts.convert_thresholds();
         let cfg = thresholds.get("http_req_duration").unwrap();
-        assert_eq!(cfg.expression, "http_req_duration.p99 < 1000");
+        // p(99)<1000 ms → 1 000 000 µs.
+        assert_eq!(cfg.expression, "http_req_duration.p99 < 1000000");
         assert!(cfg.abort_on_fail);
         assert_eq!(cfg.delay_abort_eval.as_deref(), Some("30s"));
     }
@@ -618,8 +701,9 @@ mod tests {
 
     #[test]
     fn test_threshold_p_99_9_maps_to_p99() {
+        // p(99.9) maps to the nearest supported bucket AND is ms→µs scaled.
         let expr = translate_k6_expression("http_req_duration", "p(99.9)<1000");
-        assert_eq!(expr, "http_req_duration.p99 < 1000");
+        assert_eq!(expr, "http_req_duration.p99 < 1000000");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::collector::{parse_percentile, percentile_value, MetricsResult};
+use crate::collector::{parse_percentile, percentile_value, MetricSummary, MetricsResult};
 use std::collections::HashMap;
 use std::time::Duration;
 use tropel_core::config::ThresholdConfig;
@@ -304,11 +304,81 @@ fn get_tag_scoped_metric_value(
     }
 }
 
+/// Aggregate a statistic across ALL series in `metrics.metrics` whose key
+/// starts with `name` (k6 merges tagged sub-series for the unscoped metric).
+/// Returns `None` when no series match, so callers can fall back to a
+/// top-level field or 0.0.
+fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> Option<f64> {
+    let matched: Vec<&MetricSummary> = metrics
+        .metrics
+        .iter()
+        .filter(|m| m.key.starts_with(name))
+        .collect();
+    if matched.is_empty() {
+        return None;
+    }
+    Some(match stat {
+        // Percentiles: worst (highest) across matched series, mirroring
+        // the tag-scoped path.
+        Some("min") => matched.iter().map(|m| m.min as f64).fold(f64::MAX, f64::min),
+        Some("max") => matched.iter().map(|m| m.max as f64).fold(0.0_f64, f64::max),
+        Some("p50") | Some("median") | Some("med") => {
+            matched.iter().map(|m| m.p50 as f64).fold(0.0_f64, f64::max)
+        }
+        Some("p90") => matched.iter().map(|m| m.p90 as f64).fold(0.0_f64, f64::max),
+        Some("p95") => matched.iter().map(|m| m.p95 as f64).fold(0.0_f64, f64::max),
+        Some("p99") => matched.iter().map(|m| m.p99 as f64).fold(0.0_f64, f64::max),
+        Some(s) if parse_percentile(s).is_some() => {
+            let pct = parse_percentile(s).expect("guarded");
+            matched
+                .iter()
+                .map(|m| percentile_value(m, pct))
+                .fold(0.0_f64, f64::max)
+        }
+        // Rate = total sum / total count across ALL series (k6 merges tagged
+        // sub-series for the unscoped metric).
+        Some("rate") => {
+            let total_sum: f64 = matched.iter().map(|m| m.sum).sum();
+            let total_count: f64 = matched.iter().map(|m| m.count as f64).sum();
+            if total_count > 0.0 {
+                total_sum / total_count
+            } else {
+                0.0
+            }
+        }
+        Some("count") => matched.iter().map(|m| m.count as f64).sum(),
+        Some("sum") => matched.iter().map(|m| m.sum).sum(),
+        Some("avg") => {
+            let total_sum: f64 = matched.iter().map(|m| m.sum).sum();
+            let total_count: f64 = matched.iter().map(|m| m.count as f64).sum();
+            if total_count > 0.0 {
+                total_sum / total_count
+            } else {
+                0.0
+            }
+        }
+        // Default (no stat or unknown stat) — worst mean across matches.
+        _ => matched.iter().map(|m| m.mean).fold(0.0_f64, f64::max),
+    })
+}
+
 /// Extract a metric value from the MetricsResult by name and optional statistic.
 fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> f64 {
     match name {
         "http_reqs" => metrics.http_reqs as f64,
-        "errors" => metrics.errors as f64,
+        "errors" => {
+            // Per-tag series (errors{url=…}) may exist; aggregate per stat
+            // across them (k6 merges tagged sub-series for the unscoped
+            // metric). Only when a stat is present though — for a bare
+            // `errors < N` the top-level counter IS the merged total, while
+            // the helper's default arm would return the worst per-series
+            // mean (1.0 for value-1 Counter samples) and pass spuriously.
+            if let Some(v) = stat.and_then(|_| aggregate_series(metrics, "errors", stat)) {
+                v
+            } else {
+                metrics.errors as f64
+            }
+        }
         "checks" | "checks.total" => metrics.checks_total as f64,
         "checks.passed" => metrics.checks_passed as f64,
         "checks.failed" => metrics.checks_failed as f64,
@@ -350,38 +420,13 @@ fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
             }
         }
         _ => {
-            // Try custom metric from the metrics vector
-            for m in &metrics.metrics {
-                if m.key.starts_with(name) {
-                    return match stat {
-                        Some("avg") => m.mean,
-                        Some("min") => m.min as f64,
-                        Some("max") => m.max as f64,
-                        Some("p50") | Some("median") | Some("med") => m.p50 as f64,
-                        Some("p90") => m.p90 as f64,
-                        Some("p95") => m.p95 as f64,
-                        Some("p99") => m.p99 as f64,
-                        Some("count") => m.count as f64,
-                        // Rate = sum/count. For 0/1 samples (e.g.
-                        // http_req_failed) this equals the mean, so the arm is
-                        // only distinct for non-binary Rate metrics.
-                        Some("rate") => {
-                            if m.count > 0 {
-                                m.sum / m.count as f64
-                            } else {
-                                0.0
-                            }
-                        }
-                        // Any other pNN / p(NN) percentile — exact from the
-                        // retained histogram.
-                        Some(s) if parse_percentile(s).is_some() => {
-                            percentile_value(m, parse_percentile(s).expect("guarded"))
-                        }
-                        _ => m.mean,
-                    };
-                }
-            }
-            0.0
+            // Custom metric (e.g. http_req_failed, user metrics): aggregate
+            // across ALL series whose key starts with the name. The naive
+            // first-match returned an arbitrary tagged series (e.g.
+            // http_req_failed{url=…} picked one URL's rate — 1.00 when that
+            // series was all-failed) instead of the merged value k6 reports
+            // for the unscoped metric.
+            aggregate_series(metrics, name, stat).unwrap_or(0.0)
         }
     }
 }
@@ -653,6 +698,98 @@ mod tests {
         let result = evaluate_single_threshold("http_req_duration{status=404}.p95 < 100", &metrics);
         assert!(result.0, "missing tag should return 0.0, which is < 100");
         assert_eq!(result.1, 0.0);
+    }
+
+    #[test]
+    fn test_unscoped_custom_metric_aggregates_all_series() {
+        // http_req_failed is emitted as one series per (url,status) tag set;
+        // the unscoped threshold must merge ALL of them (k6 semantics), not
+        // return one arbitrary series' rate.
+        let mut metrics = MetricsResult::default();
+        metrics.metrics.push(MetricSummary {
+            key: "http_req_failed{url=a}".into(),
+            tags: vec![("url".into(), "a".into())],
+            metric_type: MetricType::Rate,
+            count: 100,
+            sum: 20.0, // 20% failed
+            mean: 0.2,
+            min: 0,
+            max: 1,
+            p50: 0,
+            p90: 1,
+            p95: 1,
+            p99: 1,
+            last: 0.0,
+            rate: 0.2,
+            histogram: None,
+        });
+        metrics.metrics.push(MetricSummary {
+            key: "http_req_failed{url=b}".into(),
+            tags: vec![("url".into(), "b".into())],
+            metric_type: MetricType::Rate,
+            count: 100,
+            sum: 100.0, // 100% failed
+            mean: 1.0,
+            min: 0,
+            max: 1,
+            p50: 1,
+            p90: 1,
+            p95: 1,
+            p99: 1,
+            last: 0.0,
+            rate: 1.0,
+            histogram: None,
+        });
+        // Merged: 120 failures / 200 samples = 0.60 — not the 1.00 that a
+        // first-match lookup would have returned for series b.
+        let (passed, actual, _) =
+            evaluate_single_threshold("http_req_failed.rate < 0.5", &metrics);
+        assert!(!passed, "merged rate 0.60 must not pass < 0.5");
+        assert!((actual - 0.6).abs() < 1e-9, "merged rate should be 0.6, got {actual}");
+
+        let (passed, _, _) = evaluate_single_threshold("http_req_failed.rate < 0.7", &metrics);
+        assert!(passed, "merged rate 0.60 should pass < 0.7");
+    }
+
+    #[test]
+    fn test_unscoped_count_sums_all_series() {
+        let mut metrics = MetricsResult::default();
+        metrics.metrics.push(MetricSummary {
+            key: "errors{url=a}".into(),
+            tags: vec![("url".into(), "a".into())],
+            metric_type: MetricType::Counter,
+            count: 7,
+            sum: 7.0,
+            mean: 1.0,
+            min: 0,
+            max: 1,
+            p50: 0,
+            p90: 1,
+            p95: 1,
+            p99: 1,
+            last: 0.0,
+            rate: 0.0,
+            histogram: None,
+        });
+        metrics.metrics.push(MetricSummary {
+            key: "errors{url=b}".into(),
+            tags: vec![("url".into(), "b".into())],
+            metric_type: MetricType::Counter,
+            count: 3,
+            sum: 3.0,
+            mean: 1.0,
+            min: 0,
+            max: 1,
+            p50: 0,
+            p90: 1,
+            p95: 1,
+            p99: 1,
+            last: 0.0,
+            rate: 0.0,
+            histogram: None,
+        });
+        let (_, actual, _) = evaluate_single_threshold("errors.count > 5", &metrics);
+        assert_eq!(actual, 10.0, "count must sum across all series");
     }
 
     #[test]

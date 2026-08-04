@@ -169,6 +169,20 @@ pm.expect = function (actual) {
                 }
                 if (!passed) throw new Error(name + ' failed');
             },
+            be: {
+                // chai-style type assertions: pm.expect(x).to.be.an('array')
+                an: function (type) {
+                    var passed = typeOf(actual) === type;
+                    var name = 'expect to be an ' + type;
+                    if (typeof __tropel_pm_test === 'function') {
+                        __tropel_pm_test(name, passed);
+                    }
+                    if (!passed) throw new Error(name + ' failed, got ' + typeOf(actual));
+                },
+                a: function (type) {
+                    return this.an(type);
+                }
+            },
             have: {
                 property: function (prop, value) {
                     var obj = actual;
@@ -245,6 +259,14 @@ pm.iterationData = {
         return null;
     }
 };
+
+// Chai-style type names: 'array', 'object', 'string', 'number', 'boolean',
+// 'null', 'undefined', 'function'.
+function typeOf(v) {
+    if (v === null) return 'null';
+    if (Array.isArray(v)) return 'array';
+    return typeof v;
+}
 
 function buildMultipartBody(formdata) {
     var boundary = '----TropelFormBoundary' + Math.random().toString(36).slice(2);
