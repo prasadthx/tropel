@@ -29,7 +29,6 @@ depending on internal crate details.
 default = []
 unstable-protocol = []
 unstable-output = []
-unstable-auth = []
 
 [dependencies]
 tropel-core.workspace = true

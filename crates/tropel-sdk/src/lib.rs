@@ -95,7 +95,7 @@ pub use tropel_ext::traits::{
     Driver, DriverDeclaredOptions, DriverHttpClient, DriverInstance, DriverRegistration, VuContext,
 };
 
-// Protocol, Output, and AuthSigner traits are gated behind feature flags.
+// Protocol and Output traits are gated behind feature flags.
 // They exist in the backing crate but aren't yet wired into engine dispatch.
 // Enable with `tropel-sdk = { features = ["unstable-protocol"] }` etc.
 // Breaking changes to these traits only require a minor/patch bump.
@@ -107,10 +107,6 @@ pub use tropel_ext::traits::{Protocol, ProtocolOutcome, ProtocolRegistration};
 /// Unstable output extension trait (requires `unstable-output` feature).
 #[cfg(feature = "unstable-output")]
 pub use tropel_ext::traits::{Output, OutputRegistration};
-
-/// Unstable auth signer extension trait (requires `unstable-auth` feature).
-#[cfg(feature = "unstable-auth")]
-pub use tropel_ext::traits::{AuthSigner, AuthSignerRegistration};
 
 // ═══════════════════════════════════════════════════════════════════
 // Error types

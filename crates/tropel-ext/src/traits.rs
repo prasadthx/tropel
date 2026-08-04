@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
 use tropel_core::config::{ExecutionConfig, OutputConfig, ScenarioConfig, ThresholdConfig};
 use tropel_core::scenario::Scenario;
 use tropel_core::types::{Request, Response, Sample};
@@ -27,12 +26,6 @@ pub struct ProtocolOutcome {
     pub response: Option<Response>,
 }
 
-/// A new JS module callable from scripts, e.g. `import x from "tropel/x/grpc"`.
-pub trait JsModule: Send + Sync {
-    fn specifier(&self) -> &str;
-    fn register(&self, ctx: &tropel_js::JsContext) -> Result<()>;
-}
-
 /// A new metrics sink/output.
 #[async_trait]
 pub trait Output: Send + Sync {
@@ -46,12 +39,6 @@ pub trait Output: Send + Sync {
     /// job's `OutputConfig` so outputs can pick up endpoints / credentials
     /// (e.g. a Prometheus remote-write URL). Default is a no-op.
     fn configure(&mut self, _config: &OutputConfig) {}
-}
-
-/// A new auth signer usable by protocols.
-pub trait AuthSigner: Send + Sync {
-    fn kind(&self) -> &str;
-    fn sign(&self, req: &mut Request, cfg: &Value) -> Result<()>;
 }
 
 /// A new input format → protocol-agnostic Scenario.
@@ -364,32 +351,6 @@ impl OutputRegistration {
     pub const fn with_priority(mut self, priority: u8) -> Self {
         self.priority = priority;
         self
-    }
-}
-
-/// Registration wrapper for JS modules.
-pub struct JsModuleRegistration {
-    pub factory: Arc<dyn Fn() -> Box<dyn JsModule> + Send + Sync>,
-}
-
-impl JsModuleRegistration {
-    pub fn new(factory: impl Fn() -> Box<dyn JsModule> + Send + Sync + 'static) -> Self {
-        Self {
-            factory: Arc::new(factory),
-        }
-    }
-}
-
-/// Registration wrapper for auth signers.
-pub struct AuthSignerRegistration {
-    pub factory: Arc<dyn Fn() -> Box<dyn AuthSigner> + Send + Sync>,
-}
-
-impl AuthSignerRegistration {
-    pub fn new(factory: impl Fn() -> Box<dyn AuthSigner> + Send + Sync + 'static) -> Self {
-        Self {
-            factory: Arc::new(factory),
-        }
     }
 }
 

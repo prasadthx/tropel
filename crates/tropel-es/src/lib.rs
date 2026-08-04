@@ -19,10 +19,8 @@
 //!
 //! The resulting JS text is passed to `tropel-js::JsContext` for evaluation.
 
-pub mod bundler;
 pub mod transpiler;
 
-pub use bundler::*;
 pub use transpiler::*;
 
 use std::path::Path;
@@ -30,10 +28,12 @@ use tropel_core::Result;
 
 /// Transpile a script file at the given path into plain JavaScript.
 ///
-/// - `.ts` / `.mts` files are transpiled via SWC (strips types).
+/// - `.ts` / `.mts` / `.tsx` files have TypeScript types stripped.
 /// - `.js` / `.mjs` files are passed through as-is.
-/// - ES import/export statements are bundled into a single script
-///   (all dependencies resolved relative to the file).
+///
+/// The legacy `bundler.rs` module-bundling step was removed: the k6 driver
+/// (the live k6 path) resolves modules itself via its own module loader,
+/// so bundling is dead code.
 pub fn transpile_file(path: &Path) -> Result<String> {
     let ext = path
         .extension()
@@ -46,23 +46,11 @@ pub fn transpile_file(path: &Path) -> Result<String> {
 
     let is_typescript = matches!(ext.as_str(), "ts" | "mts" | "tsx");
 
-    // First pass: strip TypeScript types if needed
-    let js_source = if is_typescript {
+    // Strip TypeScript types if needed, otherwise pass through as-is.
+    if is_typescript {
         transpiler::typescript_to_javascript(&source, &path.to_string_lossy())
-            .map_err(|e| tropel_core::TropelError::Parse(format!("TS transpile error: {}", e)))?
+            .map_err(|e| tropel_core::TropelError::Parse(format!("TS transpile error: {}", e)))
     } else {
-        source
-    };
-
-    // Second pass: bundle ES module imports into a single script
-    if has_import_or_export(&js_source) {
-        bundler::bundle_module(&js_source, path)
-    } else {
-        Ok(js_source)
+        Ok(source)
     }
-}
-
-/// Check if a source string contains import or export statements.
-fn has_import_or_export(source: &str) -> bool {
-    source.contains("import ") || source.contains("export ")
 }

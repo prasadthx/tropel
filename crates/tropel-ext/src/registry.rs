@@ -16,8 +16,6 @@ use std::sync::Arc;
 pub struct ExtensionRegistry {
     protocols: IndexMap<String, Arc<ProtocolRegistration>>,
     outputs: IndexMap<String, Arc<OutputRegistration>>,
-    js_modules: IndexMap<String, Arc<JsModuleRegistration>>,
-    auth_signers: IndexMap<String, Arc<AuthSignerRegistration>>,
     input_adapters: IndexMap<String, Arc<InputAdapterRegistration>>,
     // Runtime-constructed adapter instances (e.g. subprocess adapters).
     // These bypass the fn-pointer restriction of InputAdapterRegistration.
@@ -46,18 +44,6 @@ impl ExtensionRegistry {
     pub fn register_output(&mut self, name: &str, registration: OutputRegistration) {
         self.outputs
             .insert(name.to_string(), Arc::new(registration));
-    }
-
-    /// Register a JS module.
-    pub fn register_js_module(&mut self, specifier: &str, registration: JsModuleRegistration) {
-        self.js_modules
-            .insert(specifier.to_string(), Arc::new(registration));
-    }
-
-    /// Register an auth signer.
-    pub fn register_auth_signer(&mut self, kind: &str, registration: AuthSignerRegistration) {
-        self.auth_signers
-            .insert(kind.to_string(), Arc::new(registration));
     }
 
     /// Register an input adapter.
@@ -91,16 +77,6 @@ impl ExtensionRegistry {
     /// Get an output by name.
     pub fn get_output(&self, name: &str) -> Option<Box<dyn Output>> {
         self.outputs.get(name).map(|r| (r.create)())
-    }
-
-    /// Get a JS module by specifier.
-    pub fn get_js_module(&self, specifier: &str) -> Option<Box<dyn JsModule>> {
-        self.js_modules.get(specifier).map(|r| (r.factory)())
-    }
-
-    /// Get an auth signer by kind.
-    pub fn get_auth_signer(&self, kind: &str) -> Option<Box<dyn AuthSigner>> {
-        self.auth_signers.get(kind).map(|r| (r.factory)())
     }
 
     /// Register an adapter factory closure.
@@ -157,11 +133,6 @@ impl ExtensionRegistry {
     /// List all registered drivers.
     pub fn list_drivers(&self) -> Vec<String> {
         self.drivers.keys().cloned().collect()
-    }
-
-    /// List all registered JS modules.
-    pub fn list_js_modules(&self) -> Vec<String> {
-        self.js_modules.keys().cloned().collect()
     }
 
     /// Collect all inventory-registered extensions at startup.

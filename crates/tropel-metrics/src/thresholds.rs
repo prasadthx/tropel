@@ -38,6 +38,11 @@ pub fn evaluate_thresholds(
         });
     }
 
+    // Sort by name so the summary output is deterministic — the input is a
+    // HashMap whose iteration order is random per process, which made the
+    // rendered Thresholds block (and the insta snapshot of it) flaky.
+    results.sort_by(|a, b| a.name.cmp(&b.name));
+
     results
 }
 

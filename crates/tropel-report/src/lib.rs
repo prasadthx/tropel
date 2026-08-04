@@ -43,11 +43,3 @@ pub fn create_reporter(name: &str) -> Option<Box<dyn Reporter>> {
         _ => None,
     }
 }
-
-/// Create a streaming output by name.
-pub fn create_output(name: &str) -> Option<Box<dyn Output>> {
-    match name {
-        "stdout" => Some(Box::new(StreamingStdoutOutput::new())),
-        _ => None,
-    }
-}
