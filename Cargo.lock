@@ -4046,6 +4046,7 @@ name = "tropel-bench"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "libc",
  "tokio",
  "tropel-engine",
  "tropel-js",

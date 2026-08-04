@@ -8,10 +8,13 @@
 //! 3. **native_vs_js** — the same logical operation (hex-encode ×1000) executed
 //!    via the native bridge (`__tropel_native_hex_encode`) vs a pure-JS
 //!    implementation — the headline native-vs-JS speedup.
-//! 4. **vus_per_sec** — `VUWorkerPool` task dispatch throughput (thread-per-core
-//!    sharding): spawn + await N trivial tasks across the worker pool.
-//! 5. **memory_per_vu** — process RSS growth per live `JsContext` (real
-//!    memory-per-VU, the thing `vus_max` should track).
+//! 4. **pool_dispatch** — `VUWorkerPool` task-dispatch throughput (thread-per-
+//!    core sharding): spawn + await N trivial tasks across the worker pool.
+//!    NOTE: this is a dispatch/overhead microbench, NOT end-to-end VUs/sec —
+//!    the tasks are empty, so it isolates pool scheduling cost.
+//! 5. **memory_per_vu** — process RSS growth per live `JsContext`, measured
+//!    INSIDE the timed body (a fresh batch per iteration) so the number is a
+//!    real per-context allocation, not a constant captured once.
 //!
 //! Run: `cargo bench -p tropel-bench`.
 
@@ -29,6 +32,10 @@ fn tokio_rt() -> tokio::runtime::Runtime {
 }
 
 /// Process resident set size in bytes (best-effort; None where unsupported).
+///
+/// Windows: `GetProcessMemoryInfo` working set. Linux: `/proc/self/status`
+/// `VmRSS`. macOS: `task_info` `MACH_TASK_BASIC_INFO.resident_size` — the
+/// mach API returns bytes directly (no KB scaling bug like getrusage).
 fn process_rss_bytes() -> Option<u64> {
     #[cfg(target_os = "windows")]
     {
@@ -58,7 +65,34 @@ fn process_rss_bytes() -> Option<u64> {
         let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
         Some(kb * 1024)
     }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    {
+        // libc's mach bindings: task_info(TASK_SELF, MACH_TASK_BASIC_INFO) →
+        // mach_task_basic_info { resident_size, virtual_size, ... }.
+        // The struct embeds time_value_t fields (nested structs), so it is
+        // zero-initialized rather than spelled out field-by-field.
+        use libc::{
+            mach_task_basic_info, mach_task_self, task_info, KERN_SUCCESS,
+            MACH_TASK_BASIC_INFO, MACH_TASK_BASIC_INFO_COUNT,
+        };
+        let mut info: mach_task_basic_info = unsafe { std::mem::zeroed() };
+        // task_info writes the count back, so it must be a mutable binding.
+        let mut count = MACH_TASK_BASIC_INFO_COUNT;
+        let kr = unsafe {
+            task_info(
+                mach_task_self(),
+                MACH_TASK_BASIC_INFO,
+                &mut info as *mut mach_task_basic_info as *mut libc::integer_t,
+                &mut count,
+            )
+        };
+        if kr == KERN_SUCCESS {
+            Some(info.resident_size)
+        } else {
+            None
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     {
         None
     }
@@ -163,12 +197,17 @@ fn native_vs_js(c: &mut Criterion) {
     group.finish();
 }
 
-/// 4. VUs/sec — thread-per-core pool dispatch throughput.
-fn vus_per_sec(c: &mut Criterion) {
+/// 4. Pool dispatch — thread-per-core pool throughput for EMPTY tasks.
+///
+/// Deliberately relabeled from the old `vus_per_sec`: the tasks are trivial
+/// (`async {}`), so this measures only pool scheduling/dispatch overhead —
+/// NOT end-to-end VUs/sec. A real VU does script eval + HTTP + metrics per
+/// iteration, so quoting this as "VUs/sec" overstated the product.
+fn pool_dispatch(c: &mut Criterion) {
     let pool = tropel_engine::worker::VUWorkerPool::new(4);
     let rt = tokio_rt();
     const N: usize = 10_000;
-    let mut group = c.benchmark_group("vus_per_sec");
+    let mut group = c.benchmark_group("pool_dispatch");
     group.throughput(Throughput::Elements(N as u64));
     group.sample_size(10);
 
@@ -189,31 +228,70 @@ fn vus_per_sec(c: &mut Criterion) {
     group.finish();
 }
 
-/// 5. Memory-per-VU — RSS growth across live contexts.
+/// Memory-per-VU (bench 5): RSS growth across live contexts, measured INSIDE
+/// the timed body.
+///
+/// The old bench computed `per_vu` once before the timed section and then
+/// `b.iter(|| black_box(per_vu))` measured a CONSTANT — criterion reported
+/// the same fixed number with a noise floor, and on macOS (no RSS path) it
+/// was always 0. Now each iteration creates a fresh batch of N contexts and
+/// measures the RSS delta within the timed body, so the reported value is a
+/// real per-context allocation. If RSS is unsupported the bench degrades to
+/// a context-creation throughput number (still honest) instead of a fake 0.
 fn memory_per_vu(c: &mut Criterion) {
     let rt = tokio_rt();
-    let before = process_rss_bytes().unwrap_or(0);
     const N: usize = 25;
-    let mut contexts = Vec::with_capacity(N);
-    for _ in 0..N {
-        contexts.push(rt.block_on(JsContext::new(None, None)).unwrap());
-    }
-    let after = process_rss_bytes().unwrap_or(0);
-    let per_vu = if after > before {
-        (after - before) / N as u64
-    } else {
-        0
-    };
-    eprintln!(
-        "[memory_per_vu] {N} contexts: RSS {before}B -> {after}B, per-context ~= {per_vu}B"
-    );
+    // Per-iteration observed deltas, surfaced after the group finishes. A
+    // plain Vec is enough — criterion's b.iter closure is FnMut, so the
+    // &mut capture is legal and there's no lock overhead in the timed body.
+    // `rss_available` separately tracks whether the platform ever reported
+    // RSS, so "unsupported" isn't conflated with "no growth measured".
+    let mut observed: Vec<u64> = Vec::new();
+    let mut rss_available = false;
 
     let mut group = c.benchmark_group("memory_per_vu");
     group.sample_size(10);
-    group.bench_function("rss_bytes_per_context", |b| {
-        b.iter(|| std::hint::black_box(per_vu));
+
+    group.bench_function("contexts_created_and_rss_delta", |b| {
+        b.iter(|| {
+            let before = process_rss_bytes();
+            let mut contexts = Vec::with_capacity(N);
+            for _ in 0..N {
+                contexts.push(rt.block_on(JsContext::new(None, None)).unwrap());
+            }
+            let after = process_rss_bytes();
+            if let (Some(b), Some(a)) = (before, after) {
+                rss_available = true;
+                let delta = a.saturating_sub(b);
+                if delta > 0 {
+                    observed.push(delta);
+                }
+            }
+            // Keep the batch alive until the measurement is taken; black_box
+            // the whole tuple so neither the creation nor the measurement is
+            // optimized away.
+            std::hint::black_box((contexts, before, after))
+        });
     });
+
     group.finish();
+
+    // Surface the headline number: mean observed RSS delta per context.
+    if !rss_available {
+        eprintln!(
+            "[memory_per_vu] RSS unsupported on this platform — reporting context-creation throughput only"
+        );
+    } else if observed.is_empty() {
+        eprintln!(
+            "[memory_per_vu] RSS measured but no growth observed (lazy QuickJS allocation / retained pages)"
+        );
+    } else {
+        let mean: u64 = observed.iter().sum::<u64>() / observed.len() as u64;
+        eprintln!(
+            "[memory_per_vu] {N} contexts per batch: mean RSS delta ~= {mean}B / batch, ~= {per_vu}B per context",
+            per_vu = mean / N as u64
+        );
+    }
 }
 
 criterion_group!(
@@ -221,7 +299,7 @@ criterion_group!(
     context_bootstrap,
     script_iteration,
     native_vs_js,
-    vus_per_sec,
+    pool_dispatch,
     memory_per_vu
 );
 criterion_main!(perf);
