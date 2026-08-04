@@ -197,6 +197,9 @@ fn normalize_metrics_url(url: &str) -> String {
 /// would be wrong — raw counter samples are per-event increments, not
 /// running totals from process start, and a collector would interpret each
 /// as a cumulative total.
+/// Per-tag-set aggregate: (sorted tag list, summed value, last timestamp nanos).
+type TagAggregate = (Vec<(String, String)>, f64, u64);
+
 fn build_export_request(metrics: &HashMap<String, Vec<Sample>>) -> serde_json::Value {
     let mut metric_values = Vec::with_capacity(metrics.len());
 
@@ -206,7 +209,7 @@ fn build_export_request(metrics: &HashMap<String, Vec<Sample>>) -> serde_json::V
         let data_points: Vec<serde_json::Value> = if is_counter {
             // Sum per (sorted tag-set). Keep the LAST timestamp seen for a
             // tag-set so the delta point carries the newest time.
-            let mut per_tags: Vec<(Vec<(String, String)>, f64, u64)> = Vec::new();
+            let mut per_tags: Vec<TagAggregate> = Vec::new();
             for s in samples {
                 let mut tags: Vec<(String, String)> = s
                     .tags

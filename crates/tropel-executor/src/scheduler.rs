@@ -583,7 +583,7 @@ impl VUScheduler {
                 // this ramp-up. Stale state from a fully-drained ramp-down is
                 // harmless (remaining == 0 blocks claims; see clear below).
                 let delta = target - current_vus;
-                let step_delay = stage_duration / delta as u32;
+                let step_delay = stage_duration / delta;
                 for _ in 0..delta {
                     let vu_id = current_vus;
                     let handle = run_vu(self.shared_clone(), vu_id);
@@ -598,7 +598,7 @@ impl VUScheduler {
                 //    claims a surplus slot via try_claim_ramp_down at its next
                 //    iteration start.
                 let delta = current_vus - target;
-                let step_delay = stage_duration / delta as u32;
+                let step_delay = stage_duration / delta;
                 for step in 1..=delta {
                     // Interpolate the ramp-down target from current_vus down
                     // to `target`, one unit at a time. Arm EXACTLY ONE surplus

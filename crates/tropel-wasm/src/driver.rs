@@ -170,14 +170,8 @@ impl Driver for WasmDriver {
             .get_typed_func::<(i32, i32), i32>(&mut store, "adapter_run_iteration")
             .map_err(wasm_err)?;
 
-        let malloc_fn = match instance.get_typed_func::<i32, i32>(&mut store, "malloc") {
-            Ok(f) => Some(f),
-            Err(_) => None,
-        };
-        let free_fn = match instance.get_typed_func::<i32, i32>(&mut store, "free") {
-            Ok(f) => Some(f),
-            Err(_) => None,
-        };
+        let malloc_fn = instance.get_typed_func::<i32, i32>(&mut store, "malloc").ok();
+        let free_fn = instance.get_typed_func::<i32, i32>(&mut store, "free").ok();
 
         Ok(Box::new(WasmDriverInstance {
             store,
@@ -198,18 +192,10 @@ fn wasm_err(e: impl std::fmt::Display) -> TropelError {
 // WasmDriverState — the per-store data host functions reach via Caller
 // ══════════════════════════════════════════════════════════════════
 
+#[derive(Default)]
 pub struct WasmDriverState {
     pub http_client: Option<Arc<dyn DriverHttpClient + Send + Sync>>,
     pub samples: Vec<Sample>,
-}
-
-impl Default for WasmDriverState {
-    fn default() -> Self {
-        Self {
-            http_client: None,
-            samples: Vec::new(),
-        }
-    }
 }
 
 // ══════════════════════════════════════════════════════════════════

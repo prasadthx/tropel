@@ -63,7 +63,7 @@ impl VUWorkerPool {
     pub fn new(count: usize) -> Self {
         assert!(count > 0, "VUWorkerPool requires at least 1 worker");
 
-        let workers = (0..count).map(|i| Self::make_worker(i)).collect();
+        let workers = (0..count).map(Self::make_worker).collect();
         Self {
             workers: Mutex::new(workers),
             next_idx: AtomicUsize::new(0),

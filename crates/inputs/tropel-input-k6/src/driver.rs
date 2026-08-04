@@ -86,6 +86,12 @@ impl Driver for K6Driver {
         }
     }
 
+    // `#[allow]`: WsSession embeds a std::sync::mpsc::Receiver (not Sync), so
+    // Arc<WsSession> is not Send+Sync — but the session registry never
+    // crosses threads: each DriverInstance runs on its own VU thread
+    // (thread-per-core), the same invariant the unsafe impl Send/Sync for
+    // K6DriverInstance below documents.
+    #[allow(clippy::arc_with_non_send_sync)]
     async fn init(
         &self,
         bytes: &[u8],
@@ -396,6 +402,7 @@ pub struct K6DriverInstance {
     /// bridge closures are 'static and can't own the VuContext, so the
     /// registry lives here; `__tropel_k6_ws_finish` removes the session and
     /// emits its ws_* samples into the sample_sink.
+    ///
     ws_sessions: Arc<Mutex<HashMap<u64, Arc<WsSession>>>>,
     /// Monotonic session-id allocator for ws sessions.
     ws_next_id: Arc<AtomicU64>,
@@ -1047,6 +1054,11 @@ impl K6DriverInstance {
     /// - `__tropel_k6_ws_finish(id)` tears the session down and emits its
     ///   `ws_*` samples into the sample_sink (same metric names as the
     ///   declarative WebSocket protocol extension).
+    // `#[allow]`: WsSession (with its std::sync::mpsc::Receiver) is !Sync,
+    // so Arc::new(WsSession { .. }) is not Send+Sync — but the session
+    // registry is confined to this VU's own thread (thread-per-core; see
+    // the unsafe impl Send/Sync for K6DriverInstance below).
+    #[allow(clippy::arc_with_non_send_sync)]
     fn register_ws_bridges(&mut self) {
         let sessions = self.ws_sessions.clone();
         let next_id = self.ws_next_id.clone();

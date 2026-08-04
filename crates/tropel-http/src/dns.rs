@@ -410,7 +410,9 @@ fn cache_get(inner: &DnsShared, host: &str) -> Option<Vec<SocketAddr>> {
                 DnsCacheMode::Forever => true,
                 // The entry stores its precomputed expiry, so the configured
                 // TTL duration itself is not needed here.
-                DnsCacheMode::Ttl(_t) => entry.expires_at.map_or(false, |e| Instant::now() < e),
+                DnsCacheMode::Ttl(_t) => entry
+                    .expires_at
+                    .is_some_and(|e| Instant::now() < e),
                 DnsCacheMode::Off => false,
             };
             if fresh {
@@ -580,10 +582,12 @@ mod tests {
 
     #[test]
     fn from_config_maps_options() {
-        let mut cfg = HttpConfig::default();
-        cfg.dns_ttl = Some("inf".to_string());
-        cfg.dns_select = Some("roundRobin".to_string());
-        cfg.dns_policy = Some("onlyIPv4".to_string());
+        let mut cfg = HttpConfig {
+            dns_ttl: Some("inf".to_string()),
+            dns_select: Some("roundRobin".to_string()),
+            dns_policy: Some("onlyIPv4".to_string()),
+            ..Default::default()
+        };
         cfg.hosts.insert("local.test".to_string(), "127.0.0.1".to_string());
         cfg.blacklist_ips.push("10.0.0.0/8".to_string());
 
@@ -597,8 +601,10 @@ mod tests {
 
     #[test]
     fn bad_blacklist_is_skipped() {
-        let mut cfg = HttpConfig::default();
-        cfg.blacklist_ips = vec!["10.0.0.0/8".to_string(), "junk".to_string()];
+        let cfg = HttpConfig {
+            blacklist_ips: vec!["10.0.0.0/8".to_string(), "junk".to_string()],
+            ..Default::default()
+        };
         let r = DnsResolver::from_config(&cfg);
         assert_eq!(r.inner.blacklist.len(), 1);
     }

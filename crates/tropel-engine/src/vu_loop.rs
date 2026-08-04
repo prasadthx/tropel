@@ -177,10 +177,11 @@ async fn run_vu_loop(
 
         // Shared-iterations mode: PRE-CLAIM this iteration slot atomically
         // (lock-free CAS) so concurrent VUs can never overshoot the budget.
-        if !shared.is_per_vu_iterations && shared.total_iterations != u64::MAX {
-            if !sched.try_claim_shared_iteration(shared.total_iterations) {
-                break;
-            }
+        if !shared.is_per_vu_iterations
+            && shared.total_iterations != u64::MAX
+            && !sched.try_claim_shared_iteration(shared.total_iterations)
+        {
+            break;
         }
 
         vu_sample_counter += 1;
@@ -280,10 +281,11 @@ async fn run_vu_loop(
             apply_think_time(&shared.think_time, Some(iter_start.elapsed())).await;
         }
 
-        if shared.total_iterations != u64::MAX {
-            if shared.is_per_vu_iterations && iteration_index >= shared.total_iterations {
-                break;
-            }
+        if shared.total_iterations != u64::MAX
+            && shared.is_per_vu_iterations
+            && iteration_index >= shared.total_iterations
+        {
+            break;
         }
     }
 }

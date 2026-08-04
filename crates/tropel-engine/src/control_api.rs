@@ -183,7 +183,7 @@ fn parse_status_body(body: &[u8]) -> Option<StatusPatch> {
     let attrs = json
         .get("data")
         .and_then(|d| d.get("attributes"))
-        .or_else(|| Some(&json))?;
+        .or(Some(&json))?;
 
     let vus = attrs.get("vus").and_then(|v| v.as_u64()).map(|v| v as u32);
     let max = attrs.get("max").and_then(|v| v.as_u64()).map(|v| v as u32);

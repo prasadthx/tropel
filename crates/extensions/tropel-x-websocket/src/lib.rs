@@ -151,7 +151,7 @@ impl Protocol for WebSocketProtocol {
             .and_then(|c| c.get("wait"))
             .and_then(|w| w.as_str())
         {
-            Some(s) if s == "until-close" => None,
+            Some("until-close") => None,
             Some(s) => parse_duration(s).or(Some(DEFAULT_WAIT)),
             // Absent `wait` keeps the historical 1s default — only the
             // explicit "until-close" opts into an unbounded (request-timeout

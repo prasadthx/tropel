@@ -113,7 +113,7 @@ impl Service<Request<tonic::Streaming<DynamicMessage>>> for ClientStreamHandler 
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, mut req: Request<tonic::Streaming<DynamicMessage>>) -> Self::Future {
+    fn call(&mut self, req: Request<tonic::Streaming<DynamicMessage>>) -> Self::Future {
         let out_desc = self.out_desc.clone();
         Box::pin(async move {
             let mut stream = req.into_inner();
@@ -151,7 +151,7 @@ impl Service<Request<tonic::Streaming<DynamicMessage>>> for BidiHandler {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, mut req: Request<tonic::Streaming<DynamicMessage>>) -> Self::Future {
+    fn call(&mut self, req: Request<tonic::Streaming<DynamicMessage>>) -> Self::Future {
         let out_desc = self.out_desc.clone();
         Box::pin(async move {
             let mut stream = req.into_inner();

@@ -12,6 +12,10 @@ use tropel_core::TropelError;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MULTIPART_BOUNDARY: &str = "------------------------tropel-boundary-7a2f24b9";
 
+/// Per-certificate-identity HTTP clients (`Arc<Mutex<…>>` because
+/// `std::sync::Mutex` is not `Clone` while `HttpClient` derives `Clone`).
+type CertClientMap = Arc<Mutex<HashMap<(String, String, bool), reqwest::Client>>>;
+
 /// Per-VU HTTP client with auth and response tracking.
 #[derive(Clone)]
 pub struct HttpClient {
@@ -25,11 +29,7 @@ pub struct HttpClient {
     no_redirect: Option<reqwest::Client>,
     /// Lazily-built clients for per-request mTLS identities, keyed by
     /// `(cert_path, key_path, follow_redirects)`. The identity is baked into
-    /// the client at build time, so a per-request `Request.certificate` needs
-    /// its own client; built on first use and cached per distinct identity.
-    /// `Arc<Mutex<…>>` because `std::sync::Mutex` is not `Clone` while
-    /// `HttpClient` derives `Clone`.
-    cert_clients: Arc<Mutex<HashMap<(String, String, bool), reqwest::Client>>>,
+    cert_clients: CertClientMap,
     /// Config snapshot used to lazily build per-certificate clients.
     config: HttpConfig,
     /// TLS snapshot used to lazily build per-certificate clients.
@@ -1010,8 +1010,10 @@ mod tests {
 
         // max_redirects == 0 → the primary client already never follows, so
         // no twin is needed and both request shapes share `inner`.
-        let mut no_redirect_cfg = HttpConfig::default();
-        no_redirect_cfg.max_redirects = 0;
+        let no_redirect_cfg = HttpConfig {
+            max_redirects: 0,
+            ..Default::default()
+        };
         let client = HttpClient::new(&no_redirect_cfg).unwrap();
         assert!(client.no_redirect.is_none());
     }

@@ -691,6 +691,10 @@ impl AuthSigner for HawkAuth {
 /// method (uppercased), resource, host (lowercased), port, hash, ext.
 /// ts/nonce come FIRST per the Hawk spec — the earlier implementation put
 /// method/resource/host/port first, producing a MAC any Hawk server rejects.
+/// The normalized request string has exactly 8 spec-ordered fields (scheme,
+/// ts, nonce, method, resource, host, port, hash, ext) — grouping them would
+/// obscure the wire order the spec mandates, so allow the arity.
+#[allow(clippy::too_many_arguments)]
 fn hawk_normalized_string(
     method: &str,
     ts: &str,

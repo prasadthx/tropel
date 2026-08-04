@@ -52,11 +52,14 @@ const MAX_INLINE_PROTO: usize = 1024 * 1024;
 /// high-rate tests spent tens of ms per call before the actual RPC. These
 /// caches make both one-time per (proto, authority) pair, shared across all
 /// VUs of a scenario (the engine resolves the protocol once and shares the
+/// Compiled descriptor pools, keyed by `(proto source, include dir)`.
+type PoolKey = (String, Option<String>);
+
 /// `Arc<dyn Protocol>`).
 #[derive(Default)]
 pub struct GrpcProtocol {
     /// Compiled descriptor pools, keyed by `(proto source, include dir)`.
-    pools: Mutex<HashMap<(String, Option<String>), Arc<DescriptorPool>>>,
+    pools: Mutex<HashMap<PoolKey, Arc<DescriptorPool>>>,
     /// Tonic channels pooled by authority (`scheme://host:port`).
     channels: Mutex<HashMap<String, Channel>>,
 }
