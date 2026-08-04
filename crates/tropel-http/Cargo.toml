@@ -31,3 +31,4 @@ hex.workspace = true
 percent-encoding.workspace = true
 serde_urlencoded.workspace = true
 indexmap.workspace = true
+rand.workspace = true

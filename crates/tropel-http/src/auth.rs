@@ -14,6 +14,7 @@ use base64::Engine;
 use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use rand::RngExt;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -819,7 +820,7 @@ impl AuthSigner for DigestAuth {
         let response = if let Some(qop) = qop {
             if qop.split(',').any(|q| q.trim() == "auth") {
                 let nc = "00000001".to_string();
-                let c = generate_nonce();
+                let c = generate_crypto_nonce();
                 let ha1 = sess_fold_ha1(&base_ha1, is_sess, nonce, &c, base_algorithm);
                 let response_input = format!("{ha1}:{nonce}:{nc}:{c}:auth:{ha2}");
                 let response = digest_with(&response_input, base_algorithm);
@@ -830,7 +831,7 @@ impl AuthSigner for DigestAuth {
             } else {
                 // qop present but no 'auth' — fall back to the no-qop form.
                 if is_sess {
-                    let c = generate_nonce();
+                    let c = generate_crypto_nonce();
                     let ha1 = sess_fold_ha1(&base_ha1, true, nonce, &c, base_algorithm);
                     fields.push(("cnonce".into(), c.clone()));
                     digest_with(&format!("{ha1}:{nonce}:{ha2}"), base_algorithm)
@@ -839,7 +840,7 @@ impl AuthSigner for DigestAuth {
                 }
             }
         } else if is_sess {
-            let c = generate_nonce();
+            let c = generate_crypto_nonce();
             let ha1 = sess_fold_ha1(&base_ha1, true, nonce, &c, base_algorithm);
             fields.push(("cnonce".into(), c.clone()));
             digest_with(&format!("{ha1}:{nonce}:{ha2}"), base_algorithm)
@@ -966,8 +967,10 @@ fn insert_header(request: &mut reqwest::Request, name: &str, value: &str) -> Res
 static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Deterministic-but-unique per-process nonce: time-derived seed XORed with a
-/// monotonic counter, hex-encoded. Suitable for signing nonces (uniqueness is
-/// all that is required — not cryptographic secrecy).
+/// monotonic counter, hex-encoded. Suitable for signing nonces where
+/// uniqueness is all that is required (OAuth1, Hawk) — not cryptographic
+/// secrecy. See [`generate_crypto_nonce`] for the Digest `cnonce`, which MUST
+/// be unpredictable — do not unify the two.
 fn generate_nonce() -> String {
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -975,6 +978,20 @@ fn generate_nonce() -> String {
         .unwrap_or(0);
     let counter = NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{:016x}", seed ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
+/// Cryptographically secure random nonce (16 bytes → 32 hex chars) for the
+/// HTTP Digest `cnonce`.
+///
+/// The Digest cnonce is folded into the auth response (and, for `-sess`
+/// algorithms, into HA1), so it must be unpredictable to an attacker who can
+/// observe traffic — a time-seeded counter would let them predict/replay
+/// client nonces. `rand::rng()` is a CSPRNG (ChaCha12, OS-seeded); 128 bits
+/// of entropy is the conventional crypto-nonce strength.
+fn generate_crypto_nonce() -> String {
+    let mut rng = rand::rng();
+    let bytes: [u8; 16] = rng.random();
+    hex::encode(bytes)
 }
 
 /// Build an auth signer from an `AuthConfig`.
@@ -1545,6 +1562,38 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a.len(), 16);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn crypto_nonce_is_unique_hex_and_full_width() {
+        // Digest cnonce comes from the CSPRNG, not the time-seeded counter —
+        // it must be unpredictable AND 32 hex chars (16 bytes = 128 bits).
+        let a = generate_crypto_nonce();
+        let b = generate_crypto_nonce();
+        assert_ne!(a, b, "crypto nonces must be unique");
+        assert_eq!(a.len(), 32, "crypto nonce must be 32 hex chars");
+        assert_eq!(b.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(b.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn digest_cnonce_varies_between_requests() {
+        // Two challenge responses to the SAME challenge must carry different
+        // cnonces (a replayed cnonce + nc would be a replay vector).
+        let www = r#"Digest realm="x", qop="auth", nonce="abc123""#;
+        let req = build_request("GET", "http://example.com/", None);
+        let auth = DigestAuth::new("u", "p");
+        let h1 = auth.challenge_response(www, &req).unwrap();
+        let h2 = auth.challenge_response(www, &req).unwrap();
+        let cnonce = |h: &str| -> String {
+            h.split("cnonce=\"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .unwrap()
+                .to_string()
+        };
+        assert_ne!(cnonce(&h1), cnonce(&h2), "Digest cnonce must vary per request");
     }
 
     #[test]
