@@ -28,6 +28,7 @@ use prost::Message as _;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
 use serde::de::DeserializeSeed;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue};
@@ -43,9 +44,22 @@ const DEFAULT_PORT: u16 = 50051;
 /// Max proto source size accepted as inline text (1 MiB).
 const MAX_INLINE_PROTO: usize = 1024 * 1024;
 
-/// gRPC protocol executor.
+/// gRPC protocol executor with per-scenario caches.
+///
+/// Compiling the `.proto` (protox) and establishing a tonic channel are the
+/// two dominant per-request costs — both are re-done on EVERY request in the
+/// naive implementation, so `grpc_req_duration` included compile+connect and
+/// high-rate tests spent tens of ms per call before the actual RPC. These
+/// caches make both one-time per (proto, authority) pair, shared across all
+/// VUs of a scenario (the engine resolves the protocol once and shares the
+/// `Arc<dyn Protocol>`).
 #[derive(Default)]
-pub struct GrpcProtocol;
+pub struct GrpcProtocol {
+    /// Compiled descriptor pools, keyed by `(proto source, include dir)`.
+    pools: Mutex<HashMap<(String, Option<String>), Arc<DescriptorPool>>>,
+    /// Tonic channels pooled by authority (`scheme://host:port`).
+    channels: Mutex<HashMap<String, Channel>>,
+}
 
 /// A tonic `Codec` that encodes/decodes prost-reflect `DynamicMessage`s.
 ///
@@ -144,8 +158,6 @@ impl Protocol for GrpcProtocol {
     }
 
     async fn execute(&self, req: &Request, config: Option<&serde_json::Value>) -> Result<ProtocolOutcome> {
-        let start = Instant::now();
-
         // ── Parse the URL: grpc://host:port/package.Service/Method ──
         let url = url::Url::parse(&req.url)
             .map_err(|e| TropelError::Config(format!("invalid gRPC URL '{}': {}", req.url, e)))?;
@@ -175,8 +187,27 @@ impl Protocol for GrpcProtocol {
         // ── Resolve the proto source (config → header → env) ──
         let (proto_src, proto_dir) = resolve_proto(req, config)?;
 
-        // ── Compile the proto + build the descriptor pool ──
-        let pool = compile_proto(&proto_src, proto_dir.as_deref())?;
+        // ── Compile the proto ONCE per (source, dir) and cache the pool ──
+        // Compilation (protox) is tens of ms — the dominant per-request cost
+        // before the actual RPC. The double-checked cache shares one compiled
+        // pool across every VU of the scenario (the engine hands the same
+        // `Arc<dyn Protocol>` to all VUs).
+        let pool = {
+            let key = (proto_src.clone(), proto_dir.clone());
+            let cached = self.pools.lock().unwrap().get(&key).cloned();
+            match cached {
+                Some(p) => p,
+                None => {
+                    let compiled = Arc::new(compile_proto(&proto_src, proto_dir.as_deref())?);
+                    self.pools
+                        .lock()
+                        .unwrap()
+                        .entry(key)
+                        .or_insert_with(|| compiled.clone());
+                    compiled
+                }
+            }
+        };
         let service = pool
             .get_service_by_name(service_full)
             .ok_or_else(|| {
@@ -244,20 +275,51 @@ impl Protocol for GrpcProtocol {
             input_messages.push(DynamicMessage::new(input_desc.clone()));
         }
 
-        // ── Connect ──
+        // ── Pool the channel by authority — connect ONCE per endpoint ──
+        // Tonic's `Channel` is cheaply cloneable (an Arc-backed handle), so
+        // pooling by `scheme://host:port` reuses the established HTTP/2
+        // connection instead of reconnecting per request. The endpoint is
+        // rebuilt (with TLS config) only on the first request for an
+        // authority.
         let scheme = if is_tls { "https" } else { "http" };
-        let uri = format!("{scheme}://{host}:{port}");
-        let mut endpoint = Endpoint::from_shared(uri)
-            .map_err(|e| TropelError::Extension(format!("bad gRPC endpoint: {e}")))?;
-        if is_tls {
-            endpoint = endpoint
-                .tls_config(ClientTlsConfig::new().domain_name(&host))
-                .map_err(|e| TropelError::Extension(format!("gRPC TLS config: {e}")))?;
-        }
-        let channel: Channel = endpoint
-            .connect()
-            .await
-            .map_err(|e| TropelError::Extension(format!("gRPC connect to {host}:{port}: {e}")))?;
+        let authority = format!("{scheme}://{host}:{port}");
+        let channel = {
+            let cached = self.channels.lock().unwrap().get(&authority).cloned();
+            match cached {
+                Some(c) => c,
+                None => {
+                    let mut endpoint = Endpoint::from_shared(authority.clone())
+                        .map_err(|e| TropelError::Extension(format!("bad gRPC endpoint: {e}")))?;
+                    if is_tls {
+                        endpoint = endpoint
+                            .tls_config(ClientTlsConfig::new().domain_name(&host))
+                            .map_err(|e| {
+                                TropelError::Extension(format!("gRPC TLS config: {e}"))
+                            })?;
+                    }
+                    let connected = endpoint
+                        .connect()
+                        .await
+                        .map_err(|e| {
+                            TropelError::Extension(format!(
+                                "gRPC connect to {host}:{port}: {e}"
+                            ))
+                        })?;
+                    self.channels
+                        .lock()
+                        .unwrap()
+                        .entry(authority)
+                        .or_insert_with(|| connected.clone());
+                    connected
+                }
+            }
+        };
+
+        // ── Start the RPC timer AFTER connect ──
+        // `grpc_req_duration` must measure the RPC itself, not the one-time
+        // proto compile + channel connect (which the caches above amortize to
+        // zero on the hot path).
+        let start = Instant::now();
 
         // ── Build the request metadata from request headers ──
         // Pseudo-headers (`:...`) and the internal `x-grpc-proto*` headers
@@ -299,13 +361,17 @@ impl Protocol for GrpcProtocol {
         let is_bidi = method.is_client_streaming() && is_server_streaming;
         let is_client_streaming = method.is_client_streaming() && !is_server_streaming;
 
+        // The response HEADER is bounded by `deadline` via with_timeout, but the
+        // DRAIN loop of a streaming method is NOT — a server that trickles or
+        // never closes would hold the VU forever. drain_bounded caps the whole
+        // drain with the same deadline so `req.timeout` bounds the full stream.
         let response_value: serde_json::Value = if is_bidi {
             let mut tonic_req = TonicRequest::new(tokio_stream::iter(input_messages));
             *tonic_req.metadata_mut() = metadata.clone();
             let fut = client.streaming(tonic_req, path, codec);
             let result = with_timeout(deadline, fut).await;
             match result {
-                Ok(stream) => collect_messages(stream.into_inner(), &mut status_override).await,
+                Ok(stream) => drain_bounded(deadline, stream.into_inner(), &mut status_override).await,
                 Err(e) => {
                     status_override = Some(e.code());
                     serde_json::Value::Null
@@ -334,7 +400,7 @@ impl Protocol for GrpcProtocol {
             let fut = client.server_streaming(tonic_req, path, codec);
             let result = with_timeout(deadline, fut).await;
             match result {
-                Ok(stream) => collect_messages(stream.into_inner(), &mut status_override).await,
+                Ok(stream) => drain_bounded(deadline, stream.into_inner(), &mut status_override).await,
                 Err(e) => {
                     status_override = Some(e.code());
                     serde_json::Value::Null
@@ -447,11 +513,13 @@ async fn with_timeout<T>(
 }
 
 /// Drain a tonic response stream into a JSON array, surfacing any terminal
-/// status via `status_override`.
+/// status via `status_override`. The caller bounds the whole drain with the
+/// request deadline (see `drain_bounded`), so a never-closing server can't
+/// hold the VU.
 async fn collect_messages(
-    mut stream: tonic::Streaming<DynamicMessage>,
+    stream: &mut tonic::Streaming<DynamicMessage>,
     status_override: &mut Option<GrpcCode>,
-) -> serde_json::Value {
+) -> std::result::Result<serde_json::Value, Status> {
     let mut msgs = Vec::new();
     loop {
         match stream.message().await {
@@ -467,7 +535,24 @@ async fn collect_messages(
             }
         }
     }
-    serde_json::Value::Array(msgs)
+    Ok(serde_json::Value::Array(msgs))
+}
+
+/// Drain a streaming response bounded by the request deadline. On timeout the
+/// stream is abandoned (dropped, half-closing it) and the status is set to
+/// `DEADLINE_EXCEEDED` — consistent with the header-phase timeout.
+async fn drain_bounded(
+    deadline: Option<std::time::Duration>,
+    mut stream: tonic::Streaming<DynamicMessage>,
+    status_override: &mut Option<GrpcCode>,
+) -> serde_json::Value {
+    match with_timeout(deadline, collect_messages(&mut stream, status_override)).await {
+        Ok(v) => v,
+        Err(e) => {
+            *status_override = Some(e.code());
+            serde_json::Value::Null
+        }
+    }
 }
 
 /// Parse a `/package.Service/Method` path into a `PathAndQuery`.
@@ -601,7 +686,7 @@ fn list_services(pool: &DescriptorPool) -> String {
 
 /// Inventory factory — must be a `fn` pointer for `inventory::submit!`.
 fn grpc_factory() -> Box<dyn Protocol> {
-    Box::new(GrpcProtocol)
+    Box::new(GrpcProtocol::default())
 }
 
 inventory::submit!(ProtocolRegistration::new("grpc", grpc_factory));

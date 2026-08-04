@@ -274,7 +274,7 @@ async fn unary_roundtrip() {
     let pool = tropel_x_grpc::compile_proto(TEST_PROTO, None).unwrap();
     let addr = spawn_server(pool).await;
 
-    let proto = tropel_x_grpc::GrpcProtocol;
+    let proto = tropel_x_grpc::GrpcProtocol::default();
     let outcome = proto
         .execute(
             &make_req(format!("grpc://{addr}/test.Greeter/SayHello")),
@@ -303,7 +303,7 @@ async fn server_streaming_roundtrip() {
     let pool = tropel_x_grpc::compile_proto(TEST_PROTO, None).unwrap();
     let addr = spawn_server(pool).await;
 
-    let proto = tropel_x_grpc::GrpcProtocol;
+    let proto = tropel_x_grpc::GrpcProtocol::default();
     let outcome = proto
         .execute(
             &make_req(format!("grpc://{addr}/test.Greeter/StreamHello")),
@@ -331,7 +331,7 @@ async fn client_streaming_roundtrip() {
     let pool = tropel_x_grpc::compile_proto(TEST_PROTO, None).unwrap();
     let addr = spawn_server(pool).await;
 
-    let proto = tropel_x_grpc::GrpcProtocol;
+    let proto = tropel_x_grpc::GrpcProtocol::default();
     let mut req = make_req(format!("grpc://{addr}/test.Greeter/CollectHellos"));
     req.body = Some(ReqBody::Json(serde_json::json!([
         {"name": "a"},
@@ -354,7 +354,7 @@ async fn bidi_streaming_roundtrip() {
     let pool = tropel_x_grpc::compile_proto(TEST_PROTO, None).unwrap();
     let addr = spawn_server(pool).await;
 
-    let proto = tropel_x_grpc::GrpcProtocol;
+    let proto = tropel_x_grpc::GrpcProtocol::default();
     let mut req = make_req(format!("grpc://{addr}/test.Greeter/Chat"));
     req.body = Some(ReqBody::Json(serde_json::json!([
         {"name": "x"},
@@ -379,7 +379,7 @@ async fn unknown_method_returns_error_status() {
     let pool = tropel_x_grpc::compile_proto(TEST_PROTO, None).unwrap();
     let addr = spawn_server(pool).await;
 
-    let proto = tropel_x_grpc::GrpcProtocol;
+    let proto = tropel_x_grpc::GrpcProtocol::default();
     // A method that does not exist in the proto → config error, no network call.
     let err = proto
         .execute(
