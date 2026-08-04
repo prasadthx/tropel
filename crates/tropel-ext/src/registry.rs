@@ -1,5 +1,6 @@
 use crate::traits::*;
 use indexmap::IndexMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// The extension registry: collects all registered extensions at startup.
@@ -73,6 +74,18 @@ impl ExtensionRegistry {
     /// Get a protocol by scheme.
     pub fn get_protocol(&self, scheme: &str) -> Option<Box<dyn Protocol>> {
         self.protocols.get(scheme).map(|r| (r.create)())
+    }
+
+    /// Instantiate EVERY registered protocol into a scheme-keyed map.
+    ///
+    /// The engine passes this map to the runner once per scenario so any
+    /// registered protocol (gRPC, WebSocket, or a third-party one) is
+    /// dispatched by its URL scheme — not just hardcoded `grpc`/`ws` slots.
+    pub fn instantiate_protocols(&self) -> HashMap<String, Arc<dyn Protocol>> {
+        self.protocols
+            .iter()
+            .map(|(scheme, reg)| (scheme.clone(), Arc::from((reg.create)())))
+            .collect()
     }
 
     /// Get an output by name.

@@ -40,12 +40,12 @@ pub struct VURunner {
     client: HttpClient,
     config: RunnerConfig,
     js_ctx: Option<Box<JsContext>>,
-    /// Registered protocol for `grpc://` / `grpcs://` URLs, if the binary
-    /// links a gRPC extension (e.g. `tropel-x-grpc`).
-    grpc_protocol: Option<Arc<dyn Protocol>>,
-    /// Registered protocol for `ws://` / `wss://` URLs, if the binary
-    /// links a WebSocket extension (e.g. `tropel-x-websocket`).
-    ws_protocol: Option<Arc<dyn Protocol>>,
+    /// Registered protocols keyed by URL scheme (e.g. `grpc`, `ws`, or any
+    /// third-party scheme), instantiated once per scenario from the
+    /// extension registry and shared across VUs. Dispatch is generic: a
+    /// URL's scheme is looked up here, so ANY registered protocol runs —
+    /// not just hardcoded gRPC/WebSocket slots.
+    protocols: Arc<HashMap<String, Arc<dyn Protocol>>>,
     /// Expected status codes/ranges that determine request success.
     /// Controls http_req_failed metric: 1.0 when status is NOT expected.
     expected_statuses: Vec<ExpectedStatus>,
@@ -89,8 +89,7 @@ impl VURunner {
             client,
             config: RunnerConfig::default(),
             js_ctx: None,
-            grpc_protocol: None,
-            ws_protocol: None,
+            protocols: Arc::new(HashMap::new()),
             // Default: 2xx-3xx = success (matches k6 behavior)
             expected_statuses: vec![ExpectedStatus::Range("200-399".to_string())],
             vu_id,
@@ -104,17 +103,11 @@ impl VURunner {
         self
     }
 
-    /// Attach the registered gRPC protocol so `grpc://` / `grpcs://` URLs
-    /// dispatch to it instead of the HTTP client.
-    pub fn with_grpc_protocol(mut self, protocol: Option<Arc<dyn Protocol>>) -> Self {
-        self.grpc_protocol = protocol;
-        self
-    }
-
-    /// Attach the registered WebSocket protocol so `ws://` / `wss://` URLs
-    /// dispatch to it instead of the HTTP client.
-    pub fn with_ws_protocol(mut self, protocol: Option<Arc<dyn Protocol>>) -> Self {
-        self.ws_protocol = protocol;
+    /// Attach the registry-instantiated protocol map so any non-HTTP URL
+    /// scheme (`grpc`, `ws`, third-party) dispatches to its registered
+    /// protocol instead of the HTTP client.
+    pub fn with_protocols(mut self, protocols: Arc<HashMap<String, Arc<dyn Protocol>>>) -> Self {
+        self.protocols = protocols;
         self
     }
 
@@ -268,104 +261,82 @@ impl VURunner {
                     // protocol resolves its proto source from request
                     // headers / config / env and returns both the metric
                     // samples and a Response for pm.response.
-                    let is_grpc = resolved_url.starts_with("grpc://")
-                        || resolved_url.starts_with("grpcs://");
-                    let is_ws = resolved_url.starts_with("ws://")
-                        || resolved_url.starts_with("wss://");
-                    if is_grpc {
-                        if let Some(proto) = &self.grpc_protocol {
-                            let exec_start = Instant::now();
-                            match proto.execute(&resolved_req, None).await {
-                                Ok(outcome) => {
-                                    let duration = exec_start.elapsed();
-                                    tracing::trace!(
-                                        "VU runner: gRPC call to {} completed in {:?}",
-                                        resolved_req.url,
-                                        duration
-                                    );
-                                    if let Some(resp) = outcome.response {
-                                        let mut state = self.pm_state.lock().unwrap();
-                                        state.response = Some(resp);
-                                    }
-                                    result.samples.extend(outcome.samples);
+                    // Scheme-driven dispatch: ANY registered protocol (gRPC,
+                    // WebSocket, or a third-party one) runs when its scheme
+                    // matches the URL. TLS-suffixed schemes (grpcs, wss) map
+                    // to the base registration (grpc, ws) when not registered
+                    // verbatim. The protocol returns both the metric samples
+                    // and a Response for pm.response.
+                    let scheme = resolved_url.split("://").next().unwrap_or("");
+                    // http/https are the built-in HTTP path — never dispatch
+                    // them to a registered protocol (also closes the latent
+                    // https→http strip fallback foot-gun).
+                    let is_http_scheme = matches!(scheme, "http" | "https");
+                    let protocol = if is_http_scheme {
+                        None
+                    } else {
+                        self.protocols
+                            .get(scheme)
+                            .or_else(|| self.protocols.get(scheme.strip_suffix('s').unwrap_or("")))
+                            .cloned()
+                    };
+                    // A clearly non-HTTP scheme with no registered protocol:
+                    // warn and SKIP (parity with the old 'no gRPC protocol
+                    // registered — skipping' behavior) instead of producing a
+                    // confusing reqwest error.
+                    if protocol.is_none() && !is_http_scheme {
+                        tracing::warn!(
+                            "VU {}: {}:// URL '{}' but no protocol registered for scheme '{}' — skipping",
+                            iteration_index,
+                            scheme,
+                            resolved_url,
+                            scheme
+                        );
+                    }
+                    if let Some(proto) = protocol {
+                        let exec_start = Instant::now();
+                        match proto.execute(&resolved_req, None).await {
+                            Ok(outcome) => {
+                                let duration = exec_start.elapsed();
+                                tracing::trace!(
+                                    "VU runner: {}:// call to {} completed in {:?}",
+                                    scheme,
+                                    resolved_req.url,
+                                    duration
+                                );
+                                if let Some(resp) = outcome.response {
+                                    let mut state = self.pm_state.lock().unwrap();
+                                    state.response = Some(resp);
                                 }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "VU {} gRPC request '{}' failed: {}",
-                                        iteration_index,
-                                        item.name,
-                                        e
-                                    );
-                                    let err_tags = Arc::new(TagMap::from_pairs([
-                                        ("url", resolved_url.clone()),
-                                        ("method", request.method.to_string()),
-                                        ("name", item.name.clone()),
-                                        ("error", e.to_string()),
-                                    ]));
-                                    let now = std::time::SystemTime::now();
-                                    result.samples.push(tropel_core::types::Sample {
-                                        metric: "errors".into(),
-                                        value: 1.0,
-                                        tags: err_tags,
-                                        timestamp: now,
-                                        sample_type: SampleType::Counter,
-                                    });
-                                }
+                                result.samples.extend(outcome.samples);
                             }
-                        } else {
-                            tracing::warn!(
-                                "VU {}: grpc:// URL '{}' but no gRPC protocol registered — skipping",
-                                iteration_index,
-                                resolved_url
-                            );
-                        }
-                    } else if is_ws {
-                        if let Some(proto) = &self.ws_protocol {
-                            let exec_start = Instant::now();
-                            match proto.execute(&resolved_req, None).await {
-                                Ok(outcome) => {
-                                    let duration = exec_start.elapsed();
-                                    tracing::trace!(
-                                        "VU runner: WebSocket call to {} completed in {:?}",
-                                        resolved_req.url,
-                                        duration
-                                    );
-                                    if let Some(resp) = outcome.response {
-                                        let mut state = self.pm_state.lock().unwrap();
-                                        state.response = Some(resp);
-                                    }
-                                    result.samples.extend(outcome.samples);
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "VU {} WebSocket request '{}' failed: {}",
-                                        iteration_index,
-                                        item.name,
-                                        e
-                                    );
-                                    let err_tags = Arc::new(TagMap::from_pairs([
-                                        ("url", resolved_url.clone()),
-                                        ("method", request.method.to_string()),
-                                        ("name", item.name.clone()),
-                                        ("error", e.to_string()),
-                                    ]));
-                                    let now = std::time::SystemTime::now();
-                                    result.samples.push(tropel_core::types::Sample {
-                                        metric: "errors".into(),
-                                        value: 1.0,
-                                        tags: err_tags,
-                                        timestamp: now,
-                                        sample_type: SampleType::Counter,
-                                    });
-                                }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "VU {} {}:// request '{}' failed: {}",
+                                    iteration_index,
+                                    scheme,
+                                    item.name,
+                                    e
+                                );
+                                let err_tags = Arc::new(TagMap::from_pairs([
+                                    ("url", resolved_url.clone()),
+                                    ("method", request.method.to_string()),
+                                    ("name", item.name.clone()),
+                                    ("error", e.to_string()),
+                                ]));
+                                let now = std::time::SystemTime::now();
+                                result.samples.push(tropel_core::types::Sample {
+                                    metric: "errors".into(),
+                                    value: 1.0,
+                                    tags: err_tags,
+                                    timestamp: now,
+                                    sample_type: SampleType::Counter,
+                                });
                             }
-                        } else {
-                            tracing::warn!(
-                                "VU {}: ws:// URL '{}' but no WebSocket protocol registered — skipping",
-                                iteration_index,
-                                resolved_url
-                            );
                         }
+                    } else if !is_http_scheme {
+                        // Warned above; skip — never send a non-HTTP scheme to
+                        // the HTTP client (reqwest would fail confusingly).
                     } else {
                     // Build auth signer from request auth config, or use the scenario-level auth
                     let auth_signer = resolved_req
