@@ -168,10 +168,6 @@ pub enum Commands {
         /// them too. Example: `--plugins-dir ./plugins`.
         #[arg(long = "plugins-dir")]
         plugins_dir: Option<PathBuf>,
-
-        /// Build extensions (for `tropel build` — used here for uniform parsing)
-        #[arg(long = "with")]
-        with_extensions: Vec<String>,
     },
 
     /// List available input formats and their capabilities
