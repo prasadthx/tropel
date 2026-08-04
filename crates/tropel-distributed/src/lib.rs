@@ -29,6 +29,7 @@ pub mod agent;
 pub mod cloud;
 pub mod controller;
 pub mod protocol;
+pub mod yaml;
 
 pub use agent::run_agent;
 pub use cloud::{generate_k8s_manifests, run_cloud};

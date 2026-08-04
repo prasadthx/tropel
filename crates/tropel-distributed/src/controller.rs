@@ -36,16 +36,9 @@ pub async fn run_controller(
     // The controller owns ALL output — agents must not stream to the same
     // endpoints/files the controller or other agents use (a shared NDJSON
     // file written by N processes, or N parallel remote-write pushes).
-    // Null out the streaming output fields on the dispatched config.
+    // OutputConfig::into_worker() nulls every streaming field in one place.
     let mut worker_config = config.clone();
-    worker_config.output.reporters = vec![];
-    worker_config.output.output_file = None;
-    worker_config.output.prometheus_remote_write_url = None;
-    worker_config.output.otlp_endpoint = None;
-    worker_config.output.summary_export = None;
-    worker_config.output.json_stream = None;
-    worker_config.output.statsd_addr = None;
-    worker_config.output.influxdb_addr = None;
+    worker_config.output = std::mem::take(&mut worker_config.output).into_worker();
 
     // Compute the segment dispatch: if the job declares a sequence, use it;
     // otherwise split [0,1) into num_agents equal segments.
@@ -288,6 +281,33 @@ mod tests {
 
         let _ = std::fs::remove_file(&coll);
         Ok(())
+    }
+
+    #[test]
+    fn into_worker_disables_all_streaming_output() {
+        let mut config = JobConfig::default();
+        config.output.reporters = vec!["stdout".into(), "json".into()];
+        config.output.output_file = Some("out.json".into());
+        config.output.prometheus_remote_write_url = Some("http://prom:9090".into());
+        config.output.otlp_endpoint = Some("http://otlp:4318".into());
+        config.output.summary_export = Some("summary.json".into());
+        config.output.json_stream = Some("stream.ndjson".into());
+        config.output.statsd_addr = Some("localhost:8125".into());
+        config.output.influxdb_addr = Some("localhost:8089".into());
+
+        let worker = config.output.clone().into_worker();
+        assert!(worker.reporters.is_empty());
+        assert!(worker.output_file.is_none());
+        assert!(worker.prometheus_remote_write_url.is_none());
+        assert!(worker.otlp_endpoint.is_none());
+        assert!(worker.summary_export.is_none());
+        assert!(worker.json_stream.is_none());
+        assert!(worker.statsd_addr.is_none());
+        assert!(worker.influxdb_addr.is_none());
+        // Non-streaming knobs survive (summary/trends/tag policy untouched).
+        assert!(worker.summary);
+        assert!(worker.trends);
+        assert_eq!(worker.tag_allowlist, config.output.tag_allowlist);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

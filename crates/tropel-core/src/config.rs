@@ -452,6 +452,29 @@ impl Default for OutputConfig {
     }
 }
 
+impl OutputConfig {
+    /// Build the output config dispatched to distributed worker agents.
+    ///
+    /// The controller owns ALL output — agents must not stream to the same
+    /// endpoints/files the controller or other agents use (a shared NDJSON
+    /// file written by N processes, or N parallel remote-write pushes).
+    /// This constructor nulls every streaming/reporting field in one place,
+    /// so adding a new output field can't silently leak into worker configs.
+    pub fn into_worker(self) -> Self {
+        Self {
+            reporters: Vec::new(),
+            output_file: None,
+            prometheus_remote_write_url: None,
+            otlp_endpoint: None,
+            summary_export: None,
+            json_stream: None,
+            statsd_addr: None,
+            influxdb_addr: None,
+            ..self
+        }
+    }
+}
+
 /// Expected status code or range for determining http_req_failed.
 /// A request fails (http_req_failed=1) when the response status code
 /// does NOT fall within any of the expected entries.
