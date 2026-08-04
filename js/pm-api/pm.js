@@ -122,7 +122,12 @@ pm.response = {
     to: {
         have: {
             status: function (code) {
-                return pm.response.code() === code;
+                var actual = pm.response.code();
+                if (actual !== code) {
+                    throw new Error(
+                        'expected response to have status ' + code + ' but got ' + actual
+                    );
+                }
             }
         }
     }
@@ -199,7 +204,13 @@ pm.expect = function (actual) {
                     return passed;
                 },
                 status: function (code) {
-                    return pm.response.to.have.status(code);
+                    // Must THROW on mismatch (Postman/chai semantics) — a
+                    // boolean return makes `pm.test` treat the callback's
+                    // `undefined` statement result as passed.
+                    var actual = pm.response.code();
+                    if (actual !== code) {
+                        throw new Error('expected response to have status ' + code + ' but got ' + actual);
+                    }
                 },
                 header: function (key, value) {
                     var header = pm.response.header(key);

@@ -379,16 +379,25 @@ fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
                 metrics.errors as f64
             }
         }
-        "checks" | "checks.total" => metrics.checks_total as f64,
-        "checks.passed" => metrics.checks_passed as f64,
-        "checks.failed" => metrics.checks_failed as f64,
-        "checks.pass_rate" => {
-            if metrics.checks_total > 0 {
-                metrics.checks_passed as f64 / metrics.checks_total as f64
-            } else {
-                0.0
+        // NOTE: `parse_metric_ref` strips the stat at the last dot, so a
+        // `checks.rate` / `checks.pass_rate` reference arrives here as
+        // name="checks", stat=Some("rate"/"pass_rate") — the dotted-name
+        // arms below would be unreachable. Match on (name, stat) instead of
+        // on a dot-stripped name, otherwise `checks: ['rate>0.99']` (the
+        // stock k6 gate) compares the check COUNT against the rate and
+        // always passes.
+        "checks" | "checks.total" => match stat {
+            Some("passed") => metrics.checks_passed as f64,
+            Some("failed") => metrics.checks_failed as f64,
+            Some("rate") | Some("pass_rate") => {
+                if metrics.checks_total > 0 {
+                    metrics.checks_passed as f64 / metrics.checks_total as f64
+                } else {
+                    0.0
+                }
             }
-        }
+            _ => metrics.checks_total as f64,
+        },
         "http_req_duration" => {
             if let Some(d) = &metrics.http_req_duration {
                 match stat {

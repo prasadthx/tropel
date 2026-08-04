@@ -49,6 +49,13 @@ var chai = chai || {};
         this._obj = obj;
         this._msg = msg;
         this._ssfi = ssfi || Assertion;
+        // Initialize the flags bag up front. Without this, a plain chain
+        // (no `.not`/`.deep` accessed) leaves `__flags` undefined and the
+        // `var negate = this.__flags && this.__flags.negate` idiom below
+        // yields `undefined` — and `(false) !== undefined` is TRUE, so every
+        // positive assertion silently passed. The `!!(...)` conversions below
+        // are the actual fix; this init keeps the getters' `|| {}` harmless.
+        this.__flags = {};
     }
 
     // ── Chainable properties ──
@@ -96,7 +103,7 @@ var chai = chai || {};
 
     // .equal(expected)
     Assertion.prototype.equal = function (value) {
-        var negate = this.__flags && this.__flags.negate;
+        var negate = !!(this.__flags && this.__flags.negate);
         var passed = (this._obj === value) !== negate;
         if (!passed) {
             throw new Error(
@@ -110,8 +117,8 @@ var chai = chai || {};
 
     // .eql(expected) — deep equality
     Assertion.prototype.eql = function (value) {
-        var negate = this.__flags && this.__flags.negate;
-        var deep = this.__flags && this.__flags.deep;
+        var negate = !!(this.__flags && this.__flags.negate);
+        var deep = !!(this.__flags && this.__flags.deep);
         var passed;
 
         if (deep || true) {
@@ -134,7 +141,7 @@ var chai = chai || {};
     // .include(value)
     Assertion.prototype.include = function (value) {
         var obj = this._obj;
-        var negate = this.__flags && this.__flags.negate;
+        var negate = !!(this.__flags && this.__flags.negate);
         var passed;
 
         if (typeof obj === 'string') {
@@ -160,7 +167,7 @@ var chai = chai || {};
     // .ok
     Object.defineProperty(Assertion.prototype, 'ok', {
         get: function () {
-            var negate = this.__flags && this.__flags.negate;
+            var negate = !!(this.__flags && this.__flags.negate);
             var passed = !!this._obj !== negate;
             if (!passed) {
                 throw new Error(
@@ -177,7 +184,7 @@ var chai = chai || {};
     // .true
     Object.defineProperty(Assertion.prototype, 'true', {
         get: function () {
-            var negate = this.__flags && this.__flags.negate;
+            var negate = !!(this.__flags && this.__flags.negate);
             var passed = (this._obj === true) !== negate;
             if (!passed) {
                 throw new Error(
@@ -193,7 +200,7 @@ var chai = chai || {};
     // .false
     Object.defineProperty(Assertion.prototype, 'false', {
         get: function () {
-            var negate = this.__flags && this.__flags.negate;
+            var negate = !!(this.__flags && this.__flags.negate);
             var passed = (this._obj === false) !== negate;
             if (!passed) {
                 throw new Error(
@@ -209,7 +216,7 @@ var chai = chai || {};
     // .null
     Object.defineProperty(Assertion.prototype, 'null', {
         get: function () {
-            var negate = this.__flags && this.__flags.negate;
+            var negate = !!(this.__flags && this.__flags.negate);
             var passed = (this._obj === null) !== negate;
             if (!passed) {
                 throw new Error(
@@ -225,7 +232,7 @@ var chai = chai || {};
     // .undefined
     Object.defineProperty(Assertion.prototype, 'undefined', {
         get: function () {
-            var negate = this.__flags && this.__flags.negate;
+            var negate = !!(this.__flags && this.__flags.negate);
             var passed = (this._obj === undefined) !== negate;
             if (!passed) {
                 throw new Error(
@@ -241,7 +248,7 @@ var chai = chai || {};
     // .property(name[, value])
     Assertion.prototype.property = function (name, value) {
         var obj = this._obj;
-        var negate = this.__flags && this.__flags.negate;
+        var negate = !!(this.__flags && this.__flags.negate);
         var has = obj !== null && obj !== undefined && name in obj;
         var passed = has !== negate;
 
@@ -261,7 +268,7 @@ var chai = chai || {};
     // .lengthOf(n)
     Assertion.prototype.lengthOf = function (n) {
         var obj = this._obj;
-        var negate = this.__flags && this.__flags.negate;
+        var negate = !!(this.__flags && this.__flags.negate);
         var passed;
 
         if (typeof obj === 'string' || Array.isArray(obj)) {
@@ -284,7 +291,7 @@ var chai = chai || {};
     // .match(regexp)
     Assertion.prototype.match = function (re) {
         var obj = String(this._obj);
-        var negate = this.__flags && this.__flags.negate;
+        var negate = !!(this.__flags && this.__flags.negate);
         var passed = re.test(obj) !== negate;
         if (!passed) {
             throw new Error(
@@ -298,7 +305,7 @@ var chai = chai || {};
     // .string(string)
     Assertion.prototype.string = function (str) {
         var obj = String(this._obj);
-        var negate = this.__flags && this.__flags.negate;
+        var negate = !!(this.__flags && this.__flags.negate);
         var passed = (obj.indexOf(str) !== -1) !== negate;
         if (!passed) {
             throw new Error(
@@ -313,7 +320,7 @@ var chai = chai || {};
     Assertion.prototype.keys = function () {
         var obj = this._obj;
         var expectedKeys = Array.prototype.slice.call(arguments);
-        var negate = this.__flags && this.__flags.negate;
+        var negate = !!(this.__flags && this.__flags.negate);
         var passed;
 
         if (expectedKeys.length === 1 && Array.isArray(expectedKeys[0])) {
@@ -407,12 +414,28 @@ var chai = chai || {};
             throw new Error(msg || 'Assertion failed');
         },
         throws: function (fn, err, msg) {
+            // The "expected function to throw" error must be thrown AFTER the
+            // try/catch — previously it was thrown inside the try and then
+            // caught by its own catch, so assert.throws() always passed even
+            // when nothing threw (the error fell through and returned).
+            var threw = false;
+            var caught;
             try {
                 fn();
-                throw new Error(msg || 'expected function to throw');
             } catch (e) {
-                if (err && e instanceof err) return;
-                if (typeof err === 'string' && e.message !== err) throw new Error(msg || 'expected error message ' + err + ' got ' + e.message);
+                threw = true;
+                caught = e;
+            }
+            if (!threw) {
+                throw new Error(msg || 'expected function to throw');
+            }
+            if (err && typeof err === 'function' && !(caught instanceof err)) {
+                throw new Error(
+                    msg || 'expected function to throw ' + err.name + ' but threw ' + (caught && caught.name)
+                );
+            }
+            if (typeof err === 'string' && caught.message !== err) {
+                throw new Error(msg || 'expected error message ' + err + ' got ' + caught.message);
             }
         },
         doesNotThrow: function (fn, msg) {
