@@ -76,30 +76,48 @@ impl StdoutReporter {
             result.summary_trend_stats.clone()
         };
 
-        out.push_str("\n╔══════════════════════════════════════════════════╗\n");
-        out.push_str("║          Tropel Load Test Summary               ║\n");
-        out.push_str("╚══════════════════════════════════════════════════╝\n\n");
+        // ── Dynamic-width centered header box ──
+        const BOX_W: usize = 66;
+        let title = "Tropel Load Test Summary";
+        let pad = (BOX_W - 2 - title.chars().count()) / 2;
+        let left_pad = " ".repeat(pad);
+        let right_pad = " ".repeat(BOX_W - 2 - title.chars().count() - pad);
+        out.push_str(&format!("\n╔{}╗\n", "═".repeat(BOX_W - 2)));
+        out.push_str(&format!("║{}{}{}║\n", left_pad, title, right_pad));
+        out.push_str(&format!("╠{}╣\n", "═".repeat(BOX_W - 2)));
 
-        // Execution overview
-        out.push_str("  Execution:\n");
-        out.push_str(&format!("    Iterations:     {}\n", result.iterations));
-        out.push_str(&format!("    Max VUs:        {}\n", result.vus_max));
-        out.push_str(&format!("    Dropped:        {}\n", result.dropped_iterations));
+        // Execution overview — aligned two-column block
+        out.push_str("  ── Execution ─────────────────────────────────────────────\n");
+        let exec_rows = [
+            ("Iterations", result.iterations.to_string()),
+            ("Max VUs", result.vus_max.to_string()),
+            ("Dropped", result.dropped_iterations.to_string()),
+        ];
+        for (label, value) in exec_rows {
+            out.push_str(&format!("    {:<14}{}\n", label, value));
+        }
 
-        // HTTP requests
-        out.push_str("\n  HTTP requests:\n");
-        out.push_str(&format!("    Total:     {}\n", result.http_reqs));
+        // HTTP requests — aligned two-column block
+        out.push_str("\n  ── HTTP requests ─────────────────────────────────────────\n");
         out.push_str(&format!(
-            "    Failed:    {} ({:.1}%)\n",
+            "    {:<14}{}\n",
+            "Total",
+            result.http_reqs
+        ));
+        out.push_str(&format!(
+            "    {:<14}{} ({:.1}%)\n",
+            "Failed",
             (result.http_req_failed * result.http_reqs as f64) as u64,
             result.http_req_failed * 100.0
         ));
         out.push_str(&format!(
-            "    Data received: {:.2} MB\n",
+            "    {:<14}{:.2} MB\n",
+            "Data received",
             result.data_received / 1_000_000.0
         ));
         out.push_str(&format!(
-            "    Data sent:     {:.2} MB\n",
+            "    {:<14}{:.2} MB\n",
+            "Data sent",
             result.data_sent / 1_000_000.0
         ));
 
@@ -231,7 +249,7 @@ impl StdoutReporter {
 
         // Thresholds — pass/fail against the effective threshold set.
         if !result.effective_thresholds.is_empty() {
-            out.push_str("\n  Thresholds:\n");
+            out.push_str("\n  ── Thresholds ──────────────────────────────────────────\n");
             let threshold_results = evaluate_thresholds(&result.effective_thresholds, result);
             for tr in &threshold_results {
                 let op = tr.expression.split_whitespace().nth(1).unwrap_or("<?>");
@@ -249,8 +267,37 @@ impl StdoutReporter {
             }
         }
 
+        // ── Status footer: green PASS / red FAIL ──
+        // ANSI colors only when stdout is a TTY so piped output stays clean.
+        // FAIL is driven by THRESHOLDS ONLY — matching k6 semantics and the
+        // CLI exit code (cli.rs returns Err on threshold failure, not on
+        // ordinary request failures like a single 404 in thousands).
+        let thresholds_failed = evaluate_thresholds(&result.effective_thresholds, result)
+            .iter()
+            .any(|t| !t.passed);
+        let (status, color) = if thresholds_failed {
+            ("✗ FAIL — one or more thresholds crossed", "\x1b[31m") // red
+        } else {
+            ("✓ PASS — test completed successfully", "\x1b[32m") // green
+        };
+        if Self::stdout_is_tty() {
+            out.push_str(&format!(
+                "\n  {}{}\x1b[0m\n",
+                color, status
+            ));
+        } else {
+            out.push_str(&format!("\n  {}\n", status));
+        }
+        out.push_str(&format!("╚{}╝\n", "═".repeat(BOX_W - 2)));
+
         out.push('\n');
         out
+    }
+
+    /// True when stdout is an interactive terminal (ANSI colors safe).
+    fn stdout_is_tty() -> bool {
+        use std::io::IsTerminal;
+        std::io::stdout().is_terminal()
     }
 }
 

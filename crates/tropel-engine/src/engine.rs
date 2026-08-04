@@ -199,10 +199,47 @@ impl Engine {
         let (sample_tx, _) = broadcast::channel::<Sample>(SAMPLE_STREAM_CAPACITY);
         metrics.set_sample_sink(Some(sample_tx.clone()));
 
+        // Planned wall-clock length of the run (incl. grace) for the live
+        // progress bar's 100% target. Resolved with the SAME precedence the
+        // scenario_configs below use (declared scenarios → config scenarios →
+        // declared/single execution), so the bar fills to the right total.
+        let progress_total: Option<Duration> = {
+            let consider = |exec: &ExecutionConfig, start: Duration| -> Option<Duration> {
+                exec.total_duration().map(|d| d + start)
+            };
+            // Note: `.flatten().max()` skips unbounded scenarios (None) — a
+            // run mixing a bounded and an externally-controlled scenario
+            // targets the longest bounded end while the unbounded one keeps
+            // running (the bar then just stays at 100% elapsed-only).
+            if let Some(scs) = &declared_scenarios {
+                scs.values()
+                    .map(|sc| {
+                        let start =
+                            parse_duration_str(&sc.start_time).unwrap_or(Duration::ZERO);
+                        consider(&sc.execution, start)
+                    })
+                    .flatten()
+                    .max()
+            } else if !config.scenarios.is_empty() {
+                config
+                    .scenarios
+                    .values()
+                    .map(|sc| {
+                        let start =
+                            parse_duration_str(&sc.start_time).unwrap_or(Duration::ZERO);
+                        consider(&sc.execution, start)
+                    })
+                    .flatten()
+                    .max()
+            } else {
+                consider(declared_execution.as_ref().unwrap_or(&config.execution), Duration::ZERO)
+            }
+        };
+
         let has_stdout = config.output.reporters.iter().any(|r| r == "stdout");
         if has_stdout {
             let rx = sample_tx.subscribe();
-            let handle = StreamingStdoutOutput::spawn(rx);
+            let handle = StreamingStdoutOutput::spawn(rx, progress_total);
             output_handles.push(handle);
         }
         // Shared tag-forwarding policy for the network outputs: bounds label

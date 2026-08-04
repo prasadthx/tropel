@@ -92,13 +92,15 @@ pub trait Output: Send + Sync {
 /// A live progress display printed to stdout during the test run.
 ///
 /// Spawned as a background task that receives samples and periodically
-/// prints a compact one-line summary:
+/// prints a k6-style two-line progress block:
 /// ```text
-///   running (0m02.0s), ? VUs, 120 reqs (60 rps), 1.2 MB recv, p95=452ms, max=890ms, 2.3% fail
+///   running (0m02.0s), 2/2 VUs, 120 iters, 240 reqs (120 rps), 2.3% fail
+///   [██████████░░░░░░░░░░░░░░░░░░░░]  50%  10.0s/20.0s  p95=452ms  max=890ms  1.2 MB recv
 /// ```
 ///
-/// The line overwrites itself in-place using `\r` (carriage return) and
-/// ANSI clear-line, producing a live-updating status bar.
+/// The block overwrites itself in-place using ANSI cursor-up + clear-line
+/// (`\x1b[2A\r\x1b[K`), producing a live-updating progress bar — the same
+/// shape k6 prints during a run.
 pub struct StreamingStdoutOutput;
 
 impl Default for StreamingStdoutOutput {
@@ -116,35 +118,52 @@ impl StreamingStdoutOutput {
     /// Spawn a consumer task that receives samples from the broadcast
     /// receiver and prints live progress every `PROGRESS_INTERVAL_SECS`.
     ///
+    /// `total_duration` is the planned wall-clock length of the run
+    /// (including grace); when `Some`, the bar fills toward a real 100%.
+    /// When `None` (externally-controlled / iteration-limited runs without
+    /// a fixed duration) the bar shows elapsed time only.
+    ///
     /// Returns a `JoinHandle` that completes when the broadcast sender is
     /// dropped (test end) or the receiver is closed.
-    pub fn spawn(mut rx: broadcast::Receiver<Sample>) -> tokio::task::JoinHandle<()> {
+    pub fn spawn(
+        mut rx: broadcast::Receiver<Sample>,
+        total_duration: Option<Duration>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let start = Instant::now();
-            let mut state = LiveState::new();
+            let mut state = LiveState::new(total_duration);
+            let mut drawn = false;
+
+            // Redraw on a fixed interval, NOT on recv timeouts: under any
+            // sustained sample rate `rx.recv()` resolves instantly, so a
+            // `timeout(interval, recv)` loop would never hit its timeout arm
+            // and the bar would print exactly once at the end of the run.
+            // `select!` over an interval ticker guarantees a redraw every
+            // PROGRESS_INTERVAL_SECS regardless of traffic.
+            let mut ticker = tokio::time::interval(Duration::from_secs(PROGRESS_INTERVAL_SECS));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await; // consume the immediate first tick
 
             loop {
-                let result =
-                    tokio::time::timeout(Duration::from_secs(PROGRESS_INTERVAL_SECS), rx.recv())
-                        .await;
-
-                match result {
-                    Ok(Ok(sample)) => {
-                        state.record(&sample);
-                    }
-                    Ok(Err(broadcast::error::RecvError::Closed)) => break,
-                    Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
-                        tracing::trace!("Streaming output dropped {} samples (consumer lag)", n);
-                    }
-                    Err(_elapsed) => {
-                        state.print_progress(&start);
+                tokio::select! {
+                    res = rx.recv() => match res {
+                        Ok(sample) => state.record(&sample),
+                        Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::trace!("Streaming output dropped {} samples (consumer lag)", n);
+                        }
+                    },
+                    _ = ticker.tick() => {
+                        state.print_progress(&start, drawn);
+                        drawn = true;
                     }
                 }
             }
 
-            // Final print on exit
-            state.print_progress(&start);
-            println!();
+            // Final print on exit (always overwrites the last block; the
+            // summary renderer adds its own leading newline, so no extra
+            // blank line is needed here).
+            state.print_progress(&start, drawn);
         })
     }
 }
@@ -165,10 +184,18 @@ impl Output for StreamingStdoutOutput {
 
 /// Live state accumulated during the test for progress display.
 struct LiveState {
+    /// Planned total wall-clock duration (including grace). `None` = no
+    /// fixed target (externally-controlled / iteration-budget runs).
+    total_duration: Option<Duration>,
     total_reqs: u64,
     total_failed: f64,
     total_data_received: f64,
     total_data_sent: f64,
+    /// Completed iterations (from the `iterations` counter).
+    total_iters: u64,
+    /// Latest VU / VU-max gauges (k6 emits these periodically).
+    vus: u32,
+    vus_max: u32,
     last_print: Instant,
     rolling_count: u64,
     rolling_max: f64,
@@ -180,12 +207,16 @@ struct LiveState {
 }
 
 impl LiveState {
-    fn new() -> Self {
+    fn new(total_duration: Option<Duration>) -> Self {
         Self {
+            total_duration,
             total_reqs: 0,
             total_failed: 0.0,
             total_data_received: 0.0,
             total_data_sent: 0.0,
+            total_iters: 0,
+            vus: 0,
+            vus_max: 0,
             last_print: Instant::now(),
             rolling_count: 0,
             rolling_max: 0.0,
@@ -208,6 +239,15 @@ impl LiveState {
             }
             "data_sent" => {
                 self.total_data_sent += sample.value;
+            }
+            "iterations" => {
+                self.total_iters += sample.value as u64;
+            }
+            "vus" => {
+                self.vus = sample.value as u32;
+            }
+            "vus_max" => {
+                self.vus_max = sample.value as u32;
             }
             "http_req_duration" => {
                 self.rolling_count += 1;
@@ -234,20 +274,19 @@ impl LiveState {
         sorted.get(idx).copied().unwrap_or(0) as f64 / 1000.0
     }
 
-    fn print_progress(&mut self, start: &Instant) {
+    /// Render the progress block as two lines (k6-style).
+    fn render(&mut self, start: &Instant) -> (String, String) {
         let elapsed = start.elapsed();
         let secs = elapsed.as_secs();
         let mins = secs / 60;
         let secs_remainder = secs % 60;
 
         let p95 = self.compute_p95();
-
         let fail_pct = if self.total_reqs > 0 {
             (self.total_failed / self.total_reqs as f64) * 100.0
         } else {
             0.0
         };
-
         let rolling_rps = {
             let since_last = self.last_print.elapsed().as_secs_f64().max(0.1);
             let rps = (self.rolling_count as f64 / since_last).round();
@@ -256,20 +295,73 @@ impl LiveState {
             rps
         };
 
-        print!(
-            "\r\x1b[K  running ({:02}m{:02}.{:01}s), ? VUs, {} reqs ({} rps), {:.1} MB recv, p95={:.0}ms, max={:.0}ms, {:.1}% fail",
+        // k6-style status line: running time, VUs, iterations, requests.
+        let line1 = format!(
+            "  running ({:02}m{:02}.{:01}s), {}/{} VUs, {} iters, {} reqs ({} rps), {:.1}% fail",
             mins,
             secs_remainder,
-            (elapsed.subsec_millis() / 100),
+            elapsed.subsec_millis() / 100,
+            self.vus,
+            self.vus_max,
+            self.total_iters,
             self.total_reqs,
             rolling_rps,
-            self.total_data_received / 1_000_000.0,
-            p95,
-            self.rolling_max,
             fail_pct,
         );
 
+        // Progress bar: fills toward total_duration (when known).
+        const BAR_WIDTH: usize = 32;
+        let (filled, pct) = match self.total_duration {
+            Some(total) if total > Duration::ZERO => {
+                let frac = (elapsed.as_secs_f64() / total.as_secs_f64()).clamp(0.0, 1.0);
+                (((frac * BAR_WIDTH as f64).round()) as usize, (frac * 100.0) as u64)
+            }
+            _ => (0, 0),
+        };
+        let bar: String = (0..BAR_WIDTH)
+            .map(|i| if i < filled { '█' } else { '░' })
+            .collect();
+
+        let elapsed_str = format!("{:02}m{:02}.{:01}s", mins, secs_remainder, elapsed.subsec_millis() / 100);
+        let line2 = match self.total_duration {
+            // Fixed target: bar fills toward 100% with elapsed/total.
+            Some(t) if t > Duration::ZERO => {
+                let total_str = format!(
+                    "{:02}m{:02}.{:01}s",
+                    t.as_secs() / 60,
+                    t.as_secs() % 60,
+                    t.subsec_millis() / 100
+                );
+                format!(
+                    "  [{bar}] {pct:3}%  {elapsed_str}/{total_str}  p95={p95:.0}ms  max={:.0}ms  {:.1} MB recv  {:.1} MB sent",
+                    self.rolling_max,
+                    self.total_data_received / 1_000_000.0,
+                    self.total_data_sent / 1_000_000.0,
+                )
+            }
+            // No fixed duration (externally-controlled / iteration-budget
+            // runs): elapsed-only, honest about the missing target.
+            _ => format!(
+                "  [{bar}] {pct:3}%  elapsed {elapsed_str} (no fixed duration)  p95={p95:.0}ms  max={:.0}ms  {:.1} MB recv  {:.1} MB sent",
+                self.rolling_max,
+                self.total_data_received / 1_000_000.0,
+                self.total_data_sent / 1_000_000.0,
+            ),
+        };
+
+        (line1, line2)
+    }
+
+    fn print_progress(&mut self, start: &Instant, drawn: bool) {
+        let (line1, line2) = self.render(start);
         use std::io::Write;
-        let _ = std::io::stdout().flush();
+        let mut out = std::io::stdout();
+        // Overwrite the two previously-drawn lines (if any) in place.
+        if drawn {
+            let _ = write!(out, "\x1b[2A");
+        }
+        let _ = writeln!(out, "\r\x1b[K{line1}");
+        let _ = writeln!(out, "\r\x1b[K{line2}");
+        let _ = out.flush();
     }
 }

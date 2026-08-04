@@ -278,6 +278,45 @@ impl ExecutionConfig {
         }
     }
 
+    /// Estimated wall-clock duration of this executor's PLANNED phase — the
+    /// target the live progress bar fills toward, reaching 100% when the
+    /// planned phase ends (graceful-stop drain then holds the bar full, k6
+    /// style). Grace is deliberately NOT included: an 8s run should show
+    /// 8s as its target, not 8s + 30s grace. `None` when the run has no
+    /// fixed duration: externally-controlled without a `duration`, or
+    /// shared-/per-vu-iterations without a `max_duration`.
+    pub fn total_duration(&self) -> Option<std::time::Duration> {
+        use std::time::Duration;
+        let parse = |s: &str| crate::parse_duration(s).ok();
+        match self {
+            ExecutionConfig::ConstantVus { duration, .. } => parse(duration),
+            ExecutionConfig::RampingVus { stages, .. } => {
+                let mut total = Duration::ZERO;
+                for st in stages {
+                    total += parse(&st.duration)?;
+                }
+                Some(total)
+            }
+            ExecutionConfig::ConstantArrivalRate { duration, .. } => parse(duration),
+            ExecutionConfig::SharedIterations { max_duration, .. } => {
+                max_duration.as_deref().and_then(parse)
+            }
+            ExecutionConfig::RampingArrivalRate { stages, .. } => {
+                let mut total = Duration::ZERO;
+                for st in stages {
+                    total += parse(&st.duration)?;
+                }
+                Some(total)
+            }
+            ExecutionConfig::PerVUIterations { max_duration, .. } => {
+                max_duration.as_deref().and_then(parse)
+            }
+            ExecutionConfig::ExternallyControlled { duration, .. } => {
+                duration.as_deref().and_then(parse)
+            }
+        }
+    }
+
     /// Build an `ExecutionConfig` from a k6-style executor `mode` plus the
     /// load-profile knobs (`vus` / `duration` / `iterations` / `stages`).
     ///

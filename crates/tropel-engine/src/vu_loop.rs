@@ -153,6 +153,10 @@ async fn run_vu_loop(
 ) {
     let mut iteration_index = 0u64;
     let mut vu_sample_counter: u64 = 0;
+    // Time-based VU gauge cadence: vus/vus_max are ALSO sampled every ~2s
+    // (not only every 100 iterations), so the live progress bar's VU field
+    // is real even on short runs that never reach the iteration threshold.
+    let mut last_vu_gauge = Instant::now();
 
     loop {
         if sched.is_force_stop_requested() || sched.is_stop_requested() {
@@ -185,10 +189,13 @@ async fn run_vu_loop(
         }
 
         vu_sample_counter += 1;
-        if vu_sample_counter % 100 == 0 {
+        let vu_gauge_due = vu_sample_counter % 100 == 0
+            || last_vu_gauge.elapsed() >= Duration::from_secs(2);
+        if vu_gauge_due {
             let active = sched.active_vus().await;
             let peak = sched.peak_vus();
             utils_emit_vus_metrics(&shared.metrics, active, peak, &shared.sc_tags).await;
+            last_vu_gauge = Instant::now();
         }
 
         let iter_start = Instant::now();
