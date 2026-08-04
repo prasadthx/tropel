@@ -912,35 +912,9 @@ mod multipart_tests {
     }
 }
 
+/// Delegate to the canonical `tropel_core::parse_duration`.
 pub(crate) fn parse_duration(s: &str) -> Result<Duration> {
-    let s = s.trim();
-    if let Some(num_str) = s.strip_suffix("ms") {
-        let ms: u64 = num_str
-            .parse()
-            .map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
-        Ok(Duration::from_millis(ms))
-    } else if let Some(num_str) = s.strip_suffix('s') {
-        let secs: f64 = num_str
-            .parse()
-            .map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
-        Ok(Duration::from_secs_f64(secs))
-    } else if let Some(num_str) = s.strip_suffix('m') {
-        let mins: f64 = num_str
-            .parse()
-            .map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
-        Ok(Duration::from_secs_f64(mins * 60.0))
-    } else if let Some(num_str) = s.strip_suffix('h') {
-        let hours: f64 = num_str
-            .parse()
-            .map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
-        Ok(Duration::from_secs_f64(hours * 3600.0))
-    } else {
-        // Default to seconds
-        let secs: f64 = s
-            .parse()
-            .map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
-        Ok(Duration::from_secs_f64(secs))
-    }
+    tropel_core::parse_duration(s)
 }
 
 /// Re-export serde_urlencoded for form body encoding.

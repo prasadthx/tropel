@@ -1356,33 +1356,7 @@ fn graceful_stop_duration(s: &Option<String>) -> Duration {
 }
 
 fn parse_duration(s: &str) -> Result<Duration> {
-    let s = s.trim();
-    if let Some(num) = s.strip_suffix("ms") {
-        let v: u64 = num
-            .parse()
-            .map_err(|_| tropel_core::TropelError::Config(format!("Invalid duration: {}", s)))?;
-        Ok(Duration::from_millis(v))
-    } else if let Some(num) = s.strip_suffix('s') {
-        let v: f64 = num
-            .parse()
-            .map_err(|_| tropel_core::TropelError::Config(format!("Invalid duration: {}", s)))?;
-        Ok(Duration::from_secs_f64(v))
-    } else if let Some(num) = s.strip_suffix('m') {
-        let v: f64 = num
-            .parse()
-            .map_err(|_| tropel_core::TropelError::Config(format!("Invalid duration: {}", s)))?;
-        Ok(Duration::from_secs_f64(v * 60.0))
-    } else if let Some(num) = s.strip_suffix('h') {
-        let v: f64 = num
-            .parse()
-            .map_err(|_| tropel_core::TropelError::Config(format!("Invalid duration: {}", s)))?;
-        Ok(Duration::from_secs_f64(v * 3600.0))
-    } else {
-        let v: f64 = s
-            .parse()
-            .map_err(|_| tropel_core::TropelError::Config(format!("Invalid duration: {}", s)))?;
-        Ok(Duration::from_secs_f64(v))
-    }
+    tropel_core::parse_duration(s)
 }
 
 #[cfg(test)]

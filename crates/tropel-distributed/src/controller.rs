@@ -203,18 +203,7 @@ fn agent_timeout(config: &JobConfig) -> Duration {
 /// Parse a k6-style duration string; invalid values degrade to zero rather
 /// than panicking the controller.
 fn parse_duration(s: &str) -> Duration {
-    let s = s.trim();
-    if let Some(num) = s.strip_suffix("ms") {
-        num.parse::<u64>().map(Duration::from_millis).unwrap_or(Duration::ZERO)
-    } else if let Some(num) = s.strip_suffix('s') {
-        num.parse::<f64>().map(Duration::from_secs_f64).unwrap_or(Duration::ZERO)
-    } else if let Some(num) = s.strip_suffix('m') {
-        num.parse::<f64>().map(|m| Duration::from_secs_f64(m * 60.0)).unwrap_or(Duration::ZERO)
-    } else if let Some(num) = s.strip_suffix('h') {
-        num.parse::<f64>().map(|h| Duration::from_secs_f64(h * 3600.0)).unwrap_or(Duration::ZERO)
-    } else {
-        s.parse::<f64>().map(Duration::from_secs_f64).unwrap_or(Duration::ZERO)
-    }
+    tropel_core::parse_duration(s).unwrap_or(Duration::ZERO)
 }
 
 #[cfg(test)]

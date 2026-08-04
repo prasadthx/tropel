@@ -198,50 +198,15 @@ fn env_execution(
     let think_time = ThinkTimeConfig::default();
 
     if let Some(mode) = mode {
-        return match mode {
-            "ramping-vus" => {
-                let start_vus = vus.unwrap_or(1);
-                let stage_list = stages
-                    .and_then(|s| serde_json::from_str::<Vec<Stage>>(s).ok())
-                    .unwrap_or_else(|| {
-                        vec![Stage {
-                            duration: duration.unwrap_or("30s").to_string(),
-                            target: vus.unwrap_or(10),
-                        }]
-                    });
-                Some(ExecutionConfig::RampingVus {
-                    stages: stage_list,
-                    start_vus,
-                    graceful_ramp_down: Some("30s".to_string()),
-                    graceful_stop: Some("30s".to_string()),
-                    think_time,
-                })
-            }
-            "shared-iterations" => Some(ExecutionConfig::SharedIterations {
-                iterations: iterations.unwrap_or(100),
-                max_duration: duration.map(|s| s.to_string()),
-                vus: vus.unwrap_or(1),
-                graceful_stop: Some("30s".to_string()),
-                think_time,
-            }),
-            "arrival-rate" | "constant-arrival-rate" => {
-                Some(ExecutionConfig::ConstantArrivalRate {
-                    rate: vus.unwrap_or(1) as f64,
-                    time_unit: "1s".to_string(),
-                    duration: duration.unwrap_or("30s").to_string(),
-                    pre_alloc_vus: 1,
-                    max_vus: vus.unwrap_or(10).max(10),
-                    graceful_stop: Some("30s".to_string()),
-                    think_time,
-                })
-            }
-            _ => Some(ExecutionConfig::ConstantVus {
-                vus: vus.unwrap_or(1),
-                duration: duration.unwrap_or("30s").to_string(),
-                graceful_stop: Some("30s".to_string()),
-                think_time,
-            }),
-        };
+        // Canonical mode→executor mapping lives in tropel-core (shared with
+        // the CLI), so the precedence rules exist in exactly one place.
+        return Some(ExecutionConfig::from_mode(
+            mode,
+            vus,
+            duration.map(|s| s.to_string()),
+            iterations,
+            stages.map(|s| s.to_string()),
+        ));
     }
 
     if stages.is_some() {

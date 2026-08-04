@@ -277,6 +277,66 @@ impl ExecutionConfig {
             ExecutionConfig::ExternallyControlled { .. } => "externally-controlled",
         }
     }
+
+    /// Build an `ExecutionConfig` from a k6-style executor `mode` plus the
+    /// load-profile knobs (`vus` / `duration` / `iterations` / `stages`).
+    ///
+    /// Canonical mode→executor mapping, shared by the CLI (`cli.rs`) and the
+    /// k6 env-file builder (`config_file.rs`) so the precedence rules live in
+    /// exactly one place. `stages` is the raw JSON array string (if any);
+    /// `duration` is the human duration string (if any).
+    pub fn from_mode(
+        mode: &str,
+        vus: Option<u32>,
+        duration: Option<String>,
+        iterations: Option<u64>,
+        stages: Option<String>,
+    ) -> Self {
+        let think_time = ThinkTimeConfig::default();
+        match mode {
+            "ramping-vus" => {
+                let start_vus = vus.unwrap_or(1);
+                let stages_list = stages
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<Vec<Stage>>(s).ok())
+                    .unwrap_or_else(|| {
+                        vec![Stage {
+                            duration: duration.clone().unwrap_or_else(|| "30s".to_string()),
+                            target: vus.unwrap_or(10),
+                        }]
+                    });
+                ExecutionConfig::RampingVus {
+                    stages: stages_list,
+                    start_vus,
+                    graceful_ramp_down: Some("30s".to_string()),
+                    graceful_stop: Some("30s".to_string()),
+                    think_time,
+                }
+            }
+            "shared-iterations" => ExecutionConfig::SharedIterations {
+                iterations: iterations.unwrap_or(100),
+                max_duration: duration,
+                vus: vus.unwrap_or(1),
+                graceful_stop: Some("30s".to_string()),
+                think_time,
+            },
+            "arrival-rate" | "constant-arrival-rate" => ExecutionConfig::ConstantArrivalRate {
+                rate: vus.unwrap_or(1) as f64,
+                time_unit: "1s".to_string(),
+                duration: duration.unwrap_or_else(|| "30s".to_string()),
+                pre_alloc_vus: 1,
+                max_vus: vus.unwrap_or(10).max(10),
+                graceful_stop: Some("30s".to_string()),
+                think_time,
+            },
+            _ => ExecutionConfig::ConstantVus {
+                vus: vus.unwrap_or(1),
+                duration: duration.unwrap_or_else(|| "30s".to_string()),
+                graceful_stop: Some("30s".to_string()),
+                think_time,
+            },
+        }
+    }
 }
 
 /// A ramping stage (for VU count — used by RampingVus).

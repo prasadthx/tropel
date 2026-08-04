@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use tropel_core::config::{ExecutionConfig, HttpConfig, ThinkTimeConfig, ThresholdConfig, TlsConfig};
 use tropel_core::scenario::Scenario;
 use tropel_core::types::{Request, Response, Sample, TagMap};
-use tropel_core::{Result, TropelError};
+use tropel_core::Result;
 use tropel_executor::runner::VURunner;
 use tropel_executor::scheduler::{VUScheduler, VuLease};
 use tropel_ext::registry::ExtensionRegistry;
@@ -808,32 +808,7 @@ pub(crate) fn parse_duration_str(s: &str) -> Result<Duration> {
     if s.is_empty() || s == "0" || s == "0s" {
         return Ok(Duration::ZERO);
     }
-    if let Some(num_str) = s.strip_suffix("ms") {
-        let ms: u64 = num_str
-            .parse()
-            .map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
-        Ok(Duration::from_millis(ms))
-    } else if let Some(num_str) = s.strip_suffix('s') {
-        let secs: f64 = num_str
-            .parse()
-            .map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
-        Ok(Duration::from_secs_f64(secs))
-    } else if let Some(num_str) = s.strip_suffix('m') {
-        let mins: f64 = num_str
-            .parse()
-            .map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
-        Ok(Duration::from_secs_f64(mins * 60.0))
-    } else if let Some(num_str) = s.strip_suffix('h') {
-        let hours: f64 = num_str
-            .parse()
-            .map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
-        Ok(Duration::from_secs_f64(hours * 3600.0))
-    } else {
-        let secs: f64 = s
-            .parse()
-            .map_err(|_| TropelError::Config(format!("Invalid duration: {}", s)))?;
-        Ok(Duration::from_secs_f64(secs))
-    }
+    tropel_core::parse_duration(s)
 }
 
 // ── Think time ──
