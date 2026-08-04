@@ -38,7 +38,7 @@ Legend: ✅ shipped & tested · 🟡 partial / known gaps · ❌ not implemented
 
 | Capability | Status | Notes |
 |------------|--------|-------|
-| 6 executors (constant-vus … ramping-arrival-rate) | ✅ | incl. per-vu-iterations |
+| 7 executors (constant-vus … externally-controlled) | ✅ | incl. per-vu-iterations |
 | Growing arrival-rate pool (preAllocatedVUs → maxVUs) | ✅ | token-bucket + dropped_iterations |
 | Graceful stop / ramp-down | ✅ | grace window; ramp-down only trims surplus |
 | maxDuration as a cap (fixed-iteration executors) | ✅ | raced against VU drain |
@@ -84,7 +84,8 @@ Legend: ✅ shipped & tested · 🟡 partial / known gaps · ❌ not implemented
 2. **JMeter / Locust adapters** (§11.6) — dog-food the SDK with first-party
    formats.
 3. **Custom outputs via SDK** — `Output` trait beyond the built-in four.
-4. **gRPC / WebSocket protocols** — the `tropel-x-*` crates exist and are
-   buildable; wire them into the executor hot path.
+4. **gRPC / WebSocket protocols** — `tropel-x-grpc` / `tropel-x-websocket`
+   are wired into the runner's scheme dispatch (`grpc://`, `ws://`); extend
+   coverage and protocol surface.
 5. **Profiling-driven tuning** — allocator (mimalloc/jemalloc) feature gates
    are in; validate with the bench suite on real workloads.

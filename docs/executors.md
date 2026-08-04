@@ -1,6 +1,6 @@
 # Execution Modes
 
-Tropel ships six executors. They are selected by the scenario config (from a
+Tropel ships seven executors. They are selected by the scenario config (from a
 collection, a k6 script's `options`, or a `--config` overlay).
 
 | Executor | Description |
@@ -11,6 +11,7 @@ collection, a k6 script's `options`, or a `--config` overlay).
 | `per-vu-iterations` | Each VU runs exactly N iterations |
 | `constant-arrival-rate` | Open model: iterations started at a fixed rate from a growing VU pool (`preAllocatedVUs` → `maxVUs`); drops are counted in `dropped_iterations` when the pool can't keep up |
 | `ramping-arrival-rate` | Arrival rate ramped through target-rate stages |
+| `externally-controlled` | Live pool control over a local HTTP control API (`/vus` target, `max`, pause): VUs spawn/exit on demand mid-run |
 
 ## Shared semantics
 

@@ -15,7 +15,7 @@ engine for script execution.
 ## Core concepts
 
 - [Input formats](inputs.md) — Postman, HAR, OpenAPI, k6, subprocess, WASM
-- [Execution modes](executors.md) — six executors, from constant-VUs to ramping arrival rate
+- [Execution modes](executors.md) — seven executors, from constant-VUs to ramping arrival rate and externally-controlled
 - [Scripting](scripting.md) — `pm.*` API, k6 shim, native bridge, crypto/encoding/assert helpers
 - [Metrics & thresholds](metrics.md) — HDR histograms, checks, threshold expressions
 

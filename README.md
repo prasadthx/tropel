@@ -30,9 +30,9 @@ metrics, extensions, distributed execution.
 
 ## What Tropel does
 
-- **Six executors** — constant-vus, ramping-vus, shared/per-vu iterations,
-  constant & ramping arrival rate, with graceful stop/ramp-down, think time,
-  and pacing.
+- **Seven executors** — constant-vus, ramping-vus, shared/per-vu iterations,
+  constant & ramping arrival rate, and externally-controlled (live control
+  API), with graceful stop/ramp-down, think time, and pacing.
 - **Postman `pm.*` scripting** — `pm.test`, `pm.expect`, `pm.response`,
   `pm.variables`/`pm.environment`, `pm.iterationData`,
   `pm.execution.setNextRequest`, `pm.sendRequest`, custom metrics.
@@ -58,12 +58,10 @@ and tested; a few areas remain partial. **See
 
 Notable limitations today:
 
-- **WASM plugins are declarative-only** (input parsing). Imperative WASM
-  drivers (http/sleep/metrics from inside a plugin) are not implemented.
+- **WASM drivers cover a focused surface** — plugins can run iterations and
+  use host-imported http/sleep/metrics, but the API is a subset of the
+  in-process k6 driver's (no full scripting runtime inside the module).
 - **JMeter and Locust adapters are not started** (planned §11.6).
-- **gRPC / WebSocket protocol crates** (`tropel-x-grpc`,
-  `tropel-x-websocket`) exist and build, but are not yet wired into the
-  executor hot path.
 
 ## Architecture
 
@@ -85,8 +83,8 @@ Notable limitations today:
                     │         │     └───────────┘
         ┌───────────▼───┐ ┌───▼───────────┐
         │ Postman/HAR/  │ │  Protocol     │
-        │ OpenAPI/k6/   │ │  HTTP (+gRPC, │
-        │ WASM/subproc  │ │  WebSocket …) │
+        │ OpenAPI/k6/   │ │  HTTP + gRPC +│
+        │ WASM/subproc  │ │  WebSocket    │
         └───────────────┘ └──────┬───────┘
                                  │
                     ┌────────────▼───────────┐

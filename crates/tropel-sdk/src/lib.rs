@@ -64,7 +64,7 @@
 //! | `Request`, `Response`, `Method`, `Body` | ✅ Stable — used in scenario items |
 //! | `Result<T>` / `TropelError` | ✅ Stable — error handling |
 //! | `Sample`, `SampleType`, `TagMap` | ✅ Stable — metric sample surface (tags use `Arc<str>` interning) |
-//! | `Protocol` trait | 🚧 Available but not yet wired into engine dispatch (`unstable-protocol`) |
+//! | `Protocol` trait | ✅ Stable — engine dispatches by URL scheme via the registry (`instantiate_protocols`); built-ins `grpc://`/`ws://` ship through it |
 //! | `Output` trait | ✅ Wired — engine drives registered outputs from the sample stream (emit per batch, flush on close); see the `prometheus` reference extension (`unstable-output`) |
 //! | `Driver` / `DriverInstance` / `VuContext` | ✅ Stable — re-exported and used by the k6 driver (`tropel-input-k6`) |
 //! | `WASM` / `WIT` interface | ✅ Validated — see `wit/adapter.wit` in the crate root (resolves via `wit-parser`; a unit test keeps it from silently breaking). WASM plugins use the C ABI in `tropel-wasm`; the Component-Model runtime path is pending. |

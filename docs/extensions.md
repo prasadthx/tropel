@@ -47,8 +47,11 @@ WASM modules in `--plugins-dir` are loaded by `tropel-wasm` (wasmtime):
   `InstancePre` — instantiation is cheap, not a fresh JIT+store per call
 - WASI-less capability surface: adapters do pure compute over bytes
 
-The WASM tier is currently **declarative-only** (input parsing). Imperative
-WASM drivers (host-imported http/sleep/metrics) are planned.
+The WASM tier supports **both** declarative input parsing (`adapter_detect` /
+`adapter_parse`) and an imperative driver mode (`adapter_run_iteration` with
+host-imported `env.http` / `env.sleep` / `env.metric_add`) — the module runs
+iterations against the host engine, though the exposed API is a subset of the
+in-process k6 driver's (no full scripting runtime inside the module).
 
 ## Subprocess tier
 
