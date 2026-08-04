@@ -39,7 +39,7 @@ pub fn link_builtins() -> usize {
     // `grpcs://` and `ws://` / `wss://` URLs reachable through the VU
     // runner's scheme dispatch.
     let protocols: Vec<Box<dyn Protocol>> = vec![
-        Box::new(tropel_x_grpc::GrpcProtocol),
+        Box::new(tropel_x_grpc::GrpcProtocol::default()),
         Box::new(tropel_x_websocket::WebSocketProtocol),
     ];
     adapters.len() + drivers.len() + protocols.len()

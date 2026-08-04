@@ -363,12 +363,14 @@ impl HttpClient {
         let total_start = std::time::Instant::now();
         crate::subtimings::begin_request(total_start);
 
-        // Calculate request body size for data_sent tracking
-        let request_body_size: u64 = request
-            .body
-            .as_ref()
-            .map(|b| body_size(b) as u64)
-            .unwrap_or(0);
+        // Serialize the request body ONCE. The resulting bytes feed BOTH the
+        // data_sent accounting (exact wire size) and the reqwest body — the
+        // old code called body_size() and body_to_reqwest() separately, each
+        // re-serializing JSON / urlencoded / multipart bodies (2× work per
+        // request on the hot path). The bytes are memcpy'd into reqwest
+        // (cheap); the expensive serialization happens exactly once.
+        let body_bytes: Option<Vec<u8>> = request.body.as_ref().map(body_to_bytes);
+        let request_body_size: u64 = body_bytes.as_ref().map_or(0, |b| b.len() as u64);
 
         if self.http_debug {
             // info! so the flag is self-sufficient: the default log filter is
@@ -398,24 +400,24 @@ impl HttpClient {
             Method::GET => client.get(&request.url),
             Method::POST => {
                 let rb = client.post(&request.url);
-                if let Some(body) = &request.body {
-                    rb.body(body_to_reqwest(body))
+                if let Some(bytes) = &body_bytes {
+                    rb.body(reqwest::Body::from(bytes.clone()))
                 } else {
                     rb
                 }
             }
             Method::PUT => {
                 let rb = client.put(&request.url);
-                if let Some(body) = &request.body {
-                    rb.body(body_to_reqwest(body))
+                if let Some(bytes) = &body_bytes {
+                    rb.body(reqwest::Body::from(bytes.clone()))
                 } else {
                     rb
                 }
             }
             Method::PATCH => {
                 let rb = client.patch(&request.url);
-                if let Some(body) = &request.body {
-                    rb.body(body_to_reqwest(body))
+                if let Some(bytes) = &body_bytes {
+                    rb.body(reqwest::Body::from(bytes.clone()))
                 } else {
                     rb
                 }
@@ -786,22 +788,35 @@ fn parse_tls_version(s: &Option<String>) -> Option<reqwest::tls::Version> {
 }
 
 /// Calculate the byte size of a request body.
-pub fn body_size(body: &Body) -> usize {
+/// Serialize a request body to its exact wire bytes — the SINGLE serializer
+/// for both data_sent accounting and the reqwest body. Keeping one source of
+/// truth guarantees `body_size` can never diverge from what's actually sent
+/// (the old UrlEncoded branch used an un-encoded `k.len()+v.len()+1`
+/// approximation that under-counted vs the serde_urlencoded wire bytes).
+fn body_to_bytes(body: &Body) -> Vec<u8> {
     match body {
-        Body::Raw(s) => s.len(),
-        Body::Json(val) => serde_json::to_string(val).unwrap_or_default().len(),
-        Body::FormData(map) => multipart_form_data_bytes(map).len(),
-        Body::UrlEncoded(map) => map
-            .iter()
-            .map(|(k, v)| k.len() + v.len() + 1)
-            .sum::<usize>(),
-        Body::Binary(data) => data.len(),
+        Body::Raw(s) => s.as_bytes().to_vec(),
+        Body::Json(val) => serde_json::to_string(val).unwrap_or_default().into_bytes(),
+        Body::FormData(map) => multipart_form_data_bytes(map),
+        Body::UrlEncoded(map) => {
+            let params: Vec<(String, String)> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone().to_string()))
+                .collect();
+            serde_urlencoded::to_string(params).unwrap_or_default().into_bytes()
+        }
+        Body::Binary(data) => data.clone(),
         Body::GraphQL { query, variables } => {
-            // Exact wire size — the same serializer the client sends, so
-            // data_sent accounting can't diverge from the actual body.
-            Body::graphql_json_string(query, variables).len()
+            // The same serializer the client sends, so data_sent accounting
+            // can't diverge from the actual body.
+            Body::graphql_json_string(query, variables).into_bytes()
         }
     }
+}
+
+/// Exact wire size of a request body (delegates to the single serializer).
+pub fn body_size(body: &Body) -> usize {
+    body_to_bytes(body).len()
 }
 
 fn multipart_form_data_bytes(map: &HashMap<String, String>) -> Vec<u8> {
@@ -828,26 +843,11 @@ fn escape_multipart_field_name(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Build the reqwest body from the single wire serializer (used by tests;
+/// the hot path in `execute` reuses `body_to_bytes` output directly).
+#[cfg(test)]
 fn body_to_reqwest(body: &Body) -> reqwest::Body {
-    match body {
-        Body::Raw(s) => s.clone().into(),
-        Body::Json(val) => serde_json::to_string(val).unwrap_or_default().into(),
-        Body::FormData(map) => reqwest::Body::from(multipart_form_data_bytes(map)),
-        Body::UrlEncoded(map) => {
-            let params: Vec<(String, String)> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone().to_string()))
-                .collect();
-            reqwest::Body::from(serde_urlencoded::to_string(params).unwrap_or_default())
-        }
-        Body::Binary(data) => data.clone().into(),
-        Body::GraphQL { query, variables } => {
-            // The single shared serializer — includes `variables` when
-            // present (the old code dropped them entirely, so scripts that
-            // relied on `variables` sent a query with NO variables).
-            Body::graphql_json_string(query, variables).into()
-        }
-    }
+    reqwest::Body::from(body_to_bytes(body))
 }
 
 #[cfg(test)]
