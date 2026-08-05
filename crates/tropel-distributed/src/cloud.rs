@@ -26,6 +26,7 @@
 //! manifest generation is dependency-light, testable offline, and the
 //! cluster topology is static per run.
 
+use std::path::Path;
 use tokio::net::TcpListener;
 use tropel_core::config::JobConfig;
 use tropel_core::{Result, TropelError};
@@ -33,6 +34,13 @@ use tropel_metrics::collector::MetricsResult;
 
 use crate::controller::run_controller;
 use crate::yaml::YamlDoc;
+
+/// Small non-zero Job retry budget. `backoffLimit: 0` fails the whole Job
+/// on the FIRST transient pod failure (image-pull race, node scheduling,
+/// a controller pod killed while agents reconnect) — with no kubelet
+/// retry the entire run is lost. A small budget tolerates these while
+/// still bounding how many times a genuinely broken pod restarts.
+const JOB_BACKOFF_LIMIT: u64 = 3;
 
 /// Run a distributed load test entirely in this process: bind a local
 /// controller, spawn `agents` in-process agent workers over loopback TCP,
@@ -111,6 +119,11 @@ pub async fn run_cloud(config: &JobConfig, agents: u32, token: &str) -> Result<M
 ///
 /// `image` defaults to `tropel:latest`. `namespace` defaults to `default`
 /// and is applied to every object's metadata.
+///
+/// The container command is emitted explicitly as `tropel-cloud-run` (the
+/// image may or may not declare an ENTRYPOINT) and the args are its real
+/// subcommands (`controller` / `agent`) — there is no `cloud-run`
+/// subcommand on either binary.
 pub fn generate_k8s_manifests(
     config: &JobConfig,
     agents: u32,
@@ -125,7 +138,44 @@ pub fn generate_k8s_manifests(
     let ns = if namespace.is_empty() { "default" } else { namespace };
     let img = if image.is_empty() { "tropel:latest" } else { image };
 
-    let job_json = serde_json::to_string_pretty(config)
+    // Agent pods have no access to the operator's filesystem: they resolve
+    // the scenario from `config.input` (a local path) and the only shared
+    // storage is this ConfigMap. So embed the input file's BYTES here and
+    // rewrite the serialized job's `input` to the mount path. If the input
+    // is not a readable local file (a URL, inline value, or empty), keep
+    // the original field — the operator then has to provide it some other
+    // way (sidecar, baked into the image).
+    let mut effective = config.clone();
+    let input_embed: Option<(String, String)> = match std::fs::read(&config.input) {
+        Ok(bytes) => {
+            let ext = Path::new(&config.input)
+                .extension()
+                .and_then(|e| e.to_str())
+                .filter(|e| !e.is_empty())
+                .unwrap_or("json");
+            let key = format!("input.{ext}");
+            effective.input = format!("/etc/tropel/{key}");
+            Some((key, String::from_utf8_lossy(&bytes).into_owned()))
+        }
+        Err(_) => {
+            // A manifest whose `input` points at a path agent pods cannot
+            // read is exactly the "cannot start" bug — surface it instead
+            // of silently emitting a broken bundle. (URLs/inline/empty
+            // inputs keep the original field; the operator must provide
+            // the scenario some other way.)
+            if !config.input.is_empty() {
+                tracing::warn!(
+                    "k8s manifests: input '{}' is not a readable local file — \
+                     agent pods will not be able to resolve it unless the \
+                     scenario is provided another way (sidecar, baked image)",
+                    config.input
+                );
+            }
+            None
+        }
+    };
+
+    let job_json = serde_json::to_string_pretty(&effective)
         .map_err(|e| TropelError::Parse(format!("serialize job config: {e}")))?;
 
     let mut y = YamlDoc::new();
@@ -147,6 +197,9 @@ pub fn generate_k8s_manifests(
     y.key(0, "data");
     y.block(1, "job.json", &job_json);
     y.block(1, "token", token);
+    if let Some((key, content)) = &input_embed {
+        y.block(1, key, content);
+    }
     y.separator();
 
     // 2. Controller Job — run-to-completion.
@@ -157,7 +210,7 @@ pub fn generate_k8s_manifests(
     y.kv(1, "namespace", ns);
     y.key(0, "spec");
     y.kv_num(1, "completions", 1);
-    y.kv_num(1, "backoffLimit", 0);
+    y.kv_num(1, "backoffLimit", JOB_BACKOFF_LIMIT);
     y.key(1, "template");
     y.key(2, "metadata");
     y.key(3, "labels");
@@ -167,8 +220,10 @@ pub fn generate_k8s_manifests(
     y.key(3, "containers");
     y.item_kv(4, "name", "controller");
     y.kv(5, "image", img);
+    // Explicit command + real subcommand: `tropel-cloud-run controller`.
+    y.key(5, "command");
+    y.item(6, "tropel-cloud-run");
     y.key(5, "args");
-    y.item(6, "cloud-run");
     y.item(6, "controller");
     y.item(6, "--config");
     y.item(6, "/etc/tropel/job.json");
@@ -218,7 +273,7 @@ pub fn generate_k8s_manifests(
     y.kv_num(1, "completions", agents);
     y.kv_num(1, "parallelism", agents);
     y.kv(1, "completionMode", "Indexed");
-    y.kv_num(1, "backoffLimit", 0);
+    y.kv_num(1, "backoffLimit", JOB_BACKOFF_LIMIT);
     y.key(1, "template");
     y.key(2, "metadata");
     y.key(3, "labels");
@@ -228,8 +283,10 @@ pub fn generate_k8s_manifests(
     y.key(3, "containers");
     y.item_kv(4, "name", "agent");
     y.kv(5, "image", img);
+    // Explicit command + real subcommand: `tropel-cloud-run agent`.
+    y.key(5, "command");
+    y.item(6, "tropel-cloud-run");
     y.key(5, "args");
-    y.item(6, "cloud-run");
     y.item(6, "agent");
     y.item(6, "--controller");
     y.item(6, &format!("tropel-controller:{listen_port}"));
@@ -361,12 +418,13 @@ mod tests {
             "completionMode: Indexed",
             "restartPolicy: Never",
             "clusterIP: None",
-            "backoffLimit: 0",
+            "backoffLimit: 3",
             "image: reg/tropel:v1",
             "namespace: loadtest",
-            "cloud-run",
-            "controller",
-            "agent",
+            // Explicit command + real subcommands (no `cloud-run` prefix).
+            "- \"tropel-cloud-run\"",
+            "- \"controller\"",
+            "- \"agent\"",
             "tropel-controller:17890",
             "0.0.0.0:17890",
             "--agents",
@@ -412,6 +470,47 @@ mod tests {
         let yaml = generate_k8s_manifests(&JobConfig::default(), 1, "", "", 17890, "tok").unwrap();
         assert!(yaml.contains("image: tropel:latest"));
         assert!(yaml.contains("namespace: default"));
+    }
+
+    #[test]
+    fn manifests_embed_input_file_and_rewrite_input_path() {
+        // Agent pods have no access to the operator's filesystem — they
+        // resolve the scenario from `config.input` (a local path) and the
+        // only shared storage is the ConfigMap. The input file's bytes must
+        // ride in the ConfigMap AND the embedded job.json's `input` field
+        // must point at the mount path, or every agent pod fails to parse.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tropel-k8s-input-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"item":[{"request":{}}]}"#).unwrap();
+
+        let config = JobConfig {
+            input: path.to_string_lossy().to_string(),
+            input_type: Some("postman".into()),
+            ..Default::default()
+        };
+        let yaml = generate_k8s_manifests(&config, 2, "img:v1", "ns", 9000, "tok").unwrap();
+
+        // The embedded job.json rewrites input to the mount path.
+        assert!(yaml.contains("\"input\": \"/etc/tropel/input.json\""));
+        // The file bytes themselves are in the ConfigMap under input.json.
+        assert!(yaml.contains("input.json: |-"), "input bytes missing from ConfigMap");
+        assert!(yaml.contains("{\"item\":[{\"request\":{}}]}"), "file contents missing");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn manifests_keep_unreadable_input_as_is() {
+        // A non-file input (URL / inline / empty) can't be embedded — the
+        // original `input` field must survive untouched so the operator can
+        // provide the scenario another way (sidecar, baked image).
+        let config = JobConfig {
+            input: "https://example.com/coll.json".into(),
+            ..Default::default()
+        };
+        let yaml = generate_k8s_manifests(&config, 1, "img:v1", "ns", 9000, "tok").unwrap();
+        assert!(yaml.contains("\"input\": \"https://example.com/coll.json\""));
+        assert!(!yaml.contains("input.json: |-"));
     }
 
     #[test]
