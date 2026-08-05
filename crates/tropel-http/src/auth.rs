@@ -322,6 +322,14 @@ fn default_service(host: &str) -> String {
 /// `host[:port]` — omit the port when it is the scheme default. IPv6 hosts
 /// are wrapped in brackets (`[::1]:443`) since `Url::host_str` returns the
 /// bare address.
+/// AWS "Trimall": trim leading/trailing whitespace AND collapse each run of
+/// internal whitespace to a single space. SigV4 canonicalization requires
+/// this — `.trim()` alone leaves `"a  b"` intact, which changes the
+/// canonical hash and yields 403 SignatureDoesNotMatch.
+fn trim_all(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn canonical_host(url: &reqwest::Url) -> String {
     let host = bracket_host(url.host_str().unwrap_or(""));
     match url.port() {
@@ -406,10 +414,12 @@ fn is_s3_family(service: &str) -> bool {
 ///
 /// Collects the `host` header plus every header already present on the
 /// request (lowercased, deduped), joining the VALUES of multi-value headers
-/// with ", " per AWS canonicalization, then adds the `x-amz-*` signing
-/// headers. The `Authorization` header is never signed (it is the output of
-/// this signer). Uses `get_all` so duplicate header values are preserved —
-/// the old `headers().iter()` collapsed multi-value headers to the first.
+/// with a bare `","` (NO space, per AWS canonicalization) after applying
+/// Trimall (ends trimmed, internal whitespace runs collapsed to one space),
+/// then adds the `x-amz-*` signing headers. The `Authorization` header is
+/// never signed (it is the output of this signer). Uses `get_all` so
+/// duplicate header values are preserved — the old `headers().iter()`
+/// collapsed multi-value headers to the first.
 fn sigv4_canonical_headers(
     request: &reqwest::Request,
     payload_hash: &str,
@@ -428,17 +438,21 @@ fn sigv4_canonical_headers(
         // Non-UTF8 header values cannot appear in a canonical request (the
         // sigstring is ASCII); such values are skipped rather than panicking.
         // HeaderMap preserves insertion order, so the comma-join is stable.
-        let values: Vec<&str> = request
+        let values: Vec<String> = request
             .headers()
             .get_all(name)
             .iter()
             .filter_map(|v| v.to_str().ok())
-            .map(|s| s.trim())
+            .map(trim_all)
             .collect();
         if values.is_empty() {
             continue;
         }
-        out.insert(key, values.join(", "));
+        // AWS joins multi-value headers with a bare comma — NO space — and
+        // requires Trimall (sequential spaces collapsed to one). The old
+        // `", "` join produced a different canonical hash → 403
+        // SignatureDoesNotMatch on any duplicated header.
+        out.insert(key, values.join(","));
     }
 
     out.insert("x-amz-content-sha256".to_string(), payload_hash.to_string());
@@ -1175,10 +1189,10 @@ mod tests {
         req.headers_mut().append("x-test", "two".parse().unwrap());
         req.headers_mut().append("x-test", "three".parse().unwrap());
         let headers = sigv4_canonical_headers(&req, "HASH", "20260729T000000Z", None);
-        // Multi-value header values are comma-joined in canonicalization;
-        // host + x-amz-* are also present.
+        // Multi-value header values are comma-joined with NO space per AWS
+        // canonicalization; host + x-amz-* are also present.
         let map: std::collections::HashMap<String, String> = headers.into_iter().collect();
-        assert_eq!(map.get("x-test").map(|s| s.as_str()), Some("one, two, three"));
+        assert_eq!(map.get("x-test").map(|s| s.as_str()), Some("one,two,three"));
         assert_eq!(map.get("host").map(|s| s.as_str()), Some("example.com"));
         assert_eq!(
             map.get("x-amz-content-sha256").map(|s| s.as_str()),
@@ -1187,6 +1201,23 @@ mod tests {
         assert_eq!(
             map.get("x-amz-date").map(|s| s.as_str()),
             Some("20260729T000000Z")
+        );
+    }
+
+    #[test]
+    fn sigv4_trimall_collapses_internal_whitespace() {
+        // AWS requires Trimall: trim ends AND collapse internal whitespace
+        // runs to a single space. `.trim()` alone leaves "a  b" intact,
+        // changing the canonical hash → 403 SignatureDoesNotMatch.
+        let mut req = build_request("GET", "https://example.com/thing", None);
+        req.headers_mut()
+            .insert("x-test", "  one   two \t three  ".parse().unwrap());
+        let headers = sigv4_canonical_headers(&req, "HASH", "20260729T000000Z", None);
+        let map: std::collections::HashMap<String, String> = headers.into_iter().collect();
+        assert_eq!(
+            map.get("x-test").map(|s| s.as_str()),
+            Some("one two three"),
+            "internal whitespace runs must collapse to a single space"
         );
     }
 
