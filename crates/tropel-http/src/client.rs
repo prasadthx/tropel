@@ -1261,6 +1261,37 @@ mod tests {
     }
 
     #[test]
+    fn body_size_counts_percent_encoding_and_multipart_framing() {
+        // Regression (backlog line 90): the deleted `Body::encoded_len`
+        // measured UrlEncoded/FormData as a RAW `k=v&k=v` concat — no
+        // percent-encoding and no multipart framing — so the k6/WASM
+        // drivers' `data_sent` undercounted the real wire bytes. The single
+        // serializer `body_size` must count what is actually sent.
+        //
+        // "a&b" percent-encodes to "a%26b" — `&` (1 byte) becomes `%26`
+        // (3 bytes) — so the encoded size is LARGER than the raw concat.
+        let mut map = std::collections::HashMap::new();
+        map.insert("k".to_string(), "a&b".to_string());
+        let url = Body::UrlEncoded(map);
+        let wire = serde_urlencoded::to_string(vec![("k".to_string(), "a&b".to_string())]).unwrap();
+        assert_eq!(wire, "k=a%26b");
+        // 5 raw bytes vs 7 encoded — the old function reported 5.
+        assert_eq!("k=a&b".len(), 5);
+        assert_eq!(body_size(&url), wire.len());
+        assert_eq!(wire.len(), 7);
+
+        // Multipart framing: the wire body includes boundaries and
+        // Content-Disposition headers, far larger than `k=v&k=v`.
+        let mut form = std::collections::HashMap::new();
+        form.insert("a".to_string(), "b".to_string());
+        let framed = Body::FormData(form);
+        assert!(
+            body_size(&framed) > 3,
+            "multipart framing must exceed the raw k=v size"
+        );
+    }
+
+    #[test]
     fn test_parse_duration() {
         assert_eq!(
             super::parse_duration("500ms").unwrap(),

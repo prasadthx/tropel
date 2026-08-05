@@ -776,10 +776,14 @@ impl K6DriverInstance {
                                 // (mirrors the declarative runner + WASM
                                 // driver). The req body is counted for
                                 // data_sent; k6 semantics: 2xx-3xx success.
+                                // Exact wire size via the SINGLE serializer
+                                // (percent-encoded urlencoded, multipart
+                                // framing) — the deleted Body::encoded_len
+                                // measured raw k=v&k=v with no encoding.
                                 let sent = req
                                     .body
                                     .as_ref()
-                                    .map(Body::encoded_len)
+                                    .map(tropel_http::body_size)
                                     .unwrap_or(0);
                                 // k6 parity: every redirect hop counts as its
                                 // own request (test.k6.io 302 chain = 2 reqs
@@ -907,10 +911,12 @@ impl K6DriverInstance {
                                     // Record the standard http_req_* samples
                                     // for each batch request (mirrors the
                                     // single-request bridge).
+                                    // Exact wire size via the SINGLE
+                                    // serializer (see single-request path).
                                     let sent = req
                                         .body
                                         .as_ref()
-                                        .map(Body::encoded_len)
+                                        .map(tropel_http::body_size)
                                         .unwrap_or(0);
                                     // k6 parity: every redirect hop counts as
                                     // its own request, same as the single-

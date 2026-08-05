@@ -534,10 +534,13 @@ fn http_request_host(
     // counts as hops + 1 requests, not just the final. The final response's
     // URL/status is what the script sees; each hop gets its own sample set.
     {
+        // Exact wire size via the SINGLE serializer (percent-encoded
+        // urlencoded, multipart framing) — the deleted Body::encoded_len
+        // measured raw k=v&k=v with no encoding.
         let data_sent = req
             .body
             .as_ref()
-            .map(Body::encoded_len)
+            .map(tropel_http::body_size)
             .unwrap_or(0) as f64;
         let chain = resp
             .redirects
