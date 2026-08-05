@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tropel_core::config::ExpectedStatus;
-use tropel_core::scenario::Scenario;
+use tropel_core::scenario::{Scenario, ScenarioItem};
 use tropel_core::types::{Sample, SampleType, TagMap};
 use tropel_core::Result;
 use tropel_ext::traits::Protocol;
@@ -36,6 +36,13 @@ pub struct RunnerConfig {
 /// the N1 race condition where VUs shared a response slot.
 pub struct VURunner {
     scenario: Arc<Scenario>,
+    /// Depth-first flatten of the scenario item tree into execution order.
+    /// Folder items (children present) are containers: their leaf children
+    /// run in order. Postman folders are the norm, so the walk MUST descend
+    /// or folder-organized collections would run 0 requests. Storing the
+    /// flattened list once at construction also makes `setNextRequest`
+    /// indexing/name lookup consistent with the actual run order.
+    execution_items: Vec<ScenarioItem>,
     pm_state: SharedPmState,
     client: HttpClient,
     config: RunnerConfig,
@@ -64,9 +71,10 @@ impl VURunner {
         vu_id: u32,
         scenario_name: String,
     ) -> Self {
-        // Extract all item names in order for setNextRequest resolution
-        let names: Vec<String> = scenario
-            .items
+        // Extract all item names in order for setNextRequest resolution,
+        // from the flattened execution list (folder contents included).
+        let execution_items = flatten_execution_items(&scenario.items);
+        let names: Vec<String> = execution_items
             .iter()
             .map(|item| item.name.clone())
             .collect();
@@ -85,6 +93,7 @@ impl VURunner {
         }
         Self {
             scenario,
+            execution_items,
             pm_state,
             client,
             config: RunnerConfig::default(),
@@ -167,14 +176,14 @@ impl VURunner {
             state.iteration_index = iteration_index;
         }
 
-        // Walk through the scenario items in order
+        // Walk through the flattened execution list (folders descended).
 
         // Build variable scope for this iteration
         let _scope = self.build_scope(data_row.clone(), env_vars);
         let resolver = tropel_variables::VariableResolver::new();
 
-        // Walk through the scenario items in order
-        let item_count = self.scenario.items.len();
+        // Walk through the flattened execution list in order
+        let item_count = self.execution_items.len();
         let mut current_index = 0usize;
 
         while current_index < item_count {
@@ -190,7 +199,7 @@ impl VURunner {
                 }
             }
 
-            let item = &self.scenario.items[current_index];
+            let item = &self.execution_items[current_index];
 
             // Process leaf items: execute the request (if present), then run scripts.
             // Items without a request (e.g. transpiled TS/ES module scripts) still
@@ -574,8 +583,8 @@ impl VURunner {
     /// the raw source without a meaningful label.
     /// Run a script in the VU's JS context. Takes the context by itself (not
     /// `&mut self`) so callers holding an immutable borrow of another field
-    /// (e.g. `&self.scenario.items[i]`) don't trip the borrow checker — the
-    /// js_ctx field is disjoint from scenario data.
+    /// (e.g. `&self.execution_items[i]`) don't trip the borrow checker — the
+    /// js_ctx field is disjoint from the execution list.
     async fn run_script(
         js_ctx: &mut Option<Box<JsContext>>,
         code: &str,
@@ -598,6 +607,28 @@ impl VURunner {
     pub fn state_handle(&self) -> SharedPmState {
         self.pm_state.clone()
     }
+}
+
+/// Depth-first flatten of the scenario item tree into the ordered execution
+/// list. Folder items (children present) are containers — their leaf
+/// children run in order. A leaf item (no children) runs only if it carries
+/// something executable (a request or scripts); empty leaves are skipped.
+///
+/// This is what makes folder-organized Postman collections actually execute:
+/// the parser nests children correctly, and the runner must descend into
+/// them instead of walking only the top level.
+fn flatten_execution_items(items: &[ScenarioItem]) -> Vec<ScenarioItem> {
+    let mut out = Vec::new();
+    for item in items {
+        if item.items.is_empty() {
+            if item.request.is_some() || item.prerequest.is_some() || item.test.is_some() {
+                out.push(item.clone());
+            }
+        } else {
+            out.extend(flatten_execution_items(&item.items));
+        }
+    }
+    out
 }
 
 /// Resolve variables in a request body.
@@ -651,4 +682,89 @@ fn resolve_body(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tropel_core::types::{Method, ResponseType};
 
+    fn leaf(name: &str) -> ScenarioItem {
+        ScenarioItem {
+            id: name.to_string(),
+            name: name.to_string(),
+            request: Some(tropel_core::types::Request {
+                url: format!("http://example.com/{name}"),
+                method: Method::GET,
+                headers: HashMap::new(),
+                query_params: HashMap::new(),
+                body: None,
+                auth: None,
+                certificate: None,
+                follow_redirects: true,
+                timeout: None,
+                response_type: ResponseType::None,
+            }),
+            prerequest: None,
+            test: None,
+            assertions: vec![],
+            items: vec![],
+        }
+    }
+
+    fn folder(name: &str, items: Vec<ScenarioItem>) -> ScenarioItem {
+        ScenarioItem {
+            id: name.to_string(),
+            name: name.to_string(),
+            request: None,
+            prerequest: None,
+            test: None,
+            assertions: vec![],
+            items,
+        }
+    }
+
+    #[test]
+    fn flatten_execution_items_descends_folders_in_order() {
+        // Folder-organized collection: top-level request, folder with two
+        // nested requests, a nested folder (depth 2), and an empty folder
+        // that must be skipped. The runner previously walked only depth 1 and
+        // ran 0 requests for anything inside a folder (P0).
+        let items = vec![
+            leaf("top"),
+            folder(
+                "f1",
+                vec![
+                    leaf("f1-a"),
+                    folder("f1-sub", vec![leaf("f1-sub-1"), leaf("f1-sub-2")]),
+                    leaf("f1-b"),
+                ],
+            ),
+            folder("empty", vec![]),
+        ];
+
+        let flat = flatten_execution_items(&items);
+        let names: Vec<&str> = flat.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["top", "f1-a", "f1-sub-1", "f1-sub-2", "f1-b"],
+            "depth-first folder descent, empty folders skipped, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn flatten_execution_items_skips_scriptless_empty_leaves() {
+        // A leaf with no request and no scripts is not executable; it must
+        // not appear in the run order.
+        let inert = ScenarioItem {
+            id: "inert".into(),
+            name: "inert".into(),
+            request: None,
+            prerequest: None,
+            test: None,
+            assertions: vec![],
+            items: vec![],
+        };
+        let flat = flatten_execution_items(&vec![leaf("a"), inert, leaf("b")]);
+        let names: Vec<&str> = flat.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+}
