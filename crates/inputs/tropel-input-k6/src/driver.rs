@@ -658,8 +658,6 @@ impl DriverInstance for K6DriverInstance {
         // promise. Without it, an async default export's promise would be
         // discarded (side effects still run via the job pump, but its
         // rejections would be swallowed).
-        let iter_start = Instant::now();
-
         let iter_result = self
             .js_ctx
             .run_script_cached(
@@ -667,8 +665,6 @@ impl DriverInstance for K6DriverInstance {
                 Some("k6-iteration.js".to_string()),
             )
             .await;
-
-        let iter_dur = iter_start.elapsed();
 
         // Drain samples recorded by the native bridge closures during this
         // iteration (http_req_*, checks, custom metrics) into the VuContext
@@ -703,13 +699,12 @@ impl DriverInstance for K6DriverInstance {
             )));
         }
 
-        // Emit iteration_duration sample
-        ctx.emit_sample(
-            "iteration_duration",
-            iter_dur.as_micros() as f64,
-            TagMap::new(),
-        );
-
+        // NOTE: `iteration_duration` is NOT emitted here — the shared VU loop
+        // (vu_loop.rs) already emits it as a Trend for every iteration. A
+        // duplicate emit here was typed Point, so MetricSet took its type from
+        // the first sample (Gauge-like) and the stock k6 threshold
+        // `iteration_duration: ['p(95)<2000']` compared against 0 → always
+        // PASS. The shared Trend emit is the single source of truth.
         Ok(())
     }
 }

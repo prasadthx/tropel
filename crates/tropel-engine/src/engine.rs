@@ -20,10 +20,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tropel_core::config::{ExecutionConfig, JobConfig, OutputConfig, ScenarioConfig};
 use tropel_core::types::Sample;
-use tropel_core::Result;
+use tropel_core::{Result, TropelError};
 use tropel_ext::registry::ExtensionRegistry;
 use tropel_ext::traits::Protocol;
 use tropel_metrics::collector::MetricsCollector;
+use tropel_metrics::thresholds::validate_thresholds;
 use tropel_report::{create_reporter, InfluxdbOutput, JsonStreamOutput, OtlpOutput, PrometheusRemoteWriteOutput, Reporter, StatsdOutput, StreamingStdoutOutput, TagPolicy};
 
 /// Capacity of the streaming-output broadcast ring. Sized for ~2.5s of
@@ -175,6 +176,13 @@ impl Engine {
                 }
             }
         }
+
+        // Fail closed at startup (k6 behavior): a malformed threshold
+        // expression must abort the run with a clear config error BEFORE any
+        // load is generated — never silently pass at the end (the old
+        // evaluator returned `(true, …)` for unparseable input, so a typo'd
+        // metric or a bogus operator reported green).
+        validate_thresholds(&thresholds).map_err(TropelError::Config)?;
 
         // Global RPS limiter (k6 `options.rps`): created ONCE per run and
         // shared by every VU across every scenario, so the cap is global.

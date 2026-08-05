@@ -455,8 +455,11 @@ const DURATION_METRICS: [&str; 6] = [
 /// expressions (`&&`/`||`) are logged loudly because the evaluator cannot
 /// parse them and would otherwise report them as silently passing.
 fn translate_k6_expression(metric: &str, expr: &str) -> String {
+    // k6's real median stat is `med` (not `median`). Accepting `median` meant
+    // `med<400` fell through to the evaluator as a 1-token expression and
+    // silently passed (fail-open gate).
     let re = Regex::new(
-        r"^\s*(p\(\d+(?:\.\d+)?\)|avg|median|min|max|count|sum|rate)\s*(<=|>=|==|!=|<|>)\s*(-?\d+(?:\.\d+)?)\s*$",
+        r"^\s*(p\(\d+(?:\.\d+)?\)|avg|med|min|max|count|sum|rate)\s*(<=|>=|==|!=|<|>)\s*(-?\d+(?:\.\d+)?)\s*$",
     )
     .expect("threshold translation regex is valid");
     if let Some(caps) = re.captures(expr) {
@@ -496,7 +499,7 @@ fn translate_k6_expression(metric: &str, expr: &str) -> String {
                     _ => ".p99".to_string(),
                 }
             }
-            "median" => ".p50".to_string(),
+            "med" | "median" => ".p50".to_string(),
             // avg / min / max / count / sum / rate map 1:1 onto evaluator stats
             other => format!(".{other}"),
         };

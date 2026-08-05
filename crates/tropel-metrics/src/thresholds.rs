@@ -46,6 +46,52 @@ pub fn evaluate_thresholds(
     results
 }
 
+/// Validate every configured threshold expression BEFORE the run starts.
+/// Returns an error naming the first malformed expression so the run aborts
+/// at startup with a clear message — k6 rejects bad threshold syntax at init
+/// rather than silently passing it at the end.
+///
+/// Rejects: fewer/greater than 3 whitespace tokens, an unknown operator,
+/// a non-numeric RHS, and compound `&&`/`||` expressions (not yet
+/// supported — previously they warned and always PASSED, which is a
+/// fail-open gate; now they are a hard config error).
+pub fn validate_thresholds(
+    thresholds: &HashMap<String, ThresholdConfig>,
+) -> Result<(), String> {
+    for (name, config) in thresholds {
+        let expr = config.expression.trim();
+        if expr.contains("&&") || expr.contains("||") {
+            return Err(format!(
+                "threshold '{}': compound expression '{}' is not supported — use a single \
+                 '<metric> <op> <value>' per threshold",
+                name, expr
+            ));
+        }
+        let parts: Vec<&str> = expr.split_whitespace().collect();
+        if parts.len() != 3 {
+            return Err(format!(
+                "threshold '{}': '{}' — expected '<metric> <op> <value>' (3 tokens), got {}",
+                name,
+                expr,
+                parts.len()
+            ));
+        }
+        if !matches!(parts[1], "<" | "<=" | ">" | ">=" | "==" | "!=") {
+            return Err(format!(
+                "threshold '{}': unknown operator '{}' in '{}'",
+                name, parts[1], expr
+            ));
+        }
+        if parts[2].parse::<f64>().is_err() {
+            return Err(format!(
+                "threshold '{}': value '{}' is not a number",
+                name, parts[2]
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Check if any abort-on-fail threshold has been breached (mid-run evaluation).
 /// Returns `true` if the test should be aborted immediately.
 /// Respects `delay_abort_eval` — thresholds in their grace period won't abort.
@@ -68,14 +114,18 @@ pub fn check_abort_on_fail(
             }
         }
 
-        let (passed, _, _) = evaluate_single_threshold(&config.expression, metrics);
-        if !passed {
-            tracing::error!(
-                "Threshold '{}' ({}) breached with abortOnFail — aborting test",
-                name,
-                config.expression
-            );
-            return true;
+        // Use the `_opt` variant: a metric with no samples YET (mid-run)
+        // returns None and must NOT abort — data may simply not have
+        // arrived. Only a definite numerical breach aborts.
+        if let Some((passed, _, _)) = evaluate_single_threshold_opt(&config.expression, metrics) {
+            if !passed {
+                tracing::error!(
+                    "Threshold '{}' ({}) breached with abortOnFail — aborting test",
+                    name,
+                    config.expression
+                );
+                return true;
+            }
         }
     }
     false
@@ -153,11 +203,27 @@ pub(crate) fn parse_metric_ref(metric_ref: &str) -> (&str, Vec<(&str, &str)>, Op
 ///   "http_reqs > 100"
 ///   "checks.pass_rate > 0.99"
 ///   "errors < 10"
-fn evaluate_single_threshold(expression: &str, metrics: &MetricsResult) -> (bool, f64, f64) {
+/// Evaluate a single threshold expression, returning `None` when the metric
+/// has NO samples yet (mid-run this must NOT abort — data may simply not have
+/// arrived). Parse errors and unknown operators fail closed (see
+/// [`validate_thresholds`], which rejects them at startup).
+fn evaluate_single_threshold_opt(
+    expression: &str,
+    metrics: &MetricsResult,
+) -> Option<(bool, f64, f64)> {
+    // Fail CLOSED: any parse error or unknown operator must FAIL the
+    // threshold (and, via `validate_thresholds` at startup, abort the run).
+    // The old code returned `(true, …)` on malformed input, so a typo'd
+    // metric or a bogus operator silently reported green. k6 rejects bad
+    // threshold syntax at startup instead.
     let parts: Vec<&str> = expression.split_whitespace().collect();
-    if parts.len() < 3 {
-        tracing::warn!("Invalid threshold expression: '{}'", expression);
-        return (true, 0.0, 0.0);
+    if parts.len() != 3 {
+        tracing::error!(
+            "Invalid threshold expression '{}' — expected '<metric> <op> <value>' (3 tokens), got {}",
+            expression,
+            parts.len()
+        );
+        return Some((false, 0.0, 0.0));
     }
 
     // Format: "metric_ref operator value"
@@ -168,19 +234,22 @@ fn evaluate_single_threshold(expression: &str, metrics: &MetricsResult) -> (bool
     let threshold: f64 = match parts[2].parse() {
         Ok(v) => v,
         Err(_) => {
-            tracing::warn!(
+            tracing::error!(
                 "Invalid threshold value in '{}': '{}'",
                 expression,
                 parts[2]
             );
-            return (true, 0.0, 0.0);
+            return Some((false, 0.0, 0.0));
         }
     };
 
     // Parse metric reference into (metric_name, tags, stat)
     let (metric_name, tag_filters, stat) = parse_metric_ref(metric_ref);
 
-    // Look up the actual metric value
+    // Look up the actual metric value. `None` means the metric has NO
+    // samples at all — distinguish that from a real measured 0.0: a missing
+    // metric must fail the threshold (k6 marks no-data thresholds as failed),
+    // never pass a `<` comparison against an invented 0.0.
     let actual = if !tag_filters.is_empty() {
         // Tag-scoped threshold: search metrics.metrics for matching entries
         get_tag_scoped_metric_value(metrics, metric_name, &tag_filters, stat)
@@ -188,6 +257,8 @@ fn evaluate_single_threshold(expression: &str, metrics: &MetricsResult) -> (bool
         // No tag filter — use the existing top-level lookup
         get_metric_value(metrics, metric_name, stat)
     };
+
+    let actual = actual?; // None → metric has no samples yet — no data.
 
     let passed = match operator {
         "<" => actual < threshold,
@@ -197,16 +268,23 @@ fn evaluate_single_threshold(expression: &str, metrics: &MetricsResult) -> (bool
         "==" => (actual - threshold).abs() < f64::EPSILON,
         "!=" => (actual - threshold).abs() > f64::EPSILON,
         _ => {
-            tracing::warn!(
+            tracing::error!(
                 "Unknown operator '{}' in threshold '{}'",
                 operator,
                 expression
             );
-            true
+            return Some((false, 0.0, threshold));
         }
     };
 
-    (passed, actual, threshold)
+    Some((passed, actual, threshold))
+}
+
+/// Fail-closed wrapper used by the final summary: no data → FAILED (k6 marks
+/// no-data thresholds as failed).
+fn evaluate_single_threshold(expression: &str, metrics: &MetricsResult) -> (bool, f64, f64) {
+    evaluate_single_threshold_opt(expression, metrics)
+        .unwrap_or((false, 0.0, 0.0))
 }
 
 /// Get a metric value for a tag-scoped threshold by searching the metrics list.
@@ -224,13 +302,15 @@ fn evaluate_single_threshold(expression: &str, metrics: &MetricsResult) -> (bool
 /// - **Sum**: returns the SUM of sums
 /// - **Rate**: recomputes sum/count from totals
 ///
-/// If no entry matches, returns 0.0.
+/// If no entry matches, returns `None` (no data for this tag set → the
+/// evaluator fails the threshold closed, matching k6's "no data" behavior
+/// instead of inventing a passing 0.0).
 fn get_tag_scoped_metric_value(
     metrics: &MetricsResult,
     metric_name: &str,
     tag_filters: &[(&str, &str)],
     stat: Option<&str>,
-) -> f64 {
+) -> Option<f64> {
     let mut matched = Vec::new();
 
     for m in &metrics.metrics {
@@ -251,11 +331,11 @@ fn get_tag_scoped_metric_value(
     }
 
     if matched.is_empty() {
-        return 0.0;
+        return None;
     }
 
     // Aggregate all matching entries
-    match stat {
+    Some(match stat {
         Some("avg") => {
             // Return the WORST (highest) mean across all matches
             matched.iter().map(|m| m.mean).fold(0.0_f64, f64::max)
@@ -301,7 +381,7 @@ fn get_tag_scoped_metric_value(
         Some("last") => matched.last().map(|m| m.last).unwrap_or(0.0),
         // Default (no stat or unknown stat) — return WORST mean
         _ => matched.iter().map(|m| m.mean).fold(0.0_f64, f64::max),
-    }
+    })
 }
 
 /// Aggregate a statistic across ALL series in `metrics.metrics` whose key
@@ -362,10 +442,13 @@ fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
     })
 }
 
-/// Extract a metric value from the MetricsResult by name and optional statistic.
-fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> f64 {
+/// Extract a metric value from the MetricsResult by name and optional
+/// statistic. Returns `None` when the metric has NO samples at all, so the
+/// evaluator can distinguish "no data" (fails closed, like k6) from a real
+/// measured 0.0.
+fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> Option<f64> {
     match name {
-        "http_reqs" => metrics.http_reqs as f64,
+        "http_reqs" => Some(metrics.http_reqs as f64),
         "errors" => {
             // Per-tag series (errors{url=…}) may exist; aggregate per stat
             // across them (k6 merges tagged sub-series for the unscoped
@@ -374,9 +457,9 @@ fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
             // the helper's default arm would return the worst per-series
             // mean (1.0 for value-1 Counter samples) and pass spuriously.
             if let Some(v) = stat.and_then(|_| aggregate_series(metrics, "errors", stat)) {
-                v
+                Some(v)
             } else {
-                metrics.errors as f64
+                Some(metrics.errors as f64)
             }
         }
         // NOTE: `parse_metric_ref` strips the stat at the last dot, so a
@@ -386,7 +469,7 @@ fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
         // on a dot-stripped name, otherwise `checks: ['rate>0.99']` (the
         // stock k6 gate) compares the check COUNT against the rate and
         // always passes.
-        "checks" | "checks.total" => match stat {
+        "checks" | "checks.total" => Some(match stat {
             Some("passed") => metrics.checks_passed as f64,
             Some("failed") => metrics.checks_failed as f64,
             Some("rate") | Some("pass_rate") => {
@@ -397,45 +480,41 @@ fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
                 }
             }
             _ => metrics.checks_total as f64,
-        },
-        "http_req_duration" => {
-            if let Some(d) = &metrics.http_req_duration {
-                match stat {
-                    Some("avg") => d.mean,
-                    Some("min") => d.min as f64,
-                    Some("max") => d.max as f64,
-                    Some("p50") | Some("median") | Some("med") => d.p50 as f64,
-                    Some("p90") => d.p90 as f64,
-                    Some("p95") => d.p95 as f64,
-                    Some("p99") => d.p99 as f64,
-                    Some("count") => d.count as f64,
-                    // Rate = sum/count (mirrors the custom-metric loop).
-                    Some("rate") => {
-                        if d.count > 0 {
-                            d.sum / d.count as f64
-                        } else {
-                            0.0
-                        }
+        }),
+        "http_req_duration" => metrics.http_req_duration.as_ref().map(|d| {
+            match stat {
+                Some("avg") => d.mean,
+                Some("min") => d.min as f64,
+                Some("max") => d.max as f64,
+                Some("p50") | Some("median") | Some("med") => d.p50 as f64,
+                Some("p90") => d.p90 as f64,
+                Some("p95") => d.p95 as f64,
+                Some("p99") => d.p99 as f64,
+                Some("count") => d.count as f64,
+                // Rate = sum/count (mirrors the custom-metric loop).
+                Some("rate") => {
+                    if d.count > 0 {
+                        d.sum / d.count as f64
+                    } else {
+                        0.0
                     }
-                    // Any other pNN / p(NN) percentile — exact from the
-                    // retained histogram (not the mean, not a bucket guess).
-                    Some(s) if parse_percentile(s).is_some() => {
-                        percentile_value(d, parse_percentile(s).expect("guarded"))
-                    }
-                    _ => d.mean, // default to mean if no stat specified
                 }
-            } else {
-                0.0
+                // Any other pNN / p(NN) percentile — exact from the
+                // retained histogram (not the mean, not a bucket guess).
+                Some(s) if parse_percentile(s).is_some() => {
+                    percentile_value(d, parse_percentile(s).expect("guarded"))
+                }
+                _ => d.mean, // default to mean if no stat specified
             }
-        }
+        }),
         _ => {
             // Custom metric (e.g. http_req_failed, user metrics): aggregate
             // across ALL series whose key starts with the name. The naive
             // first-match returned an arbitrary tagged series (e.g.
             // http_req_failed{url=…} picked one URL's rate — 1.00 when that
             // series was all-failed) instead of the merged value k6 reports
-            // for the unscoped metric.
-            aggregate_series(metrics, name, stat).unwrap_or(0.0)
+            // for the unscoped metric. `None` = no series at all → no data.
+            aggregate_series(metrics, name, stat)
         }
     }
 }
