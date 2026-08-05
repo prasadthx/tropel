@@ -560,9 +560,17 @@ impl VURunner {
     ) -> tropel_variables::VariableScope {
         let data = data_row.unwrap_or_default();
         let state = self.pm_state.lock().unwrap();
+        // pm.environment.set() writes into PmState.environment — overlay it
+        // on the static CLI/--env-file vars so {{var}} substitution sees
+        // script-set values (request 1 saves a token → request 2 sends
+        // Bearer {{token}}). Script-set values win over stale seeded ones.
+        let mut env = env_vars.clone();
+        for (k, v) in &state.environment {
+            env.insert(k.clone(), v.clone());
+        }
         tropel_variables::VariableScope {
             data,
-            env: env_vars.clone(),
+            env,
             collection: state.collection_vars.clone(),
             globals: state.globals.clone(),
         }
@@ -767,5 +775,83 @@ mod tests {
         let flat = flatten_execution_items(&vec![leaf("a"), inert, leaf("b")]);
         let names: Vec<&str> = flat.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b"]);
+    }
+
+    /// Build a tiny runner over a single-request scenario for scope tests.
+    fn runner_with_env_override(
+        static_env: HashMap<String, String>,
+        script_set: HashMap<String, String>,
+    ) -> (VURunner, tropel_variables::VariableScope) {
+        let scenario = Arc::new(Scenario {
+            info: tropel_core::scenario::ScenarioInfo {
+                name: "scope-test".into(),
+                description: None,
+                schema: None,
+            },
+            items: vec![leaf("request-one"), leaf("request-two")],
+            variables: HashMap::new(),
+            auth: None,
+        });
+        let execution_items = Arc::new(flatten_execution_items(&scenario.items));
+        let names: Arc<Vec<String>> = Arc::new(
+            execution_items
+                .iter()
+                .map(|i| i.name.clone())
+                .collect(),
+        );
+        let client = HttpClient::new(&tropel_core::config::HttpConfig::default())
+            .expect("http client should construct");
+        let runner = VURunner::new(
+            scenario,
+            execution_items,
+            names,
+            client,
+            0,
+            "scope-test".into(),
+        );
+        // Simulate `pm.environment.set("token", ...)` from request 1's
+        // prerequest script: it writes into PmState.environment.
+        runner.pm_state().lock().unwrap().environment = script_set;
+        let scope = runner.build_scope(None, &static_env);
+        (runner, scope)
+    }
+
+    #[test]
+    fn build_scope_sees_pm_environment_set_values() {
+        // P0: build_scope filled `env` only from the static CLI/--env-file
+        // map, never from PmState.environment where pm.environment.set()
+        // writes. The most common Postman pattern — request 1 saves a token,
+        // request 2 sends `Bearer {{authToken}}` — sent the literal string.
+        let mut static_env = HashMap::new();
+        static_env.insert("BASE_URL".to_string(), "https://api.example.com".to_string());
+        let mut script_set = HashMap::new();
+        script_set.insert("authToken".to_string(), "tok-abc-123".to_string());
+        let (_, scope) = runner_with_env_override(static_env.clone(), script_set);
+
+        // The script-set value must resolve inside {{var}} substitution.
+        let resolver = tropel_variables::VariableResolver::new();
+        assert_eq!(
+            resolver.resolve("{{authToken}}", &scope),
+            "tok-abc-123",
+            "pm.environment.set() value must be visible to {{var}} substitution"
+        );
+        // Static CLI env vars still resolve too.
+        assert_eq!(
+            resolver.resolve("{{BASE_URL}}", &scope),
+            "https://api.example.com"
+        );
+
+        // Script-set value must WIN over a stale seeded value with the same
+        // name (the seeded value silently winning was the bug).
+        let mut stale = HashMap::new();
+        stale.insert("authToken".to_string(), "STALE".to_string());
+        let mut fresh = HashMap::new();
+        fresh.insert("authToken".to_string(), "fresh-token".to_string());
+        let (_, scope2) = runner_with_env_override(stale, fresh);
+        assert_eq!(
+            resolver.resolve("{{authToken}}", &scope2),
+            "fresh-token",
+            "script-set env must override a stale seeded value"
+        );
     }
 }
