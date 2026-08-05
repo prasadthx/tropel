@@ -442,11 +442,6 @@ impl HttpClient {
         };
         let mut redirects: Vec<HttpResponse> = Vec::new();
         let mut current_url = request.url.clone();
-        // k6 `blacklistIPs` — IP-literal check. Hostnames are filtered by the
-        // DNS resolver; IP literals never resolve, so the blacklist is
-        // enforced here per hop (the initial URL AND every redirect target,
-        // since a redirect can bounce into a blocked network).
-        check_literal_blacklist(&self.blacklist, &current_url)?;
         let mut current_method = request.method.clone();
         let mut current_body: Option<Vec<u8>> = body_bytes.clone();
         let mut hop_index: usize = 0;
@@ -858,17 +853,49 @@ impl HttpClient {
 
         return Ok(response);
         } // end redirect-follow loop
-    }
+    }/// Get an auth signer based on the auth config.
+///
+/// Delegates to the single consolidated signer builder
+/// ([`crate::auth::build_auth_signer`]) shared with the executor runner,
+/// so every auth type (Bearer, Basic, ApiKey, OAuth2, SigV4, OAuth1,
+/// Hawk, Digest) is supported in exactly one place.
+pub fn get_signer(&self, auth: &AuthConfig) -> Option<Box<dyn AuthSigner>> {
+    crate::auth::build_auth_signer(auth)
+}
+}
 
-    /// Get an auth signer based on the auth config.
-    ///
-    /// Delegates to the single consolidated signer builder
-    /// ([`crate::auth::build_auth_signer`]) shared with the executor runner,
-    /// so every auth type (Bearer, Basic, ApiKey, OAuth2, SigV4, OAuth1,
-    /// Hawk, Digest) is supported in exactly one place.
-    pub fn get_signer(&self, auth: &AuthConfig) -> Option<Box<dyn AuthSigner>> {
-        crate::auth::build_auth_signer(auth)
+/// k6 `blacklistIPs` enforcement for IP-literal hosts.
+///
+/// The DNS resolver filters hostnames (every resolved address is checked),
+/// but an IP-literal URL (`http://127.0.0.1:8080`, `http://[::1]/`) never
+/// triggers a lookup — reqwest hands the literal straight to the connector.
+/// This rejects a literal that falls inside any blacklisted CIDR BEFORE any
+/// connection attempt. Hostnames pass through untouched (the resolver owns
+/// them); a URL whose host does not parse as an IP is not our concern.
+fn check_literal_blacklist(blacklist: &[IpCidr], url: &str) -> Result<()> {
+    if blacklist.is_empty() {
+        return Ok(());
     }
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| TropelError::Http(format!("Invalid request URL '{}': {}", url, e)))?;
+    let Some(host) = parsed.host_str() else {
+        return Ok(());
+    };
+    // The url crate serializes IPv6 hosts WITH brackets and normalizes
+    // v4-mapped forms to hex (`http://[::ffff:10.1.2.3]` → `[::ffff:a01:203]`),
+    // so strip the brackets before parsing as an IP.
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        // Hostname → the DNS resolver applies the blacklist.
+        return Ok(());
+    };
+    if blacklist.iter().any(|c| c.contains(ip)) {
+        return Err(TropelError::Http(format!(
+            "request to blacklisted IP literal '{}' (blacklistIPs)",
+            host
+        )));
+    }
+    Ok(())
 }
 
 /// HTTP response data (mirrors `tropel_core::Response` but from reqwest).
@@ -1209,6 +1236,21 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(result, "key=value&name=hello+world");
+    }
+
+    #[test]
+    fn blacklist_rejects_ip_literal_but_not_hostname() {
+        let blacklist = parse_blacklist(&["127.0.0.1".to_string(), "10.0.0.0/8".to_string()]);
+        // Literal host inside the blacklist → rejected before any connect.
+        assert!(check_literal_blacklist(&blacklist, "http://127.0.0.1:8080/api").is_err());
+        assert!(check_literal_blacklist(&blacklist, "http://10.1.2.3/x").is_err());
+        // v4-mapped v6 literal is canonicalized before matching.
+        assert!(check_literal_blacklist(&blacklist, "http://[::ffff:10.1.2.3]/x").is_err());
+        // Hostname → DNS resolver owns the blacklist; literal outside → fine.
+        assert!(check_literal_blacklist(&blacklist, "http://example.com/").is_ok());
+        assert!(check_literal_blacklist(&blacklist, "http://8.8.8.8/").is_ok());
+        // Invalid URL surfaces as an error (not a silent pass).
+        assert!(check_literal_blacklist(&blacklist, "not a url").is_err());
     }
 
     // ── per-request client selection (TROPEL_TODO_V2: "client cert and

@@ -94,13 +94,36 @@ impl IpCidr {
     }
 
     /// Whether `ip` falls inside this CIDR.
+    ///
+    /// Two correctness rules that the naive mask-shift got wrong:
+    /// 1. `/0` (prefix 0) must match EVERY address. `u32::MAX << 32` is a
+    ///    shift overflow (debug panic) / masked to `<< 0` in release, which
+    ///    produced an all-ones mask → exact-host match → `blacklistIPs:
+    ///    ["0.0.0.0/0"]` blocked only `0.0.0.0` itself. `checked_shl(...)
+    ///    .unwrap_or(0)` yields mask 0 → `(base & 0) == (ip & 0)` → true.
+    /// 2. IPv4-mapped IPv6 (`::ffff:10.0.0.1`) must match a v4 CIDR. Both
+    ///    sides are canonicalized with [`IpAddr::to_canonical`] before the
+    ///    family match, so a v4-mapped v6 host in a static `hosts` entry is
+    ///    caught by `10.0.0.0/8` instead of slipping through as a v6 addr.
     pub fn contains(&self, ip: IpAddr) -> bool {
-        match (self.base, ip) {
+        let base = self.base.to_canonical();
+        let ip = ip.to_canonical();
+        match (base, ip) {
             (IpAddr::V4(base), IpAddr::V4(ip)) => {
-                let mask = if self.prefix >= 32 {
+                // A v4-mapped v6 CIDR (`::ffff:10.0.0.0/104`) canonicalizes to
+                // a v4 base, but its prefix still counts v6 bits: subtract the
+                // 96-bit mapped prefix so `/104` means `10.0.0.0/8`, not a
+                // full 32-bit mask (which would silently shrink it to an
+                // exact-host match).
+                let prefix = if matches!(self.base, IpAddr::V6(_)) {
+                    self.prefix.saturating_sub(96).min(32)
+                } else {
+                    self.prefix
+                };
+                let mask = if prefix >= 32 {
                     u32::MAX
                 } else {
-                    u32::MAX << (32 - self.prefix)
+                    u32::MAX.checked_shl(32 - prefix as u32).unwrap_or(0)
                 };
                 (u32::from(base) & mask) == (u32::from(ip) & mask)
             }
@@ -108,7 +131,9 @@ impl IpCidr {
                 let mask = if self.prefix >= 128 {
                     u128::MAX
                 } else {
-                    u128::MAX << (128 - self.prefix)
+                    u128::MAX
+                        .checked_shl(128 - self.prefix as u32)
+                        .unwrap_or(0)
                 };
                 (u128::from(base) & mask) == (u128::from(ip) & mask)
             }
@@ -175,16 +200,7 @@ impl DnsResolver {
             }
         };
         let hosts = parse_hosts(&config.hosts);
-        let blacklist: Vec<IpCidr> = config
-            .blacklist_ips
-            .iter()
-            .filter_map(|s| {
-                IpCidr::parse(s).or_else(|| {
-                    tracing::warn!("invalid blacklistIPs entry '{s}' — ignored");
-                    None
-                })
-            })
-            .collect();
+        let blacklist = parse_blacklist(&config.blacklist_ips);
 
         DnsResolver {
             inner: Arc::new(DnsShared {
@@ -198,6 +214,22 @@ impl DnsResolver {
             }),
         }
     }
+}
+
+/// Parse a `blacklistIPs` list into CIDRs, warning and skipping entries that
+/// fail to parse. Shared by [`DnsResolver::from_config`] and the per-hop
+/// IP-literal check in [`crate::client::HttpClient`] — both need the exact
+/// same interpretation of the config option.
+pub fn parse_blacklist(blacklist_ips: &[String]) -> Vec<IpCidr> {
+    blacklist_ips
+        .iter()
+        .filter_map(|s| {
+            IpCidr::parse(s).or_else(|| {
+                tracing::warn!("invalid blacklistIPs entry '{s}' — ignored");
+                None
+            })
+        })
+        .collect()
 }
 
 impl Resolve for DnsResolver {
@@ -470,6 +502,41 @@ mod tests {
 
         assert!(IpCidr::parse("not-an-ip").is_none());
         assert!(IpCidr::parse("10.0.0.0/99").is_none());
+    }
+
+    #[test]
+    fn cidr_zero_prefix_matches_everything() {
+        // Regression: `u32::MAX << 32` overflowed (debug panic) / was masked
+        // to `<< 0` in release, so `0.0.0.0/0` matched only 0.0.0.0 itself.
+        let all = IpCidr::parse("0.0.0.0/0").unwrap();
+        assert!(all.contains("1.2.3.4".parse().unwrap()));
+        assert!(all.contains("255.255.255.255".parse().unwrap()));
+
+        let all_v6 = IpCidr::parse("::/0").unwrap();
+        assert!(all_v6.contains("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_v4_mapped_v6_matches_v4_net() {
+        // Regression: `::ffff:10.0.0.1` is a v6 address, so it never matched
+        // a v4 CIDR — a static-hosts entry with a mapped literal slipped
+        // past `10.0.0.0/8`. Both sides are canonicalized now.
+        let net = IpCidr::parse("10.0.0.0/8").unwrap();
+        assert!(net.contains("::ffff:10.0.0.1".parse().unwrap()));
+        assert!(!net.contains("::ffff:11.0.0.1".parse().unwrap()));
+
+        // A v4-mapped v6 CIDR counts v6 bits: /104 = 96 mapped + 8 v4 bits,
+        // i.e. the whole 10.0.0.0/8; /120 = 96 + 24 = 10.0.0.0/24.
+        let v4_cidr_from_v6 = IpCidr::parse("::ffff:10.0.0.0/104").unwrap();
+        assert!(v4_cidr_from_v6.contains("::ffff:10.5.0.1".parse().unwrap()));
+        assert!(v4_cidr_from_v6.contains("10.5.0.1".parse().unwrap()));
+        assert!(v4_cidr_from_v6.contains("10.255.255.255".parse().unwrap()));
+        assert!(!v4_cidr_from_v6.contains("11.0.0.1".parse().unwrap()));
+
+        let v4_24_from_v6 = IpCidr::parse("::ffff:10.0.0.0/120").unwrap();
+        assert!(v4_24_from_v6.contains("::ffff:10.0.0.9".parse().unwrap()));
+        assert!(v4_24_from_v6.contains("10.0.0.9".parse().unwrap()));
+        assert!(!v4_24_from_v6.contains("10.0.1.9".parse().unwrap()));
     }
 
     #[test]
