@@ -10,7 +10,7 @@ impl NativeModule for ExtraFunctionsModule {
         "__tropel_native_fn"
     }
 
-    fn install(&self, ctx: &JsContext) -> Result<()> {
+    fn install(&self, ctx: &mut JsContext) -> Result<()> {
         ctx.with_ctx(|rq_ctx| {
             let globals = rq_ctx.globals();
 

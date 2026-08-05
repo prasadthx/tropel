@@ -106,17 +106,17 @@ impl Driver for K6Driver {
         let final_source = prepare_module_source(original, source_path)?;
 
         // Step 2: Create JS context
-        let js_ctx = JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
+        let mut js_ctx = JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
             .await
             .map_err(|e| TropelError::Other(format!("JS context creation failed: {}", e)))?;
 
         // Step 3: Bootstrap shim libraries & native modules
-        bootstrap_js_libs(&js_ctx).await?;
+        bootstrap_js_libs(&mut js_ctx).await?;
 
         // Install the k6 file-access bridges (open() + SharedArray cache).
         // Needs the script directory for relative path resolution.
         let script_dir = source_path.and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        register_k6_file_bridges(&js_ctx, script_dir.clone());
+        register_k6_file_bridges(&mut js_ctx, script_dir.clone());
 
         // Register the ES-module resolver/loader so local imports
         // (`import { x } from "./helpers.js"`) resolve to files on disk,
@@ -134,7 +134,7 @@ impl Driver for K6Driver {
         // otherwise fall back to the module's `default` export. Modules are
         // the only mode where `export const options` (the k6 load profile) and
         // `export default function` survive together.
-        install_iteration_global(&js_ctx, &final_source, exec)?;
+        install_iteration_global(&mut js_ctx, &final_source, exec)?;
 
         // Verify __tropel_iteration was defined
         let has_iter = js_ctx
@@ -260,7 +260,7 @@ fn shared_array_cache() -> &'static Mutex<HashMap<String, Arc<Vec<serde_json::Va
 /// code (the per-VU init context AND the throwaway options/handleSummary
 /// contexts), because k6 scripts routinely call `open()`/`new SharedArray()`
 /// at module top level while building `export const options`.
-fn register_k6_file_bridges(ctx: &JsContext, script_dir: Option<PathBuf>) {
+fn register_k6_file_bridges(ctx: &mut JsContext, script_dir: Option<PathBuf>) {
     ctx.with_ctx(|rq_ctx| {
         let globals = rq_ctx.globals();
         let dir = script_dir.clone();
@@ -461,10 +461,12 @@ enum WsCommand {
     Close { code: u16, reason: String },
 }
 
-// Safety: each DriverInstance runs on its own VU thread (thread-per-core).
-// JsContext already has unsafe impl Send + Sync in tropel_js.
+// Safety: each DriverInstance runs on its own VU thread (thread-per-core),
+// so it is only ever used from a single thread at a time. JsContext is
+// `Send` (see tropel_js) but NOT `Sync` (rquickjs uses a non-atomic Rc), so
+// the instance can move to its VU thread but must never be shared across
+// threads — which the thread-per-core loop guarantees.
 unsafe impl Send for K6DriverInstance {}
-unsafe impl Sync for K6DriverInstance {}
 
 /// Build the standard http_req_* tag set (url/method/status/name/group).
 fn http_tags(req: &Request, status: &str) -> TagMap {
@@ -1555,7 +1557,7 @@ impl K6DriverInstance {
 
     /// Sync VuContext state into JS globals so the script can read
     /// environment variables, data rows, etc.
-    async fn sync_globals(&self, ctx: &VuContext) -> Result<()> {
+    async fn sync_globals(&mut self, ctx: &VuContext) -> Result<()> {
         let _ = self
             .js_ctx
             .set_global_str("__tropel_vu_id", &ctx.vu_id.to_string())
@@ -1806,7 +1808,7 @@ async fn eval_module_export_json(
     env: &HashMap<String, String>,
     script_dir: Option<PathBuf>,
 ) -> Result<Option<String>> {
-    let js_ctx = JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
+    let mut js_ctx = JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
         .await
         .map_err(|e| TropelError::Other(format!("JS context creation failed: {}", e)))?;
 
@@ -1816,7 +1818,7 @@ async fn eval_module_export_json(
     // context can resolve them (the shim defines the JS globals on top of the
     // native bridges). Also register the module loader so `options` blocks
     // that import local helpers (`import { x } from "./helpers.js"`) resolve.
-    register_k6_file_bridges(&js_ctx, script_dir.clone());
+    register_k6_file_bridges(&mut js_ctx, script_dir.clone());
     js_ctx.set_module_loader(
         K6ModuleResolver {
             script_dir: script_dir.clone(),
@@ -1829,7 +1831,7 @@ async fn eval_module_export_json(
     // The k6 shim libs (Rate/check/http/…) must be present: options blocks
     // commonly run k6 API at module top level (e.g. `new Rate('errors')`),
     // which threw QuickJS exceptions when the shim was missing.
-    bootstrap_js_libs(&js_ctx).await.map_err(|e| {
+    bootstrap_js_libs(&mut js_ctx).await.map_err(|e| {
         TropelError::Other(format!("k6 shim bootstrap failed for options eval: {}", e))
     })?;
 
@@ -1865,7 +1867,7 @@ async fn eval_module_handle_summary(
     env: &HashMap<String, String>,
     script_dir: Option<PathBuf>,
 ) -> Result<Option<HashMap<String, String>>> {
-    let js_ctx = JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
+    let mut js_ctx = JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
         .await
         .map_err(|e| TropelError::Other(format!("JS context creation failed: {}", e)))?;
 
@@ -1873,7 +1875,7 @@ async fn eval_module_handle_summary(
     // install the file bridges + shim on the throwaway context too. Also
     // register the module loader so a `handleSummary` module that imports
     // local helpers (`import { x } from "./helpers.js"`) resolves them.
-    register_k6_file_bridges(&js_ctx, script_dir.clone());
+    register_k6_file_bridges(&mut js_ctx, script_dir.clone());
     js_ctx.set_module_loader(
         K6ModuleResolver {
             script_dir: script_dir.clone(),
@@ -1885,7 +1887,7 @@ async fn eval_module_handle_summary(
     })?;
     // Same k6-shim requirement as the options eval: a script that touches
     // k6 API at module top level must not throw while handleSummary is read.
-    bootstrap_js_libs(&js_ctx).await.map_err(|e| {
+    bootstrap_js_libs(&mut js_ctx).await.map_err(|e| {
         TropelError::Other(format!("k6 shim bootstrap failed for handleSummary eval: {}", e))
     })?;
 
@@ -1994,7 +1996,7 @@ fn read_module_export_string(
 /// `__tropel_iteration` (what `run_iteration` invokes). When `exec` names a
 /// specific exported function (k6 multi-scenario `exec` selection), that
 /// export is installed; otherwise the module's `default` export is used.
-fn install_iteration_global(js_ctx: &JsContext, source: &str, exec: Option<&str>) -> Result<()> {
+fn install_iteration_global(js_ctx: &mut JsContext, source: &str, exec: Option<&str>) -> Result<()> {
     // Arm the per-eval timeout: this evals the module directly via with_ctx,
     // bypassing the eval-family methods that normally reset the deadline.
     js_ctx.reset_interrupt();
@@ -2093,7 +2095,7 @@ const K6_NATIVE_SHIM_BUNDLE: &str = concat!(
     include_str!("../../../../js/k6-shim/open-data-shim.js"),
 );
 
-async fn bootstrap_js_libs(ctx: &JsContext) -> Result<()> {
+async fn bootstrap_js_libs(ctx: &mut JsContext) -> Result<()> {
     // Phase 1: Base shim libraries (no native dependencies) — single eval.
     if let Err(e) = ctx.bootstrap_library(K6_BASE_SHIM_BUNDLE).await {
         tracing::warn!("Failed to bootstrap JS base shim bundle: {}", e);
@@ -2525,10 +2527,10 @@ mod tests {
 
     /// Create a JsContext with the k6 file bridges + shim installed.
     async fn ctx_with_file_bridges(script_dir: Option<PathBuf>) -> JsContext {
-        let js_ctx = JsContext::new(None, Some(Duration::from_secs(5)))
+        let mut js_ctx = JsContext::new(None, Some(Duration::from_secs(5)))
             .await
             .expect("context creation should succeed");
-        register_k6_file_bridges(&js_ctx, script_dir);
+        register_k6_file_bridges(&mut js_ctx, script_dir);
         js_ctx
             .bootstrap_library(OPEN_DATA_SHIM)
             .await
@@ -2563,7 +2565,7 @@ mod tests {
             import { triple } from "./helpers.js";
             export default function() { globalThis.__tropel_import_result = triple(14); }
         "#;
-        let js_ctx = JsContext::new(None, Some(Duration::from_secs(5)))
+        let mut js_ctx = JsContext::new(None, Some(Duration::from_secs(5)))
             .await
             .expect("context creation should succeed");
         js_ctx.set_module_loader(
@@ -2572,7 +2574,7 @@ mod tests {
             },
             K6ModuleLoader,
         );
-        install_iteration_global(&js_ctx, source, None)
+        install_iteration_global(&mut js_ctx, source, None)
             .expect("module with local import should install");
         js_ctx
             .run_script_cached(
@@ -2602,7 +2604,7 @@ mod tests {
             import { add } from "./calc.ts";
             export default function() { globalThis.__tropel_ts_result = add(20, 22); }
         "#;
-        let js_ctx = JsContext::new(None, Some(Duration::from_secs(5)))
+        let mut js_ctx = JsContext::new(None, Some(Duration::from_secs(5)))
             .await
             .expect("context creation should succeed");
         js_ctx.set_module_loader(
@@ -2611,7 +2613,7 @@ mod tests {
             },
             K6ModuleLoader,
         );
-        install_iteration_global(&js_ctx, source, None)
+        install_iteration_global(&mut js_ctx, source, None)
             .expect("module with TS local import should install");
         js_ctx
             .run_script_cached(
@@ -2635,7 +2637,7 @@ mod tests {
             import { nope } from "./does-not-exist.js";
             export default function() {}
         "#;
-        let js_ctx = JsContext::new(None, Some(Duration::from_secs(5)))
+        let mut js_ctx = JsContext::new(None, Some(Duration::from_secs(5)))
             .await
             .expect("context creation should succeed");
         js_ctx.set_module_loader(
@@ -2644,7 +2646,7 @@ mod tests {
             },
             K6ModuleLoader,
         );
-        let err = install_iteration_global(&js_ctx, source, None).err();
+        let err = install_iteration_global(&mut js_ctx, source, None).err();
         assert!(
             err.is_some(),
             "unresolvable local import must fail module install"
@@ -2656,7 +2658,7 @@ mod tests {
     async fn test_open_reads_text_relative_to_script_dir() {
         let dir = temp_script_dir("text");
         std::fs::write(dir.join("data.txt"), "hello from open").unwrap();
-        let js_ctx = ctx_with_file_bridges(Some(dir.clone())).await;
+        let mut js_ctx = ctx_with_file_bridges(Some(dir.clone())).await;
         let out = js_ctx
             .eval("open('data.txt')")
             .await
@@ -2676,7 +2678,7 @@ mod tests {
     async fn test_open_binary_returns_array_buffer() {
         let dir = temp_script_dir("bin");
         std::fs::write(dir.join("blob.bin"), [0u8, 1, 2, 255, 128]).unwrap();
-        let js_ctx = ctx_with_file_bridges(Some(dir.clone())).await;
+        let mut js_ctx = ctx_with_file_bridges(Some(dir.clone())).await;
         let out = js_ctx
             .eval(
                 "var b = open('blob.bin', 'b');\
@@ -2691,7 +2693,7 @@ mod tests {
     #[tokio::test]
     async fn test_open_missing_file_throws_js_error() {
         let dir = temp_script_dir("missing");
-        let js_ctx = ctx_with_file_bridges(Some(dir.clone())).await;
+        let mut js_ctx = ctx_with_file_bridges(Some(dir.clone())).await;
         let out = js_ctx
             .eval(
                 "try { open('nope.txt'); 'no-throw'; }\
@@ -2713,7 +2715,7 @@ mod tests {
         // re-running the factory (k6 semantics: computed once, shared).
         let dir = temp_script_dir("shared");
         let name = "tropel-shared-test-1";
-        let js_ctx1 = ctx_with_file_bridges(Some(dir.clone())).await;
+        let mut js_ctx1 = ctx_with_file_bridges(Some(dir.clone())).await;
         let script = format!(
             "var calls = 0;\
              var sa = new SharedArray('{name}', function () {{ calls++; return [10, 20, 30]; }});\
@@ -2732,7 +2734,7 @@ mod tests {
         );
 
         // Second context: same name -> cached, factory NOT re-run.
-        let js_ctx2 = ctx_with_file_bridges(Some(dir.clone())).await;
+        let mut js_ctx2 = ctx_with_file_bridges(Some(dir.clone())).await;
         let script2 = format!(
             "var calls = 0;\
              var sa = new SharedArray('{name}', function () {{ calls++; return [99]; }});\
@@ -2754,7 +2756,7 @@ mod tests {
     #[tokio::test]
     async fn test_shared_array_is_read_only() {
         let dir = temp_script_dir("ro");
-        let js_ctx = ctx_with_file_bridges(Some(dir.clone())).await;
+        let mut js_ctx = ctx_with_file_bridges(Some(dir.clone())).await;
         let out = js_ctx
             .eval(
                 "var sa = new SharedArray('tropel-shared-test-ro', function () { return [1, 2, 3]; });\

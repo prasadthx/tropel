@@ -148,7 +148,7 @@ impl VURunner {
 
     /// Run a single iteration through the scenario items.
     pub async fn run_iteration(
-        &self,
+        &mut self,
         iteration_index: u64,
         data_row: Option<HashMap<String, serde_json::Value>>,
         env_vars: &HashMap<String, String>,
@@ -170,7 +170,7 @@ impl VURunner {
         // Walk through the scenario items in order
 
         // Build variable scope for this iteration
-        let _scope = self.build_scope(data_row.clone(), env_vars).await;
+        let _scope = self.build_scope(data_row.clone(), env_vars);
         let resolver = tropel_variables::VariableResolver::new();
 
         // Walk through the scenario items in order
@@ -209,14 +209,16 @@ impl VURunner {
                 // Run prerequest script
                 if let Some(script) = &item.prerequest {
                     let source_url = Some(format!("{}.prerequest.js", item.name));
-                    if let Err(e) = self.run_script(script, source_url).await {
+                    if let Err(e) =
+                        Self::run_script(&mut self.js_ctx, script, source_url).await
+                    {
                         tracing::warn!("VU {} prerequest script error: {}", iteration_index, e);
                     }
                 }
 
                 // Rebuild scope after prerequest script (may have changed env vars)
                 let data_row_ref = data_row.as_ref();
-                let scope = self.build_scope(data_row_ref.cloned(), env_vars).await;
+                let scope = self.build_scope(data_row_ref.cloned(), env_vars);
 
                 // Execute HTTP request only if this item has one.
                 // Script-only items (transpiled TS/ES module scripts) don't have
@@ -518,7 +520,9 @@ impl VURunner {
                 // Run test script
                 if let Some(script) = &item.test {
                     let source_url = Some(format!("{}.test.js", item.name));
-                    if let Err(e) = self.run_script(script, source_url).await {
+                    if let Err(e) =
+                        Self::run_script(&mut self.js_ctx, script, source_url).await
+                    {
                         tracing::warn!("VU {} test script error: {}", iteration_index, e);
                     }
                 }
@@ -537,7 +541,12 @@ impl VURunner {
     }
 
     /// Build a variable scope from the current PM state + iteration data + env.
-    async fn build_scope(
+    ///
+    /// Deliberately synchronous (`&self`, no `.await`): the `#[async_trait]`
+    /// `VuIterationSource` future must be `Send`, and an async `&self` method
+    /// would hold `&VURunner` across an await — `&VURunner: Send` requires
+    /// `VURunner: Sync`, which the now-`!Sync` `JsContext` can't satisfy.
+    fn build_scope(
         &self,
         data_row: Option<HashMap<String, serde_json::Value>>,
         env_vars: &HashMap<String, String>,
@@ -563,8 +572,16 @@ impl VURunner {
     /// `source_url` is an identifier shown in error messages and stack traces
     /// (e.g. `"prerequest.js"` or `"test.js"`). When omitted, errors show
     /// the raw source without a meaningful label.
-    async fn run_script(&self, code: &str, source_url: Option<String>) -> Result<()> {
-        if let Some(ctx) = &self.js_ctx {
+    /// Run a script in the VU's JS context. Takes the context by itself (not
+    /// `&mut self`) so callers holding an immutable borrow of another field
+    /// (e.g. `&self.scenario.items[i]`) don't trip the borrow checker — the
+    /// js_ctx field is disjoint from scenario data.
+    async fn run_script(
+        js_ctx: &mut Option<Box<JsContext>>,
+        code: &str,
+        source_url: Option<String>,
+    ) -> Result<()> {
+        if let Some(ctx) = js_ctx {
             ctx.run_script_cached(code, source_url)
                 .await
                 .map_err(|e| tropel_core::TropelError::Other(format!("Script error: {}", e)))?;

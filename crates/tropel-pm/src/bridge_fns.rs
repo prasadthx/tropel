@@ -153,7 +153,7 @@ impl PmBridge {
     }
 
     /// Register all bridge functions into the given JS context.
-    pub fn install(&self, ctx: &JsContext) -> Result<()> {
+    pub fn install(&self, ctx: &mut JsContext) -> Result<()> {
         let state = self.state.clone();
 
         ctx.with_ctx(|rq_ctx| {

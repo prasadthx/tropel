@@ -19,11 +19,11 @@ pub trait NativeModule {
     /// Namespace the module installs under (e.g. "__tropel_native").
     fn name(&self) -> &str;
     /// Install native functions into the JS context.
-    fn install(&self, ctx: &JsContext) -> Result<()>;
+    fn install(&self, ctx: &mut JsContext) -> Result<()>;
 }
 
 /// Install all native builtins into a JS context.
-pub async fn install_all(ctx: &JsContext) -> Result<()> {
+pub async fn install_all(ctx: &mut JsContext) -> Result<()> {
     let modules: Vec<Box<dyn NativeModule>> = vec![
         Box::new(crypto::CryptoModule),
         Box::new(hash::HashModule),
@@ -54,10 +54,10 @@ mod tests {
     /// 2. A function was renamed — update this list to match
     #[tokio::test]
     async fn test_all_native_functions_are_registered() {
-        let ctx = tropel_js::JsContext::new(Some(1024 * 1024), Some(Duration::from_secs(5)))
+        let mut ctx = tropel_js::JsContext::new(Some(1024 * 1024), Some(Duration::from_secs(5)))
             .await
             .unwrap();
-        install_all(&ctx).await.unwrap();
+        install_all(&mut ctx).await.unwrap();
 
         // Every expected global. When adding a new native module or function,
         // add its globals here so the registration convention is enforced.

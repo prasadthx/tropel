@@ -10,7 +10,7 @@ impl NativeModule for HashModule {
         "__tropel_native_hash"
     }
 
-    fn install(&self, ctx: &JsContext) -> Result<()> {
+    fn install(&self, ctx: &mut JsContext) -> Result<()> {
         ctx.with_ctx(|rq_ctx| {
             let globals = rq_ctx.globals();
             // Hash module reuses crypto functions — add any hash-specific bindings here

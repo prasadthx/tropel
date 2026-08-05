@@ -286,7 +286,7 @@ pub struct DriverDeclaredOptions {
 /// Created by `Driver::init()`. The engine calls `run_iteration()`
 /// once per iteration, passing a `VuContext` with native functions.
 #[async_trait]
-pub trait DriverInstance: Send + Sync {
+pub trait DriverInstance: Send {
     /// Run one iteration of this driver.
     /// The `ctx` provides native host functions for HTTP, metrics, etc.
     async fn run_iteration(&mut self, ctx: &mut VuContext) -> Result<()>;

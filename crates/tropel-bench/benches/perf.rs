@@ -131,13 +131,13 @@ fn script_iteration(c: &mut Criterion) {
 
     // Cold path: parse + compile + execute the source every iteration.
     group.bench_function("eval_cold", |b| {
-        let ctx = rt.block_on(JsContext::new(None, None)).unwrap();
+        let mut ctx = rt.block_on(JsContext::new(None, None)).unwrap();
         b.iter(|| rt.block_on(ctx.eval(src)).unwrap());
     });
 
     // Warm path: Persistent<Function> compiled once, invoked per iteration.
     group.bench_function("run_script_cached_warm", |b| {
-        let ctx = rt.block_on(JsContext::new(None, None)).unwrap();
+        let mut ctx = rt.block_on(JsContext::new(None, None)).unwrap();
         // Compile once (fills the cache), then measure repeated invocations.
         rt.block_on(ctx.run_script_cached(src, None)).unwrap();
         b.iter(|| rt.block_on(ctx.run_script_cached(src, None)).unwrap());
@@ -149,8 +149,8 @@ fn script_iteration(c: &mut Criterion) {
 /// 3. Native-vs-JS — same operation, native bridge vs pure JS.
 fn native_vs_js(c: &mut Criterion) {
     let rt = tokio_rt();
-    let ctx = rt.block_on(JsContext::new(None, None)).unwrap();
-    rt.block_on(tropel_native::install_all(&ctx)).unwrap();
+    let mut ctx = rt.block_on(JsContext::new(None, None)).unwrap();
+    rt.block_on(tropel_native::install_all(&mut ctx)).unwrap();
 
     let mut group = c.benchmark_group("native_vs_js");
     group.sample_size(30);

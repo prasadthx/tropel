@@ -18,7 +18,7 @@ pub(crate) async fn create_vu_js_context(
     pm_state: &SharedPmState,
     http_client: &Arc<HttpClient>,
 ) -> Option<tropel_js::JsContext> {
-    let ctx = match tropel_js::JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
+    let mut ctx = match tropel_js::JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
         .await
     {
         Ok(ctx) => ctx,
@@ -67,12 +67,12 @@ pub(crate) async fn create_vu_js_context(
         );
     }
 
-    if let Err(e) = tropel_native::install_all(&ctx).await {
+    if let Err(e) = tropel_native::install_all(&mut ctx).await {
         tracing::warn!("VU {}: Failed to install native modules: {}", vu_id, e);
     }
 
     let bridge = tropel_pm::bridge_fns::PmBridge::new(pm_state.clone(), http_client.clone());
-    if let Err(e) = bridge.install(&ctx) {
+    if let Err(e) = bridge.install(&mut ctx) {
         tracing::warn!("VU {}: Failed to install PM bridge functions: {}", vu_id, e);
     }
 

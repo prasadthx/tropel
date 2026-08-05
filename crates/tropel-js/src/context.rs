@@ -216,12 +216,17 @@ pub struct JsContext {
     max_execution_time: Duration,
 }
 
-// Safety: each JsContext owns its own rquickjs Runtime, and thread-per-core
-// architecture ensures it is only ever used from a single thread at a time.
-// Sync is required because `&self` async methods (eval, run_script_cached,
-// etc.) need `&JsContext: Send`, which requires `JsContext: Sync`.
+// Safety: each JsContext owns its own rquickjs Runtime, and the thread-per-
+// core architecture ensures it is only ever used from a single thread at a
+// time. `Send` lets the whole VU future move onto its pinned worker thread.
+//
+// `Sync` is deliberately NOT implemented: rquickjs is built with
+// `full-async` (no `parallel` feature), so `Runtime`/`Context` are `!Sync`
+// and `Persistent` is `!Send + !Sync`. `&JsContext` across threads would
+// allow concurrent QuickJS refcount mutation (non-atomic Rc) → heap
+// corruption with no compiler complaint. All JS entry points therefore take
+// `&mut self`, so a `JsContext` can only ever be used exclusively.
 unsafe impl Send for JsContext {}
-unsafe impl Sync for JsContext {}
 
 /// Get the current time as nanoseconds since UNIX epoch.
 fn now_nanos() -> u64 {
@@ -326,7 +331,7 @@ impl JsContext {
     /// in the JS runtime. This method drives those jobs to completion.
     ///
     /// Returns the number of times we pumped (0 means nothing was pending).
-    fn pump_promise_queue(&self) -> Result<u32> {
+    fn pump_promise_queue(&mut self) -> Result<u32> {
         let mut pump_count = 0u32;
         let max_iterations = 1000; // safety limit
         for _ in 0..max_iterations {
@@ -465,7 +470,7 @@ impl JsContext {
     /// Evaluate JavaScript code and return the result as a string.
     /// After evaluation, pumps the promise job queue to resolve any
     /// pending microtasks (Promise callbacks, async/await continuations).
-    pub async fn eval(&self, code: &str) -> Result<String> {
+    pub async fn eval(&mut self, code: &str) -> Result<String> {
         self.reset_interrupt();
         let code = code.to_string();
         let result = self.ctx.with(move |ctx| {
@@ -492,7 +497,7 @@ impl JsContext {
     /// 3. Surfaces rejections as errors instead of swallowing them
     ///
     /// If the script does NOT return a Promise, it behaves like `eval()`.
-    pub async fn eval_async(&self, code: &str) -> Result<String> {
+    pub async fn eval_async(&mut self, code: &str) -> Result<String> {
         self.reset_interrupt();
         let code = code.to_string();
 
@@ -522,7 +527,7 @@ impl JsContext {
     }
 
     /// Set a global variable from a string value.
-    pub async fn set_global_str(&self, name: &str, value: &str) -> Result<()> {
+    pub async fn set_global_str(&mut self, name: &str, value: &str) -> Result<()> {
         let name = name.to_string();
         let value = value.to_string();
         self.ctx.with(move |ctx| {
@@ -534,7 +539,7 @@ impl JsContext {
     }
 
     /// Set a global variable from a JSON value.
-    pub async fn set_global_json(&self, name: &str, json_value: &serde_json::Value) -> Result<()> {
+    pub async fn set_global_json(&mut self, name: &str, json_value: &serde_json::Value) -> Result<()> {
         let s = serde_json::to_string(json_value)
             .map_err(|e| JsError::Conversion(format!("JSON serialization error: {}", e)))?;
         let name = name.to_string();
@@ -558,7 +563,7 @@ impl JsContext {
     }
 
     /// Get a global variable as a string.
-    pub async fn get_global(&self, name: &str) -> Result<Option<String>> {
+    pub async fn get_global(&mut self, name: &str) -> Result<Option<String>> {
         let name = name.to_string();
         self.ctx.with(move |ctx| {
             let globals = ctx.globals();
@@ -575,7 +580,7 @@ impl JsContext {
     }
 
     /// Execute a JS script and return whether it completed successfully.
-    pub async fn run_script(&self, code: &str) -> Result<bool> {
+    pub async fn run_script(&mut self, code: &str) -> Result<bool> {
         self.eval(code).await?;
         Ok(true)
     }
@@ -591,7 +596,7 @@ impl JsContext {
     /// Note: kept as public API; in-tree callers (runner.rs) now use
     /// `run_script_cached` exclusively (its wrapper is async too), so this
     /// method has no internal callers but remains available for embedders.
-    pub async fn run_script_async(&self, source: &str) -> Result<bool> {
+    pub async fn run_script_async(&mut self, source: &str) -> Result<bool> {
         self.reset_interrupt();
         let source = source.to_string();
 
@@ -645,7 +650,7 @@ impl JsContext {
     /// `"prerequest.js"` or `"test.js"`). When set, it's injected as
     /// `//# sourceURL=<source_url>` in the wrapper and used in error messages.
     pub async fn run_script_cached(
-        &self,
+        &mut self,
         source: &str,
         source_url: Option<String>,
     ) -> Result<bool> {
@@ -737,7 +742,7 @@ impl JsContext {
     }
 
     /// Run embedded JS library code (bootstrap).
-    pub async fn bootstrap_library(&self, code: &str) -> Result<()> {
+    pub async fn bootstrap_library(&mut self, code: &str) -> Result<()> {
         tracing::debug!("Bootstrapping JS library ({} chars)", code.len());
         self.eval(code).await?;
         Ok(())
@@ -760,7 +765,7 @@ impl JsContext {
     /// installed on the underlying `JSRuntime` (`JS_SetModuleLoaderFunc2`), so
     /// it applies to all contexts of this runtime — no ordering constraint
     /// relative to `Context::full`.
-    pub fn set_module_loader<R, L>(&self, resolver: R, loader: L)
+    pub fn set_module_loader<R, L>(&mut self, resolver: R, loader: L)
     where
         R: rquickjs::loader::Resolver + 'static,
         L: rquickjs::loader::Loader + 'static,
@@ -771,7 +776,7 @@ impl JsContext {
     /// Execute a closure with access to the underlying rquickjs Ctx.
     /// This is used by bridge modules to register native functions as JS globals.
     /// The closure runs synchronously within the JS context lock.
-    pub fn with_ctx<F, R>(&self, f: F) -> R
+    pub fn with_ctx<F, R>(&mut self, f: F) -> R
     where
         F: FnOnce(&rquickjs::Ctx) -> R,
     {
@@ -814,7 +819,7 @@ mod tests {
 
     #[tokio::test]
     async fn eval_async_returns_resolved_value() {
-        let ctx = new_ctx().await;
+        let mut ctx = new_ctx().await;
         // A script that returns a Promise must return the *resolved value*,
         // not a type-name placeholder.
         let r = ctx.eval_async("Promise.resolve(42)").await.unwrap();
@@ -826,7 +831,7 @@ mod tests {
 
     #[tokio::test]
     async fn eval_async_returns_json_for_objects() {
-        let ctx = new_ctx().await;
+        let mut ctx = new_ctx().await;
         let r = ctx
             .eval_async("Promise.resolve({a: 1, b: [2, 3]})")
             .await
@@ -837,7 +842,7 @@ mod tests {
 
     #[tokio::test]
     async fn eval_async_surfaces_rejections() {
-        let ctx = new_ctx().await;
+        let mut ctx = new_ctx().await;
         let err = ctx.eval_async("Promise.reject(new Error('boom'))").await;
         let msg = format!("{:?}", err.err());
         assert!(msg.contains("rejected"), "got: {}", msg);
@@ -846,7 +851,7 @@ mod tests {
 
     #[tokio::test]
     async fn eval_async_awaits_internal_awaits() {
-        let ctx = new_ctx().await;
+        let mut ctx = new_ctx().await;
         // The awaited value must be computed after internal awaits, not the
         // pre-resolution placeholder.
         let r = ctx
@@ -858,7 +863,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_script_cached_handles_top_level_await() {
-        let ctx = new_ctx().await;
+        let mut ctx = new_ctx().await;
         // Top-level `await` must be valid inside the cached wrapper.
         let ok = ctx
             .run_script_cached(
@@ -874,7 +879,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_script_cached_surfaces_rejected_promise() {
-        let ctx = new_ctx().await;
+        let mut ctx = new_ctx().await;
         // A cached script whose returned promise rejects must surface the
         // error instead of silently swallowing it.
         let err = ctx
@@ -888,7 +893,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_script_cached_sync_script_still_works() {
-        let ctx = new_ctx().await;
+        let mut ctx = new_ctx().await;
         let ok = ctx
             .run_script_cached("globalThis.__tropel_x = 7;", Some("sync.js".to_string()))
             .await

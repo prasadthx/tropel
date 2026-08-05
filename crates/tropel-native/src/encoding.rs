@@ -10,7 +10,7 @@ impl NativeModule for EncodingModule {
         "__tropel_native_encoding"
     }
 
-    fn install(&self, ctx: &JsContext) -> Result<()> {
+    fn install(&self, ctx: &mut JsContext) -> Result<()> {
         ctx.with_ctx(|rq_ctx| {
             let globals = rq_ctx.globals();
 

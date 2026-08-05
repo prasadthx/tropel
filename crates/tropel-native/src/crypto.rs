@@ -18,7 +18,7 @@ impl NativeModule for CryptoModule {
         "__tropel_native_crypto"
     }
 
-    fn install(&self, ctx: &JsContext) -> Result<()> {
+    fn install(&self, ctx: &mut JsContext) -> Result<()> {
         ctx.with_ctx(|rq_ctx| {
             let globals = rq_ctx.globals();
 
