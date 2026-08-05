@@ -456,7 +456,7 @@ pub(crate) fn load_module_aot(path: &Path) -> std::result::Result<Module, anyhow
     if let Some(m) = module_cache()
         .lock()
         .ok()
-        .and_then(|mut c| c.get(&key).cloned())
+        .and_then(|c| c.get(&key).cloned())
     {
         return Ok(m);
     }

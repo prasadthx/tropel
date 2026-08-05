@@ -78,6 +78,23 @@ use tropel_ext::traits::{Driver, DriverHttpClient, DriverInstance, DriverRegistr
 use wasmtime::{Caller, Extern, Linker, Memory, Module, Store, TypedFunc};
 
 // ══════════════════════════════════════════════════════════════════
+// Host-call DoS bounds
+// ══════════════════════════════════════════════════════════════════
+
+/// Per-call ceiling for guest-controlled `sleep` / `timeout_ms` values (ms).
+/// A hostile module can pass `1e300`; the float→int conversion saturates to
+/// `u64::MAX` ms (≈ 584 M years). Fuel does NOT tick during host calls, so
+/// this clamp is the DoS guard for the sleep path.
+const MAX_HOST_CALL_MS: f64 = 60_000.0;
+
+/// Per-iteration total sleep budget (ms). Host `env.sleep` draws from it;
+/// once exhausted, further sleeps are refused (no blocking) and the
+/// iteration is failed when the module returns. This bounds a module that
+/// would otherwise sleep in repeated 60 s chunks forever (each
+/// `adapter_run_iteration` gets a fresh budget).
+const ITERATION_SLEEP_BUDGET_MS: f64 = 60_000.0;
+
+// ══════════════════════════════════════════════════════════════════
 // WasmDriver — the stateless Driver factory
 // ══════════════════════════════════════════════════════════════════
 
@@ -144,8 +161,28 @@ impl Driver for WasmDriver {
             .func_wrap("env", "http_request", http_request_host)
             .map_err(wasm_err)?;
         linker
-            .func_wrap("env", "sleep", |_: Caller<'_, WasmDriverState>, ms: f64| {
-                std::thread::sleep(Duration::from_millis(ms.max(0.0) as u64));
+            .func_wrap("env", "sleep", |mut caller: Caller<'_, WasmDriverState>, ms: f64| {
+                // NaN / negative / absurd values are coerced first:
+                // NaN.max(0.0) → 0.0, so a hostile `sleep(1e300)` is handled
+                // below instead of saturating to u64::MAX ms (≈ 584 M years).
+                let ms = ms.max(0.0);
+                // Check the RAW value against the remaining budget BEFORE any
+                // clamping: `sleep(60001)` must trip the budget even though
+                // the per-call clamp would reduce it to exactly 60 000 ms.
+                // Over budget → do NOT block (the P0 hang vector). Record the
+                // violation; run_iteration fails the iteration after the call.
+                let sleep_for = ms.min(MAX_HOST_CALL_MS);
+                {
+                    let state = caller.data_mut();
+                    if ms > state.sleep_budget_ms {
+                        state.sleep_over_budget = true;
+                        return;
+                    }
+                    state.sleep_budget_ms -= sleep_for;
+                }
+                if sleep_for > 0.0 {
+                    std::thread::sleep(Duration::from_millis(sleep_for as u64));
+                }
             })
             .map_err(wasm_err)?;
         linker
@@ -196,6 +233,16 @@ fn wasm_err(e: impl std::fmt::Display) -> TropelError {
 pub struct WasmDriverState {
     pub http_client: Option<Arc<dyn DriverHttpClient + Send + Sync>>,
     pub samples: Vec<Sample>,
+    /// Remaining per-iteration sleep budget in ms. Host `env.sleep` draws
+    /// from it; once exhausted, further sleeps are refused (no blocking) and
+    /// [`Self::sleep_over_budget`] is set so the iteration fails. (Fuel does
+    /// not tick during host calls, so without this a hostile module could
+    /// sleep in repeated 60 s chunks indefinitely.) Reset every iteration.
+    pub sleep_budget_ms: f64,
+    /// Set when a host `env.sleep` call exceeded the remaining per-iteration
+    /// budget. `run_iteration` fails the iteration after the module returns
+    /// (the host function cannot trap — it just refuses to block).
+    pub sleep_over_budget: bool,
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -214,11 +261,15 @@ pub struct WasmDriverInstance {
 #[async_trait]
 impl DriverInstance for WasmDriverInstance {
     async fn run_iteration(&mut self, ctx: &mut VuContext) -> Result<()> {
-        // Per-iteration state: fresh client handle + fresh sample buffer.
+        // Per-iteration state: fresh client handle + fresh sample buffer +
+        // fresh sleep budget (each iteration may legitimately sleep up to
+        // ITERATION_SLEEP_BUDGET_MS; a hostile module is bounded per iteration).
         {
             let state = self.store.data_mut();
             state.http_client = ctx.http_client.clone();
             state.samples.clear();
+            state.sleep_budget_ms = ITERATION_SLEEP_BUDGET_MS;
+            state.sleep_over_budget = false;
         }
 
         // Reset the per-call instruction budget (fuel is consumed per call;
@@ -280,7 +331,17 @@ impl DriverInstance for WasmDriverInstance {
 
         // Drain samples collected by host functions, unconditionally.
         let state = self.store.data_mut();
+        let over_budget = state.sleep_over_budget;
         ctx.samples.append(&mut state.samples);
+
+        // A host sleep that refused to block (budget exhausted) fails the
+        // iteration, mirroring a trap: the module's declared pacing cannot
+        // hang the run.
+        if over_budget {
+            return Err(TropelError::Other(
+                "WASM driver iteration exceeded its per-iteration sleep budget".into(),
+            ));
+        }
 
         let ret = call_result.map_err(wasm_err)?;
         if ret != 0 {
@@ -328,7 +389,29 @@ impl WasmHttpRequest {
             auth: None,
             certificate: None,
             follow_redirects: self.follow_redirects,
-            timeout: self.timeout_ms.map(|ms| Duration::from_millis(ms as u64)),
+            // Bound the guest-supplied timeout. `timeout_ms: 1e300` would
+            // saturate to u64::MAX ms and silently replace the client's
+            // default request timeout, parking the caller on rx.recv() with
+            // no bound. A non-positive value falls back to the client's
+            // DEFAULT_REQUEST_TIMEOUT (10 s) — never an unbounded wait — and
+            // an over-ceiling value is clamped with a warning.
+            timeout: self.timeout_ms.and_then(|ms| {
+                let ms = ms.max(0.0);
+                if ms <= 0.0 {
+                    // Client default applies (bounded); reqwest treats a
+                    // zero timeout as an instant failure, so None is the
+                    // correct "no per-request override" spelling.
+                    None
+                } else if ms > MAX_HOST_CALL_MS {
+                    tracing::warn!(
+                        "WASM driver timeout_ms({ms}ms) clamped to {}s (DoS guard)",
+                        MAX_HOST_CALL_MS as u64 / 1000
+                    );
+                    Some(Duration::from_millis(MAX_HOST_CALL_MS as u64))
+                } else {
+                    Some(Duration::from_millis(ms as u64))
+                }
+            }),
             response_type: tropel_core::types::ResponseType::Text,
         }
     }
@@ -599,6 +682,29 @@ mod tests {
 )
 "#;
 
+    const SLEEP_DRIVER_WAT: &str = r#"
+(module
+  (import "env" "sleep" (func $sleep (param f64)))
+  (memory (export "memory") 64 256)
+  (func (export "adapter_run_iteration") (param $in i32) (param $in_len i32) (result i32)
+    ;; sleep(ITERATION_SLEEP_BUDGET_MS + 1) — must trap via the budget, not
+    ;; actually block the thread.
+    (call $sleep (f64.const 60001.0))
+    (i32.const 0))
+)
+"#;
+
+    const SLEEP_OK_DRIVER_WAT: &str = r#"
+(module
+  (import "env" "sleep" (func $sleep (param f64)))
+  (memory (export "memory") 64 256)
+  (func (export "adapter_run_iteration") (param $in i32) (param $in_len i32) (result i32)
+    ;; sleep(1ms) — well within budget, must succeed.
+    (call $sleep (f64.const 1.0))
+    (i32.const 0))
+)
+"#;
+
     struct StubClient;
 
     #[async_trait]
@@ -726,5 +832,97 @@ mod tests {
             start.elapsed() < Duration::from_secs(5),
             "infinite loop must trap quickly"
         );
+    }
+
+    #[tokio::test]
+    async fn test_sleep_over_budget_traps_quickly() {
+        // P0 regression: `sleep(1e300)` saturated to u64::MAX ms (584 M
+        // years) and hung the run — fuel doesn't tick during host calls, so
+        // the instruction budget never applied. A sleep that would exceed the
+        // per-iteration budget must trap IMMEDIATELY (no actual sleeping).
+        let driver = WasmDriver;
+        let mut inst = driver
+            .init(SLEEP_DRIVER_WAT.as_bytes(), None, None)
+            .await
+            .expect("driver init must succeed");
+
+        let mut ctx = VuContext::new(1, 0, "default".into());
+        let start = std::time::Instant::now();
+        let result = inst.run_iteration(&mut ctx).await;
+        assert!(
+            result.is_err(),
+            "over-budget sleep must trap, got {:?}",
+            result
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "over-budget sleep must trap without blocking (took {:?})",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sleep_within_budget_succeeds() {
+        // A legitimate small sleep must still work.
+        let driver = WasmDriver;
+        let mut inst = driver
+            .init(SLEEP_OK_DRIVER_WAT.as_bytes(), None, None)
+            .await
+            .expect("driver init must succeed");
+
+        let mut ctx = VuContext::new(1, 0, "default".into());
+        let start = std::time::Instant::now();
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("1ms sleep within budget must succeed");
+        assert!(
+            start.elapsed() >= Duration::from_millis(1),
+            "sleep should have actually blocked ~1ms"
+        );
+    }
+
+    #[test]
+    fn test_timeout_ms_clamped() {
+        // P0 regression: `timeout_ms: 1e300` saturated to u64::MAX and
+        // replaced the client's default request timeout, parking the caller
+        // on rx.recv() with no bound. The clamp caps it at MAX_HOST_CALL_MS.
+        let req = WasmHttpRequest {
+            url: "http://example.com".into(),
+            method: "GET".into(),
+            headers: HashMap::new(),
+            body: None,
+            timeout_ms: Some(1e300),
+            follow_redirects: true,
+        }
+        .into_request();
+        assert_eq!(
+            req.timeout,
+            Some(Duration::from_millis(MAX_HOST_CALL_MS as u64))
+        );
+
+        // Sub-ceiling values pass through unchanged.
+        let req = WasmHttpRequest {
+            url: "http://example.com".into(),
+            method: "GET".into(),
+            headers: HashMap::new(),
+            body: None,
+            timeout_ms: Some(2500.0),
+            follow_redirects: true,
+        }
+        .into_request();
+        assert_eq!(req.timeout, Some(Duration::from_millis(2500)));
+
+        // Non-positive → falls back to the client's default request timeout
+        // (bounded) instead of an instant-fail zero or an unbounded wait.
+        let req = WasmHttpRequest {
+            url: "http://example.com".into(),
+            method: "GET".into(),
+            headers: HashMap::new(),
+            body: None,
+            timeout_ms: Some(-5.0),
+            follow_redirects: true,
+        }
+        .into_request();
+        assert_eq!(req.timeout, None);
     }
 }
