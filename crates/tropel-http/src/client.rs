@@ -1,5 +1,5 @@
 use crate::auth::AuthSigner;
-use crate::dns::DnsResolver;
+use crate::dns::{parse_blacklist, DnsResolver, IpCidr};
 use crate::rps::RpsLimiter;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -43,6 +43,13 @@ pub struct HttpClient {
     /// Log every HTTP request/response (method, URL, status, timing) at
     /// debug level — the `--http-debug` flag / `HttpConfig.http_debug`.
     http_debug: bool,
+    /// k6 `blacklistIPs` CIDRs, parsed once at client build. Hostnames are
+    /// filtered by the DNS resolver, but an IP-literal URL (e.g.
+    /// `http://127.0.0.1:8080`) never triggers a lookup — reqwest hands the
+    /// literal straight to the connector. This list backs the per-hop
+    /// literal check in `execute()` so a blacklisted literal (including a
+    /// redirect target) is rejected before any connection attempt.
+    blacklist: Vec<IpCidr>,
 }
 
 impl HttpClient {
@@ -114,6 +121,7 @@ impl HttpClient {
             discard_bodies: config.discard_response_bodies,
             rps,
             http_debug: config.http_debug,
+            blacklist: parse_blacklist(&config.blacklist_ips),
         })
     }
 
@@ -434,6 +442,11 @@ impl HttpClient {
         };
         let mut redirects: Vec<HttpResponse> = Vec::new();
         let mut current_url = request.url.clone();
+        // k6 `blacklistIPs` — IP-literal check. Hostnames are filtered by the
+        // DNS resolver; IP literals never resolve, so the blacklist is
+        // enforced here per hop (the initial URL AND every redirect target,
+        // since a redirect can bounce into a blocked network).
+        check_literal_blacklist(&self.blacklist, &current_url)?;
         let mut current_method = request.method.clone();
         let mut current_body: Option<Vec<u8>> = body_bytes.clone();
         let mut hop_index: usize = 0;
@@ -443,6 +456,9 @@ impl HttpClient {
         let mut strip_sensitive = false;
 
         loop {
+            // Each redirect hop is checked too — a Location header pointing
+            // at a blacklisted literal must not slip past the resolver.
+            check_literal_blacklist(&self.blacklist, &current_url)?;
             let hop_start = std::time::Instant::now();
             crate::subtimings::begin_request(hop_start);
 

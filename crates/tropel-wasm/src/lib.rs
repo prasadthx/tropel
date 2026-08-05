@@ -66,7 +66,9 @@
 pub mod driver;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use tropel_core::scenario::{Scenario, ScenarioInfo, ScenarioItem};
 use tropel_core::types::{AuthConfig, Body, Method, Request};
@@ -416,57 +418,149 @@ impl WasmPlugin {
     }
 }
 
-/// Load a `.wasm` module with the AOT `.cwasm` cache (see
-/// [`WasmPlugin::from_file`] for the cache-freshness + sidecar-hash rules).
+/// Load a `.wasm` module with the AOT `.cwasm` cache.
 ///
-/// Shared by the declarative adapters (`WasmPlugin::from_file`) and the
+/// Shared by the declarative adapters ([`WasmPlugin::from_file`]) and the
 /// imperative driver (`driver.rs`), so both get JIT-free reloads.
+///
+/// # Cache security model (P0 fixes)
+///
+/// The old cache sat **next to the plugin file** and its sidecar hashed the
+/// *source* `.wasm`; a malicious tarball pairing a benign `evil.wasm` with an
+/// attacker-authored `evil.cwasm` + `evil.cwasm.sha256 = sha256(evil.wasm)`
+/// passed the check and `unsafe Module::deserialize` ran the attacker's
+/// native code — bypassing fuel, the 16 MiB cap, and
+/// `define_unknown_imports_as_traps` (the `.wasm` never compiled).
+///
+/// Now:
+/// - The cache lives in a **host-private `0700` dir** (`wasm_cache_dir()`),
+///   keyed by `sha256(source)` — never beside third-party plugin files, so a
+///   plugin tarball cannot plant a cache entry.
+/// - The sidecar authenticates the **artifact we deserialize**: it stores
+///   `sha256(.cwasm bytes)`, and the cache is only trusted when the file on
+///   disk re-hashes to it. A tampered/torn/foreign artifact fails the check
+///   and is recompiled from the trusted source bytes.
+/// - Writes are **atomic** (`<tmp>.<pid>` + rename): concurrent `init()`s on
+///   a cold cache can never hand `deserialize` torn bytes.
+/// - A process-global in-memory cache means each unique source is compiled
+///   **once per process**, not once per VU.
 pub(crate) fn load_module_aot(path: &Path) -> std::result::Result<Module, anyhow::Error> {
     let wasm_bytes = std::fs::read(path)
         .map_err(|e| anyhow::anyhow!("failed to read '{}': {}", path.display(), e))?;
-    let cache_path = path.with_extension("cwasm");
-    // Sidecar holds the SHA-256 of the SOURCE .wasm that produced the
-    // cache. A .cwasm whose sidecar hash doesn't match the current source
-    // is a foreign/tampered cache — we refuse to deserialize it (wasmtime's
-    // Module::deserialize is `unsafe` precisely because it trusts its
-    // input), and instead recompile from the trusted .wasm bytes.
-    let hash_path = path.with_extension("cwasm.sha256");
+    let key = sha256_hex(&wasm_bytes);
     let engine = global_engine();
 
-    let cache_is_fresh = std::fs::metadata(&cache_path)
-        .and_then(|cache_md| {
-            std::fs::metadata(path).map(|src_md| {
-                cache_md
-                    .modified()
-                    .is_ok_and(|cache_t| src_md.modified().is_ok_and(|src_t| cache_t >= src_t))
-            })
-        })
-        .unwrap_or(false);
-    // Cache is only trusted if it exists, is fresh, AND its sidecar hash
-    // equals the SHA-256 of the source bytes we're about to load.
-    let cache_matches_source = cache_is_fresh
-        && std::fs::read_to_string(&hash_path)
-            .map(|h| h.trim() == sha256_hex(&wasm_bytes))
-            .unwrap_or(false);
+    // In-memory module cache: compile once per unique source, share the
+    // compiled artifact across all VUs (thread-per-core calls init() from
+    // many VU threads concurrently).
+    if let Some(m) = module_cache()
+        .lock()
+        .ok()
+        .and_then(|mut c| c.get(&key).cloned())
+    {
+        return Ok(m);
+    }
 
-    if cache_matches_source {
-        let cached = std::fs::read(&cache_path)?;
-        // SAFETY: `cached` was verified to be produced from the exact
-        // source bytes (sidecar hash match) by the same engine version
-        // (wasmtime 47, fixed in Cargo.toml). If the cache is from an
-        // incompatible engine, deserialize fails and we fall through to
-        // recompiling below.
+    let cache_dir = wasm_cache_dir();
+    let cache_path = cache_dir.join(format!("{key}.cwasm"));
+    let hash_path = cache_dir.join(format!("{key}.sha256"));
+
+    // Cache is trusted ONLY if the artifact on disk re-hashes to the sidecar
+    // we wrote for it. A missing/mismatched cache falls through to compile.
+    let cache_artifact = std::fs::read(&cache_path).ok();
+    let cache_trusted = cache_artifact
+        .as_ref()
+        .zip(std::fs::read_to_string(&hash_path).ok())
+        .map(|(bytes, sidecar)| sidecar.trim() == sha256_hex(bytes))
+        .unwrap_or(false);
+
+    let module = if cache_trusted {
+        let cached = cache_artifact.expect("cache_trusted implies artifact exists");
+        // SAFETY: `cached` re-hashes to the sidecar we wrote for this exact
+        // source, in a host-private dir, produced by this engine version.
+        // A cache from an incompatible engine fails deserialize and we
+        // recompile below.
         match unsafe { Module::deserialize(engine, &cached) } {
-            Ok(m) => Ok(m),
-            Err(_) => aot_compile(engine, &wasm_bytes, &cache_path, &hash_path),
+            Ok(m) => m,
+            Err(_) => aot_compile(engine, &wasm_bytes, &cache_path, &hash_path)?,
         }
     } else {
-        aot_compile(engine, &wasm_bytes, &cache_path, &hash_path)
+        aot_compile(engine, &wasm_bytes, &cache_path, &hash_path)?
+    };
+
+    if let Ok(mut c) = module_cache().lock() {
+        c.insert(key, module.clone());
     }
+    Ok(module)
 }
 
-/// Precompile wasm bytes, persist the `.cwasm` cache + its source-hash
-/// sidecar, and load it (shared by adapters and the driver).
+/// Host-private AOT cache directory: `~/.cache/tropel/wasm-cache` (unix) /
+/// `%LOCALAPPDATA%\tropel\wasm-cache` (Windows), created with `0700`
+/// permissions. Never the plugin's own directory — a third-party plugin must
+/// not be able to plant a `.cwasm` next to its `.wasm`.
+fn wasm_cache_dir() -> PathBuf {
+    let base = if cfg!(windows) {
+        std::env::var("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir())
+    } else {
+        std::env::var("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .ok()
+            .filter(|p| !p.as_os_str().is_empty())
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| PathBuf::from(h).join(".cache"))
+            })
+            .unwrap_or_else(std::env::temp_dir)
+    };
+    let dir = base.join("tropel").join("wasm-cache");
+    let _ = std::fs::create_dir_all(&dir);
+    // 0700 is load-bearing even on the temp_dir fallback (unix /tmp is
+    // world-writable): another local user must not be able to pre-plant a
+    // `.cwasm` + sidecar pair that matches a source hash we later load.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    dir
+}
+
+/// Process-global compiled-module cache, keyed by `sha256(source)`. Lets all
+/// VUs share ONE compiled artifact per unique plugin (no per-VU JIT/AOT).
+fn module_cache() -> &'static Mutex<HashMap<String, Module>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Module>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Unique suffix for `atomic_write` temp files. The pid alone is not unique:
+/// concurrent VU threads in one process share the pid, so two writers could
+/// collide on the same tmp name (truncate+write interleave → torn file, and a
+/// failed rename on Windows where rename-over-existing is an error). The
+/// per-call counter makes every writer's tmp file distinct.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Atomic write: write to a unique temp name, then rename over the target.
+/// Concurrent writers can never produce a torn file (rename is atomic on the
+/// same filesystem), and readers never observe partial bytes. A failed rename
+/// (e.g. Windows refusing to replace an existing file) degrades to a logged
+/// cache miss — never corruption, since the in-memory `module_cache` covers
+/// intra-process reuse anyway.
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let unique = format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let tmp = path.with_extension(unique);
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Precompile wasm bytes, persist the `.cwasm` cache + its artifact-hash
+/// sidecar atomically, and load it (shared by adapters and the driver).
 pub(crate) fn aot_compile(
     engine: &Engine,
     wasm_bytes: &[u8],
@@ -474,13 +568,13 @@ pub(crate) fn aot_compile(
     hash_path: &Path,
 ) -> std::result::Result<Module, anyhow::Error> {
     let compiled = engine.precompile_module(wasm_bytes)?;
-    if let Err(e) = std::fs::write(cache_path, &compiled) {
+    if let Err(e) = atomic_write(cache_path, &compiled) {
         tracing::warn!(
             "Failed to write WASM AOT cache '{}': {}",
             cache_path.display(),
             e
         );
-    } else if let Err(e) = std::fs::write(hash_path, sha256_hex(wasm_bytes)) {
+    } else if let Err(e) = atomic_write(hash_path, sha256_hex(&compiled).as_bytes()) {
         tracing::warn!(
             "Failed to write WASM cache hash '{}': {}",
             hash_path.display(),
@@ -1049,8 +1143,23 @@ mod tests {
         let plugin1 = WasmInputAdapter::from_file(&wasm_path).expect("first load must succeed");
         assert_eq!(plugin1.plugin_id(), "roundtrip-plugin");
 
-        let cache_path = temp.path().join("plugin.cwasm");
+        // The cache lives in the host-private dir keyed by sha256(source),
+        // never beside the plugin file (P0: an attacker-authored .cwasm next
+        // to a benign .wasm must not be deserialized).
+        let key = sha256_hex(ECHO_WAT.as_bytes());
+        let cache_path = wasm_cache_dir().join(format!("{key}.cwasm"));
         assert!(cache_path.exists(), "AOT cache must be written");
+        assert!(
+            !temp.path().join("plugin.cwasm").exists(),
+            "cache must NOT sit beside the plugin file"
+        );
+        // Sidecar authenticates the ARTIFACT: it must equal the hash of the
+        // .cwasm bytes (not the source) — tampering with the artifact breaks
+        // the match and forces a recompile.
+        let sidecar = std::fs::read_to_string(wasm_cache_dir().join(format!("{key}.sha256")))
+            .unwrap();
+        let artifact = std::fs::read(&cache_path).unwrap();
+        assert_eq!(sidecar.trim(), sha256_hex(&artifact));
 
         // Second load reuses the .cwasm cache.
         let plugin2 = WasmInputAdapter::from_file(&wasm_path).expect("cached load must succeed");
