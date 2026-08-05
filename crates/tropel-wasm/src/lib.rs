@@ -114,8 +114,24 @@ pub fn create_wasm_engine() -> std::result::Result<Engine, anyhow::Error> {
     // Pooling allocator (per C3): reuse memory/table/stack slots across
     // instances. Cheap Store/Instance creation per call.
     // (total_stacks is async-gated in wasmtime, so it stays at its default.)
+    //
+    // Pool sizing matters for the DRIVER path: every WASM driver VU holds a
+    // live Store/Instance for the WHOLE test, so a small pool silently caps
+    // the VU count. The old config kept wasmtime's default 4 GiB
+    // `memory_reservation` per slot, so 16 slots already reserved ~64 GiB of
+    // *virtual* address space — and `--vus 500` silently ran 16 VUs (VU #17
+    // failed to instantiate; the engine swallowed the error and the summary
+    // reported the requested count).
+    //
+    // Fix: shrink the per-slot reservation to the 16 MiB memory cap (and the
+    // guard to 64 KiB) so the pool holds 4096 concurrent instances at the
+    // SAME ~64 GiB of virtual address space. Runs that exhaust the pool now
+    // fail LOUDLY in the engine instead of silently truncating the VU count.
+    config.memory_reservation(MAX_MEMORY_BYTES as u64);
+    config.memory_guard_size(64 * 1024);
+
     let mut pooling = PoolingAllocationConfig::default();
-    pooling.total_memories(16).total_tables(16);
+    pooling.total_memories(4096).total_tables(4096);
     // Cap linear memory to 16 MiB for ALL instances — imported AND exported
     // memories alike (memory_pages was removed in wasmtime 47; max_memory_size
     // is the modern engine-level ceiling and it covers exported memories). A

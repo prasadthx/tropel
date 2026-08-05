@@ -571,6 +571,21 @@ async fn run_command(cli: Cli) -> Result<()> {
         result.metrics.checks_total
     );
 
+    // VUs that failed to START (e.g. WASM driver pool exhaustion) mean the
+    // requested load was not delivered — the summary has already printed, so
+    // fail loudly here with a non-zero exit instead of silently reporting the
+    // requested VU count as if the run succeeded.
+    if result.vu_init_failures > 0 {
+        tracing::error!(
+            "{} VU(s) failed to start — requested load was NOT delivered (see errors above)",
+            result.vu_init_failures
+        );
+        return Err(TropelError::Other(format!(
+            "{} VU(s) failed to start — requested load was not delivered",
+            result.vu_init_failures
+        )));
+    }
+
     // Evaluate thresholds and drive exit code. Uses the engine's EFFECTIVE
     // threshold set (job thresholds merged with script-declared ones, e.g.
     // k6 `export const options` thresholds) so k6 SLOs are reported too.

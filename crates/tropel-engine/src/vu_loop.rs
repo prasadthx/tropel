@@ -13,6 +13,7 @@ use crate::worker::VUWorkerPool;
 use async_trait::async_trait;
 use rand::RngExt;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tropel_core::config::{ExecutionConfig, HttpConfig, ThinkTimeConfig, ThresholdConfig, TlsConfig};
@@ -309,6 +310,12 @@ struct VuRunShared {
     is_per_vu_iterations: bool,
     think_time: ThinkTimeConfig,
     executor_name: String,
+    /// Count of VUs that failed to START (driver init / HTTP client creation).
+    /// Incremented inside the per-VU task before it bails; read after the
+    /// executor run so a silently-truncated VU count (e.g. WASM pool
+    /// exhaustion) becomes a LOUD error instead of the summary reporting the
+    /// requested count.
+    vu_init_failures: Arc<AtomicU32>,
 }
 
 /// Shared VU-run scaffolding used by both the scenario and driver paths:
@@ -331,7 +338,8 @@ async fn run_vus<F>(
     test_start: Instant,
     control_port: Option<u16>,
     run_vu: F,
-) where
+) -> u32
+where
     F: Fn(Arc<VUScheduler>, u32, &VuRunShared) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
 {
     if start_delay > Duration::ZERO {
@@ -381,6 +389,7 @@ async fn run_vus<F>(
         test_start,
     );
 
+    let vu_init_failures = Arc::new(AtomicU32::new(0));
     let shared = VuRunShared {
         metrics: metrics.clone(),
         sc_tags: sc_tags.clone(),
@@ -390,12 +399,26 @@ async fn run_vus<F>(
         is_per_vu_iterations,
         think_time: think_time_cfg,
         executor_name,
+        vu_init_failures: vu_init_failures.clone(),
     };
 
     executor
         .run(move |sched, vu_id| run_vu(sched, vu_id, &shared))
         .await
         .ok();
+
+    // A VU that failed to START (driver init / client creation) means the
+    // requested load was NOT delivered — surfacing the count loudly here (and
+    // up through run_scenario_vus/run_driver_vus to the engine, which fails
+    // the run) turns silent truncation into an explicit failure.
+    let init_failures = vu_init_failures.load(Ordering::SeqCst);
+    if init_failures > 0 {
+        tracing::error!(
+            "Scenario '{}': {} VU(s) failed to start — run did not deliver the requested load",
+            sc_name,
+            init_failures
+        );
+    }
 
     // Stop the single abort coordinator — the run has finished, so a
     // lingering 2s poller would otherwise keep the metrics aggregator alive.
@@ -452,6 +475,7 @@ async fn run_vus<F>(
     if let Some(handle) = control_server {
         handle.abort();
     }
+    init_failures
 }
 
 // ── Driver HTTP client adapter ──
@@ -471,7 +495,9 @@ impl DriverHttpClient for DriverHttpClientImpl {
 
 /// Run a declarative (Postman-style) scenario: each VU builds its own
 /// HttpClient + VURunner + JS context and drives the shared loop through
-/// [`ScenarioVuSource`].
+/// [`ScenarioVuSource`]. Returns the number of VUs that failed to START
+/// (so the engine can fail the run loudly when the requested load is not
+/// delivered).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_scenario_vus(
     sc_name: String,
@@ -491,7 +517,7 @@ pub(crate) async fn run_scenario_vus(
     protocols: Arc<HashMap<String, Arc<dyn Protocol>>>,
     control_port: Option<u16>,
     rps_limiter: Option<Arc<tropel_http::RpsLimiter>>,
-) {
+) -> u32 {
     let http_cfg_c = http_cfg.clone();
     let tls_cfg_c = tls_cfg.clone();
     let rps_limiter_c = rps_limiter.clone();
@@ -552,6 +578,7 @@ pub(crate) async fn run_scenario_vus(
                     Ok(c) => c,
                     Err(e) => {
                         tracing::error!("VU {}: Failed to create HTTP client: {}", vu_id, e);
+                        shared.vu_init_failures.fetch_add(1, Ordering::SeqCst);
                         return;
                     }
                 };
@@ -587,14 +614,16 @@ pub(crate) async fn run_scenario_vus(
             handle
         },
     )
-    .await;
+    .await
 }
 
 // ── Driver entry point ──
 
 /// Run an imperative (k6-style) driver: each VU re-resolves the driver from
 /// the registry, inits a fresh instance, wraps its own HttpClient, and drives
-/// the shared loop through [`DriverVuSource`].
+/// the shared loop through [`DriverVuSource`]. Returns the number of VUs
+/// that failed to START (so the engine can fail the run loudly when the
+/// requested load is not delivered).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_driver_vus(
     sc_name: String,
@@ -616,13 +645,13 @@ pub(crate) async fn run_driver_vus(
     registry: Arc<ExtensionRegistry>,
     control_port: Option<u16>,
     rps_limiter: Option<Arc<tropel_http::RpsLimiter>>,
-) {
+) -> u32 {
     let driver_id = driver.id().to_string();
     let input_bytes = match std::fs::read(input_path) {
         Ok(b) => b,
         Err(e) => {
             tracing::error!("Scenario '{}': failed to read input: {}", sc_name, e);
-            return;
+            return 0;
         }
     };
     let input_p = std::path::Path::new(input_path).to_path_buf();
@@ -675,6 +704,7 @@ pub(crate) async fn run_driver_vus(
                     Some(d) => d,
                     None => {
                         tracing::error!("VU {}: Driver '{}' not found in registry", vu_id, driver_id);
+                        shared.vu_init_failures.fetch_add(1, Ordering::SeqCst);
                         return;
                     }
                 };
@@ -692,6 +722,7 @@ pub(crate) async fn run_driver_vus(
                             driver_id,
                             e
                         );
+                        shared.vu_init_failures.fetch_add(1, Ordering::SeqCst);
                         return;
                     }
                 };
@@ -700,6 +731,7 @@ pub(crate) async fn run_driver_vus(
                     Ok(c) => c,
                     Err(e) => {
                         tracing::error!("VU {}: Failed to create HTTP client: {}", vu_id, e);
+                        shared.vu_init_failures.fetch_add(1, Ordering::SeqCst);
                         return;
                     }
                 };
@@ -720,7 +752,7 @@ pub(crate) async fn run_driver_vus(
             handle
         },
     )
-    .await;
+    .await
 }
 // Helpers
 // ══════════════════════════════════════════════════════════════════

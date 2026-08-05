@@ -449,7 +449,7 @@ impl Engine {
                             input_path,
                             e
                         );
-                        return;
+                        return 0;
                     }
                 };
 
@@ -460,7 +460,7 @@ impl Engine {
                 // to its registered protocol (the runner's scheme lookup).
                 let protocols: Arc<HashMap<String, Arc<dyn Protocol>>> =
                     Arc::new(registry_sc.instantiate_protocols());
-                match resolved {
+                let failures = match resolved {
                     ResolvedInput::Scenario(scenario) => {
                         run_scenario_vus(
                             sc_name,
@@ -481,7 +481,7 @@ impl Engine {
                             control_port,
                             rps_limiter_sc,
                         )
-                        .await;
+                        .await
                     }
                     ResolvedInput::Driver(driver) => {
                         run_driver_vus(
@@ -505,18 +505,27 @@ impl Engine {
                             control_port,
                             rps_limiter_sc,
                         )
-                        .await;
+                        .await
                     }
-                }
+                };
 
                 tracing::info!("Scenario '{}': completed", sc_name_log);
+                failures
             });
 
             scenario_handles.push(handle);
         }
 
+        // Any VU that failed to START (e.g. WASM driver pool exhaustion)
+        // means the requested load was not delivered. Count them so the CLI
+        // can fail the run loudly AFTER the summary/teardown run — returning
+        // Err here would skip the end-of-run reporting (and the output
+        // teardown) exactly when the user most needs to see what DID run.
+        let mut total_vu_init_failures = 0u32;
         for handle in scenario_handles {
-            handle.await.ok();
+            if let Ok(failures) = handle.await {
+                total_vu_init_failures += failures;
+            }
         }
 
         // The broadcast channel only closes when ALL senders drop. The
@@ -577,6 +586,11 @@ impl Engine {
             // against THIS set so k6 SLOs appear in the end-of-run summary,
             // not just mid-run abort checks.
             effective_thresholds: thresholds,
+            // Number of VUs that failed to START (driver init / HTTP client
+            // creation). Non-zero means the requested load was NOT delivered;
+            // the CLI treats this as a hard failure (non-zero exit) after the
+            // summary prints.
+            vu_init_failures: total_vu_init_failures,
         })
     }
 
@@ -701,6 +715,10 @@ pub struct EngineResult {
     /// `export const options`). Consumers should report/evaluate against this
     /// set rather than the raw `JobConfig.thresholds`.
     pub effective_thresholds: HashMap<String, tropel_core::config::ThresholdConfig>,
+    /// Number of VUs that failed to START (driver init / HTTP client
+    /// creation). Non-zero means the requested load was NOT delivered — the
+    /// CLI exits non-zero after printing the summary.
+    pub vu_init_failures: u32,
 }
 
 

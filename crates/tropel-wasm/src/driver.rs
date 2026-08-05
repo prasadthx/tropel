@@ -977,6 +977,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_many_concurrent_driver_instances_start() {
+        // P0 regression: the pooling allocator capped concurrent WASM memories
+        // engine-wide at `total_memories(16)`. On the DRIVER path every VU
+        // holds a live Store/Instance for the whole test, so `--vus 500`
+        // silently ran only 16 VUs — VU #17 failed to instantiate and
+        // `vu_loop.rs` swallowed the error (the summary reported the requested
+        // count). The pool now holds 4096 instances; 32 concurrent driver
+        // instances must all start.
+        let driver = WasmDriver;
+        let mut instances: Vec<Box<dyn DriverInstance>> = Vec::new();
+        for _ in 0..32 {
+            let inst = driver
+                .init(DRIVER_WAT.as_bytes(), None, None)
+                .await
+                .expect("every concurrent driver instance must start");
+            instances.push(inst);
+        }
+        assert_eq!(instances.len(), 32);
+    }
+
+    #[tokio::test]
     async fn test_run_iteration_http_and_metric() {
         let driver = WasmDriver;
         let mut inst = driver
