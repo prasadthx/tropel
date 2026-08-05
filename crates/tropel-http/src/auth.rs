@@ -1001,6 +1001,12 @@ fn generate_crypto_nonce() -> String {
 /// previously duplicated builders were consolidated into this one function.
 pub fn build_auth_signer(auth: &AuthConfig) -> Option<Box<dyn AuthSigner>> {
     match auth {
+        // Explicit noauth: no signer — and crucially the RUNNER must not
+        // fall back to scenario auth. The runner's `.or(scenario.auth)`
+        // only falls through on `None`, so `Some(NoAuth)` reaching here
+        // yields no signer while still blocking inheritance (Postman
+        // semantics: noauth does NOT inherit collection/folder auth).
+        AuthConfig::NoAuth => None,
         AuthConfig::Bearer { token } => Some(Box::new(BearerAuth::new(token))),
         AuthConfig::Basic { username, password } => {
             Some(Box::new(BasicAuth::new(username, password)))

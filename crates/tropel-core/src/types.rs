@@ -343,6 +343,14 @@ pub struct Cookie {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AuthConfig {
+    /// Explicitly NO auth — Postman's `{"type":"noauth"}`. Distinct from
+    /// `None` (which means "no auth configured → inherit from the parent
+    /// scope"): a request marked noauth must NOT inherit collection/folder
+    /// auth. The runner treats `Some(NoAuth)` as "no signer, and don't fall
+    /// back to scenario auth" — the inverse of Postman semantics that the
+    /// old `None` mapping produced.
+    #[serde(rename = "noauth")]
+    NoAuth,
     #[serde(rename = "bearer")]
     Bearer { token: String },
     #[serde(rename = "basic")]

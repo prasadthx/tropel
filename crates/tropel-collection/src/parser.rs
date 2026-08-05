@@ -58,24 +58,40 @@ pub fn collection_to_scenario(
         }
     }
 
-    // Convert items
-    scenario.items = convert_items(&collection.item, &collection.event);
+    // Convert items, threading collection-level auth down as the inherited
+    // scope (Postman inheritance: request > folder > collection).
+    scenario.items =
+        convert_items(&collection.item, &collection.event, collection.auth.as_ref());
 
     scenario
 }
 
-fn convert_items(items: &[CollectionItem], parent_events: &[Event]) -> Vec<ScenarioItem> {
+fn convert_items(
+    items: &[CollectionItem],
+    parent_events: &[Event],
+    inherited_auth: Option<&CollectionAuth>,
+) -> Vec<ScenarioItem> {
     let mut result = Vec::new();
     let mut index = 0usize;
 
     for item in items {
         match item {
             CollectionItem::Request(req) => {
-                let scenario_item = convert_request_item(req, parent_events, index);
+                let scenario_item =
+                    convert_request_item(req, parent_events, inherited_auth, index);
                 result.push(scenario_item);
                 index += 1;
             }
             CollectionItem::Folder(folder) => {
+                // Folder-level auth overrides the inherited (collection/parent)
+                // auth for every request inside the folder. `inherit` passes
+                // the parent's auth through; `noauth` explicitly disables it
+                // for the whole subtree.
+                let folder_auth = match folder.auth.as_ref() {
+                    Some(a) if a.auth_type == "inherit" => inherited_auth,
+                    Some(a) => Some(a),
+                    None => inherited_auth,
+                };
                 let scenario_item = ScenarioItem {
                     id: format!("folder_{}", index),
                     name: folder.name.clone(),
@@ -83,7 +99,7 @@ fn convert_items(items: &[CollectionItem], parent_events: &[Event]) -> Vec<Scena
                     prerequest: find_prerequest_script(&folder.event),
                     test: find_test_script(&folder.event),
                     assertions: vec![],
-                    items: convert_items(&folder.item, &folder.event),
+                    items: convert_items(&folder.item, &folder.event, folder_auth),
                 };
                 result.push(scenario_item);
                 index += 1;
@@ -94,8 +110,18 @@ fn convert_items(items: &[CollectionItem], parent_events: &[Event]) -> Vec<Scena
     result
 }
 
-fn convert_request_item(req: &RequestItem, parent_events: &[Event], index: usize) -> ScenarioItem {
-    let request = convert_request(&req.request, &req.auth);
+fn convert_request_item(
+    req: &RequestItem,
+    parent_events: &[Event],
+    inherited_auth: Option<&CollectionAuth>,
+    index: usize,
+) -> ScenarioItem {
+    // v2.1 schema location for request-level auth is `item.request.auth`
+    // (RequestDetail.auth) — `item.auth` is a position the schema doesn't
+    // define, but legacy exports use it, so prefer the schema location and
+    // fall back to the legacy one.
+    let request_auth = req.request.auth.as_ref().or(req.auth.as_ref());
+    let request = convert_request(&req.request, request_auth, inherited_auth);
     let events = if req.event.is_empty() {
         parent_events
     } else {
@@ -113,7 +139,11 @@ fn convert_request_item(req: &RequestItem, parent_events: &[Event], index: usize
     }
 }
 
-fn convert_request(detail: &RequestDetail, item_auth: &Option<CollectionAuth>) -> Request {
+fn convert_request(
+    detail: &RequestDetail,
+    request_auth: Option<&CollectionAuth>,
+    inherited_auth: Option<&CollectionAuth>,
+) -> Request {
     let method = Method::parse(&detail.method).unwrap_or(Method::GET);
 
     let url = build_url(detail);
@@ -145,8 +175,27 @@ fn convert_request(detail: &RequestDetail, item_auth: &Option<CollectionAuth>) -
         headers,
         query_params,
         body,
-        auth: convert_auth(item_auth.as_ref()),
+        auth: resolve_auth(request_auth, inherited_auth),
         ..Default::default()
+    }
+}
+
+/// Resolve a request's effective auth following Postman inheritance
+/// (request > folder > collection):
+/// - explicit `noauth` → `Some(AuthConfig::NoAuth)` — disables auth and
+///   BLOCKS inheritance (the old `None` mapping made noauth inherit the
+///   parent scope, the inverse of Postman);
+/// - explicit `inherit` or no request-level auth → the inherited scope auth;
+/// - a real auth type → its config.
+fn resolve_auth(
+    request_auth: Option<&CollectionAuth>,
+    inherited_auth: Option<&CollectionAuth>,
+) -> Option<AuthConfig> {
+    match request_auth {
+        None => convert_auth(inherited_auth),
+        Some(a) if a.auth_type == "inherit" => convert_auth(inherited_auth),
+        Some(a) if a.auth_type == "noauth" => Some(AuthConfig::NoAuth),
+        Some(a) => convert_auth(Some(a)),
     }
 }
 
@@ -223,6 +272,12 @@ fn convert_body(body: Option<&RequestBody>) -> Option<Body> {
 fn convert_auth(auth: Option<&CollectionAuth>) -> Option<AuthConfig> {
     let auth = auth.as_ref()?;
     match auth.auth_type.as_str() {
+        // Explicit noauth at ANY scope (request/folder/collection) must
+        // yield Some(NoAuth) — never None. None means "no auth configured →
+        // inherit the parent scope" and the runner falls back to scenario
+        // auth on None, which would silently re-apply collection auth to a
+        // folder/request explicitly marked noauth (the inverse of Postman).
+        "noauth" => Some(AuthConfig::NoAuth),
         "bearer" => {
             let token = get_auth_attr(&auth.bearer, "token")
                 .or_else(|| get_auth_attr(&auth.bearer, "bearerToken"))
@@ -577,6 +632,158 @@ mod tests {
         // String-form URL: the custom UrlDetail deserializer handles it.
         let str_req = scenario.items[1].request.as_ref().unwrap();
         assert_eq!(str_req.url, "https://api.example.com/str");
+    }
+
+    #[test]
+    fn test_request_level_auth_read_from_request_detail() {
+        // Regression (backlog line 69): the v2.1 schema puts request-level
+        // auth at `item.request.auth` (RequestDetail.auth), but the parser
+        // only read the non-schema `item.auth` position — per-request bearer
+        // tokens were silently dropped, so no auth was sent at all.
+        let json = r#"{
+            "info": {"name": "Auth", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "item": [{
+                "name": "Secure",
+                "request": {
+                    "method": "GET",
+                    "url": {"raw": "https://api.example.com/secure"},
+                    "auth": {
+                        "type": "bearer",
+                        "bearer": [{"key": "token", "value": "tok123", "type": "string"}]
+                    }
+                }
+            }]
+        }"#;
+
+        let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
+        let req = scenario.items[0].request.as_ref().unwrap();
+        match req.auth.as_ref() {
+            Some(AuthConfig::Bearer { token }) => assert_eq!(token, "tok123"),
+            other => panic!("expected Bearer auth, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_folder_auth_inherited_by_children() {
+        // Folder-level auth must be inherited by every request in the folder
+        // (Postman inheritance: request > folder > collection).
+        let json = r#"{
+            "info": {"name": "Folders", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "auth": {"type": "basic", "basic": [{"key": "username", "value": "coll_user"}, {"key": "password", "value": "coll_pass"}]},
+            "item": [{
+                "name": "Folder",
+                "auth": {"type": "bearer", "bearer": [{"key": "token", "value": "folder_tok"}]},
+                "item": [{
+                    "name": "Child",
+                    "request": {"method": "GET", "url": {"raw": "https://api.example.com/child"}}
+                }]
+            }]
+        }"#;
+
+        let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
+        let req = scenario.items[0].items[0].request.as_ref().unwrap();
+        match req.auth.as_ref() {
+            Some(AuthConfig::Bearer { token }) => assert_eq!(token, "folder_tok"),
+            other => panic!("child must inherit folder bearer auth, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_collection_auth_inherited_by_requests() {
+        // No folder or request auth → the collection-level auth applies.
+        let json = r#"{
+            "info": {"name": "Coll", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "auth": {"type": "apikey", "apikey": [{"key": "key", "value": "k1"}, {"key": "value", "value": "v1"}, {"key": "in", "value": "header"}]},
+            "item": [{
+                "name": "Req",
+                "request": {"method": "GET", "url": {"raw": "https://api.example.com/x"}}
+            }]
+        }"#;
+
+        let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
+        let req = scenario.items[0].request.as_ref().unwrap();
+        assert!(
+            matches!(req.auth.as_ref(), Some(AuthConfig::ApiKey { .. })),
+            "request must inherit collection api-key auth, got {:?}",
+            req.auth
+        );
+    }
+
+    #[test]
+    fn test_noauth_blocks_inheritance() {
+        // Regression (backlog line 69): `{"type":"noauth"}` mapped to None,
+        // indistinguishable from inherit, so an explicitly unauthenticated
+        // request inherited collection auth — the INVERSE of Postman. noauth
+        // must yield AuthConfig::NoAuth so the runner sends no auth.
+        let json = r#"{
+            "info": {"name": "NoAuth", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "auth": {"type": "bearer", "bearer": [{"key": "token", "value": "coll_tok"}]},
+            "item": [{
+                "name": "Public",
+                "request": {
+                    "method": "GET",
+                    "url": {"raw": "https://api.example.com/public"},
+                    "auth": {"type": "noauth"}
+                }
+            }]
+        }"#;
+
+        let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
+        let req = scenario.items[0].request.as_ref().unwrap();
+        assert!(
+            matches!(req.auth.as_ref(), Some(AuthConfig::NoAuth)),
+            "noauth must block inheritance (AuthConfig::NoAuth), got {:?}",
+            req.auth
+        );
+    }
+
+    #[test]
+    fn test_folder_noauth_blocks_collection_inheritance() {
+        // Regression: a folder marked noauth inside a bearer-authenticated
+        // collection must NOT re-inherit the collection bearer. convert_auth
+        // maps "noauth" → Some(AuthConfig::NoAuth) at every scope level so
+        // the runner's `.or(scenario.auth)` fallback can't re-apply it.
+        let json = r#"{
+            "info": {"name": "NoAuthFolder", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "auth": {"type": "bearer", "bearer": [{"key": "token", "value": "coll_tok"}]},
+            "item": [{
+                "name": "Public Folder",
+                "auth": {"type": "noauth"},
+                "item": [{
+                    "name": "Public Req",
+                    "request": {"method": "GET", "url": {"raw": "https://api.example.com/public"}}
+                }]
+            }]
+        }"#;
+
+        let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
+        let req = scenario.items[0].items[0].request.as_ref().unwrap();
+        assert!(
+            matches!(req.auth.as_ref(), Some(AuthConfig::NoAuth)),
+            "folder noauth must block collection inheritance, got {:?}",
+            req.auth
+        );
+    }
+
+    #[test]
+    fn test_legacy_item_auth_fallback() {
+        // Some exports put request auth at the non-schema `item.auth` slot;
+        // it must still be honored when `item.request.auth` is absent.
+        let json = r#"{
+            "info": {"name": "Legacy", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "item": [{
+                "name": "Legacy Auth",
+                "auth": {"type": "bearer", "bearer": [{"key": "token", "value": "legacy_tok"}]},
+                "request": {"method": "GET", "url": {"raw": "https://api.example.com/legacy"}}
+            }]
+        }"#;
+
+        let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
+        let req = scenario.items[0].request.as_ref().unwrap();
+        match req.auth.as_ref() {
+            Some(AuthConfig::Bearer { token }) => assert_eq!(token, "legacy_tok"),
+            other => panic!("legacy item.auth must be honored, got {:?}", other),
+        }
     }
 
     #[test]
