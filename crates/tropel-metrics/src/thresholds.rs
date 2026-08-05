@@ -287,9 +287,20 @@ fn evaluate_single_threshold(expression: &str, metrics: &MetricsResult) -> (bool
         .unwrap_or((false, 0.0, 0.0))
 }
 
+/// Extract the base metric name from a series key string, stripping any
+/// `{tag=value}` suffix: `"http_req_duration{status=200}"` → `"http_req_duration"`.
+/// Exact base-name matching (not prefix) keeps a threshold on `login` from
+/// aggregating `login_errors` + `login_duration`.
+fn metric_base_name(key: &str) -> &str {
+    match key.find('{') {
+        Some(i) => &key[..i],
+        None => key,
+    }
+}
+
 /// Get a metric value for a tag-scoped threshold by searching the metrics list.
-/// Looks for entries whose key starts with the metric name and contains all
-/// the specified tag key=value pairs.
+/// Looks for entries whose BASE name equals the metric name and that contain
+/// all the specified tag key=value pairs.
 ///
 /// When MULTIPLE entries match (e.g. `http_req_duration{status=200}{method=GET}`
 /// and `http_req_duration{status=200}{method=POST}` both match `{status=200}`),
@@ -314,8 +325,8 @@ fn get_tag_scoped_metric_value(
     let mut matched = Vec::new();
 
     for m in &metrics.metrics {
-        // Check if this entry's key starts with the metric name
-        if !m.key.starts_with(metric_name) {
+        // Exact base-name match: `login` must not aggregate `login_errors`.
+        if metric_base_name(&m.key) != metric_name {
             continue;
         }
         // Check if all tag filters are present in the key string
@@ -384,15 +395,17 @@ fn get_tag_scoped_metric_value(
     })
 }
 
-/// Aggregate a statistic across ALL series in `metrics.metrics` whose key
-/// starts with `name` (k6 merges tagged sub-series for the unscoped metric).
+/// Aggregate a statistic across ALL series in `metrics.metrics` whose BASE
+/// name equals `name` (k6 merges tagged sub-series for the unscoped metric).
+/// Exact match — never prefix: a threshold on `login` must not aggregate
+/// `login_errors` / `login_duration`.
 /// Returns `None` when no series match, so callers can fall back to a
 /// top-level field or 0.0.
 fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> Option<f64> {
     let matched: Vec<&MetricSummary> = metrics
         .metrics
         .iter()
-        .filter(|m| m.key.starts_with(name))
+        .filter(|m| metric_base_name(&m.key) == name)
         .collect();
     if matched.is_empty() {
         return None;
@@ -881,6 +894,122 @@ mod tests {
         });
         let (_, actual, _) = evaluate_single_threshold("errors.count > 5", &metrics);
         assert_eq!(actual, 10.0, "count must sum across all series");
+    }
+
+    #[test]
+    fn test_threshold_exact_name_not_prefix_aggregated() {
+        // Regression (backlog line 80): the unscoped series lookup used
+        // `starts_with`, so a threshold on `login` aggregated `login_errors`
+        // and `login_duration` too. Series must match the base name exactly.
+        let mut metrics = MetricsResult::default();
+        metrics.metrics.push(MetricSummary {
+            key: "login".into(),
+            tags: vec![],
+            metric_type: MetricType::Trend,
+            count: 5,
+            sum: 1000.0,
+            mean: 200.0,
+            min: 50,
+            max: 400,
+            p50: 200,
+            p90: 300,
+            p95: 350,
+            p99: 390,
+            last: 0.0,
+            rate: 0.0,
+            histogram: None,
+        });
+        metrics.metrics.push(MetricSummary {
+            key: "login_errors".into(),
+            tags: vec![],
+            metric_type: MetricType::Trend,
+            count: 500, // high count — would swamp `login` if prefix-folded
+            sum: 1.0,
+            mean: 1.0,
+            min: 1,
+            max: 1,
+            p50: 1,
+            p90: 1,
+            p95: 1,
+            p99: 1,
+            last: 0.0,
+            rate: 0.0,
+            histogram: None,
+        });
+        metrics.metrics.push(MetricSummary {
+            key: "login_duration".into(),
+            tags: vec![],
+            metric_type: MetricType::Trend,
+            count: 500,
+            sum: 1.0,
+            mean: 1.0,
+            min: 1,
+            max: 1,
+            p50: 1,
+            p90: 1,
+            p95: 1,
+            p99: 1,
+            last: 0.0,
+            rate: 0.0,
+            histogram: None,
+        });
+
+        // `login.count < 10` must evaluate against ONLY the `login` series
+        // (count 5). Prefix folding would have summed all three → 1005 → fail.
+        let (passed, actual, _) = evaluate_single_threshold("login.count < 10", &metrics);
+        assert!(passed, "login.count must be 5 (only the exact series), not 1005");
+        assert_eq!(actual, 5.0);
+
+        // A threshold on login_errors itself still resolves its own series.
+        let (passed, actual, _) = evaluate_single_threshold("login_errors.count < 1000", &metrics);
+        assert!(passed);
+        assert_eq!(actual, 500.0);
+    }
+
+    #[test]
+    fn test_tag_scoped_exact_name_not_prefix() {
+        // Tag-scoped lookup had the same starts_with bug: `{status=200}` on
+        // `login` must not match `login_errors{status=200}`.
+        let mut metrics = MetricsResult::default();
+        metrics.metrics.push(MetricSummary {
+            key: "login{status=200}".into(),
+            tags: vec![("status".into(), "200".into())],
+            metric_type: MetricType::Trend,
+            count: 2,
+            sum: 400.0,
+            mean: 200.0,
+            min: 100,
+            max: 300,
+            p50: 200,
+            p90: 250,
+            p95: 280,
+            p99: 290,
+            last: 0.0,
+            rate: 0.0,
+            histogram: None,
+        });
+        metrics.metrics.push(MetricSummary {
+            key: "login_errors{status=200}".into(),
+            tags: vec![("status".into(), "200".into())],
+            metric_type: MetricType::Trend,
+            count: 900,
+            sum: 1.0,
+            mean: 1.0,
+            min: 1,
+            max: 1,
+            p50: 1,
+            p90: 1,
+            p95: 1,
+            p99: 1,
+            last: 0.0,
+            rate: 0.0,
+            histogram: None,
+        });
+
+        let (passed, actual, _) =
+            evaluate_single_threshold("login{status=200}.count < 10", &metrics);
+        assert!(passed, "must match only the login{{status=200}} series (count 2)");
+        assert_eq!(actual, 2.0);
     }
 
     #[test]

@@ -672,8 +672,15 @@ impl Aggregator {
                 }
             };
 
-            // Derive headline values from the metric key prefix
-            if key.metric.starts_with("http_req_duration") {
+            // Derive headline values from the metric key — EXACT base-name
+            // match (k6 semantics). Prefix matching folded unrelated custom
+            // metrics into the headlines: a Trend named `checks_latency` hit
+            // `starts_with("checks")` → "Total: 1 Passed: 250000 (25000000%)",
+            // and `starts_with("vus")` captured the pre-allocated `vus_max`
+            // series instead of the observed peak. MetricKey separates the
+            // name from tags, so exact equality still merges every tagged
+            // variant (e.g. `http_req_duration{status=200}`).
+            if key.metric.as_ref() == "http_req_duration" {
                 match &mut merged_http_dur {
                     Some(ref mut merged) => {
                         merged.histogram.merge(&set.histogram);
@@ -732,11 +739,15 @@ impl Aggregator {
                 }
             }
 
-            if key.metric.starts_with("http_reqs") {
+            // Headline accumulators: EXACT name match only. A custom metric
+            // sharing a prefix (checks_latency, errors_custom, http_reqs_total,
+            // data_received_bytes, iterations_count, vus_peak) must never fold
+            // into these — it still appears as its own series in `metrics`.
+            if key.metric.as_ref() == "http_reqs" {
                 http_reqs += set.count as u64;
-            } else if key.metric.starts_with("errors") {
+            } else if key.metric.as_ref() == "errors" {
                 errors += set.count as u64;
-            } else if key.metric.starts_with("checks") {
+            } else if key.metric.as_ref() == "checks" {
                 checks_total += set.count as u64;
                 checks_passed += set.sum as u64;
                 checks_failed += if set.count > set.sum {
@@ -744,16 +755,16 @@ impl Aggregator {
                 } else {
                     0
                 }
-            } else if key.metric.starts_with("data_received") {
+            } else if key.metric.as_ref() == "data_received" {
                 data_received += set.sum;
-            } else if key.metric.starts_with("data_sent") {
+            } else if key.metric.as_ref() == "data_sent" {
                 data_sent += set.sum;
-            } else if key.metric.starts_with("http_req_failed") {
+            } else if key.metric.as_ref() == "http_req_failed" {
                 http_req_failed_total += set.count;
                 http_req_failed_count += set.sum;
-            } else if key.metric.starts_with("iterations") {
+            } else if key.metric.as_ref() == "iterations" {
                 iterations += set.count as u64;
-            } else if key.metric.starts_with("iteration_duration") {
+            } else if key.metric.as_ref() == "iteration_duration" {
                 match &mut merged_iter_dur {
                     Some(ref mut merged) => {
                         merged.histogram.merge(&set.histogram);
@@ -764,8 +775,11 @@ impl Aggregator {
                         merged_iter_dur = Some(set.clone());
                     }
                 }
-            } else if key.metric.starts_with("vus") {
-                // vus_max: use the max value observed from Gauge tracking
+            } else if key.metric.as_ref() == "vus" {
+                // vus_max headline = OBSERVED peak of the active-VU gauge.
+                // The separate `vus_max` series carries the config's
+                // PRE-ALLOCATED peak — it must not feed this accumulator,
+                // or a run that ramps below its cap would report the cap.
                 if set.metric_type == MetricType::Gauge && set.max != f64::MIN {
                     let obs = set.max as u64;
                     if obs > vus_max {
@@ -779,6 +793,8 @@ impl Aggregator {
                     }
                 }
             }
+            // `vus_max` series is intentionally NOT matched here: it would
+            // overwrite the observed peak with the config pre-allocation.
 
             metrics.push(summary);
         }
@@ -1555,6 +1571,111 @@ mod tests {
         assert_eq!(stats.min, 1);
         assert_eq!(stats.max, 1);
         assert_eq!(set.sum, 0.0);
+    }
+
+    #[test]
+    fn test_headline_checks_not_folded_by_custom_prefix_metric() {
+        // Regression (backlog line 80): a custom Trend named `checks_latency`
+        // hit `starts_with("checks")` in the headline derivation and folded
+        // into the checks headline → "Total: 1 Passed: 250000 (25000000%)".
+        // Headline accumulators must match the metric name EXACTLY.
+        let mut agg = Aggregator::new();
+        let ts = std::time::SystemTime::now();
+        let tags = Arc::new(tropel_core::types::TagMap::new());
+
+        // Real checks Rate: 1 pass + 1 fail → total 2, passed 1.
+        agg.record(Sample {
+            metric: "checks".into(),
+            value: 1.0,
+            tags: tags.clone(),
+            timestamp: ts,
+            sample_type: SampleType::Rate,
+        });
+        agg.record(Sample {
+            metric: "checks".into(),
+            value: 0.0,
+            tags: tags.clone(),
+            timestamp: ts,
+            sample_type: SampleType::Rate,
+        });
+        // Custom Trend sharing the "checks" prefix must NOT fold in.
+        agg.record(Sample {
+            metric: "checks_latency".into(),
+            value: 250_000.0,
+            tags,
+            timestamp: ts,
+            sample_type: SampleType::Trend,
+        });
+
+        let res = agg.build_results();
+        assert_eq!(res.checks_total, 2, "checks_latency must not fold into checks_total");
+        assert_eq!(res.checks_passed, 1);
+        assert_eq!(res.checks_failed, 1);
+        // The custom metric still exists as its own series.
+        assert!(res.metrics.iter().any(|m| m.key == "checks_latency"));
+    }
+
+    #[test]
+    fn test_headline_http_reqs_not_folded_by_custom_prefix_metric() {
+        // A custom `http_reqs_total` counter must not inflate the http_reqs
+        // headline (prefix matching used to capture it).
+        let mut agg = Aggregator::new();
+        let ts = std::time::SystemTime::now();
+        let tags = Arc::new(tropel_core::types::TagMap::new());
+
+        // Real emission: one http_reqs Counter sample (value 1.0) per request.
+        for _ in 0..3 {
+            agg.record(Sample {
+                metric: "http_reqs".into(),
+                value: 1.0,
+                tags: tags.clone(),
+                timestamp: ts,
+                sample_type: SampleType::Counter,
+            });
+        }
+        agg.record(Sample {
+            metric: "http_reqs_total".into(),
+            value: 999.0,
+            tags,
+            timestamp: ts,
+            sample_type: SampleType::Counter,
+        });
+
+        let res = agg.build_results();
+        assert_eq!(res.http_reqs, 3, "http_reqs_total must not fold into http_reqs");
+    }
+
+    #[test]
+    fn test_headline_vus_max_is_observed_peak_not_prealloc() {
+        // Regression: `starts_with("vus")` also captured the `vus_max`
+        // series, so the headline reported the config PRE-ALLOCATION instead
+        // of the observed peak of the active-VU gauge. A run that ramps below
+        // its cap must report what was actually observed.
+        let mut agg = Aggregator::new();
+        let ts = std::time::SystemTime::now();
+        let tags = Arc::new(tropel_core::types::TagMap::new());
+
+        // Observed active VUs over time: peak 5.
+        for v in [2.0, 5.0, 3.0] {
+            agg.record(Sample {
+                metric: "vus".into(),
+                value: v,
+                tags: tags.clone(),
+                timestamp: ts,
+                sample_type: SampleType::Point, // Gauge
+            });
+        }
+        // Config pre-allocation of 20 must not drive the headline.
+        agg.record(Sample {
+            metric: "vus_max".into(),
+            value: 20.0,
+            tags,
+            timestamp: ts,
+            sample_type: SampleType::Point,
+        });
+
+        let res = agg.build_results();
+        assert_eq!(res.vus_max, 5, "vus_max headline must be the observed peak, not 20");
     }
 
     #[test]
