@@ -139,8 +139,26 @@ impl Default for Request {
 }
 
 /// Request body variants.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+///
+/// Custom serde: `#[serde(untagged)]` made `Json(Value)` match ANY JSON, so
+/// `FormData`/`UrlEncoded`/`Binary`/`GraphQL` were unreachable on
+/// deserialize — every JSON round-trip (distributed workers, spool, replay)
+/// silently converted `UrlEncoded` → `Json`: Content-Type flipped and wire
+/// bytes changed from `a=1&b=2` to `{"a":"1"}` (a form endpoint 400s on the
+/// worker and passes locally).
+///
+/// Wire format (backward compatible for the two common cases):
+/// - `Raw(s)` → JSON string (unchanged)
+/// - `Json(v)` → the raw JSON value (unchanged)
+/// - the other four → a tagged object `{"__tropel_body": "<kind>", …}` so
+///   they survive a round-trip intact instead of collapsing into `Json`.
+///
+/// Known limitation: a user `Json` body that legitimately contains a
+/// `__tropel_body` key with a recognized tag value (e.g.
+/// `{"__tropel_body": "url_encoded", "fields": …}`) is interpreted as that
+/// variant. Unknown tag values are treated as plain `Json` (the key is
+/// preserved), so only the four exact tag strings are ambiguous.
+#[derive(Debug, Clone)]
 pub enum Body {
     Raw(String),
     Json(serde_json::Value),
@@ -151,6 +169,116 @@ pub enum Body {
         query: String,
         variables: Option<HashMap<String, serde_json::Value>>,
     },
+}
+
+impl Serialize for Body {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        match self {
+            Body::Raw(s) => serializer.serialize_str(s),
+            Body::Json(v) => v.serialize(serializer),
+            Body::FormData(fields) => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("__tropel_body", "form_data")?;
+                map.serialize_entry("fields", fields)?;
+                map.end()
+            }
+            Body::UrlEncoded(fields) => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("__tropel_body", "url_encoded")?;
+                map.serialize_entry("fields", fields)?;
+                map.end()
+            }
+            Body::Binary(data) => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("__tropel_body", "binary")?;
+                map.serialize_entry("data", data)?;
+                map.end()
+            }
+            Body::GraphQL {
+                query,
+                variables,
+            } => {
+                let mut map = serializer.serialize_map(Some(3))?;
+                map.serialize_entry("__tropel_body", "graphql")?;
+                map.serialize_entry("query", query)?;
+                map.serialize_entry("variables", variables)?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Body {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            // A JSON string is a Raw body (unchanged wire format).
+            serde_json::Value::String(s) => Ok(Body::Raw(s)),
+            serde_json::Value::Object(mut obj) => {
+                match obj
+                    .remove("__tropel_body")
+                    .and_then(|v| v.as_str().map(str::to_string))
+                {
+                    Some(tag) => match tag.as_str() {
+                        "form_data" => {
+                            let fields = obj
+                                .remove("fields")
+                                .and_then(|f| serde_json::from_value(f).ok())
+                                .unwrap_or_default();
+                            Ok(Body::FormData(fields))
+                        }
+                        "url_encoded" => {
+                            let fields = obj
+                                .remove("fields")
+                                .and_then(|f| serde_json::from_value(f).ok())
+                                .unwrap_or_default();
+                            Ok(Body::UrlEncoded(fields))
+                        }
+                        "binary" => {
+                            let data = obj
+                                .remove("data")
+                                .and_then(|d| serde_json::from_value(d).ok())
+                                .unwrap_or_default();
+                            Ok(Body::Binary(data))
+                        }
+                        "graphql" => {
+                            let query = obj
+                                .remove("query")
+                                .and_then(|q| q.as_str().map(str::to_string))
+                                .unwrap_or_default();
+                            let variables = obj
+                                .remove("variables")
+                                .and_then(|v| serde_json::from_value(v).ok());
+                            Ok(Body::GraphQL { query, variables })
+                        }
+                        // Unknown tag → treat the WHOLE object as a Json body
+                        // (restoring the removed key). Hard-erroring here
+                        // would be a regression: before this fix ANY object
+                        // parsed as Json, including a legit user payload that
+                        // happens to carry a `__tropel_body` key.
+                        other => {
+                            obj.insert(
+                                "__tropel_body".to_string(),
+                                serde_json::Value::String(other.to_string()),
+                            );
+                            Ok(Body::Json(serde_json::Value::Object(obj)))
+                        }
+                    },
+                    // No discriminator → Json body (backward compatible with
+                    // the old untagged wire form).
+                    None => Ok(Body::Json(serde_json::Value::Object(obj))),
+                }
+            }
+            other => Ok(Body::Json(other)),
+        }
+    }
 }
 
 impl Body {
@@ -523,5 +651,77 @@ pub enum SampleType {
     Counter,
     Trend,
     Rate,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_roundtrip_preserves_all_variants() {
+        // Regression (backlog line 92): #[serde(untagged)] made `Json(Value)`
+        // match ANY JSON, so FormData/UrlEncoded/Binary/GraphQL were
+        // unreachable on deserialize — every round-trip silently converted
+        // them to Json (Content-Type flips, wire bytes change).
+        let mut form = HashMap::new();
+        form.insert("a".to_string(), "1".to_string());
+        form.insert("b".to_string(), "2".to_string());
+        let mut url = HashMap::new();
+        url.insert("q".to_string(), "hello world".to_string());
+        let mut vars = HashMap::new();
+        vars.insert("id".to_string(), serde_json::json!(42));
+
+        let cases = vec![
+            Body::Raw("raw body".into()),
+            Body::Json(serde_json::json!({"a": 1, "b": [true, null]})),
+            Body::FormData(form),
+            Body::UrlEncoded(url),
+            Body::Binary(vec![0u8, 1, 2, 255]),
+            Body::GraphQL {
+                query: "{ user { id } }".into(),
+                variables: Some(vars),
+            },
+        ];
+
+        for body in cases {
+            let json = serde_json::to_string(&body).expect("serialize");
+            let back: Body = serde_json::from_str(&json).expect("deserialize");
+            match (&body, &back) {
+                (Body::Raw(a), Body::Raw(b)) => assert_eq!(a, b),
+                (Body::Json(a), Body::Json(b)) => assert_eq!(a, b),
+                (Body::FormData(a), Body::FormData(b)) => assert_eq!(a, b),
+                (Body::UrlEncoded(a), Body::UrlEncoded(b)) => {
+                    assert_eq!(a, b, "UrlEncoded must not collapse into Json")
+                }
+                (Body::Binary(a), Body::Binary(b)) => assert_eq!(a, b),
+                (
+                    Body::GraphQL {
+                        query: aq,
+                        variables: av,
+                    },
+                    Body::GraphQL {
+                        query: bq,
+                        variables: bv,
+                    },
+                ) => {
+                    assert_eq!(aq, bq);
+                    assert_eq!(av, bv);
+                }
+                (a, b) => panic!("variant changed on round-trip: {a:?} -> {b:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn body_untagged_wire_forms_still_parse() {
+        // Backward compat: the OLD untagged serialization of Raw (a JSON
+        // string) and Json (a bare JSON value) must still deserialize.
+        let raw: Body = serde_json::from_str("\"hello\"").unwrap();
+        assert!(matches!(raw, Body::Raw(_)));
+        let json: Body = serde_json::from_str(r#"{"x":1}"#).unwrap();
+        assert!(matches!(json, Body::Json(_)));
+        let arr: Body = serde_json::from_str("[1,2,3]").unwrap();
+        assert!(matches!(arr, Body::Json(_)));
+    }
 }
 
