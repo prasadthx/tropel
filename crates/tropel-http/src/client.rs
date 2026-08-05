@@ -12,6 +12,25 @@ use tropel_core::TropelError;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MULTIPART_BOUNDARY: &str = "------------------------tropel-boundary-7a2f24b9";
 
+/// Credential headers stripped on cross-origin redirect hops and carried
+/// forward on same-origin hops. Single source of truth — the two `matches!`
+/// sites below must not drift (drift in exactly this kind of list is what
+/// caused the signed-Authorization-dropped-on-redirect bug).
+const CREDENTIAL_HEADERS: [&str; 8] = [
+    "authorization",
+    "cookie",
+    "cookie2",
+    "proxy-authorization",
+    "www-authenticate",
+    "x-amz-date",
+    "x-amz-content-sha256",
+    "x-amz-security-token",
+];
+
+fn is_credential_header(key: &str) -> bool {
+    CREDENTIAL_HEADERS.contains(&key)
+}
+
 /// Per-certificate-identity HTTP clients (`Arc<Mutex<…>>` because
 /// `std::sync::Mutex` is not `Clone` while `HttpClient` derives `Clone`).
 type CertClientMap = Arc<Mutex<HashMap<(String, String, bool), reqwest::Client>>>;
@@ -449,6 +468,13 @@ impl HttpClient {
         // next hop must not carry credentials (Authorization/Cookie/…),
         // matching reqwest's and k6's redirect policies.
         let mut strip_sensitive = false;
+        // Headers the signer ADDED to the hop-0 request (Authorization,
+        // x-amz-*, …). `request.headers` is never mutated by signers — they
+        // sign the built reqwest::Request in place — so without this capture
+        // the signed header dies with hop 0's consumed request and a
+        // same-origin redirect 401s (reqwest's auto-follow used to forward
+        // it for us).
+        let mut signed_headers: Vec<(String, String)> = Vec::new();
 
         loop {
             // Each redirect hop is checked too — a Location header pointing
@@ -508,19 +534,21 @@ impl HttpClient {
                 // Cross-origin redirect hops must not leak credentials to
                 // another origin (reqwest's redirect policy strips
                 // Authorization/Cookie/etc on origin change).
-                if strip_sensitive
-                    && matches!(
-                        key.to_ascii_lowercase().as_str(),
-                        "authorization"
-                            | "cookie"
-                            | "cookie2"
-                            | "proxy-authorization"
-                            | "www-authenticate"
-                    )
-                {
+                if strip_sensitive && is_credential_header(&key.to_ascii_lowercase()) {
                     continue;
                 }
                 req_builder = req_builder.header(key.as_str(), value.as_str());
+            }
+            // Same-origin hops re-apply the signer-added headers captured at
+            // hop 0 (Authorization, x-amz-*, …). Cross-origin hops
+            // (strip_sensitive) drop them — credentials never leak to another
+            // origin. Applied AFTER the base headers so a signer that
+            // overrode a header (e.g. replaced a user-supplied Authorization)
+            // wins on every hop, not just hop 0.
+            if !strip_sensitive {
+                for (key, value) in &signed_headers {
+                    req_builder = req_builder.header(key.as_str(), value.as_str());
+                }
             }
 
             // Add query parameters
@@ -538,8 +566,9 @@ impl HttpClient {
             // RequestBuilder cannot expose, so the auth happens on the built
             // Request. Auth is applied ONLY to the first hop: signing the
             // redirect target would be wrong (the signature is for the
-            // original URL). reqwest strips Authorization on cross-origin
-            // redirects; same-origin hops keep whatever hop 0 carried.
+            // original URL). The signer-added headers are captured and
+            // re-applied on same-origin hops (see above); cross-origin hops
+            // strip them, matching reqwest's redirect policy.
             let mut built_request = req_builder.build().map_err(|e| {
                 TropelError::Http(format!("Failed to build request: {}", e))
             })?;
@@ -548,6 +577,26 @@ impl HttpClient {
                     signer
                         .sign(&mut built_request)
                         .map_err(|e| TropelError::Http(format!("Auth signing failed: {}", e)))?;
+                    // Capture what the signer added/changed vs the original
+                    // headers so same-origin redirect hops re-apply them.
+                    // Filtered to the credential header names (the same set
+                    // the strip_sensitive check uses) so hop-0-only headers
+                    // like reqwest's injected `Accept: */*` or the code's own
+                    // multipart Content-Type are NOT carried to hops where
+                    // the body/method may have been rewritten.
+                    for (name, value) in built_request.headers().iter() {
+                        let key = name.as_str().to_ascii_lowercase();
+                        if !is_credential_header(&key) {
+                            continue;
+                        }
+                        let value_str = value.to_str().unwrap_or("");
+                        let identical_in_original = request.headers.iter().any(|(k, v)| {
+                            k.eq_ignore_ascii_case(&key) && v == value_str
+                        });
+                        if !identical_in_original {
+                            signed_headers.push((key, value_str.to_string()));
+                        }
+                    }
                 }
             }
 
@@ -1388,6 +1437,159 @@ mod tests {
         assert_eq!(resp.status_code, 302, "redirect must NOT be followed");
 
         server.abort();
+    }
+
+    /// Minimal signer: sets a fixed Authorization header, like a Bearer
+    /// token signer. Lets the redirect tests observe whether the signed
+    /// header survives to hop 1+.
+    struct StaticSigner;
+
+    impl AuthSigner for StaticSigner {
+        fn name(&self) -> &str {
+            "static"
+        }
+
+        fn sign(&self, request: &mut reqwest::Request) -> Result<()> {
+            request
+                .headers_mut()
+                .insert(reqwest::header::AUTHORIZATION, "Bearer s3cret".parse().unwrap());
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_origin_redirect_keeps_signed_authorization() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // P0 regression: hop-0's request was signed in place on the built
+        // reqwest::Request, but hop 1+ rebuilt from request.headers (never
+        // signed), so the Authorization died with hop 0 and any same-origin
+        // authenticated redirect 401'd. Server: /start → 302 → /final;
+        // /final echoes whether it saw the Authorization header.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let req = String::from_utf8_lossy(&buf);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let resp = if path == "/start" {
+                        "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    } else if path == "/final" {
+                        let saw_auth = req
+                            .lines()
+                            .any(|l| l.to_ascii_lowercase().starts_with("authorization:"));
+                        let body = if saw_auth { "AUTH=YES" } else { "AUTH=NO" };
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let cfg = HttpConfig::default();
+        let client = HttpClient::new(&cfg).unwrap();
+        let signer = StaticSigner;
+        let req = Request {
+            url: format!("http://{}/start", addr),
+            method: Method::GET,
+            follow_redirects: true,
+            ..Default::default()
+        };
+        let resp = client.execute(&req, Some(&signer)).await.unwrap();
+        assert_eq!(resp.status_code, 200);
+        assert_eq!(
+            String::from_utf8_lossy(&resp.body),
+            "AUTH=YES",
+            "signed Authorization must be forwarded on a same-origin redirect hop"
+        );
+        // The 302 hop must also be captured as its own response (k6 parity).
+        assert_eq!(resp.redirects.len(), 1);
+        assert_eq!(resp.redirects[0].status_code, 302);
+
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_origin_redirect_strips_signed_authorization() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // P0 corollary: a redirect to a DIFFERENT origin must NOT carry the
+        // hop-0 signed Authorization (credential leak). /start on server A
+        // → 302 → server B /final; B reports whether it saw the header.
+        let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = listener_a.local_addr().unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+
+        let server_b = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener_b.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let req = String::from_utf8_lossy(&buf);
+                    let saw_auth = req
+                        .lines()
+                        .any(|l| l.to_ascii_lowercase().starts_with("authorization:"));
+                    let body = if saw_auth { "AUTH=YES" } else { "AUTH=NO" };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let server_a = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener_a.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://{}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        addr_b
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let cfg = HttpConfig::default();
+        let client = HttpClient::new(&cfg).unwrap();
+        let signer = StaticSigner;
+        let req = Request {
+            url: format!("http://{}/start", addr_a),
+            method: Method::GET,
+            follow_redirects: true,
+            ..Default::default()
+        };
+        let resp = client.execute(&req, Some(&signer)).await.unwrap();
+        assert_eq!(resp.status_code, 200);
+        assert_eq!(
+            String::from_utf8_lossy(&resp.body),
+            "AUTH=NO",
+            "signed Authorization must NOT leak to a different origin"
+        );
+
+        server_a.abort();
+        server_b.abort();
     }
 
     #[tokio::test(flavor = "current_thread")]
