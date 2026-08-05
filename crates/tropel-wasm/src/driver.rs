@@ -94,6 +94,39 @@ const MAX_HOST_CALL_MS: f64 = 60_000.0;
 /// `adapter_run_iteration` gets a fresh budget).
 const ITERATION_SLEEP_BUDGET_MS: f64 = 60_000.0;
 
+/// Per-iteration cap on samples a WASM driver may emit (via `env.metric_add`
+/// and the auto-recorded `http_req_*` set). Fuel buys a hostile module
+/// millions of `metric_add` calls in one iteration; without a cap its
+/// `samples` Vec grows toward multi-GB and downstream tag maps grow
+/// unbounded. Exceeding the cap fails the iteration (like the sleep budget).
+/// Matches the collector's `MAX_PENDING_SAMPLES` (100k).
+const MAX_ITERATION_SAMPLES: usize = 100_000;
+
+/// Cap on a single metric name read from guest memory (bytes). Longer names
+/// are refused — otherwise a hostile module could drive unbounded
+/// cardinality / per-call allocations with a single 16 MiB name.
+const MAX_METRIC_NAME_LEN: usize = 256;
+
+/// Cap on the tag count per `env.metric_add` call, and on the raw JSON tags
+/// buffer size (bytes). Refusing oversized tag sets bounds the downstream
+/// tag maps.
+const MAX_METRIC_TAGS: usize = 32;
+const MAX_METRIC_TAGS_BYTES: usize = 64 * 1024;
+
+/// Caps on a single tag KEY / VALUE length (bytes). The per-call buffer cap
+/// bounds the JSON parse but not the stored map — without these, 100k capped
+/// samples × 32 unbounded tags could still grow resident memory toward
+/// multi-GB per VU. Oversized keys/values refuse the whole sample.
+const MAX_METRIC_TAG_KEY_LEN: usize = 256;
+const MAX_METRIC_TAG_VALUE_LEN: usize = 4 * 1024;
+
+/// Cumulative per-iteration budget on stored tag bytes across ALL samples
+/// (both `env.metric_add` and the auto-recorded `http_req_*` set, whose `url`
+/// tag is also guest-controlled). The sample-count cap alone does not bound
+/// memory when each sample carries up to [`MAX_METRIC_TAGS_BYTES`] of tags;
+/// this budget does. Exceeding it fails the iteration like the sample cap.
+const MAX_ITERATION_TAG_BYTES: usize = 8 * 1024 * 1024;
+
 // ══════════════════════════════════════════════════════════════════
 // WasmDriver — the stateless Driver factory
 // ══════════════════════════════════════════════════════════════════
@@ -243,6 +276,14 @@ pub struct WasmDriverState {
     /// budget. `run_iteration` fails the iteration after the module returns
     /// (the host function cannot trap — it just refuses to block).
     pub sleep_over_budget: bool,
+    /// Set when the per-iteration sample cap ([`MAX_ITERATION_SAMPLES`]) or
+    /// the cumulative tag-bytes budget ([`MAX_ITERATION_TAG_BYTES`]) was
+    /// hit. `run_iteration` fails the iteration after the module returns
+    /// (further samples are refused, so the buffer stays bounded).
+    pub metric_spam_exceeded: bool,
+    /// Stored tag bytes across all samples in this iteration. [`MAX_ITERATION_TAG_BYTES`]
+    /// caps the aggregate so 100k capped samples cannot carry multi-GB of tags.
+    pub iteration_tag_bytes: usize,
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -270,6 +311,8 @@ impl DriverInstance for WasmDriverInstance {
             state.samples.clear();
             state.sleep_budget_ms = ITERATION_SLEEP_BUDGET_MS;
             state.sleep_over_budget = false;
+            state.metric_spam_exceeded = false;
+            state.iteration_tag_bytes = 0;
         }
 
         // Reset the per-call instruction budget (fuel is consumed per call;
@@ -332,6 +375,7 @@ impl DriverInstance for WasmDriverInstance {
         // Drain samples collected by host functions, unconditionally.
         let state = self.store.data_mut();
         let over_budget = state.sleep_over_budget;
+        let spam = state.metric_spam_exceeded;
         ctx.samples.append(&mut state.samples);
 
         // A host sleep that refused to block (budget exhausted) fails the
@@ -340,6 +384,14 @@ impl DriverInstance for WasmDriverInstance {
         if over_budget {
             return Err(TropelError::Other(
                 "WASM driver iteration exceeded its per-iteration sleep budget".into(),
+            ));
+        }
+        // Sample spam is bounded the same way: past the cap, further samples
+        // are refused and the iteration fails, so a hostile module cannot
+        // flood the metrics pipeline with multi-GB of samples.
+        if spam {
+            return Err(TropelError::Other(
+                "WASM driver iteration exceeded its per-iteration sample cap".into(),
             ));
         }
 
@@ -435,7 +487,13 @@ fn http_request_host(
         Some(Extern::Memory(m)) => m,
         _ => return -1,
     };
-    let mut req_buf = vec![0u8; req_len.max(0) as usize];
+    // Bounds-check BEFORE allocating (P1): a hostile `req_len = i32::MAX`
+    // would zero-allocate ~2 GiB and abort() the host (non-unwinding,
+    // killing every VU). Clamp to the module's actual memory size — any
+    // claim beyond it is a lie, and memory is engine-capped at 16 MiB — so
+    // the read below either succeeds or fails with -2, never OOM-aborts.
+    let req_len = (req_len.max(0) as usize).min(memory.data_size(&caller));
+    let mut req_buf = vec![0u8; req_len];
     if memory
         .read(&caller, req_ptr.max(0) as usize, &mut req_buf)
         .is_err()
@@ -477,7 +535,6 @@ fn http_request_host(
             .as_ref()
             .map(Body::encoded_len)
             .unwrap_or(0) as f64;
-        let samples = &mut caller.data_mut().samples;
         let chain = resp
             .redirects
             .iter()
@@ -492,52 +549,67 @@ fn http_request_host(
             tags.insert("group", "http");
             let tags = Arc::new(tags);
 
-            samples.push(Sample {
-                metric: "http_req_duration".into(),
-                value: hop.response_time.as_micros() as f64,
-                tags: tags.clone(),
-                timestamp: now,
-                sample_type: SampleType::Trend,
-            });
-            samples.push(Sample {
-                metric: "http_reqs".into(),
-                value: 1.0,
-                tags: tags.clone(),
-                timestamp: now,
-                sample_type: SampleType::Counter,
-            });
+            push_iteration_sample(
+                caller.data_mut(),
+                Sample {
+                    metric: "http_req_duration".into(),
+                    value: hop.response_time.as_micros() as f64,
+                    tags: tags.clone(),
+                    timestamp: now,
+                    sample_type: SampleType::Trend,
+                },
+            );
+            push_iteration_sample(
+                caller.data_mut(),
+                Sample {
+                    metric: "http_reqs".into(),
+                    value: 1.0,
+                    tags: tags.clone(),
+                    timestamp: now,
+                    sample_type: SampleType::Counter,
+                },
+            );
             // http_req_failed: k6's default semantics (2xx-3xx = success).
             // The declarative runner instead consults the configurable
             // expectedStatuses; the WASM driver has no config channel, so it
             // deliberately matches the k6 default.
             let is_failed = !(200..400).contains(&hop.status_code);
-            samples.push(Sample {
-                metric: "http_req_failed".into(),
-                value: if is_failed { 1.0 } else { 0.0 },
-                tags: tags.clone(),
-                timestamp: now,
-                sample_type: SampleType::Rate,
-            });
-            samples.push(Sample {
-                metric: "data_received".into(),
-                value: hop.size as f64,
-                tags: tags.clone(),
-                timestamp: now,
-                sample_type: SampleType::Counter,
-            });
+            push_iteration_sample(
+                caller.data_mut(),
+                Sample {
+                    metric: "http_req_failed".into(),
+                    value: if is_failed { 1.0 } else { 0.0 },
+                    tags: tags.clone(),
+                    timestamp: now,
+                    sample_type: SampleType::Rate,
+                },
+            );
+            push_iteration_sample(
+                caller.data_mut(),
+                Sample {
+                    metric: "data_received".into(),
+                    value: hop.size as f64,
+                    tags: tags.clone(),
+                    timestamp: now,
+                    sample_type: SampleType::Counter,
+                },
+            );
             // data_sent only on the FINAL response (the one carrying the
             // redirects chain) — redirect hops carry no request body.
-            samples.push(Sample {
-                metric: "data_sent".into(),
-                value: if std::ptr::eq(hop, &resp) {
-                    data_sent
-                } else {
-                    0.0
+            push_iteration_sample(
+                caller.data_mut(),
+                Sample {
+                    metric: "data_sent".into(),
+                    value: if std::ptr::eq(hop, &resp) {
+                        data_sent
+                    } else {
+                        0.0
+                    },
+                    tags,
+                    timestamp: now,
+                    sample_type: SampleType::Counter,
                 },
-                tags,
-                timestamp: now,
-                sample_type: SampleType::Counter,
-            });
+            );
         }
     }
 
@@ -575,25 +647,62 @@ fn metric_add_host(
     tags_len: i32,
     type_code: i32,
 ) {
+    // Fast-fail once the iteration is already over the sample/tag caps: skip
+    // the reads and parse entirely. A hostile module could otherwise keep
+    // paying the full per-call path (name read + tags parse) for every one
+    // of the ~50 M fuel-bought calls after the cap trips.
+    if caller.data().metric_spam_exceeded {
+        return;
+    }
     let memory = match caller.get_export("memory") {
         Some(Extern::Memory(m)) => m,
         _ => return,
     };
-    let name = read_mem_string(&memory, &caller, name_ptr, name_len);
-    if name.is_empty() {
+    // Refuse oversized names (cardinality / allocation bound): read at most
+    // MAX_METRIC_NAME_LEN + 1 bytes so a hostile module cannot force a 16 MiB
+    // allocation per call, and refuse when the name is longer than the cap
+    // (strict refusal, not silent truncation — a truncated 300-byte name
+    // could collide with a legitimate 256-byte one).
+    let name = read_mem_string(
+        &memory,
+        &caller,
+        name_ptr,
+        name_len.min(MAX_METRIC_NAME_LEN as i32 + 1),
+    );
+    if name.is_empty() || name.len() > MAX_METRIC_NAME_LEN {
         return;
     }
-    let mut tags_buf = vec![0u8; tags_len.max(0) as usize];
+    // Bounds-check BEFORE allocating (P1): a hostile tags_len could abort
+    // the host with a multi-GB zeroed allocation. Clamp to memory size AND
+    // to a sane per-call cap.
+    let tags_len = (tags_len.max(0) as usize)
+        .min(memory.data_size(&caller))
+        .min(MAX_METRIC_TAGS_BYTES);
+    let mut tags_buf = vec![0u8; tags_len];
     let mut tags = TagMap::new();
     if memory
         .read(&caller, tags_ptr.max(0) as usize, &mut tags_buf)
         .is_ok()
     {
         if let Ok(map) = serde_json::from_slice::<HashMap<String, String>>(&tags_buf) {
+            if map.len() > MAX_METRIC_TAGS {
+                return; // refuse oversized tag sets (cardinality bound)
+            }
             for (k, v) in map {
+                // Per-key/value caps: without these, 100k capped samples × 32
+                // unbounded tags could still grow resident memory toward
+                // multi-GB (the buffer cap bounds the parse, not the map).
+                if k.len() > MAX_METRIC_TAG_KEY_LEN || v.len() > MAX_METRIC_TAG_VALUE_LEN {
+                    return;
+                }
                 tags.insert(k, v);
             }
         }
+    }
+    // Refuse non-finite values: a guest NaN/Inf sample would poison Counter/
+    // Trend aggregates and thresholds downstream (avg/p95 become NaN).
+    if !value.is_finite() {
+        return;
     }
     let sample_type = match type_code {
         1 => SampleType::Counter,
@@ -601,13 +710,44 @@ fn metric_add_host(
         3 => SampleType::Rate,
         _ => SampleType::Point,
     };
-    caller.data_mut().samples.push(Sample {
-        metric: name.into(),
-        value,
-        tags: Arc::new(tags),
-        timestamp: SystemTime::now(),
-        sample_type,
-    });
+    push_iteration_sample(
+        caller.data_mut(),
+        Sample {
+            metric: name.into(),
+            value,
+            tags: Arc::new(tags),
+            timestamp: SystemTime::now(),
+            sample_type,
+        },
+    );
+}
+
+/// Push a sample into the current iteration's buffer, enforcing
+/// [`MAX_ITERATION_SAMPLES`] AND the cumulative tag-bytes budget
+/// ([`MAX_ITERATION_TAG_BYTES`], computed from the sample's own tags — so it
+/// also covers the auto-recorded `http_req_*` set whose `url` tag is
+/// guest-controlled). Once a cap is reached, further samples are dropped and
+/// [`WasmDriverState::metric_spam_exceeded`] is set so the iteration fails
+/// (mirroring the sleep-budget pattern). This bounds the per-iteration
+/// `samples` Vec, its resident tag memory, AND the downstream metrics
+/// pipeline — fuel buys a hostile module ~50 M `metric_add` calls, which
+/// would otherwise grow the Vec toward multi-GB.
+fn push_iteration_sample(state: &mut WasmDriverState, sample: Sample) {
+    if state.samples.len() >= MAX_ITERATION_SAMPLES {
+        state.metric_spam_exceeded = true;
+        return;
+    }
+    let tag_bytes: usize = sample
+        .tags
+        .iter()
+        .map(|(k, v)| k.len() + v.len())
+        .sum();
+    if state.iteration_tag_bytes.saturating_add(tag_bytes) > MAX_ITERATION_TAG_BYTES {
+        state.metric_spam_exceeded = true;
+        return;
+    }
+    state.iteration_tag_bytes += tag_bytes;
+    state.samples.push(sample);
 }
 
 /// Read a UTF-8 string from WASM memory, stopping at the first NUL.
@@ -620,7 +760,10 @@ fn read_mem_string(
     if ptr < 0 || len <= 0 {
         return String::new();
     }
-    let mut buf = vec![0u8; len as usize];
+    // Bounds-check BEFORE allocating (P1): a hostile length could abort the
+    // host with a huge zeroed allocation. Clamp to the module's memory size.
+    let len = (len as usize).min(memory.data_size(store));
+    let mut buf = vec![0u8; len];
     if memory.read(store, ptr as usize, &mut buf).is_err() {
         return String::new();
     }
@@ -701,6 +844,41 @@ mod tests {
   (func (export "adapter_run_iteration") (param $in i32) (param $in_len i32) (result i32)
     ;; sleep(1ms) — well within budget, must succeed.
     (call $sleep (f64.const 1.0))
+    (i32.const 0))
+)
+"#;
+
+    const HOSTILE_LEN_DRIVER_WAT: &str = r#"
+(module
+  (import "env" "http_request" (func $http_request (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 64 256)
+  (data (i32.const 4096) "{\"url\":\"http://example.com/\"}")
+  (func (export "adapter_run_iteration") (param $in i32) (param $in_len i32) (result i32)
+    (local $r i32)
+    ;; req_len = i32::MAX — the host must clamp to memory size and fail the
+    ;; read (negative return), NOT abort() the process with a ~2 GiB alloc.
+    (local.set $r (call $http_request (i32.const 4096) (i32.const 2147483647) (i32.const 12288) (i32.const 1024)))
+    ;; Negative result = host rejected safely → iteration succeeds.
+    (if (i32.lt_s (local.get $r) (i32.const 0)) (then (return (i32.const 0))))
+    (i32.const 1))
+)
+"#;
+
+    const SPAM_DRIVER_WAT: &str = r#"
+(module
+  (import "env" "metric_add" (func $metric_add (param i32 i32 f64 i32 i32 i32)))
+  (memory (export "memory") 64 256)
+  (data (i32.const 4096) "spam\00")
+  (data (i32.const 8192) "{}\00")
+  (func (export "adapter_run_iteration") (param $in i32) (param $in_len i32) (result i32)
+    (local $i i32)
+    (block $done
+      (loop $loop
+        ;; metric_add("spam", 1.0, "{}", type=1 Counter) — MAX_ITERATION_SAMPLES+2 times
+        (call $metric_add (i32.const 4096) (i32.const 4) (f64.const 1.0) (i32.const 8192) (i32.const 2) (i32.const 1))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br_if $done (i32.gt_u (local.get $i) (i32.const 100001)))
+        (br $loop)))
     (i32.const 0))
 )
 "#;
@@ -878,6 +1056,65 @@ mod tests {
         assert!(
             start.elapsed() >= Duration::from_millis(1),
             "sleep should have actually blocked ~1ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metric_spam_capped() {
+        // P1 regression: a hostile module could call metric_add ~50 M times
+        // per iteration (fuel-bounded), growing state.samples toward
+        // multi-GB and flooding the metrics pipeline. The per-iteration
+        // sample cap must bound the buffer AND fail the iteration.
+        let driver = WasmDriver;
+        let mut inst = driver
+            .init(SPAM_DRIVER_WAT.as_bytes(), None, None)
+            .await
+            .expect("driver init must succeed");
+
+        let mut ctx = VuContext::new(1, 0, "default".into());
+        let start = std::time::Instant::now();
+        let result = inst.run_iteration(&mut ctx).await;
+        assert!(
+            result.is_err(),
+            "sample spam must fail the iteration, got {:?}",
+            result
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "spam cap must trip quickly"
+        );
+        // The buffer is bounded: at most MAX_ITERATION_SAMPLES samples were
+        // drained into ctx.samples (the 100002nd call sets the flag).
+        assert!(
+            ctx.samples.len() <= MAX_ITERATION_SAMPLES,
+            "samples must be capped, got {}",
+            ctx.samples.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hostile_guest_length_does_not_abort() {
+        // P1 regression: `req_len = i32::MAX` used to zero-allocate ~2 GiB
+        // (vec![0u8; guest_len]) BEFORE any bounds check, hitting
+        // handle_alloc_error → abort() (non-unwinding — kills every VU and
+        // discards metrics). The host must clamp to the module's memory size
+        // (engine-capped at 16 MiB), fail the read, and return a negative
+        // error code instead.
+        let driver = WasmDriver;
+        let mut inst = driver
+            .init(HOSTILE_LEN_DRIVER_WAT.as_bytes(), None, None)
+            .await
+            .expect("driver init must succeed");
+
+        let mut ctx = VuContext::new(1, 0, "default".into());
+        ctx.http_client = Some(Arc::new(StubClient));
+        let start = std::time::Instant::now();
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("hostile length must be rejected without aborting");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "clamped read must complete quickly"
         );
     }
 
