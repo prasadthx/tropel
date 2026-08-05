@@ -3,6 +3,7 @@ use rquickjs::function::Func;
 use rquickjs::{Context, Coerced, FromJs, Function, Persistent, Promise, Runtime};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::ffi::{c_void, CString};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -748,6 +749,138 @@ impl JsContext {
         Ok(())
     }
 
+    /// Compile a global script into QuickJS bytecode WITHOUT executing it.
+    ///
+    /// This is the `qjsc`-style path: `JS_Eval` with
+    /// `JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY` parses and compiles
+    /// the source, returning the compiled function without running it;
+    /// `JS_WriteObject` with `JS_WRITE_OBJ_BYTECODE` serializes it into a
+    /// self-contained byte blob.
+    ///
+    /// The resulting bytes are tied to the QuickJS build (version + feature
+    /// flags), not to any particular context, so they can be compiled ONCE
+    /// and loaded into every VU's context via
+    /// [`JsContext::run_global_bytecode`]. This turns the per-VU cost of
+    /// bootstrapping a large shim bundle (pm-api/chai/lodash/crypto/exec)
+    /// from parse+compile+execute into read+execute.
+    pub fn compile_global_bytecode(&mut self, code: &str) -> Result<Vec<u8>> {
+        self.reset_interrupt();
+        let filename = CString::new("<tropel-shim-bundle>").expect("static filename");
+        let code_c = CString::new(code.as_bytes())
+            .map_err(|_| JsError::Eval("shim source contains NUL byte".into()))?;
+        let code_len = code.len() as rquickjs::qjs::size_t;
+
+        let result = self.ctx.with(move |ctx| {
+            let raw = ctx.as_raw().as_ptr();
+            let flags = (rquickjs::qjs::JS_EVAL_TYPE_GLOBAL
+                | rquickjs::qjs::JS_EVAL_FLAG_COMPILE_ONLY) as i32;
+            let val = unsafe {
+                rquickjs::qjs::JS_Eval(
+                    raw,
+                    code_c.as_ptr(),
+                    code_len,
+                    filename.as_ptr(),
+                    flags,
+                )
+            };
+            if unsafe { rquickjs::qjs::JS_IsException(val) } {
+                let caught = ctx.catch();
+                let msg = format!(
+                    "Shim bytecode compile error: {}",
+                    Self::rejection_to_string(&ctx, &caught)
+                        .unwrap_or_else(|| "unknown compile error".into())
+                );
+                unsafe { rquickjs::qjs::JS_FreeValue(raw, val) };
+                return Err(JsError::Eval(msg));
+            }
+
+            let mut size: rquickjs::qjs::size_t = 0;
+            let buf = unsafe {
+                rquickjs::qjs::JS_WriteObject(
+                    raw,
+                    &mut size,
+                    val,
+                    rquickjs::qjs::JS_WRITE_OBJ_BYTECODE as i32,
+                )
+            };
+            unsafe { rquickjs::qjs::JS_FreeValue(raw, val) };
+            if buf.is_null() {
+                let caught = ctx.catch();
+                let msg = format!(
+                    "Shim bytecode serialization failed (OOM or unsupported object): {}",
+                    Self::rejection_to_string(&ctx, &caught)
+                        .unwrap_or_else(|| "unknown serialization error".into())
+                );
+                return Err(JsError::Eval(msg));
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(buf, size as usize) }.to_vec();
+            unsafe { rquickjs::qjs::js_free(raw, buf as *mut c_void) };
+            Ok(bytes)
+        });
+        result
+    }
+
+    /// Load QuickJS bytecode produced by [`JsContext::compile_global_bytecode`]
+    /// and execute it in THIS context's global scope.
+    ///
+    /// `JS_ReadObject` rebuilds the compiled global function from the byte
+    /// blob, then `JS_Call` with `JS_UNDEFINED` as `this` runs it — matching
+    /// what `qjsc`-embedded scripts do at startup. Global `var`/`function`
+    /// declarations land on this context's global object, exactly as a
+    /// source `eval` would.
+    pub async fn run_global_bytecode(&mut self, bytecode: &[u8]) -> Result<()> {
+        self.reset_interrupt();
+        let bytes = bytecode.to_vec();
+
+        let result = self.ctx.with(|ctx| {
+            let raw = ctx.as_raw().as_ptr();
+            let val = unsafe {
+                rquickjs::qjs::JS_ReadObject(
+                    raw,
+                    bytes.as_ptr(),
+                    bytes.len() as rquickjs::qjs::size_t,
+                    rquickjs::qjs::JS_READ_OBJ_BYTECODE as i32,
+                )
+            };
+            if unsafe { rquickjs::qjs::JS_IsException(val) } {
+                let caught = ctx.catch();
+                let msg = format!(
+                    "Shim bytecode load error: {}",
+                    Self::rejection_to_string(&ctx, &caught)
+                        .unwrap_or_else(|| "unknown bytecode load error".into())
+                );
+                unsafe { rquickjs::qjs::JS_FreeValue(raw, val) };
+                return Err(JsError::Eval(msg));
+            }
+
+            // Execute the compiled global script. `JS_EvalFunction` is what
+            // qjs uses to run precompiled scripts: it instantiates the raw
+            // bytecode function into a real closure bound to THIS context's
+            // global object (so `var`/`function` declarations land there) and
+            // calls it. The function value is CONSUMED (freed) by
+            // `JS_CallFree` inside `JS_EvalFunction`, so we must NOT free it
+            // again — only the returned value.
+            let ret = unsafe { rquickjs::qjs::JS_EvalFunction(raw, val) };
+            if unsafe { rquickjs::qjs::JS_IsException(ret) } {
+                let caught = ctx.catch();
+                let msg = format!(
+                    "Shim bytecode run error: {}",
+                    Self::rejection_to_string(&ctx, &caught)
+                        .unwrap_or_else(|| "unknown shim run error".into())
+                );
+                unsafe { rquickjs::qjs::JS_FreeValue(raw, ret) };
+                return Err(JsError::Eval(msg));
+            }
+            unsafe { rquickjs::qjs::JS_FreeValue(raw, ret) };
+            Ok(())
+        })?;
+
+        // Pump the promise queue to resolve any pending microtasks, matching
+        // the behavior of the source `eval` path.
+        self.pump_promise_queue()?;
+        Ok(result)
+    }
+
     /// Get the context ID.
     pub fn id(&self) -> u64 {
         self.context_id
@@ -901,5 +1034,58 @@ mod tests {
         assert!(ok);
         let x = ctx.get_global("__tropel_x").await.unwrap();
         assert_eq!(x.as_deref(), Some("7"));
+    }
+
+    #[tokio::test]
+    async fn compile_global_bytecode_runs_in_fresh_context() {
+        // Simulates the shim bootstrap: bytecode compiled ONCE in one context
+        // must run in a completely fresh context (another VU), with globals
+        // landing on the new context's global object.
+        let mut compiler = new_ctx().await;
+        let bytecode = compiler
+            .compile_global_bytecode(
+                "var __tropel_shim_marker = 42;\nfunction __tropel_shim_fn() { return 'shim-ok'; }\n",
+            )
+            .unwrap();
+        assert!(!bytecode.is_empty(), "bytecode must be non-empty");
+
+        // A different, brand-new context (as if a second VU):
+        let mut runner = new_ctx().await;
+        runner.run_global_bytecode(&bytecode).await.unwrap();
+
+        let marker = runner.get_global("__tropel_shim_marker").await.unwrap();
+        assert_eq!(marker.as_deref(), Some("42"));
+        let result = runner.eval("__tropel_shim_fn()").await.unwrap();
+        assert_eq!(result, "shim-ok");
+    }
+
+    #[tokio::test]
+    async fn compile_global_bytecode_surfaces_compile_errors() {
+        let mut ctx = new_ctx().await;
+        let err = ctx
+            .compile_global_bytecode("function { syntax error")
+            .err();
+        assert!(err.is_some(), "invalid source must fail to compile");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("compile") || msg.contains("Compile"),
+            "error should mention compilation: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn run_global_bytecode_surfaces_runtime_errors() {
+        let mut ctx = new_ctx().await;
+        let bytecode = ctx
+            .compile_global_bytecode("throw new Error('shim-boom');")
+            .unwrap();
+        let err = ctx.run_global_bytecode(&bytecode).await.err();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("shim-boom") || msg.contains("shim run"),
+            "runtime error must surface: {}",
+            msg
+        );
     }
 }
