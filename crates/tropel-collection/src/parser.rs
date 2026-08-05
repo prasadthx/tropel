@@ -146,7 +146,7 @@ fn convert_request(
 ) -> Request {
     let method = Method::parse(&detail.method).unwrap_or(Method::GET);
 
-    let url = build_url(detail);
+    let mut url = build_url(detail);
 
     let headers: HashMap<String, String> = detail
         .header
@@ -155,17 +155,7 @@ fn convert_request(
         .map(|h| (h.key.clone(), h.value.clone()))
         .collect();
 
-    let query_params: HashMap<String, String> = detail
-        .url
-        .as_ref()
-        .map(|u| {
-            u.query
-                .iter()
-                .filter(|q| !q.disabled)
-                .map(|q| (q.key.clone(), q.value.clone().unwrap_or_default()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let query_params = build_query_params(detail, &mut url);
 
     let body = convert_body(detail.body.as_ref());
 
@@ -178,6 +168,53 @@ fn convert_request(
         auth: resolve_auth(request_auth, inherited_auth),
         ..Default::default()
     }
+}
+
+/// Harvest the structured `url.query` list into `query_params` — but ONLY
+/// when the URL itself does not already carry a query (same convention as
+/// the HAR adapter; the HTTP client re-appends `query_params`, so doing
+/// both would send every param twice: `?page=2&page=2`).
+///
+/// Postman's `url.raw` is the URL exactly as typed and ALWAYS contains the
+/// query when one exists — so the common case leaves `query_params` empty
+/// and the query rides in the URL. When the URL has no `?` but the
+/// structured query has DUPLICATE keys (a HashMap cannot represent
+/// `a=1&a=2`), fold the query string into the URL instead, preserving
+/// order and duplicates.
+fn build_query_params(detail: &RequestDetail, url: &mut String) -> HashMap<String, String> {
+    if url.contains('?') {
+        return HashMap::new();
+    }
+    let pairs: Vec<(String, String)> = detail
+        .url
+        .as_ref()
+        .map(|u| {
+            u.query
+                .iter()
+                .filter(|q| !q.disabled)
+                .map(|q| (q.key.clone(), q.value.clone().unwrap_or_default()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if pairs.is_empty() {
+        return HashMap::new();
+    }
+    if has_duplicate_keys(&pairs) {
+        let qs: Vec<String> = pairs
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+        url.push('?');
+        url.push_str(&qs.join("&"));
+        HashMap::new()
+    } else {
+        pairs.into_iter().collect()
+    }
+}
+
+fn has_duplicate_keys(pairs: &[(String, String)]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    pairs.iter().any(|(k, _)| !seen.insert(k.clone()))
 }
 
 /// Resolve a request's effective auth following Postman inheritance
@@ -784,6 +821,94 @@ mod tests {
             Some(AuthConfig::Bearer { token }) => assert_eq!(token, "legacy_tok"),
             other => panic!("legacy item.auth must be honored, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_query_not_sent_twice() {
+        // Regression (backlog line 72): build_url returns url.raw verbatim
+        // (which ALWAYS contains the query) AND query_params harvested the
+        // structured url.query list — the HTTP client re-appends
+        // query_params, so `GET /items?page=2` went out as
+        // `/items?page=2&page=2`. When the URL already carries a query,
+        // query_params must stay empty (same convention as the HAR adapter).
+        let json = r#"{
+            "info": {"name": "Q", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "item": [{
+                "name": "List",
+                "request": {
+                    "method": "GET",
+                    "url": {
+                        "raw": "https://api.example.com/items?page=2",
+                        "host": ["api", "example", "com"],
+                        "path": ["items"],
+                        "query": [{"key": "page", "value": "2"}]
+                    }
+                }
+            }]
+        }"#;
+
+        let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
+        let req = scenario.items[0].request.as_ref().unwrap();
+        assert_eq!(req.url, "https://api.example.com/items?page=2");
+        assert!(
+            req.query_params.is_empty(),
+            "query_params must be empty when the URL already has the query — got {:?}",
+            req.query_params
+        );
+    }
+
+    #[test]
+    fn test_query_populated_when_url_has_no_query() {
+        // Structured query WITHOUT a query in the raw URL must still be
+        // harvested into query_params (the client appends them once).
+        let json = r#"{
+            "info": {"name": "Q", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "item": [{
+                "name": "List",
+                "request": {
+                    "method": "GET",
+                    "url": {
+                        "raw": "https://api.example.com/items",
+                        "host": ["api", "example", "com"],
+                        "path": ["items"],
+                        "query": [{"key": "page", "value": "2"}]
+                    }
+                }
+            }]
+        }"#;
+
+        let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
+        let req = scenario.items[0].request.as_ref().unwrap();
+        assert_eq!(req.url, "https://api.example.com/items");
+        assert_eq!(req.query_params.get("page").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn test_query_duplicate_keys_folded_into_url() {
+        // A HashMap cannot represent `tag=a&tag=b`; when the URL has no
+        // query and the structured list has duplicate keys, fold the full
+        // query string into the URL (order + duplicates preserved) and keep
+        // query_params empty — mirroring the HAR adapter's convention.
+        let json = r#"{
+            "info": {"name": "Q", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "item": [{
+                "name": "Tags",
+                "request": {
+                    "method": "GET",
+                    "url": {
+                        "raw": "https://api.example.com/search",
+                        "host": ["api", "example", "com"],
+                        "path": ["search"],
+                        "query": [{"key": "tag", "value": "a"}, {"key": "tag", "value": "b"}]
+                    }
+                }
+            }]
+        }"#;
+
+        let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
+        let req = scenario.items[0].request.as_ref().unwrap();
+        assert_eq!(req.url, "https://api.example.com/search?tag=a&tag=b");
+        assert!(req.query_params.is_empty());
     }
 
     #[test]
