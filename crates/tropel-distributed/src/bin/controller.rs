@@ -60,9 +60,10 @@ async fn main() -> Result<()> {
         .map_err(TropelError::Io)?;
     tracing::info!("Controller listening on {}. Waiting for {} agent(s)...", args.listen, args.agents);
 
+    let test_start = std::time::Instant::now();
     let result = tropel_distributed::run_controller(listener, &config, args.agents, &token).await?;
 
     // Report through the configured reporters + evaluate thresholds
     // (exit-code contract shared with `tropel-cloud-run`).
-    tropel_distributed::report_and_thresholds(&config, &result).await
+    tropel_distributed::report_and_thresholds(&config, &result, test_start).await
 }

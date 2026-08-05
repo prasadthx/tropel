@@ -141,8 +141,9 @@ async fn main() -> Result<()> {
             };
             let listener = TcpListener::bind(&listen).await.map_err(TropelError::Io)?;
             tracing::info!("Controller listening on {listen}. Waiting for {agents} agent(s)...");
+            let test_start = std::time::Instant::now();
             let result = tropel_distributed::run_controller(listener, &config, agents, &token).await?;
-            tropel_distributed::report_and_thresholds(&config, &result).await
+            tropel_distributed::report_and_thresholds(&config, &result, test_start).await
         }
         Cmd::Agent {
             controller,
@@ -164,8 +165,9 @@ async fn main() -> Result<()> {
             let config = load_config(&config)?;
             tracing::info!("Cloud-run local mode: {agents} in-process agent(s)");
             let token = resolve_token(token, token_file).unwrap_or_else(|_| generate_token());
+            let test_start = std::time::Instant::now();
             let result = tropel_distributed::run_cloud(&config, agents, &token).await?;
-            tropel_distributed::report_and_thresholds(&config, &result).await
+            tropel_distributed::report_and_thresholds(&config, &result, test_start).await
         }
         Cmd::K8s {
             config,

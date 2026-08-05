@@ -28,8 +28,10 @@
 //! `MetricsSnapshot` back. The controller merges and reports.
 
 use std::path::PathBuf;
+use std::time::Instant;
 use tropel_core::config::JobConfig;
 use tropel_core::{Result, TropelError};
+use tropel_ext::registry::ExtensionRegistry;
 use tropel_metrics::thresholds::evaluate_thresholds;
 use tropel_report::create_reporter;
 
@@ -85,9 +87,13 @@ pub fn resolve_token(cli: Option<String>, file: Option<PathBuf>) -> Result<Strin
 /// Run the configured reporters over a merged result, then evaluate
 /// thresholds and return an error if any failed (exit-code contract shared
 /// by the `tropel-controller` and `tropel-cloud-run local/controller` bins).
+///
+/// `test_start` is the controller-side run start, used for the summary
+/// export's duration field (the merged result carries no wall clock).
 pub async fn report_and_thresholds(
     config: &JobConfig,
     result: &tropel_metrics::collector::MetricsResult,
+    test_start: Instant,
 ) -> Result<()> {
     let mut reporters = Vec::new();
     for name in &config.output.reporters {
@@ -100,6 +106,50 @@ pub async fn report_and_thresholds(
     for reporter in &reporters {
         reporter.report(result).await?;
     }
+
+    // Streaming outputs (Prometheus/OTLP/StatsD/Influx/json-stream) consume
+    // a LIVE sample stream during the run. In distributed mode agents run
+    // with outputs nulled (OutputConfig::into_worker) and only ship merged
+    // snapshots at the end — there is no sample stream on the controller to
+    // feed them, so they cannot be honored. Warn loudly instead of silently
+    // dropping them (the previous behavior: no warning at all).
+    let mut unstreamable: Vec<&str> = Vec::new();
+    if config.output.prometheus_remote_write_url.is_some() {
+        unstreamable.push("prometheus_remote_write_url");
+    }
+    if config.output.otlp_endpoint.is_some() {
+        unstreamable.push("otlp_endpoint");
+    }
+    if config.output.json_stream.is_some() {
+        unstreamable.push("json_stream");
+    }
+    if config.output.statsd_addr.is_some() {
+        unstreamable.push("statsd_addr");
+    }
+    if config.output.influxdb_addr.is_some() {
+        unstreamable.push("influxdb_addr");
+    }
+    if !unstreamable.is_empty() {
+        tracing::warn!(
+            "Distributed mode cannot stream samples live to: {} — agents run with outputs \
+             nulled (into_worker) and the controller merges end-of-run snapshots only, so \
+             there is no sample stream to push. Configure these on a local run instead.",
+            unstreamable.join(", ")
+        );
+    }
+
+    // Honor summary_export / script handleSummary from the MERGED result —
+    // the engine's emit_handle_summary is public for exactly this. Previously
+    // the controller never called it, silently dropping summary_export.
+    let registry = ExtensionRegistry::new();
+    tropel_engine::emit_handle_summary(
+        config,
+        &registry,
+        result,
+        &result.effective_thresholds,
+        test_start,
+    )
+    .await;
 
     let threshold_results = evaluate_thresholds(&result.effective_thresholds, result);
     let mut any_failed = false;
@@ -115,5 +165,59 @@ pub async fn report_and_thresholds(
         Err(TropelError::Other("One or more thresholds failed".into()))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use tropel_core::config::JobConfig;
+    use tropel_metrics::collector::MetricsResult;
+
+    #[tokio::test]
+    async fn report_and_thresholds_honors_summary_export() {
+        // P1 regression: report_and_thresholds only built stdout/json/csv
+        // reporters and NEVER called emit_handle_summary, so summary_export
+        // was silently dropped on distributed runs. It must write the file.
+        let dir = std::env::temp_dir().join(format!(
+            "tropel-summary-export-test-{}",
+            std::process::id()
+        ));
+        let path = dir.with_extension("json");
+        let _ = std::fs::remove_file(&path);
+
+        let mut config = JobConfig::default();
+        config.output.reporters = Vec::new();
+        config.output.summary_export = Some(path.to_string_lossy().to_string());
+        // The input path doesn't exist — emit_handle_summary must fall through
+        // to the --summary-export write instead of failing.
+        config.input = "/nonexistent/input.json".into();
+
+        let result = MetricsResult::default();
+        let start = Instant::now() - Duration::from_secs(3);
+        let outcome = report_and_thresholds(&config, &result, start).await;
+        assert!(outcome.is_ok(), "report_and_thresholds failed: {:?}", outcome.err());
+
+        let written = std::fs::read_to_string(&path).expect("summary_export must be written");
+        let value: serde_json::Value =
+            serde_json::from_str(&written).expect("summary_export must be valid JSON");
+        // The merged result feeds the summary data (metrics map present).
+        assert!(value.get("metrics").is_some(), "summary JSON has metrics");
+        assert!(value.get("state").is_some(), "summary JSON has state");
+        // testRunDurationMs reflects the passed test_start (at least 3s —
+        // elapsed() includes the setup time between the two calls, so an
+        // exact-equality assert would flake under load).
+        let state = value.get("state").unwrap();
+        assert!(
+            state
+                .get("testRunDurationMs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                >= 3000,
+            "testRunDurationMs must reflect the passed test_start"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -574,8 +574,7 @@ impl Engine {
             // (JSON/HTML/JUnit). Runs after the run with the aggregated data;
             // returned files are written (`stdout` prints). Falls back to
             // `--summary-export` when the script declares no handleSummary.
-            self.emit_handle_summary(config, &registry, &results, &thresholds, test_start)
-                .await;
+            emit_handle_summary(config, &registry, &results, &thresholds, test_start).await;
         }
 
         Ok(EngineResult {
@@ -634,20 +633,22 @@ impl Default for Engine {
 // handleSummary(data) — script-emitted custom summaries
 
 
-impl Engine {
-    /// Invoke the script's `handleSummary(data)` (k6) after the run and
-    /// write the returned files (`stdout` key prints to stdout). When the
-    /// script declares no handleSummary, honor `--summary-export` by
-    /// writing the default summary data object as JSON. Best-effort — a
-    /// failing script summary never fails the run.
-    async fn emit_handle_summary(
-        &self,
-        config: &JobConfig,
-        registry: &ExtensionRegistry,
-        results: &tropel_metrics::collector::MetricsResult,
-        thresholds: &HashMap<String, tropel_core::config::ThresholdConfig>,
-        test_start: Instant,
-    ) {
+/// Invoke the script's `handleSummary(data)` (k6) after the run and
+/// write the returned files (`stdout` key prints to stdout). When the
+/// script declares no handleSummary, honor `--summary-export` by
+/// writing the default summary data object as JSON. Best-effort — a
+/// failing script summary never fails the run.
+///
+/// Public so the distributed controller can emit the same summaries from
+/// its MERGED result (previously `report_and_thresholds` only ran
+/// stdout/json/csv and silently dropped summary_export and handleSummary).
+pub async fn emit_handle_summary(
+    config: &JobConfig,
+    registry: &ExtensionRegistry,
+    results: &tropel_metrics::collector::MetricsResult,
+    thresholds: &HashMap<String, tropel_core::config::ThresholdConfig>,
+    test_start: Instant,
+) {
         let summary_value = build_summary_data(results, thresholds, test_start);
         let summary_json = serde_json::to_string(&summary_value).unwrap_or_default();
 
@@ -694,9 +695,7 @@ impl Engine {
                 if let Err(e) = std::fs::write(path, pretty) {
                     tracing::warn!("Failed to write summary export to '{:?}': {}", path, e);
                 } else {
-                    tracing::info!("Summary exported to '{:?}'", path);
-                }
-            }
+                    tracing::info!("Summary exported to '{:?}'", path);            }
         }
     }
 }
