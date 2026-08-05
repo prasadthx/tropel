@@ -31,7 +31,10 @@ pub struct PmState {
     /// Flow control: next request index to jump to.
     pub next_request: Option<usize>,
     /// Names of all items in order (for setNextRequest by name).
-    pub request_names: Vec<String>,
+    /// Flattened request names for setNextRequest name lookup. Shared as an
+    /// `Arc` so a large collection's names are computed ONCE per scenario
+    /// (in the engine) instead of re-cloned into every VU's PmState.
+    pub request_names: Arc<Vec<String>>,
     /// Iteration data (from CSV/JSON data file), set per-iteration.
     pub iteration_data: Option<HashMap<String, Value>>,
     /// Whether to skip the remaining tests.
@@ -90,7 +93,7 @@ impl PmState {
             custom_metrics: HashMap::new(),
             samples: Vec::new(),
             next_request: None,
-            request_names: Vec::new(),
+            request_names: Arc::new(Vec::new()),
             iteration_data: None,
             skip_tests: false,
             group_stack: Vec::new(),
@@ -126,7 +129,7 @@ impl PmState {
     }
 
     /// Set the list of request names in order (for resolving setNextRequest by name).
-    pub fn set_request_names(&mut self, names: Vec<String>) {
+    pub fn set_request_names(&mut self, names: Arc<Vec<String>>) {
         self.request_names = names;
     }
 

@@ -39,10 +39,11 @@ pub struct VURunner {
     /// Depth-first flatten of the scenario item tree into execution order.
     /// Folder items (children present) are containers: their leaf children
     /// run in order. Postman folders are the norm, so the walk MUST descend
-    /// or folder-organized collections would run 0 requests. Storing the
-    /// flattened list once at construction also makes `setNextRequest`
-    /// indexing/name lookup consistent with the actual run order.
-    execution_items: Vec<ScenarioItem>,
+    /// or folder-organized collections would run 0 requests. Shared as an
+    /// `Arc` across all VUs: the flatten is computed ONCE per scenario (in
+    /// the engine) instead of re-cloned per VU at construction. Also makes
+    /// `setNextRequest` indexing/name lookup consistent with run order.
+    execution_items: Arc<Vec<ScenarioItem>>,
     pm_state: SharedPmState,
     client: HttpClient,
     config: RunnerConfig,
@@ -67,21 +68,18 @@ impl VURunner {
     /// Create a new VU runner with a dedicated HTTP client.
     pub fn new(
         scenario: Arc<Scenario>,
+        execution_items: Arc<Vec<ScenarioItem>>,
+        execution_names: Arc<Vec<String>>,
         client: HttpClient,
         vu_id: u32,
         scenario_name: String,
     ) -> Self {
-        // Extract all item names in order for setNextRequest resolution,
-        // from the flattened execution list (folder contents included).
-        let execution_items = flatten_execution_items(&scenario.items);
-        let names: Vec<String> = execution_items
-            .iter()
-            .map(|item| item.name.clone())
-            .collect();
+        // Request names for setNextRequest resolution, precomputed ONCE per
+        // scenario by the engine and shared across VUs (no per-VU clone).
         let pm_state = Arc::new(Mutex::new(PmState::new()));
         {
             let mut state = pm_state.lock().unwrap();
-            state.set_request_names(names);
+            state.set_request_names(execution_names);
             state.vu_id = vu_id;
             state.scenario_name = scenario_name.clone();
             // Seed collection variables from the scenario (the Postman
@@ -617,7 +615,10 @@ impl VURunner {
 /// This is what makes folder-organized Postman collections actually execute:
 /// the parser nests children correctly, and the runner must descend into
 /// them instead of walking only the top level.
-fn flatten_execution_items(items: &[ScenarioItem]) -> Vec<ScenarioItem> {
+///
+/// `pub`: the engine pre-flattens ONCE per scenario (shared across all VUs
+/// via `Arc`) so a large collection is not re-cloned per VU.
+pub fn flatten_execution_items(items: &[ScenarioItem]) -> Vec<ScenarioItem> {
     let mut out = Vec::new();
     for item in items {
         if item.items.is_empty() {

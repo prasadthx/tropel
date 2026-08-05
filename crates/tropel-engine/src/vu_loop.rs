@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tropel_core::config::{ExecutionConfig, HttpConfig, ThinkTimeConfig, ThresholdConfig, TlsConfig};
-use tropel_core::scenario::Scenario;
+use tropel_core::scenario::{Scenario, ScenarioItem};
 use tropel_core::types::{Request, Response, Sample, TagMap};
 use tropel_core::Result;
 use tropel_executor::runner::VURunner;
@@ -500,6 +500,19 @@ pub(crate) async fn run_scenario_vus(
     let pool_c = pool.clone();
     let sc_name_c = sc_name.clone();
 
+    // Pre-flatten the item tree ONCE per scenario and share the Arcs with
+    // every VU — a large collection must not be re-flattened/re-cloned per
+    // VU at runner construction (VURunner::new). Request names for
+    // setNextRequest are derived from the same flatten and shared too.
+    let flattened_c: Arc<Vec<ScenarioItem>> =
+        Arc::new(tropel_executor::runner::flatten_execution_items(&scenario.items));
+    let names_c: Arc<Vec<String>> = Arc::new(
+        flattened_c
+            .iter()
+            .map(|item| item.name.clone())
+            .collect(),
+    );
+
     run_vus(
         sc_name,
         start_delay,
@@ -522,6 +535,9 @@ pub(crate) async fn run_scenario_vus(
             let pool = pool_c.clone();
             let sc_name_vu = sc_name_c.clone();
             let executor_name = shared.executor_name.clone();
+            // Per-VU Arc bumps (cheap) so the Fn closure isn't moved out of.
+            let flattened_vu = flattened_c.clone();
+            let names_vu = names_c.clone();
 
             // 1-VU-per-task: pin this VU to its own dedicated worker thread so
             // a blocking script `sleep()` (std::thread::sleep) never freezes a
@@ -540,7 +556,14 @@ pub(crate) async fn run_scenario_vus(
                     }
                 };
                 let bridge_client = Arc::new(client.clone());
-                let mut runner = VURunner::new(scenario, client, vu_id, sc_name_vu.clone())
+                let mut runner = VURunner::new(
+                    scenario,
+                    flattened_vu,
+                    names_vu,
+                    client,
+                    vu_id,
+                    sc_name_vu.clone(),
+                )
                     .with_expected_statuses(http_cfg.expected_statuses.clone())
                     .with_protocols(protocols_vu.clone())
                     .with_exec_context(
