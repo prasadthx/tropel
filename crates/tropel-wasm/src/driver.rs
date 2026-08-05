@@ -883,6 +883,39 @@ mod tests {
 )
 "#;
 
+    // A 4 KiB tag VALUE per sample (just under MAX_METRIC_TAG_VALUE_LEN) —
+    // repeated calls must trip the cumulative per-iteration tag-bytes budget
+    // (MAX_ITERATION_TAG_BYTES = 8 MiB -> ~2047 samples) BEFORE the 100k
+    // sample-count cap, and the iteration must fail. The ~4 KiB of tag data
+    // is embedded in the WAT data segment, generated with format!.
+    fn tag_spam_driver_wat() -> String {
+        let big_value = "a".repeat(4096);
+        let tags_json = format!(r#"{{"k":"{}"}}"#, big_value);
+        let tags_len = tags_json.len();
+        // WAT data strings need " and \ escaped.
+        let escaped = tags_json.replace('\\', "\\\\").replace('"', "\\\"");
+        format!(
+            r#"(module
+  (import "env" "metric_add" (func $metric_add (param i32 i32 f64 i32 i32 i32)))
+  (memory (export "memory") 64 256)
+  (data (i32.const 4096) "tagspam\00")
+  (data (i32.const 8192) "{escaped}")
+  (func (export "adapter_run_iteration") (param $in i32) (param $in_len i32) (result i32)
+    (local $i i32)
+    (block $done
+      (loop $loop
+        ;; metric_add("tagspam", 1.0, <4 KiB tags at 8192>, type=1 Counter)
+        (call $metric_add (i32.const 4096) (i32.const 7) (f64.const 1.0) (i32.const 8192) (i32.const {tags_len}) (i32.const 1))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br_if $done (i32.gt_u (local.get $i) (i32.const 5000)))
+        (br $loop)))
+    (i32.const 0))
+)"#,
+            escaped = escaped,
+            tags_len = tags_len,
+        )
+    }
+
     struct StubClient;
 
     #[async_trait]
@@ -1088,6 +1121,36 @@ mod tests {
         assert!(
             ctx.samples.len() <= MAX_ITERATION_SAMPLES,
             "samples must be capped, got {}",
+            ctx.samples.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tag_bytes_budget_capped() {
+        // P1 regression: the sample-count cap alone does not bound memory
+        // when each sample carries up to MAX_METRIC_TAGS_BYTES of tags —
+        // 100k capped samples x 64 KiB would be ~6.4 GB per VU. The
+        // cumulative per-iteration tag-bytes budget must trip (~2048 samples
+        // of 4 KiB) and fail the iteration.
+        let driver = WasmDriver;
+        let mut inst = driver
+            .init(tag_spam_driver_wat().as_bytes(), None, None)
+            .await
+            .expect("driver init must succeed");
+
+        let mut ctx = VuContext::new(1, 0, "default".into());
+        let start = std::time::Instant::now();
+        let result = inst.run_iteration(&mut ctx).await;
+        assert!(result.is_err(), "tag-bytes spam must fail the iteration, got {:?}", result);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "tag-bytes cap must trip quickly"
+        );
+        // ~2047 samples of ~4 KiB tags fit in the 8 MiB budget; anything more
+        // is refused. The count never reaches the 100k sample cap.
+        assert!(
+            ctx.samples.len() < MAX_ITERATION_SAMPLES,
+            "tag budget should trip before the sample cap, got {}",
             ctx.samples.len()
         );
     }
