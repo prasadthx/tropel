@@ -782,9 +782,12 @@ mod tests {
     #[test]
     fn test_tag_scoped_nonexistent_tag() {
         let metrics = make_tag_scoped_metrics();
-        // Tag that doesn't exist in the metrics — should return 0.0
+        // Tag that doesn't exist in the metrics = no samples for that series.
+        // Fail CLOSED: a missing series must FAIL the threshold (k6 marks
+        // no-data thresholds as failed), never pass a `<` against an invented
+        // 0.0 (the old behavior silently reported green).
         let result = evaluate_single_threshold("http_req_duration{status=404}.p95 < 100", &metrics);
-        assert!(result.0, "missing tag should return 0.0, which is < 100");
+        assert!(!result.0, "missing tag must fail closed, not pass with 0.0");
         assert_eq!(result.1, 0.0);
     }
 

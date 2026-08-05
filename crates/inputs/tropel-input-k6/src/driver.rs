@@ -37,7 +37,6 @@ use crate::options::K6Options;
 use async_trait::async_trait;
 use futures::future::join_all;
 use futures_util::{SinkExt, StreamExt};
-use regex::Regex;
 use rquickjs::function::Func;
 use rquickjs::loader::{ImportAttributes, Loader, Resolver};
 use std::collections::HashMap;
@@ -1740,10 +1739,15 @@ impl Loader for K6ModuleLoader {
 /// `export const options`, `export default function`, `export function
 /// setup()` — because they are valid (and load-bearing) in a module.
 ///
-/// Only k6 virtual imports and re-exports are removed: `import … from
-/// "k6/…"`, `import "k6/…"`, `export { x } from "k6/…"` and
-/// `export * from "k6/…"` — the k6 shim provides those APIs as globals, and
-/// there is no `k6/*` module on disk to resolve.
+/// k6 virtual imports and re-exports are removed on the oxc AST (see
+/// [`tropel_es::strip_k6_virtual_imports`]): `import … from "k6/…"`,
+/// `import "k6/…"`, `export { x } from "k6/…"`, `export * from "k6/…"`, and
+/// remote `https://…` (jslib) specifiers — the k6 shim provides those APIs as
+/// globals and there is no `k6/*` module or fetched jslib file on disk. The
+/// AST-based splice (vs. the old line-anchored regex) also strips multi-line
+/// imports (`import {\n check\n} from 'k6';`) and imports with trailing
+/// comments, which used to survive, reach the module resolver, hard-error,
+/// and kill `init` before iteration 1 → zero-metric, exit-0 runs.
 ///
 /// Local imports (`import { x } from "./helpers.js"`) and local re-exports
 /// (`export { x } from "./helpers"`, `export * from "./helpers"`) are KEPT:
@@ -1751,28 +1755,7 @@ impl Loader for K6ModuleLoader {
 /// `K6ModuleLoader`) resolves them to files on disk, transpiling TypeScript
 /// on the fly.
 fn preprocess_k6_source_module(source: &str) -> String {
-    let mut result = source.to_string();
-
-    // ── Remove k6 virtual import / re-export lines entirely ──
-    let re_import =
-        Regex::new(r#"(?m)^\s*import\s+.*?from\s+['"]k6(?:/[^'""]*)?['""]\s*;?\s*$"#).unwrap();
-    result = re_import.replace_all(&result, "").to_string();
-
-    let re_import_side =
-        Regex::new(r#"(?m)^\s*import\s+['"]k6(?:/[^'""]*)?['""]\s*;?\s*$"#).unwrap();
-    result = re_import_side.replace_all(&result, "").to_string();
-
-    let re_reexport =
-        Regex::new(r#"(?m)^\s*export\s+\{[^}]*\}.*from\s+['"]k6(?:/[^'""]*)?['""]\s*;?\s*$"#)
-            .unwrap();
-    result = re_reexport.replace_all(&result, "").to_string();
-
-    let re_reexport_star_k6 =
-        Regex::new(r#"(?m)^\s*export\s+\*\s*[^'"]*?from\s+['"]k6(?:/[^'""]*)?['""]\s*;?\s*$"#)
-            .unwrap();
-    result = re_reexport_star_k6.replace_all(&result, "").to_string();
-
-    result
+    tropel_es::strip_k6_virtual_imports(source)
 }
 
 /// Build the final source for ES-module evaluation: pre-process (keep
@@ -2281,6 +2264,57 @@ mod tests {
             result.contains("export default function"),
             "default export lost: {result}"
         );
+    }
+
+    #[test]
+    fn test_module_preprocess_strips_multiline_import() {
+        // The §0-7 regression: the old line-anchored regex left multi-line
+        // imports (`import {\n check\n} from 'k6';`) in place → they reached
+        // the module resolver, hard-errored, and killed init before iteration
+        // 1 → zero metrics, exit 0. The AST splice must remove them.
+        let code = r#"
+            import {
+                check,
+                group,
+            } from "k6";
+            import http from "k6/http";
+            export const options = { vus: 2 };
+            export default function() {}
+        "#;
+        let result = preprocess_k6_source_module(code);
+        assert!(!result.contains("from \"k6\""), "multiline k6 import kept: {result}");
+        assert!(!result.contains("check,"), "multiline k6 import body kept: {result}");
+        assert!(!result.contains("from \"k6/http\""), "k6/http import kept: {result}");
+        assert!(result.contains("export const options"), "options lost: {result}");
+    }
+
+    #[test]
+    fn test_module_preprocess_strips_import_with_trailing_comment() {
+        // `import http from 'k6/http'; // c` — the old line-anchored regex
+        // required the line to END after the specifier, so the trailing
+        // comment made it survive. The AST splice strips the statement
+        // regardless of trailing comment.
+        let code = "import http from 'k6/http'; // shim provides this\nexport default function() {}\n";
+        let result = preprocess_k6_source_module(code);
+        assert!(
+            !result.contains("from 'k6/http'"),
+            "k6 import with trailing comment kept: {result}"
+        );
+        assert!(result.contains("export default function"), "default export lost: {result}");
+    }
+
+    #[test]
+    fn test_module_preprocess_strips_jslib_url_import() {
+        // `https://jslib.k6.io/...` imports can't be fetched by the local
+        // module resolver — strip them so init doesn't hard-fail.
+        let code =
+            "import { randomIntBetween } from 'https://jslib.k6.io/k6-utils/1.4.0/index.js';\nexport default function() {}\n";
+        let result = preprocess_k6_source_module(code);
+        assert!(
+            !result.contains("jslib.k6.io"),
+            "jslib URL import kept: {result}"
+        );
+        assert!(result.contains("export default function"), "default export lost: {result}");
     }
 
     #[test]

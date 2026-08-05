@@ -33,11 +33,12 @@
 //!   (module-mode eval, e.g. reading a k6 script's `export const options`).
 
 use oxc_allocator::Allocator;
+use oxc_ast::ast::Statement;
 use oxc_codegen::Codegen;
 use oxc_diagnostics::Severity;
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
-use oxc_span::SourceType;
+use oxc_span::{GetSpan, SourceType};
 use oxc_transformer::{
     DecoratorOptions, HelperLoaderMode, HelperLoaderOptions, TransformOptions, Transformer,
 };
@@ -263,6 +264,82 @@ fn remove_exports(s: &str) -> String {
         .join("\n");
 
     result
+}
+
+/// Strip k6 virtual-module imports / re-exports from a module source using the
+/// oxc AST (NOT regex).
+///
+/// k6 scripts import from virtual modules (`k6`, `k6/http`, `k6/metrics`, …)
+/// that have no backing file on disk — the k6 shim provides those APIs as
+/// globals. The old line-anchored regexes missed multi-line imports
+/// (`import {\n check\n} from 'k6';`), trailing comments, and jslib URLs, so
+/// those survived preprocessing, reached the module resolver, hard-errored,
+/// and killed `init` before iteration 1 → zero metrics, exit 0.
+///
+/// This parses the source and splices out any top-level statement whose module
+/// specifier is a k6 virtual module (`k6`, `k6/*`) or a remote URL
+/// (`https://…`, e.g. `https://jslib.k6.io/…`), by its exact AST span — any
+/// syntactic form is handled. Local imports (`./helpers.js`) and local
+/// re-exports (`export { x } from "./helpers"`) are PRESERVED: the module
+/// loader resolves those to files on disk.
+///
+/// On a parse failure the source is returned unchanged (never fail hard here —
+/// the caller surfaces the real parse error from the eval path).
+pub fn strip_k6_virtual_imports(source: &str) -> String {
+    let allocator = Allocator::default();
+    // Parse in module + TypeScript mode so imports/exports AND `.ts` sources
+    // (the preprocessor runs before TS transpilation) both parse.
+    let source_type = SourceType::default().with_typescript(true).with_module(true);
+    let parser_return = Parser::new(&allocator, source, source_type).parse();
+    if parser_return.panicked {
+        return source.to_string();
+    }
+    let program = parser_return.program;
+
+    // Collect byte spans of k6-virtual import / re-export statements, in
+    // source order (AST body order == source order).
+    let mut spans: Vec<(u32, u32)> = Vec::new();
+    for stmt in &program.body {
+        let module_specifier: Option<&str> = match stmt {
+            Statement::ImportDeclaration(decl) => Some(decl.source.value.as_str()),
+            Statement::ExportAllDeclaration(decl) => Some(decl.source.value.as_str()),
+            Statement::ExportNamedDeclaration(decl) => {
+                decl.source.as_ref().map(|s| s.value.as_str())
+            }
+            _ => None,
+        };
+        if let Some(spec) = module_specifier {
+            if is_k6_virtual_specifier(spec) {
+                let span = stmt.span();
+                spans.push((span.start, span.end));
+            }
+        }
+    }
+
+    if spans.is_empty() {
+        return source.to_string();
+    }
+
+    // Splice out the removed statements, preserving everything else
+    // byte-for-byte (comments, spacing, all other statements).
+    let mut result = String::with_capacity(source.len());
+    let mut cursor = 0usize;
+    for (start, end) in spans {
+        result.push_str(&source[cursor..start as usize]);
+        cursor = end as usize;
+    }
+    result.push_str(&source[cursor..]);
+    result
+}
+
+/// Is this module specifier a k6 virtual module or a remote URL that cannot
+/// resolve on disk? `k6` and `k6/<sub>` are shim-provided; `http(s)://…`
+/// (jslib etc.) can't be fetched by the local module resolver.
+fn is_k6_virtual_specifier(spec: &str) -> bool {
+    spec == "k6"
+        || spec.starts_with("k6/")
+        || spec.starts_with("https://")
+        || spec.starts_with("http://")
 }
 
 /// Check if a file path has a TypeScript extension.
