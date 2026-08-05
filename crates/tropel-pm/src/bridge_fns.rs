@@ -26,6 +26,25 @@ fn string_to_json_encoded(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_default()
 }
 
+/// Return the response body as a JSON string for the `pm.response.json()`
+/// bridge, validating that it IS valid JSON first.
+///
+/// The body is validated against a SCRATCH copy and the ORIGINAL bytes are
+/// returned. simd-json parses in-place and REWRITES its input buffer
+/// (in-situ de-escaping), so validating-and-returning the same buffer
+/// corrupts any body containing `\n`, `\"`, `\\` or `\uXXXX` escapes: the
+/// de-escaped bytes overwrite the escape sequences but the buffer length is
+/// unchanged, leaving stale bytes — `{"a":"x\ny"}` becomes invalid JSON.
+/// The JS shim then JSON.parses the returned text, so it must be pristine.
+fn response_json_string(body: &[u8]) -> Option<String> {
+    if body.is_empty() {
+        return None;
+    }
+    let mut scratch = body.to_vec();
+    simd_json::serde::from_slice::<serde_json::Value>(&mut scratch).ok()?;
+    String::from_utf8(body.to_vec()).ok()
+}
+
 /// Resolve {{variable}} references in a URL using the current PM state.
 /// Searches environment, collection vars, and globals in order.
 /// Uses a cursor-based approach that builds the result string by pushing
@@ -344,17 +363,7 @@ impl PmBridge {
                 "__tropel_pm_response_json",
                 Func::from(move || -> Option<String> {
                     let st = state_clone.lock().unwrap();
-                    st.response.as_ref().and_then(|r| {
-                        // Validate JSON directly from raw bytes using simd-json
-                        // This avoids the String::from_utf8 and serde_json::from_str steps
-                        let mut body_bytes = r.body.clone();
-                        if body_bytes.is_empty() {
-                            return None;
-                        }
-                        simd_json::serde::from_slice::<serde_json::Value>(&mut body_bytes).ok()?;
-                        // Return body text for JS-side JSON.parse()
-                        String::from_utf8(body_bytes).ok()
-                    })
+                    st.response.as_ref().and_then(|r| response_json_string(&r.body))
                 }),
             );
 
@@ -770,5 +779,37 @@ mod tests {
         let num = serde_json::json!(123);
         let parsed: serde_json::Value = serde_json::from_str(&variable_value_to_string(&num)).unwrap();
         assert!(parsed.is_number());
+    }
+
+    /// Regression (backlog line 68): `pm.response.json()` returned
+    /// simd-json's IN-PLACE scratch buffer. simd-json rewrites the input
+    /// bytes while de-escaping, so the returned text contained raw control
+    /// chars / stale bytes for any body with `\n`, `\"`, `\\` or `\uXXXX`.
+    /// The bridge must validate against a scratch copy and return the
+    /// ORIGINAL bytes, which the shim JSON.parses cleanly.
+    #[test]
+    fn test_response_json_returns_pristine_body() {
+        // The classic failing body: a real newline escape. The old code
+        // de-escaped it in-place, shortening the string but keeping the
+        // buffer length → stale byte after the newline → invalid JSON.
+        // NOTE: the \n, \", \\ and \uXXXX here are JSON ESCAPE sequences
+        // inside the raw string (backslash + char), NOT real control bytes —
+        // a literal newline byte would be invalid JSON.
+        let body = br#"{"a":"x\ny","b":"\"q\"","c":"path\\to","d":"\u00e9"}"#;
+        let s = response_json_string(body).expect("valid JSON must be returned");
+        // The returned text must be EXACTLY the original bytes — pristine
+        // for the shim's JSON.parse().
+        assert_eq!(s.as_bytes(), body);
+        // And it must actually parse.
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["a"], "x\ny");
+        assert_eq!(v["b"], "\"q\"");
+        assert_eq!(v["c"], "path\\to");
+        assert_eq!(v["d"], "é");
+
+        // Non-JSON body → None (shim throws its descriptive error).
+        assert!(response_json_string(b"not json").is_none());
+        // Empty body → None.
+        assert!(response_json_string(b"").is_none());
     }
 }
