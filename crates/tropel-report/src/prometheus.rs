@@ -13,6 +13,14 @@
 //! sub-series (the Prometheus summary convention), all stamped with the
 //! flush time.
 //!
+//! **Temporality**: remote-write has no temporality field, so every
+//! accumulating series (Counter, Rate, and Trend `_count`/`_sum`) is pushed
+//! as a **cumulative** total since run start — NOT a per-window delta. A
+//! per-window delta would make a counter appear to reset every flush
+//! (500, 480, 510…) and break `rate()`/`increase()`. This is the exact
+//! inverse of the OTLP output, which correctly uses DELTA temporality
+//! because its protocol expresses it; Prometheus cannot.
+//!
 //! Samples are flushed every `FLUSH_INTERVAL` or when the number of series
 //! exceeds `MAX_BUFFERED_SERIES`. A final flush happens when the sample
 //! stream closes (test end).
@@ -55,6 +63,12 @@ pub struct PrometheusRemoteWriteOutput {
     client: reqwest::Client,
     /// Per-series aggregation accumulated during the current flush window.
     series: Mutex<HashMap<SeriesKey, SeriesAgg>>,
+    /// Cumulative running totals for the OUTPUT series (Counter/Rate values
+    /// and Trend `_count`/`_sum` sub-series). Remote-write has no temporality
+    /// field, so these must be monotonic totals since run start — a
+    /// per-window delta would make counters appear to reset every flush and
+    /// break `rate()`/`increase()`.
+    cumulative: Mutex<HashMap<SeriesKey, f64>>,
     /// Number of series currently buffered (fast read without the lock).
     total_buffered: AtomicUsize,
     /// Tag forwarding policy (allowlist + cardinality cap).
@@ -107,6 +121,7 @@ impl PrometheusRemoteWriteOutput {
             url: normalize_remote_write_url(&url.into()),
             client: reqwest::Client::new(),
             series: Mutex::new(HashMap::new()),
+            cumulative: Mutex::new(HashMap::new()),
             total_buffered: AtomicUsize::new(0),
             tag_policy: TagPolicy::default(),
         }
@@ -223,10 +238,17 @@ impl PrometheusRemoteWriteOutput {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let wire_series: HashMap<SeriesKey, Vec<(f64, i64)>> = series
-            .iter()
-            .flat_map(|(key, agg)| expand_series(key, agg, ts_ms))
-            .collect();
+        // Hold the cumulative-total lock for the whole expansion so the
+        // monotonic counters advance consistently across concurrent flushes.
+        // Scoped in a block so the (non-Send) MutexGuard is provably dropped
+        // before the POST await below.
+        let wire_series: HashMap<SeriesKey, Vec<(f64, i64)>> = {
+            let mut cumulative = self.cumulative.lock().unwrap();
+            series
+                .iter()
+                .flat_map(|(key, agg)| expand_series(key, agg, ts_ms, &mut cumulative))
+                .collect()
+        };
 
         let payload = encode_write_request(&wire_series);
         let compressed = snap::raw::Encoder::new()
@@ -283,18 +305,28 @@ fn normalize_remote_write_url(url: &str) -> String {
 
 /// Expand one flush-window aggregation into wire series (one sample per
 /// series, all stamped with the flush time `ts_ms`):
-/// - Counter/Rate → the window sum
+/// - Counter/Rate → the CUMULATIVE total since run start (remote-write has
+///   no temporality field; a per-window delta would make the counter appear
+///   to reset every flush and break `rate()`/`increase()`)
 /// - Point → the last observed value
 /// - Trend → two series, `{metric}_count` and `{metric}_sum` (the Prometheus
-///   summary convention, so backends can derive mean/p50-style aggregates)
+///   summary convention, so backends can derive mean/p50-style aggregates),
+///   also emitted as cumulative totals
+///
+/// `cumulative` holds the running total keyed by OUTPUT series (Counter keys
+/// directly; Trend sub-series keyed by their `_count`/`_sum` keys), so the
+/// value only ever increases across flushes.
 fn expand_series(
     key: &SeriesKey,
     agg: &SeriesAgg,
     ts_ms: i64,
+    cumulative: &mut HashMap<SeriesKey, f64>,
 ) -> Vec<(SeriesKey, Vec<(f64, i64)>)> {
     match agg.sample_type {
         SampleType::Counter | SampleType::Rate => {
-            vec![(key.clone(), vec![(agg.sum, ts_ms)])]
+            let total = cumulative.entry(key.clone()).or_insert(0.0);
+            *total += agg.sum;
+            vec![(key.clone(), vec![(*total, ts_ms)])]
         }
         SampleType::Point => {
             vec![(key.clone(), vec![(agg.last, ts_ms)])]
@@ -321,9 +353,22 @@ fn expand_series(
                 metric: format!("{}_sum", key.metric),
                 labels: sum_labels,
             };
+            // Scoped so each `entry` borrow of `cumulative` ends before the
+            // next one starts (E0499: cannot borrow `*cumulative` as mutable
+            // more than once).
+            let count_total = {
+                let e = cumulative.entry(count_key.clone()).or_insert(0.0);
+                *e += agg.count as f64;
+                *e
+            };
+            let sum_total = {
+                let e = cumulative.entry(sum_key.clone()).or_insert(0.0);
+                *e += agg.sum;
+                *e
+            };
             vec![
-                (count_key, vec![(agg.count as f64, ts_ms)]),
-                (sum_key, vec![(agg.sum, ts_ms)]),
+                (count_key, vec![(count_total, ts_ms)]),
+                (sum_key, vec![(sum_total, ts_ms)]),
             ]
         }
     }
@@ -546,9 +591,13 @@ mod tests {
             agg.sum += s.value;
             agg.last = s.value;
         }
+        // A fresh cumulative map per aggregate() call — the test helper
+        // models one flush window in isolation (callers wanting cross-window
+        // monotonicity drive the real flush() path repeatedly).
+        let mut cumulative: HashMap<SeriesKey, f64> = HashMap::new();
         series
             .iter()
-            .flat_map(|(k, a)| expand_series(k, a, ts_ms))
+            .flat_map(|(k, a)| expand_series(k, a, ts_ms, &mut cumulative))
             .collect()
     }
 
@@ -617,6 +666,67 @@ mod tests {
     }
 
     #[test]
+    fn counters_are_cumulative_across_flush_windows() {
+        // P1 regression: remote-write has no temporality field, so Counter /
+        // Rate (and Trend _count/_sum) must be pushed as CUMULATIVE totals
+        // since run start. Per-window deltas (500, 480, 510…) make Prometheus
+        // see a counter resetting every flush → rate()/increase() wrong.
+        let key = SeriesKey::from_parts("http_reqs", &TagMap::new());
+        let mut cumulative = HashMap::new();
+
+        let w1 = SeriesAgg {
+            sample_type: SampleType::Counter,
+            count: 500,
+            sum: 500.0,
+            last: 1.0,
+        };
+        let out1 = expand_series(&key, &w1, 1000, &mut cumulative);
+        assert_eq!(out1[0].1[0].0, 500.0, "first window: cumulative == window sum");
+
+        let w2 = SeriesAgg {
+            sample_type: SampleType::Counter,
+            count: 480,
+            sum: 480.0,
+            last: 1.0,
+        };
+        let out2 = expand_series(&key, &w2, 2000, &mut cumulative);
+        assert_eq!(
+            out2[0].1[0].0, 980.0,
+            "second window must be CUMULATIVE (500+480), not the 480 delta"
+        );
+
+        // Trend sub-series are cumulative too.
+        let tkey = SeriesKey::from_parts("http_req_duration", &TagMap::new());
+        let tw1 = SeriesAgg {
+            sample_type: SampleType::Trend,
+            count: 3,
+            sum: 300.0,
+            last: 100.0,
+        };
+        let tout1 = expand_series(&tkey, &tw1, 1000, &mut cumulative);
+        let tw2 = SeriesAgg {
+            sample_type: SampleType::Trend,
+            count: 2,
+            sum: 250.0,
+            last: 125.0,
+        };
+        let tout2 = expand_series(&tkey, &tw2, 2000, &mut cumulative);
+        let count2 = tout2
+            .iter()
+            .find(|(k, _)| k.metric.ends_with("_count"))
+            .map(|(_, s)| s[0].0)
+            .unwrap();
+        let sum2 = tout2
+            .iter()
+            .find(|(k, _)| k.metric.ends_with("_sum"))
+            .map(|(_, s)| s[0].0)
+            .unwrap();
+        assert_eq!(count2, 5.0, "trend _count cumulative across windows (3+2)");
+        assert_eq!(sum2, 550.0, "trend _sum cumulative across windows (300+250)");
+        let _ = tout1; // first window's values are single-window by construction
+    }
+
+    #[test]
     fn name_label_sorted_with_tags_not_hardcoded_first() {
         // `__name__` used to be inserted at index 0 AFTER sorting the tags, so
         // a tag that byte-sorts before `__name__` (e.g. `__custom`, `_a`) sat
@@ -652,7 +762,7 @@ mod tests {
             sum: 45.0,
             last: 45.0,
         };
-        let expanded = expand_series(&key, &agg, 1000);
+        let expanded = expand_series(&key, &agg, 1000, &mut HashMap::new());
         assert_eq!(expanded.len(), 2);
         for (k, samples) in &expanded {
             // __custom tag survives on the sub-series.
