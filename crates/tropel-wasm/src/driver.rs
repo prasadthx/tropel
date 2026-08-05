@@ -241,7 +241,11 @@ impl Driver for WasmDriver {
             .map_err(wasm_err)?;
 
         let malloc_fn = instance.get_typed_func::<i32, i32>(&mut store, "malloc").ok();
-        let free_fn = instance.get_typed_func::<i32, i32>(&mut store, "free").ok();
+        // C's free is (i32) -> () — looking it up as (i32) -> i32 returns
+        // None for every real cdylib, silently disabling the free path and
+        // leaking the guest heap every iteration (malloc failure ~1/3 into a
+        // long run, surfacing as a generic "WASM memory write failed").
+        let free_fn = instance.get_typed_func::<i32, ()>(&mut store, "free").ok();
 
         Ok(Box::new(WasmDriverInstance {
             store,
@@ -296,7 +300,7 @@ pub struct WasmDriverInstance {
     memory: Memory,
     call_fuel: u64,
     malloc_fn: Option<TypedFunc<i32, i32>>,
-    free_fn: Option<TypedFunc<i32, i32>>,
+    free_fn: Option<TypedFunc<i32, ()>>,
 }
 
 #[async_trait]
@@ -944,6 +948,30 @@ mod tests {
         assert!(!driver.detect(b"export default function() {}"));
     }
 
+    // free is C's `void free(void*)` = (i32)->(). This module's free emits a
+    // marker metric through the registered `env.metric_add` host function so
+    // the test can assert the host actually invoked free (a lookup with the
+    // wrong signature silently yields None and leaks the guest heap).
+    const FREE_MARKER_WAT: &str = r#"
+(module
+  (import "env" "metric_add" (func $metric_add (param i32 i32 f64 i32 i32 i32)))
+  (memory (export "memory") 64 256)
+  (global $heap (mut i32) (i32.const 1024))
+  (data (i32.const 8192) "free_called\00")
+  (data (i32.const 8300) "{}\00")
+  (func (export "malloc") (param $size i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (global.get $heap))
+    (global.set $heap (i32.add (global.get $heap) (local.get $size)))
+    (local.get $ptr))
+  (func (export "free") (param $ptr i32)
+    ;; (i32)->() — matches C's free. Emits a marker so the host call is observable.
+    (call $metric_add (i32.const 8192) (i32.const 11) (f64.const 1.0) (i32.const 8300) (i32.const 2) (i32.const 1)))
+  (func (export "adapter_run_iteration") (param $in i32) (param $in_len i32) (result i32)
+    (i32.const 0))
+)
+"#;
+
     const DECLARATIVE_ONLY_WAT: &str = r#"
 (module
   (memory (export "memory") 64 256)
@@ -995,6 +1023,34 @@ mod tests {
             instances.push(inst);
         }
         assert_eq!(instances.len(), 32);
+    }
+
+    #[tokio::test]
+    async fn test_free_invoked_after_iteration() {
+        // P1 regression: free was looked up as TypedFunc<i32, i32> but C's
+        // free is (i32)->() — get_typed_func returned None for every real
+        // module, so the host's free path was dead code and the guest heap
+        // leaked one malloc per iteration (malloc failures ~1/3 into a long
+        // run, surfacing as a generic "WASM memory write failed"). The module
+        // here emits a marker metric from its free; the host must invoke free
+        // after run_iteration so the marker lands in ctx.samples.
+        let driver = WasmDriver;
+        let mut inst = driver
+            .init(FREE_MARKER_WAT.as_bytes(), None, None)
+            .await
+            .expect("driver init must succeed");
+
+        let mut ctx = VuContext::new(1, 0, "default".into());
+        ctx.http_client = Some(Arc::new(StubClient));
+
+        inst.run_iteration(&mut ctx).await.expect("iteration must succeed");
+
+        let names: Vec<&str> = ctx.samples.iter().map(|s| s.metric.as_ref()).collect();
+        assert!(
+            names.contains(&"free_called"),
+            "free must be invoked after run_iteration (marker 'free_called' missing): {:?}",
+            names
+        );
     }
 
     #[tokio::test]
