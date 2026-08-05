@@ -8,8 +8,14 @@
 //! ## Usage
 //!
 //! ```ignore
-//! tropel build --with tropel-x-grpc --with tropel-x-websocket
+//! tropel build --with tropel-x-grpc@0.1.0 --with ./my-ext
 //! ```
+//!
+//! > **Security note:** a bare registry name (`--with tropel-x-grpc`) resolves
+//! > from crates.io with a floating version, and its `build.rs` runs with your
+//! > privileges. Pin a version (`name@x.y.z`), prefer a local path
+//! > (`--with ./my-ext`) or a git URL with a rev/tag. The generated crate is
+//! > built with `--locked` against a freshly-resolved `Cargo.lock`.
 //!
 //! This generates a temporary crate, adds the extensions as dependencies,
 //! and builds a custom binary with those extensions linked in.
@@ -288,11 +294,38 @@ pub fn parse_dep_spec(spec: &str) -> Result<ExtensionDep> {
             Some((n, v)) if !n.is_empty() && !v.is_empty() => (n, v),
             _ => (spec, "*"),
         };
+        // Supply-chain warning (P0): a bare registry name — the documented
+        // `--with tropel-x-grpc` — resolves from crates.io with a FLOATING
+        // version. Anyone can publish a crate with that name, and its
+        // `build.rs` runs with the user's privileges when the custom binary
+        // is compiled. This is inherent to xk6-style builders, so the fix is
+        // loud guidance: pin a version, or point at a local path.
+        if version == "*" {
+            println!(
+                "warning: --with '{name}': floating version '*'. This resolves from crates.io - \
+                 anyone can publish it, and its build.rs runs with your privileges. \
+                 Pin a version (--with {name}@1.2.3) or use a local path (--with ./{name})."
+            );
+        }
         ExtensionDep::Registry {
             name: name.to_string(),
             version: version.to_string(),
         }
     };
+
+    // A git dep without a reference also floats (default branch moves under
+    // you between builds). Same loud guidance as the registry `*` case.
+    if let ExtensionDep::Git {
+        name, reference: None, ..
+    } = &dep
+    {
+        println!(
+            "warning: --with '{}': no rev/tag - this follows the git repo's default \
+             branch, which can move between builds. Pin a tag or rev \
+             (--with <url>@v1.2.3 or --with <url>@<sha>).",
+            name
+        );
+    }
 
     validate_extension(&dep)?;
     Ok(dep)
@@ -428,15 +461,38 @@ pub fn build(config: &BuildConfig) -> Result<()> {
 
     println!("Generated temporary crate at: {}", temp_path.display());
 
+    // Resolve the dependency graph into a Cargo.lock BEFORE building, then
+    // build with --locked. A floating `cargo build` silently re-resolves
+    // registry deps (supply-chain P0: the version pinned at the top of this
+    // run could drift); --locked makes the build fail instead of drifting.
+    let lock_output = Command::new("cargo")
+        .current_dir(&temp_path)
+        .arg("generate-lockfile")
+        .output()
+        .map_err(|e| TropelError::Other(format!("Failed to run cargo generate-lockfile: {}", e)))?;
+    if !lock_output.status.success() {
+        let stderr = String::from_utf8_lossy(&lock_output.stderr);
+        eprintln!("{}", stderr);
+        let temp_path = temp_dir.path().to_path_buf();
+        std::mem::forget(temp_dir); // prevent cleanup — preserve artifacts for debugging
+        return Err(TropelError::Other(format!(
+            "cargo generate-lockfile failed. Build artifacts left at: {}",
+            temp_path.display()
+        )));
+    }
+
     // Run cargo build
     let build_profile = if config.release { "--release" } else { "" };
-    println!("Running: cargo build {} ...", build_profile);
+    println!("Running: cargo build {} --locked ...", build_profile);
 
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&temp_path).arg("build");
     if config.release {
         cmd.arg("--release");
     }
+    // --locked: fail if the lockfile would need updating, so the build uses
+    // exactly the resolution we just pinned.
+    cmd.arg("--locked");
 
     let output = cmd
         .output()
@@ -597,6 +653,13 @@ fn generate_cargo_toml(config: &BuildConfig, workspace_root: &Path) -> String {
 name = "tropel-custom"
 version = "0.1.0"
 edition = "2021"
+
+# Mark this temp crate as its own workspace root. Without this, cargo walks
+# UP from the temp dir (world-writable /tmp on Unix) looking for a
+# Cargo.toml with [workspace] — a planted one with members = ["*"] could
+# inject a [patch.crates-io] and run arbitrary build scripts with the user's
+# privileges.
+[workspace]
 
 [dependencies]
 {}
