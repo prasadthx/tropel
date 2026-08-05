@@ -1,6 +1,6 @@
 //! Agent worker logic: connect to the controller, receive a segment, run.
 
-use crate::protocol::{read_frame, write_frame, AssignMsg, SnapshotMsg};
+use crate::protocol::{read_frame, token_matches, write_frame, AssignMsg, HelloMsg, SnapshotMsg};
 use tokio::net::TcpStream;
 use tropel_core::{Result, TropelError};
 use tropel_engine::Engine;
@@ -23,16 +23,35 @@ const CONNECT_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(
 /// Connect to a controller, run this worker's segment of the job, and ship
 /// the raw metrics snapshot back for central lossless merging.
 ///
+/// `token` is the shared secret the controller requires: the agent presents
+/// it in a [`HelloMsg`] as the first frame and verifies the controller
+/// echoes it back in the [`AssignMsg`] (mutual auth on a plaintext channel).
+///
 /// The initial connect retries with exponential backoff (bounded by
 /// [`CONNECT_TOTAL_BOUND`]). In a Kubernetes Indexed Job the controller pod
 /// may still be scheduling when this agent starts, and `restartPolicy:
 /// Never` + `backoffLimit: 0` means a single failed attempt would fail the
 /// whole Job — so a short-lived refusal must not be fatal.
-pub async fn run_agent(controller_addr: &str) -> Result<()> {
+pub async fn run_agent(controller_addr: &str, token: &str) -> Result<()> {
     let mut stream = connect_with_retry(controller_addr).await?;
     tracing::info!("Agent: connected to controller {controller_addr}");
 
+    // Authenticate BEFORE any assignment is sent — the controller never
+    // dispatches to an unauthenticated peer.
+    write_frame(
+        &mut stream,
+        &HelloMsg {
+            token: token.to_string(),
+        },
+    )
+    .await?;
+
     let assign: AssignMsg = read_frame(&mut stream).await?;
+    if !token_matches(token, &assign.token) {
+        return Err(TropelError::Execution(
+            "controller authentication failed: token mismatch".into(),
+        ));
+    }
     let index = assign.index;
     let total = assign.total;
     tracing::info!(

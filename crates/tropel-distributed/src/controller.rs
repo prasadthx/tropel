@@ -1,6 +1,6 @@
 //! Controller orchestration: accept N agents, dispatch segments, merge.
 
-use crate::protocol::{write_frame, read_frame, AssignMsg, SnapshotMsg};
+use crate::protocol::{token_matches, write_frame, read_frame, AssignMsg, HelloMsg, SnapshotMsg};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tropel_core::config::JobConfig;
@@ -23,11 +23,16 @@ const AGENT_GRACE: Duration = Duration::from_secs(120);
 /// connections on `listener`, dispatches one segment per agent, collects
 /// their raw snapshots, and returns the centrally merged `MetricsResult`.
 ///
+/// `token` is the shared secret: every agent must present it in its
+/// [`HelloMsg`] before the controller sends its assignment (the ClusterIP
+/// service is reachable by anything in the cluster).
+///
 /// The caller (CLI) reports the merged result and evaluates thresholds.
 pub async fn run_controller(
     listener: TcpListener,
     config: &JobConfig,
     num_agents: u32,
+    token: &str,
 ) -> Result<MetricsResult> {
     if num_agents == 0 {
         return Err(TropelError::Config("--agents must be >= 1".into()));
@@ -89,6 +94,7 @@ pub async fn run_controller(
         let worker_config = worker_config.clone();
         let segment = segment.clone();
         let sequence = sequence.clone();
+        let token = token.to_string();
         agent_tasks.push(tokio::spawn(async move {
             tracing::info!("Controller: waiting for agent {}/{}...", i + 1, num_agents);
             let (mut stream, peer) = tokio::time::timeout(
@@ -100,12 +106,41 @@ pub async fn run_controller(
             .map_err(TropelError::Io)?;
             tracing::info!("Controller: agent {i} connected from {peer}");
 
+            // Authentication gate: the agent MUST present the shared token
+            // before any assignment is sent. Anything else in the cluster
+            // (the listener is a ClusterIP service) is refused — it never
+            // sees the JobConfig (which carries env credentials) and can't
+            // forge a SnapshotMsg. Timeout-wrapped like the connect so a
+            // hostile stream that connects and stays silent cannot hang.
+            let hello: HelloMsg = tokio::time::timeout(
+                per_agent_timeout,
+                read_frame(&mut stream),
+            )
+            .await
+            .map_err(|_| {
+                TropelError::Execution(format!(
+                    "agent {i} did not authenticate within {per_agent_timeout:?}"
+                ))
+            })??;
+            if !token_matches(&token, &hello.token) {
+                tracing::warn!(
+                    "Controller: refusing agent {i} from {peer} — bad auth token"
+                );
+                return Err(TropelError::Execution(
+                    "agent authentication failed: token mismatch".into(),
+                ));
+            }
+            tracing::debug!("Controller: agent {i} from {peer} authenticated");
+
             let assign = AssignMsg {
                 config: worker_config,
                 segment,
                 sequence,
                 index: i as u32,
                 total: num_agents,
+                // Echo the token so the agent can authenticate the
+                // controller (mutual auth on a plaintext channel).
+                token: token.clone(),
             };
             write_frame(&mut stream, &assign).await?;
 
@@ -227,9 +262,14 @@ mod tests {
     }
 
     /// Write a minimal Postman collection hitting `base` and return its path.
-    fn write_collection(base: &str) -> String {
+    ///
+    /// The temp file is keyed on a per-test `tag` IN ADDITION to the pid:
+    /// two e2e tests run in parallel in the same process (same pid) and used
+    /// to clobber each other's collection mid-write — one test's engine then
+    /// read the other's config (or a truncated file) and reported 0 requests.
+    fn write_collection(base: &str, tag: &str) -> String {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("tropel-distributed-e2e-{}.json", std::process::id()));
+        let path = dir.join(format!("tropel-distributed-e2e-{tag}-{}.json", std::process::id()));
         let json = format!(
             r#"{{"info":{{"_postman_id":"e2e","name":"dist","schema":"https://schema.getpostman.com/json/collection/v2.1.0/collection.json"}},"item":[{{"name":"r1","request":{{"method":"GET","url":"{base}/","header":[]}},"response":[]}}]}}"#
         );
@@ -240,7 +280,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn distributed_two_agents_merge_losslessly() -> Result<()> {
         let srv = start_http_server().await;
-        let coll = write_collection(&format!("http://{srv}"));
+        let coll = write_collection(&format!("http://{srv}"), "merge");
 
         let config = JobConfig {
             input: coll.clone(),
@@ -260,11 +300,11 @@ mod tests {
         let addr_str = addr.to_string();
         let cfg = config.clone();
 
-        let controller = tokio::spawn(async move { run_controller(listener, &cfg, 2).await });
+        let controller = tokio::spawn(async move { run_controller(listener, &cfg, 2, "test-token").await });
         let mut agents = Vec::new();
         for _ in 0..2 {
             let a = addr_str.clone();
-            agents.push(tokio::spawn(async move { crate::agent::run_agent(&a).await }));
+            agents.push(tokio::spawn(async move { crate::agent::run_agent(&a, "test-token").await }));
         }
         for h in agents {
             h.await.unwrap()?;
@@ -318,8 +358,50 @@ mod tests {
         };
         let listener = TokioListener::bind("127.0.0.1:0").await.unwrap();
         // 3 boundaries in the sequence vs --agents 2 → hard error, no hang.
-        let err = run_controller(listener, &config, 2).await.unwrap_err();
+        let err = run_controller(listener, &config, 2, "test-token").await.unwrap_err();
         assert!(err.to_string().contains("boundaries"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controller_rejects_bad_token() {
+        // P2 regression: the ClusterIP service is reachable by anything in
+        // the cluster. An agent presenting the wrong token must be refused
+        // BEFORE the controller sends the credential-bearing JobConfig, and
+        // the run must fail with an auth error — not dispatch anyway.
+        let srv = start_http_server().await;
+        let coll = write_collection(&format!("http://{srv}"), "badtoken");
+
+        let config = JobConfig {
+            input: coll.clone(),
+            input_type: Some("postman".into()),
+            execution: ExecutionConfig::SharedIterations {
+                iterations: 1,
+                max_duration: Some("30s".into()),
+                vus: 1,
+                graceful_stop: Some("10s".into()),
+                think_time: ThinkTimeConfig::default(),
+            },
+            ..Default::default()
+        };
+
+        let listener = TokioListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_str = listener.local_addr().unwrap().to_string();
+        let cfg = config.clone();
+
+        let controller =
+            tokio::spawn(async move { run_controller(listener, &cfg, 1, "right-token").await });
+        let agent = tokio::spawn(async move { crate::agent::run_agent(&addr_str, "wrong-token").await });
+
+        let merged = controller.await.unwrap();
+        let agent_res = agent.await.unwrap();
+        assert!(merged.is_err(), "controller must reject bad token");
+        assert!(
+            merged.unwrap_err().to_string().contains("token"),
+            "error should mention the auth failure"
+        );
+        assert!(agent_res.is_err(), "agent must fail on controller mismatch");
+
+        let _ = std::fs::remove_file(&coll);
     }
 }
 

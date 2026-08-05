@@ -41,7 +41,7 @@ use crate::yaml::YamlDoc;
 /// This is the "cloud-run" mode: `tropel-cloud-run local --config job.json
 /// --agents N`. The caller (CLI) reports the merged result and evaluates
 /// thresholds, mirroring the controller binary's tail.
-pub async fn run_cloud(config: &JobConfig, agents: u32) -> Result<MetricsResult> {
+pub async fn run_cloud(config: &JobConfig, agents: u32, token: &str) -> Result<MetricsResult> {
     if agents == 0 {
         return Err(TropelError::Config("--agents must be >= 1".into()));
     }
@@ -50,12 +50,14 @@ pub async fn run_cloud(config: &JobConfig, agents: u32) -> Result<MetricsResult>
     let addr = listener.local_addr().map_err(TropelError::Io)?;
     tracing::info!("Cloud-run: controller on {addr}, spawning {agents} in-process agent(s)");
 
+    let token = token.to_string();
     let mut handles = Vec::with_capacity(agents as usize);
     for i in 0..agents {
         let a = addr.to_string();
+        let tok = token.clone();
         handles.push(tokio::spawn(async move {
             tracing::debug!("cloud-run agent {i}: connecting to {a}");
-            crate::agent::run_agent(&a).await
+            crate::agent::run_agent(&a, &tok).await
         }));
     }
 
@@ -63,7 +65,7 @@ pub async fn run_cloud(config: &JobConfig, agents: u32) -> Result<MetricsResult>
     // with a job-bounded timeout — a hung agent fails the run, not the host.
     // On error, abort the in-process agents so no detached tasks keep running
     // the load engine in the background before propagating.
-    let merged = match run_controller(listener, config, agents).await {
+    let merged = match run_controller(listener, config, agents, &token).await {
         Ok(m) => m,
         Err(e) => {
             for h in &handles {
@@ -86,19 +88,23 @@ pub async fn run_cloud(config: &JobConfig, agents: u32) -> Result<MetricsResult>
 /// Topology (one YAML document per `---` separator, `kubectl apply -f -`
 /// ready):
 ///
-/// 1. `ConfigMap tropel-job` — the serialized job config (agents receive
-///    their assignments from the controller over TCP, so only the
-///    controller mounts this).
+/// 1. `ConfigMap tropel-job` — the serialized job config AND the shared
+///    auth token. Agents receive their assignments from the controller over
+///    TCP, but they mount the ConfigMap too: the token file must be readable
+///    by agent pods so they can authenticate before the controller
+///    dispatches the (credential-bearing) config.
 /// 2. `Job tropel-controller` — `completions: 1`, listens on
-///    `0.0.0.0:<listen_port>`, mounts the job ConfigMap, runs
-///    `cloud-run controller --config /etc/tropel/job.json --agents N`.
+///    `0.0.0.0:<listen_port>`, mounts the job ConfigMap (job.json + token),
+///    runs `cloud-run controller --config /etc/tropel/job.json --agents N
+///    --token-file /etc/tropel/token`.
 ///    Run-to-completion: a finished Job is not restarted by kubelet (a
 ///    Deployment would re-run the finished controller forever).
 /// 3. `Service tropel-controller` — ClusterIP so agents resolve the
 ///    controller by DNS name (`tropel-controller.<ns>.svc`).
 /// 4. `Job tropel-agent` — **Indexed** Job (`completions/parallelism =
 ///    agents`, `completionMode: Indexed`), runs
-///    `cloud-run agent --controller tropel-controller:<port>`. Each pod
+///    `cloud-run agent --controller tropel-controller:<port>
+///    --token-file /etc/tropel/token`, mounting the same ConfigMap. Each pod
 ///    runs its agent once and exits; the Job completes when all agents do.
 /// 5. `Service tropel-agent` — headless (`clusterIP: None`) so each agent
 ///    pod owns a stable `tropel-agent-<i>.<ns>.svc` DNS name.
@@ -111,6 +117,7 @@ pub fn generate_k8s_manifests(
     image: &str,
     namespace: &str,
     listen_port: u16,
+    token: &str,
 ) -> Result<String> {
     if agents == 0 {
         return Err(TropelError::Config("agents must be >= 1".into()));
@@ -127,7 +134,11 @@ pub fn generate_k8s_manifests(
     ));
     y.comment("Apply:  kubectl apply -f -   (or write to a file first)");
 
-    // 1. ConfigMap tropel-job — the serialized job config.
+    // 1. ConfigMap tropel-job — the serialized job config AND the shared
+    //    auth token (mounted into both controller and agent pods, passed as
+    //    --token-file). The controller is reachable by anything in the
+    //    cluster via its ClusterIP service, so agents must authenticate
+    //    before the controller dispatches the (credential-bearing) config.
     y.kv(0, "apiVersion", "v1");
     y.kv(0, "kind", "ConfigMap");
     y.key(0, "metadata");
@@ -135,6 +146,7 @@ pub fn generate_k8s_manifests(
     y.kv(1, "namespace", ns);
     y.key(0, "data");
     y.block(1, "job.json", &job_json);
+    y.block(1, "token", token);
     y.separator();
 
     // 2. Controller Job — run-to-completion.
@@ -164,6 +176,8 @@ pub fn generate_k8s_manifests(
     y.item(6, &agents.to_string());
     y.item(6, "--listen");
     y.item(6, &format!("0.0.0.0:{listen_port}"));
+    y.item(6, "--token-file");
+    y.item(6, "/etc/tropel/token");
     y.key(5, "ports");
     y.item_kv(6, "name", "control");
     y.kv_num(7, "containerPort", listen_port);
@@ -219,6 +233,18 @@ pub fn generate_k8s_manifests(
     y.item(6, "agent");
     y.item(6, "--controller");
     y.item(6, &format!("tropel-controller:{listen_port}"));
+    y.item(6, "--token-file");
+    y.item(6, "/etc/tropel/token");
+    // The agent mounts the same ConfigMap (job config + token) so it can
+    // authenticate before receiving its assignment.
+    y.key(5, "volumeMounts");
+    y.item_kv(6, "name", "job");
+    y.kv(7, "mountPath", "/etc/tropel");
+    y.kv_plain(7, "readOnly", "true");
+    y.key(2, "volumes");
+    y.item_kv(3, "name", "job");
+    y.key(4, "configMap");
+    y.kv(5, "name", "tropel-job");
     y.separator();
 
     // 5. Agent headless Service — stable per-pod DNS without a StatefulSet.
@@ -296,7 +322,7 @@ mod tests {
             ..Default::default()
         };
 
-        let merged = run_cloud(&config, 2).await?;
+        let merged = run_cloud(&config, 2, "test-token").await?;
         assert_eq!(merged.http_reqs, 4, "merged http_reqs = 4: {}", merged.http_reqs);
         assert_eq!(merged.iterations, 4, "merged iterations = 4");
         let dur = merged.http_req_duration.expect("merged http_req_duration");
@@ -320,7 +346,8 @@ mod tests {
             },
             ..Default::default()
         };
-        let yaml = generate_k8s_manifests(&config, 3, "reg/tropel:v1", "loadtest", 17890).unwrap();
+        let yaml =
+            generate_k8s_manifests(&config, 3, "reg/tropel:v1", "loadtest", 17890, "tok123").unwrap();
 
         for needle in [
             "kind: ConfigMap",
@@ -344,6 +371,8 @@ mod tests {
             "0.0.0.0:17890",
             "--agents",
             "\"3\"",
+            "--token-file",
+            "/etc/tropel/token",
         ] {
             assert!(yaml.contains(needle), "manifest missing {needle:?}");
         }
@@ -363,25 +392,39 @@ mod tests {
         // Values with YAML-significant characters must be quoted, never
         // interpolated raw (namespace is user-controlled).
         let config = JobConfig::default();
-        let yaml = generate_k8s_manifests(&config, 2, "img:v1", "my ns:qa#1", 9000).unwrap();
+        let yaml = generate_k8s_manifests(&config, 2, "img:v1", "my ns:qa#1", 9000, "tok").unwrap();
         // `:` + space, `#`, and the space are all quoted away.
         assert!(yaml.contains("namespace: \"my ns:qa#1\""));
         assert!(!yaml.contains("namespace: my ns:qa#1"));
         // Image with a quote is escaped, not a raw `"` breaking the doc.
-        let yaml = generate_k8s_manifests(&config, 2, "img\"evil:latest", "ns", 9000).unwrap();
+        let yaml = generate_k8s_manifests(&config, 2, "img\"evil:latest", "ns", 9000, "tok").unwrap();
         assert!(yaml.contains("image: \"img\\\"evil:latest\""));
     }
 
     #[test]
     fn manifests_reject_zero_agents() {
         let config = JobConfig::default();
-        assert!(generate_k8s_manifests(&config, 0, "", "default", 17890).is_err());
+        assert!(generate_k8s_manifests(&config, 0, "", "default", 17890, "tok").is_err());
     }
 
     #[test]
     fn manifests_defaults() {
-        let yaml = generate_k8s_manifests(&JobConfig::default(), 1, "", "", 17890).unwrap();
+        let yaml = generate_k8s_manifests(&JobConfig::default(), 1, "", "", 17890, "tok").unwrap();
         assert!(yaml.contains("image: tropel:latest"));
         assert!(yaml.contains("namespace: default"));
+    }
+
+    #[test]
+    fn manifests_embed_token_and_mount_for_agents() {
+        // The auth token must ride in the ConfigMap so BOTH controller and
+        // agent pods can read it (agents authenticate before the controller
+        // dispatches the credential-bearing config).
+        let yaml =
+            generate_k8s_manifests(&JobConfig::default(), 2, "img:v1", "ns", 9000, "secret123").unwrap();
+        assert!(yaml.contains("token: |-"), "token block missing");
+        assert!(yaml.contains("secret123"), "token value missing");
+        // Both jobs mount /etc/tropel (job.json + token) and pass --token-file.
+        assert_eq!(yaml.matches("--token-file").count(), 2, "both jobs need --token-file");
+        assert_eq!(yaml.matches("mountPath: /etc/tropel").count(), 2, "both jobs mount the config");
     }
 }

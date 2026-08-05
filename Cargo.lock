@@ -4106,6 +4106,7 @@ name = "tropel-distributed"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "rand",
  "serde",
  "serde_json",
  "tokio",

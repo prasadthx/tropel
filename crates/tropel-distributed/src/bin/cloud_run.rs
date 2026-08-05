@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use tokio::net::TcpListener;
 use tropel_core::config::JobConfig;
 use tropel_core::{Result, TropelError};
+use tropel_distributed::{generate_token, has_token_source, resolve_token};
 
 #[derive(Parser)]
 #[command(
@@ -41,12 +42,24 @@ enum Cmd {
         /// Listen address for agents.
         #[arg(long, default_value = "127.0.0.1:17890")]
         listen: String,
+        /// Shared auth token (or set TROPEL_TOKEN). Agents must present it.
+        #[arg(long)]
+        token: Option<String>,
+        /// Read the shared auth token from this file.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
     },
     /// Run a worker that connects to a controller and ships its snapshot back.
     Agent {
         /// Controller address (host:port).
         #[arg(long, short = 'C', default_value = "127.0.0.1:17890")]
         controller: String,
+        /// Shared auth token (or set TROPEL_TOKEN). Must match the controller's.
+        #[arg(long)]
+        token: Option<String>,
+        /// Read the shared auth token from this file.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
     },
     /// Run controller + N agents in this process (CI/laptop mode).
     Local {
@@ -56,6 +69,13 @@ enum Cmd {
         /// Number of in-process agent workers.
         #[arg(long, default_value_t = 1)]
         agents: u32,
+        /// Shared auth token. If omitted, a random one is generated (safe
+        /// here: controller and agents are in-process).
+        #[arg(long)]
+        token: Option<String>,
+        /// Read the shared auth token from this file.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
     },
     /// Generate Kubernetes manifests (ConfigMap + controller + agents).
     K8s {
@@ -74,6 +94,12 @@ enum Cmd {
         /// Controller listen/service port.
         #[arg(long, default_value_t = 17890)]
         port: u16,
+        /// Shared auth token embedded in the manifests (or set TROPEL_TOKEN).
+        #[arg(long)]
+        token: Option<String>,
+        /// Read the shared auth token from this file.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
         /// Write manifests to this file instead of stdout.
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,
@@ -92,28 +118,80 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.command {
-        Cmd::Controller { config, agents, listen } => {
+        Cmd::Controller {
+            config,
+            agents,
+            listen,
+            token,
+            token_file,
+        } => {
             let config = load_config(&config)?;
+            // Only auto-generate when NO token source was given — a typo'd
+            // --token-file path (an Io error) must surface, not silently
+            // substitute a random token the operator never sees.
+            let token = if has_token_source(&token, &token_file) {
+                resolve_token(token, token_file)?
+            } else {
+                let t = generate_token();
+                tracing::warn!(
+                    "No --token/--token-file/TROPEL_TOKEN given — generated one; \
+                     agents MUST present it: {t}"
+                );
+                t
+            };
             let listener = TcpListener::bind(&listen).await.map_err(TropelError::Io)?;
             tracing::info!("Controller listening on {listen}. Waiting for {agents} agent(s)...");
-            let result = tropel_distributed::run_controller(listener, &config, agents).await?;
+            let result = tropel_distributed::run_controller(listener, &config, agents, &token).await?;
             tropel_distributed::report_and_thresholds(&config, &result).await
         }
-        Cmd::Agent { controller } => {
+        Cmd::Agent {
+            controller,
+            token,
+            token_file,
+        } => {
             if controller.is_empty() {
                 return Err(TropelError::Config("--controller must not be empty".into()));
             }
-            tropel_distributed::run_agent(&controller).await
+            let token = resolve_token(token, token_file)?;
+            tropel_distributed::run_agent(&controller, &token).await
         }
-        Cmd::Local { config, agents } => {
+        Cmd::Local {
+            config,
+            agents,
+            token,
+            token_file,
+        } => {
             let config = load_config(&config)?;
             tracing::info!("Cloud-run local mode: {agents} in-process agent(s)");
-            let result = tropel_distributed::run_cloud(&config, agents).await?;
+            let token = resolve_token(token, token_file).unwrap_or_else(|_| generate_token());
+            let result = tropel_distributed::run_cloud(&config, agents, &token).await?;
             tropel_distributed::report_and_thresholds(&config, &result).await
         }
-        Cmd::K8s { config, agents, image, namespace, port, output } => {
+        Cmd::K8s {
+            config,
+            agents,
+            image,
+            namespace,
+            port,
+            token,
+            token_file,
+            output,
+        } => {
             let config = load_config(&config)?;
-            let yaml = tropel_distributed::generate_k8s_manifests(&config, agents, &image, &namespace, port)?;
+            // Manifest mode needs a concrete token embedded in the ConfigMap:
+            // honor --token, else generate one and surface it so the operator
+            // knows the shared secret before `kubectl apply`. Only generate
+            // when NO source was given — a bad --token-file must error.
+            let token = if has_token_source(&token, &token_file) {
+                resolve_token(token, token_file)?
+            } else {
+                let t = generate_token();
+                tracing::warn!("Generated auth token for the manifests: {t}");
+                t
+            };
+            let yaml = tropel_distributed::generate_k8s_manifests(
+                &config, agents, &image, &namespace, port, &token,
+            )?;
             match output {
                 Some(path) => {
                     std::fs::write(&path, yaml).map_err(TropelError::Io)?;

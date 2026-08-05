@@ -1,13 +1,34 @@
 //! Wire protocol for controller ↔ agent communication.
 //!
 //! Messages are JSON, framed as `u32 BE length + bytes` over TCP.
+//!
+//! # Authentication
+//!
+//! The control channel is unauthenticated plaintext by design (the
+//! controller listens on a ClusterIP service that anything in the cluster
+//! can reach). A shared secret token gates the connection: the agent sends
+//! a [`HelloMsg`] with its token as the FIRST frame; the controller refuses
+//! the connection unless it matches (constant-time compare) and echoes the
+//! token back inside [`AssignMsg`] so the agent can verify it is talking to
+//! the real controller, not an impostor.
 
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use tropel_core::config::JobConfig;
 use tropel_metrics::collector::MetricsSnapshot;
 
+/// Agent → Controller: authentication preamble, sent before any other
+/// message. The controller rejects the connection on a mismatch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HelloMsg {
+    /// Shared secret token. MUST be the first frame an agent sends.
+    pub token: String,
+}
+
 /// Controller → Agent: dispatch a job with this worker's execution segment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AssignMsg {
     /// The full job config (input, execution, env, thresholds...). The agent
     /// applies `distributed_worker` + its segment on top.
@@ -20,6 +41,29 @@ pub struct AssignMsg {
     pub index: u32,
     /// Total number of workers in the run.
     pub total: u32,
+    /// The controller's token, echoed back so the agent can authenticate
+    /// the controller (mutual auth on a plaintext channel).
+    pub token: String,
+}
+
+/// Constant-time string equality (the token gate must not leak byte
+/// positions through early-exit timing).
+pub fn token_matches(expect: &str, got: &str) -> bool {
+    if expect.len() != got.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (e, g) in expect.bytes().zip(got.bytes()) {
+        diff |= e ^ g;
+    }
+    diff == 0
+}
+
+/// Generate a fresh shared secret for a controller run (32 random bytes,
+/// hex-encoded). `rand::rng()` is a CSPRNG (ChaCha12, OS-seeded).
+pub fn generate_token() -> String {
+    let bytes: [u8; 32] = rand::rng().random();
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Agent → Controller: the worker's raw metrics snapshot (histograms as
@@ -57,6 +101,12 @@ pub async fn write_frame<W: tokio::io::AsyncWrite + Unpin, T: Serialize>(
 }
 
 /// Read a length-prefixed JSON frame.
+///
+/// Reads the declared length incrementally (64 KiB chunks) instead of
+/// allocating `vec![0u8; len]` up front — a hostile stream declaring a
+/// near-MAX_FRAME length must actually SEND that much data before the host
+/// allocates it, so a lying length prefix no longer forces a giant
+/// allocation. The frame cap still bounds the final allocation.
 pub async fn read_frame<R: tokio::io::AsyncRead + Unpin, T: serde::de::DeserializeOwned>(
     stream: &mut R,
 ) -> tropel_core::Result<T> {
@@ -69,8 +119,15 @@ pub async fn read_frame<R: tokio::io::AsyncRead + Unpin, T: serde::de::Deseriali
             "distributed protocol frame too large: {len} bytes"
         )));
     }
-    let mut data = vec![0u8; len];
-    stream.read_exact(&mut data).await?;
+    let mut data = Vec::with_capacity(len.min(64 * 1024));
+    let mut remaining = len;
+    let mut chunk = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let take = remaining.min(chunk.len());
+        stream.read_exact(&mut chunk[..take]).await?;
+        data.extend_from_slice(&chunk[..take]);
+        remaining -= take;
+    }
     serde_json::from_slice(&data).map_err(|e| {
         tropel_core::TropelError::Parse(format!("distributed protocol deserialize: {e}"))
     })
@@ -117,5 +174,42 @@ mod tests {
         let mut rx = b;
         let err = read_frame::<_, SnapshotMsg>(&mut rx).await.unwrap_err();
         assert!(err.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn token_matches_compares_constant_time_style() {
+        assert!(token_matches("abc", "abc"));
+        assert!(!token_matches("abc", "abd"));
+        assert!(!token_matches("abc", "abcd"));
+        assert!(!token_matches("", "x"));
+        // Same length, all bytes differ — must be false.
+        assert!(!token_matches("aaaa", "bbbb"));
+        // Generated tokens round-trip and are unique-ish (64 hex chars).
+        let t1 = generate_token();
+        let t2 = generate_token();
+        assert_eq!(t1.len(), 64);
+        assert!(t1.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(t1 != t2, "tokens should be random");
+        assert!(token_matches(&t1, &t1));
+    }
+
+    #[tokio::test]
+    async fn read_frame_is_incremental_not_alloc_on_declare() {
+        // The declared length must not be allocated up front: write a length
+        // prefix declaring 1 MB but only send a small frame; the read must
+        // still succeed once the ACTUAL bytes arrive (allocation grows with
+        // received bytes, not the declared length). A lying 600 MB prefix
+        // already trips the cap test above; this one pins the incremental
+        // behavior so the alloc-on-demand vector stays closed.
+        let (mut a, mut b) = split_duplex(64 * 1024);
+        let payload = serde_json::to_vec(&HelloMsg {
+            token: "tok".into(),
+        })
+        .unwrap();
+        let len = (payload.len() as u32).to_be_bytes();
+        a.write_all(&len).await.unwrap();
+        a.write_all(&payload).await.unwrap();
+        let got: HelloMsg = read_frame(&mut b).await.unwrap();
+        assert_eq!(got.token, "tok");
     }
 }

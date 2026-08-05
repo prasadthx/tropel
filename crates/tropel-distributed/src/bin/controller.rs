@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use tokio::net::TcpListener;
 use tropel_core::config::JobConfig;
 use tropel_core::{Result, TropelError};
+use tropel_distributed::{generate_token, has_token_source, resolve_token};
 
 #[derive(Parser)]
 #[command(name = "tropel-controller", about = "Distributed load-test controller")]
@@ -22,6 +23,12 @@ struct Args {
     /// Listen address for agents.
     #[arg(long, default_value = "127.0.0.1:17890")]
     listen: String,
+    /// Shared auth token (or set TROPEL_TOKEN). Agents must present it.
+    #[arg(long)]
+    token: Option<String>,
+    /// Read the shared auth token from this file.
+    #[arg(long)]
+    token_file: Option<PathBuf>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -34,12 +41,26 @@ async fn main() -> Result<()> {
     let config: JobConfig = serde_json::from_str(&raw)
         .map_err(|e| TropelError::Parse(format!("invalid job config: {e}")))?;
 
+    // Only auto-generate when NO token source was given — a typo'd
+    // --token-file path (an Io error) must surface, not silently substitute
+    // a random token the operator never sees.
+    let token = if has_token_source(&args.token, &args.token_file) {
+        resolve_token(args.token, args.token_file)?
+    } else {
+        let t = generate_token();
+        tracing::warn!(
+            "No --token/--token-file/TROPEL_TOKEN given — generated one; \
+             agents MUST present it: {t}"
+        );
+        t
+    };
+
     let listener = TcpListener::bind(&args.listen)
         .await
         .map_err(TropelError::Io)?;
     tracing::info!("Controller listening on {}. Waiting for {} agent(s)...", args.listen, args.agents);
 
-    let result = tropel_distributed::run_controller(listener, &config, args.agents).await?;
+    let result = tropel_distributed::run_controller(listener, &config, args.agents, &token).await?;
 
     // Report through the configured reporters + evaluate thresholds
     // (exit-code contract shared with `tropel-cloud-run`).
