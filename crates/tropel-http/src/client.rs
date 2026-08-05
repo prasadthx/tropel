@@ -551,8 +551,12 @@ impl HttpClient {
                 }
             }
 
-            // Add query parameters
-            if !request.query_params.is_empty() {
+            // Add query parameters. ONLY on hop 0: the original request's
+            // query_params describe the ORIGINAL URL. A redirect target URL
+            // (Location header) carries its own query — re-appending the
+            // original params there turns /x?page=2 → 302 /y?token=z into
+            // /y?token=z&page=2 (k6/reqwest don't do this).
+            if hop_index == 0 && !request.query_params.is_empty() {
                 req_builder = req_builder.query(&request.query_params);
             }
 
@@ -1519,6 +1523,102 @@ mod tests {
         // The 302 hop must also be captured as its own response (k6 parity).
         assert_eq!(resp.redirects.len(), 1);
         assert_eq!(resp.redirects[0].status_code, 302);
+
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn redirect_hops_do_not_reappend_original_query() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // P1 regression: the original request's query_params were re-appended
+        // on EVERY redirect hop — /x?page=2 → 302 /y?token=z fetched
+        // /y?token=z&page=2. The redirect target's own query must win; the
+        // original query belongs to hop 0 only (k6/reqwest behavior).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let req = String::from_utf8_lossy(&buf);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let resp = if path == "/start?page=2" {
+                        "HTTP/1.1 302 Found\r\nLocation: /final?token=z\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    } else if path == "/final?token=z" {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string()
+                    } else {
+                        // Any OTHER path/query means the original query leaked
+                        // onto the redirect hop — report it in the body so
+                        // the test can assert the exact request target.
+                        let body = format!("GOT:{}", path);
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let cfg = HttpConfig::default();
+        let client = HttpClient::new(&cfg).unwrap();
+
+        // Redirect case: URL carries its own query; query_params empty. The
+        // final hop must be exactly /final?token=z (no re-appended page=2).
+        let req = Request {
+            url: format!("http://{}/start?page=2", addr),
+            method: Method::GET,
+            follow_redirects: true,
+            ..Default::default()
+        };
+        let resp = client.execute(&req, None).await.unwrap();
+        assert_eq!(
+            resp.status_code, 200,
+            "final hop should be served; got body: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&resp.body),
+            "ok",
+            "original query must NOT be re-appended to the redirect target; got: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
+        assert_eq!(resp.redirects.len(), 1);
+        assert_eq!(resp.redirects[0].status_code, 302);
+
+        // Preserved hop-0 behavior: a populated query_params (URL without its
+        // own query) must STILL be appended exactly once on hop 0 — the gate
+        // must not break the common case.
+        let mut query_params = std::collections::HashMap::new();
+        query_params.insert("page".to_string(), "2".to_string());
+        let req2 = Request {
+            url: format!("http://{}/start", addr),
+            method: Method::GET,
+            follow_redirects: true,
+            query_params,
+            ..Default::default()
+        };
+        let resp2 = client.execute(&req2, None).await.unwrap();
+        assert_eq!(
+            resp2.status_code, 200,
+            "hop 0 with populated query_params should be served; got: {}",
+            String::from_utf8_lossy(&resp2.body)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&resp2.body),
+            "ok",
+            "populated query_params must still be appended once on hop 0; got: {}",
+            String::from_utf8_lossy(&resp2.body)
+        );
 
         server.abort();
     }
