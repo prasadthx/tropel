@@ -1,4 +1,4 @@
-use crate::collector::{parse_percentile, percentile_value, MetricSummary, MetricsResult};
+use crate::collector::{parse_percentile, percentile_value, MetricSummary, MetricType, MetricsResult};
 use std::collections::HashMap;
 use std::time::Duration;
 use tropel_core::config::ThresholdConfig;
@@ -431,23 +431,37 @@ fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
         // Rate = total sum / total count across ALL series (k6 merges tagged
         // sub-series for the unscoped metric).
         Some("rate") => {
-            let total_sum: f64 = matched.iter().map(|m| m.sum).sum();
-            let total_count: f64 = matched.iter().map(|m| m.count as f64).sum();
-            if total_count > 0.0 {
-                total_sum / total_count
+            if matched.iter().all(|m| m.metric_type == MetricType::Counter) {
+                // Counter `count` IS the accumulated value (k6 semantics), so
+                // sum/count would degenerate to 1.0. There is no per-event
+                // rate for a merged counter — fall back to the per-series
+                // mean (worst across matches, mirroring the default arm).
+                matched.iter().map(|m| m.mean).fold(0.0_f64, f64::max)
             } else {
-                0.0
+                let total_sum: f64 = matched.iter().map(|m| m.sum).sum();
+                let total_count: f64 = matched.iter().map(|m| m.count as f64).sum();
+                if total_count > 0.0 {
+                    total_sum / total_count
+                } else {
+                    0.0
+                }
             }
         }
         Some("count") => matched.iter().map(|m| m.count as f64).sum(),
         Some("sum") => matched.iter().map(|m| m.sum).sum(),
         Some("avg") => {
-            let total_sum: f64 = matched.iter().map(|m| m.sum).sum();
-            let total_count: f64 = matched.iter().map(|m| m.count as f64).sum();
-            if total_count > 0.0 {
-                total_sum / total_count
+            if matched.iter().all(|m| m.metric_type == MetricType::Counter) {
+                // Counter: count == accumulated value, so sum/count is always
+                // 1.0 — use the preserved per-series mean instead.
+                matched.iter().map(|m| m.mean).fold(0.0_f64, f64::max)
             } else {
-                0.0
+                let total_sum: f64 = matched.iter().map(|m| m.sum).sum();
+                let total_count: f64 = matched.iter().map(|m| m.count as f64).sum();
+                if total_count > 0.0 {
+                    total_sum / total_count
+                } else {
+                    0.0
+                }
             }
         }
         // Default (no stat or unknown stat) — worst mean across matches.

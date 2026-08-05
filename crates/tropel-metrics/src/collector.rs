@@ -595,7 +595,11 @@ impl Aggregator {
                     key: key_str,
                     tags: summary_tags.clone(),
                     metric_type: MetricType::Counter,
-                    count: set.count as u64,
+                    // k6 semantics: a Counter's `count` IS the accumulated
+                    // value (myCounter.add(5)x5 -> count 25, not 5). The
+                    // internal MetricSet.count stays sample-count for mean;
+                    // the k6-facing summary exposes the sum.
+                    count: set.sum as u64,
                     sum: set.sum,
                     mean: set.mean(),
                     min: 0,
@@ -744,9 +748,14 @@ impl Aggregator {
             // data_received_bytes, iterations_count, vus_peak) must never fold
             // into these — it still appears as its own series in `metrics`.
             if key.metric.as_ref() == "http_reqs" {
-                http_reqs += set.count as u64;
+                // Counters: use the ACCUMULATED value (sum) — the totals-map
+                // fallback below is also sum-based, so the two paths can
+                // never disagree (the old split used sample-count here vs
+                // sum in the fallback). http_reqs samples are value 1.0, so
+                // this still equals the number of requests.
+                http_reqs += set.sum as u64;
             } else if key.metric.as_ref() == "errors" {
-                errors += set.count as u64;
+                errors += set.sum as u64;
             } else if key.metric.as_ref() == "checks" {
                 checks_total += set.count as u64;
                 checks_passed += set.sum as u64;
@@ -763,7 +772,7 @@ impl Aggregator {
                 http_req_failed_total += set.count;
                 http_req_failed_count += set.sum;
             } else if key.metric.as_ref() == "iterations" {
-                iterations += set.count as u64;
+                iterations += set.sum as u64;
             } else if key.metric.as_ref() == "iteration_duration" {
                 match &mut merged_iter_dur {
                     Some(ref mut merged) => {
@@ -855,7 +864,8 @@ impl Aggregator {
                     key: format!("{fam}{{group={group}}}"),
                     tags: vec![("group".to_string(), group.clone())],
                     metric_type: MetricType::Counter,
-                    count: merged.count as u64,
+                    // k6 semantics: Counter count = accumulated value.
+                    count: merged.sum as u64,
                     sum: merged.sum,
                     mean: merged.mean(),
                     min: 0,
@@ -1158,7 +1168,9 @@ pub struct MetricSummary {
     pub tags: Vec<(String, String)>,
     /// The type of this metric — determines which fields are meaningful.
     pub metric_type: MetricType,
-    /// Sample count (Counter: events added; Rate: events; Trend: samples; Gauge: samples).
+    /// Sample count. k6 semantics per type: **Counter** = the accumulated
+    /// value (myCounter.add(5)x5 -> 25); Rate = events (denominator);
+    /// Trend/Gauge = samples.
     pub count: u64,
     /// Sum of values (Counter/ Rate: total; Trend/Gauge: sum for avg).
     pub sum: f64,
@@ -1643,6 +1655,82 @@ mod tests {
 
         let res = agg.build_results();
         assert_eq!(res.http_reqs, 3, "http_reqs_total must not fold into http_reqs");
+    }
+
+    #[test]
+    fn test_counter_count_is_accumulated_value() {
+        // Regression (backlog line 82): k6's Counter `count` IS the summed
+        // value. `myCounter.add(5)` x5 -> k6 reports 25, Tropel reported 5
+        // (the sample count). `data_received: ['count<10485760']` therefore
+        // compared a REQUEST count to a BYTE threshold (off by ~2500x, false
+        // PASS) with the correct value sitting in `sum`.
+        let mut agg = Aggregator::new();
+        let ts = std::time::SystemTime::now();
+        let tags = Arc::new(tropel_core::types::TagMap::new());
+
+        // Custom counter: 5 adds of value 5.0 each.
+        for _ in 0..5 {
+            agg.record(Sample {
+                metric: "my_counter".into(),
+                value: 5.0,
+                tags: tags.clone(),
+                timestamp: ts,
+                sample_type: SampleType::Counter,
+            });
+        }
+
+        let res = agg.build_results();
+        let m = res
+            .metrics
+            .iter()
+            .find(|m| m.key == "my_counter")
+            .expect("my_counter series");
+        assert_eq!(m.metric_type, MetricType::Counter);
+        assert_eq!(m.count, 25, "Counter count must be the accumulated value, not samples");
+        assert_eq!(m.sum, 25.0);
+    }
+
+    #[test]
+    fn test_counter_count_headline_uses_accumulated_value() {
+        // Regression (backlog line 82): http_reqs/errors headlines had two
+        // conflicting definitions — sample count in the per-series loop vs
+        // accumulated sum in the totals-map fallback (selected by whether
+        // the first series was empty). Both must be the accumulated value.
+        let mut agg = Aggregator::new();
+        let ts = std::time::SystemTime::now();
+        let tags = Arc::new(tropel_core::types::TagMap::new());
+
+        // A counter that adds value 2.0 per event (not 1.0): sample count 3
+        // but accumulated value 6 — the headline must be 6, matching the
+        // totals-map fallback for an equivalent zero-series run.
+        for _ in 0..3 {
+            agg.record(Sample {
+                metric: "http_reqs".into(),
+                value: 2.0,
+                tags: tags.clone(),
+                timestamp: ts,
+                sample_type: SampleType::Counter,
+            });
+        }
+
+        let res = agg.build_results();
+        assert_eq!(res.http_reqs, 6, "headline must use accumulated value, not sample count");
+        // A second fresh aggregator with the same input must produce the
+        // identical headline — the old code's per-series loop read sample
+        // count (3) while the totals-map fallback read the accumulated sum
+        // (6), so the result silently depended on internal bookkeeping.
+        let mut fresh = Aggregator::new();
+        let ts2 = std::time::SystemTime::now();
+        for _ in 0..3 {
+            fresh.record(Sample {
+                metric: "http_reqs".into(),
+                value: 2.0,
+                tags: Arc::new(tropel_core::types::TagMap::new()),
+                timestamp: ts2,
+                sample_type: SampleType::Counter,
+            });
+        }
+        assert_eq!(fresh.build_results().http_reqs, 6);
     }
 
     #[test]
