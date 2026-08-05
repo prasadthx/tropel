@@ -48,12 +48,19 @@ impl LatencyHistogram {
     /// Record a duration value.
     pub fn record(&mut self, duration: Duration) {
         let micros = duration.as_micros() as u64;
-        self.inner.record(micros).ok();
+        self.inner.record(micros.max(1)).ok();
     }
 
     /// Record a value in microseconds.
+    ///
+    /// Values are clamped to the histogram's lowest trackable value (1 µs)
+    /// BEFORE recording: hdrhistogram rejects 0 (returns `RecordError`), and
+    /// the caller's `.ok()` would silently drop it — recreating the
+    /// population-mismatch bug (zeros excluded from percentiles while still
+    /// counted in `count`/`sum`). Clamping keeps zero samples in the
+    /// distribution, so `min ≤ avg` always holds.
     pub fn record_micros(&mut self, micros: u64) {
-        self.inner.record(micros).ok();
+        self.inner.record(micros.max(1)).ok();
     }
 
     /// Get the total count of recorded values.

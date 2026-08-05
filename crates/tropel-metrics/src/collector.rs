@@ -170,9 +170,20 @@ impl MetricSet {
             }
             MetricType::Trend => {
                 // Trend: histogram distribution
-                if value > 0.0 {
-                    self.histogram.record_micros(value as u64);
-                }
+                //
+                // Record EVERY sample — including 0 — so the histogram
+                // population matches `count`/`sum`. The old `value > 0.0`
+                // gate excluded zeros (pooled keep-alive reuse makes
+                // blocked/dns/connecting 0 for most requests), so percentiles
+                // were computed over a smaller, biased population while
+                // count/sum covered everything → arithmetically impossible
+                // results like `min > avg` and wrong p-values.
+                //
+                // Values are rounded (not truncated) because `value as u64`
+                // silently dropped sub-µs samples: `myTrend.add(0.25)` (ms)
+                // became 0 µs → p(95)=0, max=0. Rounding keeps fractional
+                // µs values ≥ 0.5 in the distribution.
+                self.histogram.record_micros(value.max(0.0).round() as u64);
                 self.count += 1.0;
                 self.sum += value;
             }
@@ -1457,6 +1468,93 @@ mod tests {
         // summaryTrendStats p(99.9) also triggers retention.
         let stats = vec!["avg".into(), "p(99.9)".into()];
         assert!(config_needs_histograms(&stats, &std::collections::HashMap::new()));
+    }
+
+    #[test]
+    fn test_trend_population_includes_zero_samples() {
+        // Regression (backlog line 65): the Trend arm used to gate histogram
+        // recording on `value > 0.0` while `count`/`sum` always incremented.
+        // Pooled keep-alive reuse makes sub-timings (blocked/dns/connecting)
+        // 0 for most requests, so percentiles were computed over a smaller
+        // biased population → `min > avg` (arithmetically impossible).
+        let mut set = MetricSet::new(MetricType::Trend, None);
+        let trend = SampleType::Trend;
+
+        // Simulate 10 k requests where only 10 actually connected (~25 ms):
+        // the rest are pooled reuse with connecting = 0.
+        for _ in 0..9990 {
+            set.record(0.0, &trend);
+        }
+        for _ in 0..10 {
+            set.record(25_000.0, &trend); // 25 ms in µs
+        }
+
+        assert_eq!(set.count, 10_000.0, "count must include zero samples");
+        let stats = set.histogram.stats();
+        assert_eq!(stats.count, 10_000, "histogram population must match count");
+        assert!(
+            stats.min <= stats.max,
+            "min ({}) must be <= max ({})",
+            stats.min,
+            stats.max
+        );
+        let mean = set.mean();
+        assert!(
+            (stats.min as f64) <= mean,
+            "min ({}) must be <= avg ({}) — the old bug produced min > avg",
+            stats.min,
+            mean
+        );
+        // With 9990/10000 zeros, even p99 sits in the zero bucket.
+        assert_eq!(stats.p99, 1, "p99 should reflect the zero-majority population");
+    }
+
+    #[test]
+    fn test_trend_fractional_values_round_not_truncate() {
+        // Regression: `value as u64` truncated fractional µs, so
+        // `myTrend.add(0.25)` (ms) recorded 0 µs → p(95)=0, max=0 while
+        // avg stayed meaningful. Values ≥ 0.5 µs must round into the
+        // histogram instead of vanishing.
+        let mut set = MetricSet::new(MetricType::Trend, None);
+        let trend = SampleType::Trend;
+
+        set.record(0.25, &trend); // truncation would drop this to 0
+        set.record(0.6, &trend); // rounds to 1 µs
+        set.record(2_500.0, &trend); // 2.5 ms
+
+        assert_eq!(set.count, 3.0);
+        let stats = set.histogram.stats();
+        assert_eq!(stats.count, 3, "all samples must be in the histogram");
+        assert!(
+            stats.max >= 2_500,
+            "2.5 ms sample must be recorded (max={})",
+            stats.max
+        );
+        assert!(
+            stats.min >= 1,
+            "0.25/0.6 are clamped to the 1 µs floor (min={}) — not dropped to 0",
+            stats.min
+        );
+    }
+
+    #[test]
+    fn test_trend_all_zero_samples_stay_in_population() {
+        // Direct pin of the clamp path: an all-zero trend (every sub-timing
+        // 0 on pooled reuse) must still record every sample — min == max == 1
+        // µs (hdrhistogram floor), count fully populated. (min <= avg cannot
+        // hold here: the 1 µs clamp makes min == 1 while the mean is 0 µs.)
+        let mut set = MetricSet::new(MetricType::Trend, None);
+        let trend = SampleType::Trend;
+        for _ in 0..100 {
+            set.record(0.0, &trend);
+        }
+
+        assert_eq!(set.count, 100.0);
+        let stats = set.histogram.stats();
+        assert_eq!(stats.count, 100, "all 100 zeros must be recorded");
+        assert_eq!(stats.min, 1);
+        assert_eq!(stats.max, 1);
+        assert_eq!(set.sum, 0.0);
     }
 
     #[test]
