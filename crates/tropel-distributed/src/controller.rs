@@ -186,7 +186,9 @@ pub async fn run_controller(
 
     let snapshots: Vec<MetricsSnapshot> = snapshots.into_iter().flatten().collect();
     tracing::info!("Controller: all {num_agents} agents done — merging losslessly");
-    Ok(merge_snapshots(snapshots, config.thresholds.clone()))
+    // A corrupt histogram (bad base64 / truncated V2 bytes) fails the merge
+    // loudly instead of silently fabricating results from a partial set.
+    merge_snapshots(snapshots, config.thresholds.clone())
 }
 
 /// Read an agent's snapshot frame (drain any prior frames defensively).

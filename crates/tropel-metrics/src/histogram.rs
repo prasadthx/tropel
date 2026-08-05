@@ -147,8 +147,16 @@ impl LatencyHistogram {
         use hdrhistogram::serialization::{Serializer, V2Serializer};
         let mut serializer = V2Serializer::new();
         let mut buf = Vec::new();
-        // Serialization into an in-memory Vec cannot fail in practice.
-        let _ = serializer.serialize(&self.inner, &mut buf);
+        // Serialization into an in-memory Vec cannot fail in practice, but a
+        // failure must never be swallowed silently: an empty/partial buffer
+        // shipped to a controller would otherwise deserialize as "no data"
+        // and corrupt the merge the same way a truncated frame does.
+        if let Err(e) = serializer.serialize(&self.inner, &mut buf) {
+            tracing::error!(
+                "hdr-histogram V2 serialization failed ({} samples): {e}",
+                self.count()
+            );
+        }
         buf
     }
 

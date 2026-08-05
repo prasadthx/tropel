@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc};
 use tropel_core::types::{Sample, SampleType};
+use tropel_core::{Result, TropelError};
 
 /// Information about the type of a metric — stored alongside MetricSet so the
 /// aggregator can report type-appropriate summary statistics.
@@ -1054,7 +1055,14 @@ impl Aggregator {
     /// (deserializing Trend histograms) and merge into this aggregator.
     /// Histograms merge losslessly — the controller's total is exactly the
     /// sum of the workers' buckets.
-    fn absorb_snapshot(&mut self, snap: &MetricsSnapshot) {
+    ///
+    /// Returns an error when a Trend histogram's payload is corrupt (bad
+    /// base64, or valid base64 that fails hdr-histogram V2 deserialization).
+    /// A "lossless merge" must NOT substitute an empty histogram while the
+    /// series' `count`/`sum` still merge — that silently fabricates
+    /// `avg` over all samples with percentiles over fewer, looking
+    /// indistinguishable from a clean run.
+    fn absorb_snapshot(&mut self, snap: &MetricsSnapshot) -> Result<()> {
         for s in &snap.series {
             let mut tags = tropel_core::types::TagMap::new();
             for (k, v) in &s.tags {
@@ -1063,11 +1071,26 @@ impl Aggregator {
             let key = MetricKey::new(&s.metric, &tags);
 
             let histogram = match &s.histogram {
-                Some(b64) => base64::engine::general_purpose::STANDARD
-                    .decode(b64)
-                    .ok()
-                    .and_then(|bytes| LatencyHistogram::from_bytes(&bytes))
-                    .unwrap_or_default(),
+                Some(b64) => {
+                    let raw = base64::engine::general_purpose::STANDARD
+                        .decode(b64)
+                        .map_err(|e| {
+                            TropelError::Execution(format!(
+                                "corrupt histogram in worker snapshot for '{}' tags {:?}: \
+                                 invalid base64: {e}",
+                                s.metric, s.tags
+                            ))
+                        })?;
+                    LatencyHistogram::from_bytes(&raw).ok_or_else(|| {
+                        TropelError::Execution(format!(
+                            "corrupt histogram in worker snapshot for '{}' tags {:?}: \
+                             {} bytes do not deserialize as hdr-histogram V2",
+                            s.metric,
+                            s.tags,
+                            raw.len()
+                        ))
+                    })?
+                }
                 None => LatencyHistogram::default(),
             };
 
@@ -1107,6 +1130,7 @@ impl Aggregator {
         if self.summary_trend_stats.is_empty() && !snap.summary_trend_stats.is_empty() {
             self.summary_trend_stats = snap.summary_trend_stats.clone();
         }
+        Ok(())
     }
 }
 
@@ -1146,14 +1170,14 @@ pub struct MetricsSnapshot {
 pub fn merge_snapshots(
     snapshots: Vec<MetricsSnapshot>,
     thresholds: std::collections::HashMap<String, tropel_core::config::ThresholdConfig>,
-) -> MetricsResult {
+) -> Result<MetricsResult> {
     let mut agg = Aggregator::new();
     agg.retain_histograms = config_needs_histograms(&agg.summary_trend_stats, &thresholds);
     agg.effective_thresholds = thresholds;
     for snap in &snapshots {
-        agg.absorb_snapshot(snap);
+        agg.absorb_snapshot(snap)?;
     }
-    agg.build_results()
+    Ok(agg.build_results())
 }
 
 /// Summary of a single metric, with type-aware statistics.
@@ -1798,5 +1822,106 @@ mod tests {
         assert_eq!(second.summary_trend_stats, vec!["avg", "p(95)"]);
         assert_eq!(second.effective_thresholds.len(), 1);
         assert!(second.effective_thresholds.contains_key("p95"));
+    }
+
+    #[test]
+    fn merge_fails_on_corrupt_base64_histogram() {
+        // Regression (backlog line 87): a corrupt agent histogram was
+        // silently replaced with an empty one while its `count` still
+        // merged — `count = 4,000,000` with percentiles over 3 M,
+        // indistinguishable from a clean run. A lossless merge must fail
+        // loudly instead.
+        let snap = MetricsSnapshot {
+            series: vec![SeriesSnapshot {
+                metric: "http_req_duration".into(),
+                tags: vec![],
+                metric_type: MetricType::Trend,
+                histogram: Some("!!!not-base64!!!".into()),
+                count: 4_000_000.0,
+                sum: 4_000_000_000.0,
+                min: 1.0,
+                max: 2000.0,
+                last: 0.0,
+            }],
+            totals: std::collections::HashMap::new(),
+            summary_trend_stats: k6_default_trend_stats(),
+        };
+        let err = merge_snapshots(vec![snap], std::collections::HashMap::new()).unwrap_err();
+        assert!(
+            err.to_string().contains("http_req_duration"),
+            "error must name the metric: {err}"
+        );
+        assert!(err.to_string().contains("base64"), "error must explain: {err}");
+    }
+
+    #[test]
+    fn merge_fails_on_truncated_v2_bytes() {
+        // Valid base64 that fails hdr-histogram V2 deserialization must also
+        // fail the merge (not substitute an empty histogram).
+        let snap = MetricsSnapshot {
+            series: vec![SeriesSnapshot {
+                metric: "iteration_duration".into(),
+                tags: vec![("group".into(), "checkout".into())],
+                metric_type: MetricType::Trend,
+                // "garbage" base64-encodes to a few bytes that will never
+                // parse as a V2 histogram header.
+                histogram: Some(
+                    base64::engine::general_purpose::STANDARD.encode(b"garbage"),
+                ),
+                count: 10.0,
+                sum: 1000.0,
+                min: 1.0,
+                max: 100.0,
+                last: 0.0,
+            }],
+            totals: std::collections::HashMap::new(),
+            summary_trend_stats: k6_default_trend_stats(),
+        };
+        let err = merge_snapshots(vec![snap], std::collections::HashMap::new()).unwrap_err();
+        assert!(
+            err.to_string().contains("iteration_duration"),
+            "error must name the metric: {err}"
+        );
+        assert!(
+            err.to_string().contains("hdr-histogram V2"),
+            "error must explain: {err}"
+        );
+    }
+
+    #[test]
+    fn merge_roundtrip_clean_snapshots_losslessly() {
+        // A clean snapshot must still merge losslessly — the loud-failure
+        // change must not break the happy path (2 histograms -> exact total).
+        let mut agg = Aggregator::new();
+        let ts = std::time::SystemTime::now();
+        let tags = Arc::new(tropel_core::types::TagMap::new());
+        for ms in [1u64, 2, 3] {
+            agg.record(Sample {
+                metric: "http_req_duration".into(),
+                value: (ms * 1000) as f64,
+                tags: tags.clone(),
+                timestamp: ts,
+                sample_type: SampleType::Trend,
+            });
+        }
+        let snap_a = agg.build_snapshot();
+
+        let mut agg2 = Aggregator::new();
+        for ms in [50u64, 100] {
+            agg2.record(Sample {
+                metric: "http_req_duration".into(),
+                value: (ms * 1000) as f64,
+                tags: Arc::new(tropel_core::types::TagMap::new()),
+                timestamp: ts,
+                sample_type: SampleType::Trend,
+            });
+        }
+        let snap_b = agg2.build_snapshot();
+
+        let merged =
+            merge_snapshots(vec![snap_a, snap_b], std::collections::HashMap::new()).unwrap();
+        let m = merged.http_req_duration.expect("merged duration");
+        assert_eq!(m.count, 5, "all 5 samples must merge");
+        assert!(m.max >= 100_000, "max must reflect the merged buckets");
     }
 }
