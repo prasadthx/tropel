@@ -14,7 +14,7 @@
 // ══════════════════════════════════════════════════════════════════
 
 // ── Globals set by native host (K6DriverInstance) ──
-// __tropel_k6_http_request(method, url, headers_json, body, timeout_ms, response_type) -> JSON string
+// __tropel_k6_http_request(method, url, headers_json, body, timeout_ms, response_type) -> native JS object (the PM fallback bridge returns a JSON string)
 // __tropel_pm_send_request(method, url, headers_json, body, timeout_ms, response_type) -> JSON string
 // __tropel_vu_id, __tropel_iteration_num, __tropel_scenario
 
@@ -59,10 +59,17 @@ function k6HTTPRequest(method, url, body, params) {
     }
 
     var result;
-    try {
-        result = JSON.parse(resultJson);
-    } catch (e) {
-        throw new Error('k6 http.request: failed to parse native response: ' + e.message);
+    if (typeof resultJson === 'string') {
+        // Legacy path: the PM fallback bridge returns a JSON string.
+        try {
+            result = JSON.parse(resultJson);
+        } catch (e) {
+            throw new Error('k6 http.request: failed to parse native response: ' + e.message);
+        }
+    } else {
+        // Native k6 bridge returns a live JS object — no JSON round trip
+        // (avoids the old 3-4 full-body copies per response).
+        result = resultJson;
     }
 
     var respCode = result.code || result.status_code || result.status || 0;
@@ -226,6 +233,11 @@ K6Response.prototype.json = function () {
     if (!this.body || this.body === '') {
         throw new Error('Response body is empty — cannot parse JSON');
     }
+    // Parse fresh on every call, exactly like k6: a script that mutates the
+    // returned object must see a clean re-parse on the next .json() call
+    // (k6 does not cache, and caching would persist user mutations). The
+    // heavy copy savings for the response envelope itself come from the
+    // native-object bridge (driver.rs), not from re-parsing here.
     return JSON.parse(this.body);
 };
 

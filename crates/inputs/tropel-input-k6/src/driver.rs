@@ -51,7 +51,7 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tropel_js::JsContext;
 use tropel_sdk::{Body, Method, Request, Response, Sample, SampleType, TagMap};
-use tropel_sdk::{Driver, DriverDeclaredOptions, DriverInstance, DriverRegistration, VuContext};
+use tropel_sdk::{Driver, DriverDeclaredOptions, DriverHttpClient, DriverInstance, DriverRegistration, VuContext};
 use tropel_sdk::{Result, TropelError};
 
 // ══════════════════════════════════════════════════════════════════
@@ -762,14 +762,38 @@ impl K6DriverInstance {
             }
         };
 
+        let sink = self.sample_sink.clone();
+        // The bridge closures must name the QuickJS lifetime `'js` in their
+        // signatures (to return a native `Object<'js>`), which a closure
+        // cannot declare — the registration lives in the generic free fn
+        // below. Behavior is identical; only the marshalling changes.
         self.js_ctx.with_ctx(|rq_ctx| {
-            let globals = rq_ctx.globals();
-            let http_client_request = http_client.clone();
-            let sink = self.sample_sink.clone();
-            let _ = globals.set(
-                "__tropel_k6_http_request",
-                Func::from(
-                    move |ctx: rquickjs::Ctx<'js>,
+            register_http_bridges(rq_ctx, http_client.clone(), sink.clone());
+        });
+
+        self.http_bridge_registered = true;
+        tracing::debug!("K6Driver: registered __tropel_k6_http_request native bridge");
+    }
+}
+
+/// Register the native HTTP bridges (`__tropel_k6_http_request` /
+/// `__tropel_k6_http_batch`) on a per-VU QuickJS context. Lives in a generic
+/// fn — not an inline closure — because the request bridge's closure must
+/// name the QuickJS lifetime `'js` in its signature to return a native
+/// `Object<'js>` (eliminating the escaped-JSON-string round trip), and
+/// closures cannot declare lifetimes.
+fn register_http_bridges<'js>(
+    rq_ctx: &rquickjs::Ctx<'js>,
+    http_client: Arc<dyn DriverHttpClient + Send + Sync>,
+    sink: Arc<Mutex<Vec<Sample>>>,
+) {
+    let globals = rq_ctx.globals();
+    let http_client_request = http_client.clone();
+    let sink_req = sink.clone();
+    let _ = globals.set(
+        "__tropel_k6_http_request",
+        Func::from(
+            move |ctx: rquickjs::Ctx<'js>,
                           method: String,
                           url: String,
                           headers_json: String,
@@ -845,9 +869,9 @@ impl K6DriverInstance {
                                 // k6 parity: every redirect hop counts as its
                                 // own request (test.k6.io 302 chain = 2 reqs
                                 // per iteration, not 1).
-                                push_redirect_hops(&sink, &resp, &req.method.to_string());
+                                push_redirect_hops(&sink_req, &resp, &req.method.to_string());
                                 push_http_samples(
-                                    &sink,
+                                    &sink_req,
                                     &req,
                                     resp.status_code,
                                     resp.response_time,
@@ -865,7 +889,7 @@ impl K6DriverInstance {
                             }
                             Err(e) => {
                                 tracing::debug!("k6 http request failed: {}", e);
-                                push_http_failure(&sink, &req);
+                                push_http_failure(&sink_req, &req);
                                 build_k6_response_object(
                                     &ctx,
                                     0,
@@ -880,7 +904,7 @@ impl K6DriverInstance {
                 ),
             );
 
-            let batch_sink = self.sample_sink.clone();
+    let batch_sink = sink.clone();
             let _ = globals.set(
                 "__tropel_k6_http_batch",
                 Func::from(move |requests_json: String| -> String {
@@ -1031,11 +1055,6 @@ impl K6DriverInstance {
                     serde_json::Value::Object(response_map).to_string()
                 }),
             );
-        });
-
-        self.http_bridge_registered = true;
-        tracing::debug!("K6Driver: registered __tropel_k6_http_request native bridge");
-    }
 }
 
 impl K6DriverInstance {
