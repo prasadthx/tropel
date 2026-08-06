@@ -217,14 +217,20 @@ pub trait Driver: Send + Sync {
     /// `env` carries the job's environment variables so scripts that compute
     /// their options from `__ENV` (a common k6 pattern) see them.
     ///
+    /// Returns `Ok(None)` when the script declares nothing usable (the engine
+    /// falls back to the CLI profile). Returns `Err` when the script DECLARES
+    /// options but they are malformed — e.g. a type mismatch in `stages` — so
+    /// the run aborts loudly instead of silently running a profile nobody
+    /// asked for (k6 hard-errors; backlog line 153).
+    ///
     /// The default implementation declares no options.
     async fn declared_options(
         &self,
         _bytes: &[u8],
         _source_path: Option<&std::path::Path>,
         _env: &HashMap<String, String>,
-    ) -> Option<DriverDeclaredOptions> {
-        None
+    ) -> Result<Option<DriverDeclaredOptions>> {
+        Ok(None)
     }
 
     /// Invoke the script's `handleSummary(data)` function (k6) after the run,

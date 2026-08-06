@@ -165,33 +165,48 @@ impl Driver for K6Driver {
         bytes: &[u8],
         source_path: Option<&Path>,
         env: &HashMap<String, String>,
-    ) -> Option<DriverDeclaredOptions> {
+    ) -> Result<Option<DriverDeclaredOptions>> {
         // Read the script's `export const options` by evaluating it as an ES
         // module. This is what makes k6's declared load profile (vus/duration/
         // stages/scenarios/thresholds) drive the run instead of being silently
-        // ignored. Any failure (not a k6 options export, eval error, …) simply
-        // yields `None` — the engine falls back to the CLI/JobConfig profile.
-        let original = std::str::from_utf8(bytes).ok()?;
-        let module_source = prepare_module_source(original, source_path).ok()?;
+        // ignored.
+        //
+        // Backlog line 153: `None` (nothing declared) and `Err` (declared but
+        // MALFORMED) are now distinct. A type mismatch anywhere in `options`
+        // — e.g. `stages: [{duration: 60}]` where k6 wants a string — used to
+        // fail the whole parse, warn, and silently fall back to the CLI
+        // profile: the run succeeded reporting numbers for a profile nobody
+        // asked for. k6 hard-errors, so Tropel aborts with a Parse error too.
+        // A non-UTF8 script / module-prep failure / eval failure / missing
+        // export all mean "nothing declared" → Ok(None) → the engine falls
+        // back to the CLI profile (unchanged from before line 153). Only a
+        // PRESENT `options` export that fails to deserialize is fatal (Err).
+        let original = match std::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+        let module_source = match prepare_module_source(original, source_path) {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
         let script_dir = source_path.and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        // eval_module_export_json returns Result<Option<String>> — .ok()?
-        // unwraps the Result, the second ? unwraps the Option.
-        let json_str =
-            eval_module_export_json(&module_source, "options", env, script_dir).await.ok()??;
+        let json_str = match eval_module_export_json(&module_source, "options", env, script_dir).await
+        {
+            Ok(Some(s)) => s,
+            _ => return Ok(None),
+        };
         let options: K6Options = match serde_json::from_str(&json_str) {
             Ok(o) => o,
             Err(e) => {
-                // Never fail silently: a misparse drops the script's entire
-                // load profile (vus/duration included).
-                tracing::warn!(
-                    "k6 options could not be parsed — falling back to the CLI/JobConfig load \
-                     profile: {}",
+                return Err(TropelError::Parse(format!(
+                    "k6 script declares `options` but they failed to parse: {} \
+                     (k6 would abort — fix the type mismatch, e.g. `stages: \
+                     [{{duration: 60}}]` needs a string duration like \"60s\")",
                     e
-                );
-                return None;
+                )));
             }
         };
-        options.to_declared()
+        Ok(options.to_declared())
     }
 
     async fn handle_summary(
@@ -5023,6 +5038,47 @@ mod tests {
             }
             other => panic!("expected SharedIterations, got {other:?}"),
         }
+    }
+
+    // ── options type-mismatch hard error (backlog line 153) ──
+
+    #[tokio::test]
+    async fn test_declared_options_malformed_returns_err() {
+        // Backlog line 153: a script that DECLARES `options` but with a type
+        // mismatch must hard-error (k6 aborts) — NOT silently fall back to
+        // the CLI profile. `stages[].duration` must be a string; a number is
+        // the canonical k6 mistake.
+        let driver = K6Driver;
+        let script = br#"
+            export const options = {
+                stages: [ { duration: 60, target: 10 } ]
+            };
+            export default function() {}
+        "#;
+        let res = driver
+            .declared_options(script, None, &HashMap::new())
+            .await;
+        assert!(
+            res.is_err(),
+            "malformed options must return Err, got {res:?}"
+        );
+        let msg = format!("{}", res.unwrap_err());
+        assert!(
+            msg.contains("k6 script declares `options` but they failed to parse"),
+            "error should explain the parse failure, got: {msg}"
+        );
+
+        // And a WELL-FORMED script still returns Ok(Some(_)) — the hard-error
+        // path must not leak into the happy path.
+        let good = br#"
+            export const options = { vus: 2, duration: "10s" };
+            export default function() {}
+        "#;
+        let res = driver
+            .declared_options(good, None, &HashMap::new())
+            .await;
+        assert!(res.is_ok(), "well-formed options must be Ok, got {res:?}");
+        assert!(res.unwrap().is_some(), "declared options must be Some");
     }
 
     // ── k6 lifecycle: setup() / teardown() (backlog line 127) ──

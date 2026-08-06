@@ -98,10 +98,13 @@ impl Engine {
                     &config.env,
                 ),
             ) {
-                if let Some(decl) = driver
+                // Backlog line 153: a script that DECLARES malformed options
+                // (e.g. a type mismatch in `stages`) aborts the run instead of
+                // silently falling back to the CLI profile — k6 hard-errors.
+                let declared = driver
                     .declared_options(&bytes, Some(input_path), &config.env)
-                    .await
-                {
+                    .await?;
+                if let Some(decl) = declared {
                     // Script-declared global body handling (k6
                     // `options.discardResponseBodies`) applies to the HTTP
                     // client when the job didn't set one explicitly.

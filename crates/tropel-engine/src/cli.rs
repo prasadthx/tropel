@@ -902,33 +902,42 @@ async fn inspect_command(
         // options from `__ENV` will show the defaults rather than what a
         // configured `run` would apply. `inspect` is a dry-run verification
         // tool; threading real env/`-e` values here is a future enhancement.
-        if let Some(opts) = driver
+        match driver
             .declared_options(&bytes, Some(input), &HashMap::new())
             .await
         {
-            println!("Declared options:");
-            if let Some(exec) = &opts.execution {
-                println!("  execution: {} ({:?})", exec.executor_name(), exec);
-            }
-            if let Some(scenarios) = &opts.scenarios {
-                println!("  scenarios: {}", scenarios.len());
-                for (name, sc) in scenarios {
-                    println!(
-                        "    - {}: {} ({:?})",
-                        name,
-                        sc.execution.executor_name(),
-                        sc.execution
-                    );
+            Ok(Some(opts)) => {
+                println!("Declared options:");
+                if let Some(exec) = &opts.execution {
+                    println!("  execution: {} ({:?})", exec.executor_name(), exec);
+                }
+                if let Some(scenarios) = &opts.scenarios {
+                    println!("  scenarios: {}", scenarios.len());
+                    for (name, sc) in scenarios {
+                        println!(
+                            "    - {}: {} ({:?})",
+                            name,
+                            sc.execution.executor_name(),
+                            sc.execution
+                        );
+                    }
+                }
+                if !opts.thresholds.is_empty() {
+                    println!("  thresholds: {}", opts.thresholds.len());
+                    for (name, t) in &opts.thresholds {
+                        println!("    - {}: {}", name, t.expression);
+                    }
                 }
             }
-            if !opts.thresholds.is_empty() {
-                println!("  thresholds: {}", opts.thresholds.len());
-                for (name, t) in &opts.thresholds {
-                    println!("    - {}: {}", name, t.expression);
-                }
+            Ok(None) => {
+                println!("Declared options: (none)");
             }
-        } else {
-            println!("Declared options: (none)");
+            Err(e) => {
+                // Backlog line 153: the script DECLARES options but they are
+                // malformed — surface the error rather than silently showing
+                // nothing.
+                println!("Declared options: ERROR — {}", e);
+            }
         }
         return Ok(());
     }
