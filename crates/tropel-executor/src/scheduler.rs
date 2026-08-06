@@ -1,4 +1,16 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+/// Process-wide monotonic VU id allocator.
+///
+/// VU ids are handed to `run_vu` for data-row rotation, JS context naming and
+/// `exec.vu.idInTest`, and map onto the shared worker pool via
+/// `vu_id % MAX_WORKERS`. They must therefore be unique across ALL scenarios
+/// (each scenario used to restart at 0, putting two VUs on one worker) and
+/// must NEVER be reused while an old VU with the same id is still live
+/// (`run_ramping` used to reuse ids after a ramp-down, colliding with
+/// stragglers still mid-iteration). A single process-wide counter guarantees
+/// both. Only ever incremented — the id space is u32, ample for any run.
+static NEXT_VU_ID: AtomicU32 = AtomicU32::new(0);
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -369,6 +381,13 @@ impl VUScheduler {
 
     /// Shared handle to the active-VU counter — handed to a VU's PmState so
     /// the sync `exec.instance.vusActive` bridge can read it live.
+    /// Allocate a globally-unique VU id from the process-wide monotonic
+    /// counter. See [`NEXT_VU_ID`] for why uniqueness across scenarios and
+    /// across a scenario's lifetime is a hard guarantee.
+    fn alloc_vu_id(&self) -> u32 {
+        NEXT_VU_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
     pub fn active_vus_handle(&self) -> Arc<AtomicU32> {
         self.active_vus.clone()
     }
@@ -513,7 +532,8 @@ impl VUScheduler {
 
         // Spawn VUs (active count incremented by each VU task itself)
         let mut handles = Vec::new();
-        for vu_id in 0..vus {
+        for _ in 0..vus {
+            let vu_id = self.alloc_vu_id();
             let handle = run_vu(self.shared_clone(), vu_id);
             handles.push(handle);
         }
@@ -554,7 +574,8 @@ impl VUScheduler {
         let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
         // Start initial VUs (active count incremented by each VU task itself)
-        for vu_id in 0..current_vus {
+        for _ in 0..current_vus {
+            let vu_id = self.alloc_vu_id();
             let handle = run_vu(self.shared_clone(), vu_id);
             handles.push(handle);
         }
@@ -585,7 +606,7 @@ impl VUScheduler {
                 let delta = target - current_vus;
                 let step_delay = stage_duration / delta;
                 for _ in 0..delta {
-                    let vu_id = current_vus;
+                    let vu_id = self.alloc_vu_id();
                     let handle = run_vu(self.shared_clone(), vu_id);
                     handles.push(handle);
                     current_vus += 1;
@@ -711,7 +732,8 @@ impl VUScheduler {
         );
 
         let mut handles = Vec::new();
-        for vu_id in 0..vus {
+        for _ in 0..vus {
+            let vu_id = self.alloc_vu_id();
             let handle = run_vu(self.shared_clone(), vu_id);
             handles.push(handle);
         }
@@ -798,7 +820,8 @@ impl VUScheduler {
         if grow_by == 0 {
             return 0;
         }
-        for vu_id in *current_vus..*current_vus + grow_by {
+        for _ in 0..grow_by {
+            let vu_id = self.alloc_vu_id();
             let handle = run_vu(self.shared_clone(), vu_id);
             handles.push(handle);
         }
@@ -841,7 +864,8 @@ impl VUScheduler {
 
         // Pre-spawn initial VU pool
         let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-        for vu_id in 0..pre_alloc.max(1) {
+        for _ in 0..pre_alloc.max(1) {
+            let vu_id = self.alloc_vu_id();
             let handle = run_vu(self.shared_clone(), vu_id);
             handles.push(handle);
         }
@@ -955,7 +979,8 @@ impl VUScheduler {
 
         // Pre-spawn initial VU pool
         let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-        for vu_id in 0..pre_alloc.max(1) {
+        for _ in 0..pre_alloc.max(1) {
+            let vu_id = self.alloc_vu_id();
             let handle = run_vu(self.shared_clone(), vu_id);
             handles.push(handle);
         }
@@ -1087,7 +1112,8 @@ impl VUScheduler {
         );
 
         let mut handles = Vec::new();
-        for vu_id in 0..vus {
+        for _ in 0..vus {
+            let vu_id = self.alloc_vu_id();
             let handle = run_vu(self.shared_clone(), vu_id);
             handles.push(handle);
         }
@@ -1159,16 +1185,13 @@ impl VUScheduler {
         self.control_target_vus.store(vus.min(max_vus), Ordering::Release);
 
         let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-        // Monotonic VU id counter. Ids are handed to run_vu for data-row
-        // rotation / JS context naming; they must NEVER be reused while an
-        // old VU with the same id is still exiting (a regrow after a shrink
-        // would otherwise collide). Only ever incremented.
-        let mut next_vu_id = 0u32;
+        // Ids come from the process-wide monotonic allocator — globally unique
+        // across scenarios and never reused while an old VU with the same id
+        // is still exiting (a regrow after a shrink would otherwise collide).
         let initial = self.control_target();
         for _ in 0..initial {
-            let handle = run_vu(self.shared_clone(), next_vu_id);
+            let handle = run_vu(self.shared_clone(), self.alloc_vu_id());
             handles.push(handle);
-            next_vu_id += 1;
         }
         // Logical pool size — bumped synchronously at spawn so reconcile
         // never double-spawns on lagging registration.
@@ -1228,9 +1251,8 @@ impl VUScheduler {
                 // self-exit at their loop top, silently nullifying the grow.
                 self.clear_ramp_down();
                 for _ in spawned..target {
-                    let handle = run_vu(self.shared_clone(), next_vu_id);
+                    let handle = run_vu(self.shared_clone(), self.alloc_vu_id());
                     handles.push(handle);
-                    next_vu_id += 1;
                 }
                 // Synchronous bump — the next tick sees this count even if
                 // the new VUs haven't registered in `active_vus` yet, so a
@@ -1398,6 +1420,35 @@ fn parse_duration(s: &str) -> Result<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VU ids are handed to `run_vu` for data-row rotation / worker pinning /
+    /// `exec.vu.idInTest`. They must be unique across scenarios (each scenario
+    /// used to restart at 0, putting two VUs on one shared worker) and never
+    /// reused while a VU is live. The process-wide allocator guarantees both.
+    #[tokio::test]
+    async fn vu_ids_unique_across_schedulers_and_reused_nowhere() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..4 {
+            // Simulate four independent scenarios, each spawning 3 VUs (a
+            // ramp-down + regrow would previously reuse ids 0..n).
+            let sched = VUScheduler::new(&ExecutionConfig::ConstantVus {
+                vus: 1,
+                duration: "1s".to_string(),
+                graceful_stop: None,
+                think_time: Default::default(),
+            });
+            for _ in 0..3 {
+                let id = sched.alloc_vu_id();
+                assert!(
+                    seen.insert(id),
+                    "VU id {id} reused — breaks 1-VU-per-worker pinning"
+                );
+            }
+        }
+        // Sanity: the counter actually advanced past the per-scenario restart
+        // boundary that used to collide (ids 0..n per scenario).
+        assert!(*seen.iter().max().unwrap() >= 3);
+    }
 
     /// Locks the ramp-down overshoot invariant: when `current_vus` VUs contend
     /// for `current_vus - target` surplus slots, EXACTLY that many claims
