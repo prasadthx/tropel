@@ -66,68 +66,144 @@ pm.variables = {
 };
 
 // ── pm.response ──
-pm.response = {
-    code: function () {
-        if (typeof __tropel_pm_response_code === 'function') {
-            return __tropel_pm_response_code();
+// Backlog line 143: Postman exposes code/status/responseTime/headers/cookies
+// as VALUE PROPERTIES, not functions. The old function-object form broke the
+// two canonical idioms: `pm.expect(pm.response.code).to.eql(200)` compared a
+// Function to 200 (never eql), and `pm.response.headers.get('X')` threw a
+// TypeError (headers was a function). Only text()/json() are methods in
+// Postman; the rest are values.
+//
+// The native __tropel_pm_response_* bridges are registered LAZILY (first
+// iteration, after this shim bootstraps), so these are GETTERS that re-fetch
+// the bridge on every read — same pattern as exec.js. That keeps the read
+// shape a plain number/string/object exactly like Postman while staying live.
+pm.response = {};
+
+Object.defineProperty(pm.response, 'code', {
+    get: function () {
+        if (typeof globalThis !== 'undefined' && typeof globalThis.__tropel_pm_response_code === 'function') {
+            return globalThis.__tropel_pm_response_code();
         }
         return 0;
     },
-    status: function () {
-        if (typeof __tropel_pm_response_status === 'function') {
-            return __tropel_pm_response_status();
+    enumerable: true,
+    configurable: true
+});
+
+Object.defineProperty(pm.response, 'status', {
+    get: function () {
+        if (typeof globalThis !== 'undefined' && typeof globalThis.__tropel_pm_response_status === 'function') {
+            return globalThis.__tropel_pm_response_status();
         }
         return '';
     },
-    text: function () {
-        if (typeof __tropel_pm_response_body === 'function') {
-            return __tropel_pm_response_body();
-        }
-        return '';
-    },
-    json: function () {
-        if (typeof __tropel_pm_response_json === 'function') {
-            var raw = __tropel_pm_response_json();
-            if (raw) {
-                return JSON.parse(raw);
-            }
-            throw new Error('pm.response.json() — response body is not valid JSON or no response available');
-        }
-        throw new Error('pm.response.json() is not available in this runtime');
-    },
-    headers: function () {
-        if (typeof __tropel_pm_response_headers === 'function') {
-            return __tropel_pm_response_headers();
-        }
-        return {};
-    },
-    header: function (key) {
-        if (typeof __tropel_pm_response_header === 'function') {
-            return __tropel_pm_response_header(key);
-        }
-        return null;
-    },
-    responseTime: function () {
-        if (typeof __tropel_pm_response_time === 'function') {
-            return __tropel_pm_response_time();
+    enumerable: true,
+    configurable: true
+});
+
+Object.defineProperty(pm.response, 'responseTime', {
+    get: function () {
+        if (typeof globalThis !== 'undefined' && typeof globalThis.__tropel_pm_response_time === 'function') {
+            return globalThis.__tropel_pm_response_time();
         }
         return 0;
     },
-    cookies: function () {
-        if (typeof __tropel_pm_response_cookies === 'function') {
-            return __tropel_pm_response_cookies();
+    enumerable: true,
+    configurable: true
+});
+
+// Postman's pm.response.headers is a Headers object: pm.response.headers.get('X')
+// is the canonical idiom. Returns a fresh object per read (the underlying map
+// can change between iterations; the get() delegate is case-insensitive via the
+// __tropel_pm_response_header bridge, matching Postman).
+Object.defineProperty(pm.response, 'headers', {
+    get: function () {
+        var map = {};
+        if (typeof globalThis !== 'undefined' && typeof globalThis.__tropel_pm_response_headers === 'function') {
+            map = globalThis.__tropel_pm_response_headers() || {};
         }
-        return [];
-    },
-    to: {
-        have: {
-            status: function (code) {
-                var actual = pm.response.code();
-                if (actual !== code) {
-                    throw new Error(
-                        'expected response to have status ' + code + ' but got ' + actual
-                    );
+        return {
+            get: function (key) {
+                if (typeof globalThis !== 'undefined' && typeof globalThis.__tropel_pm_response_header === 'function') {
+                    var v = globalThis.__tropel_pm_response_header(key);
+                    return v !== undefined && v !== null ? v : undefined;
                 }
+                return undefined;
+            },
+            all: function () { return map; },
+            toObject: function () { return map; },
+            count: function () {
+                var n = 0;
+                for (var k in map) { if (map.hasOwnProperty(k)) n++; }
+                return n;
+            }
+        };
+    },
+    enumerable: true,
+    configurable: true
+});
+
+// Postman's pm.response.cookies is a list of Cookie objects; scripts also use
+// pm.response.cookies.get('name'). Returns an array of {name, value} objects
+// with a get() convenience, backed by the name→value bridge map.
+Object.defineProperty(pm.response, 'cookies', {
+    get: function () {
+        var map = {};
+        if (typeof globalThis !== 'undefined' && typeof globalThis.__tropel_pm_response_cookies === 'function') {
+            map = globalThis.__tropel_pm_response_cookies() || {};
+        }
+        var list = [];
+        for (var ck in map) {
+            if (map.hasOwnProperty(ck)) {
+                list.push({ name: ck, value: map[ck] });
+            }
+        }
+        list.get = function (key) {
+            for (var i = 0; i < list.length; i++) {
+                if (list[i].name === key) return list[i];
+            }
+            return undefined;
+        };
+        return list;
+    },
+    enumerable: true,
+    configurable: true
+});
+
+pm.response.text = function () {
+    if (typeof __tropel_pm_response_body === 'function') {
+        return __tropel_pm_response_body();
+    }
+    return '';
+};
+
+pm.response.json = function () {
+    if (typeof __tropel_pm_response_json === 'function') {
+        var raw = __tropel_pm_response_json();
+        if (raw) {
+            return JSON.parse(raw);
+        }
+        throw new Error('pm.response.json() — response body is not valid JSON or no response available');
+    }
+    throw new Error('pm.response.json() is not available in this runtime');
+};
+
+pm.response.header = function (key) {
+    if (typeof __tropel_pm_response_header === 'function') {
+        return __tropel_pm_response_header(key);
+    }
+    return null;
+};
+
+pm.response.to = {
+    have: {
+        status: function (code) {
+            // Backlog line 143: pm.response.code is a VALUE now.
+            var actual = pm.response.code;
+            if (actual !== code) {
+                throw new Error(
+                    'expected response to have status ' + code + ' but got ' + actual
+                );
             }
         }
     }
@@ -167,15 +243,24 @@ pm.test = function (name, fn) {
 pm.expect = function (actual) {
     return {
         to: {
+            // Backlog line 144: chai semantics — .eql is DEEP equality,
+            // .equal is strict (===). The old mapping was inverted: eql used
+            // === so `pm.expect(pm.response.json()).to.eql({...})` could
+            // never pass against a freshly-parsed body, and equal delegated
+            // to eql.
             eql: function (expected) {
-                if (actual !== expected) {
+                if (!deepEqual(actual, expected)) {
                     throw new Error(
                         'expected ' + shortJson(actual) + ' to eql ' + shortJson(expected)
                     );
                 }
             },
             equal: function (expected) {
-                return this.eql(expected);
+                if (actual !== expected) {
+                    throw new Error(
+                        'expected ' + shortJson(actual) + ' to equal ' + shortJson(expected)
+                    );
+                }
             },
             include: function (expected) {
                 if (String(actual).indexOf(String(expected)) === -1) {
@@ -211,7 +296,8 @@ pm.expect = function (actual) {
                     // Must THROW on mismatch (Postman/chai semantics) — a
                     // boolean return makes `pm.test` treat the callback's
                     // `undefined` statement result as passed.
-                    var actual = pm.response.code();
+                    // Backlog line 143: pm.response.code is a VALUE now.
+                    var actual = pm.response.code;
                     if (actual !== code) {
                         throw new Error('expected response to have status ' + code + ' but got ' + actual);
                     }
@@ -224,7 +310,10 @@ pm.expect = function (actual) {
                 },
                 jsonBody: function (expected) {
                     var body = pm.response.json();
-                    if (JSON.stringify(body) !== JSON.stringify(expected)) {
+                    // Backlog line 144: JSON.stringify comparison was
+                    // key-order sensitive — the same failure mode as the old
+                    // eql. Deep-compare instead.
+                    if (!deepEqual(body, expected)) {
                         throw new Error('expected response body to match');
                     }
                 }
@@ -238,9 +327,16 @@ pm.expect = function (actual) {
         not: {
             to: {
                 eql: function (expected) {
-                    if (actual === expected) {
+                    if (deepEqual(actual, expected)) {
                         throw new Error(
                             'expected ' + shortJson(actual) + ' not to eql ' + shortJson(expected)
+                        );
+                    }
+                },
+                equal: function (expected) {
+                    if (actual === expected) {
+                        throw new Error(
+                            'expected ' + shortJson(actual) + ' not to equal ' + shortJson(expected)
                         );
                     }
                 }
@@ -262,6 +358,36 @@ function shortJson(v) {
         return s.slice(0, 117) + '...';
     }
     return s;
+}
+
+// Proper JS deep-equality (chai .eql semantics): handles NaN, undefined,
+// key order, nested arrays/objects. Mirrors the jsDeepEqual in
+// js/chai/chai-shim.js — the backlog fix for .eql must not depend on chai
+// being loaded first (pm.js is bundled standalone).
+function deepEqual(a, b) {
+    if (a === b) return true;
+    if (typeof a === 'number' && typeof b === 'number' && isNaN(a) && isNaN(b)) return true;
+    if (a === null || b === null || a === undefined || b === undefined) return a === b;
+    if (typeof a !== typeof b) return false;
+    if (Array.isArray(a)) {
+        if (!Array.isArray(b) || a.length !== b.length) return false;
+        for (var i = 0; i < a.length; i++) {
+            if (!deepEqual(a[i], b[i])) return false;
+        }
+        return true;
+    }
+    if (typeof a === 'object') {
+        if (Array.isArray(b) || b === null || b === undefined) return false;
+        var keysA = Object.keys(a).sort();
+        var keysB = Object.keys(b).sort();
+        if (keysA.length !== keysB.length) return false;
+        for (var j = 0; j < keysA.length; j++) {
+            if (keysA[j] !== keysB[j]) return false;
+            if (!deepEqual(a[keysA[j]], b[keysB[j]])) return false;
+        }
+        return true;
+    }
+    return a === b;
 }
 
 // ── pm.iterationData ──

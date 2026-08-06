@@ -25,7 +25,6 @@ use tropel_executor::scheduler::{VUScheduler, VuLease};
 use tropel_ext::registry::ExtensionRegistry;
 use tropel_ext::traits::{Driver, DriverHttpClient, DriverInstance, Protocol, VuContext};
 use tropel_http::client::HttpClient;
-use tropel_http::AuthSigner;
 use tropel_metrics::collector::MetricsCollector;
 use tropel_metrics::thresholds::check_abort_on_fail;
 use tropel_pm::bridge::SharedPmState;
@@ -558,7 +557,11 @@ struct DriverHttpClientImpl {
 #[async_trait]
 impl DriverHttpClient for DriverHttpClientImpl {
     async fn execute(&self, req: &Request) -> Result<Response> {
-        let http_resp = self.client.execute(req, None::<&dyn AuthSigner>).await?;
+        // Backlog line 140: honor Request.auth (k6 params.auth). Build the
+        // signer from the per-request config so bearer/basic/oauth2/sigv4/
+        // digest on ONE request don't need the whole scenario to share it.
+        let signer = req.auth.as_ref().and_then(|a| self.client.get_signer(a));
+        let http_resp = self.client.execute(req, signer.as_deref()).await?;
         Ok(Response::from(&http_resp))
     }
 }

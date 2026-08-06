@@ -50,7 +50,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tropel_js::JsContext;
-use tropel_sdk::{Body, Method, Request, Response, Sample, SampleType, TagMap};
+use tropel_sdk::{AuthConfig, Body, Method, Request, Response, Sample, SampleType, TagMap};
 use tropel_sdk::{Driver, DriverDeclaredOptions, DriverHttpClient, DriverInstance, DriverRegistration, VuContext};
 use tropel_sdk::{Result, TropelError};
 
@@ -645,12 +645,23 @@ fn interned(s: &'static str) -> Arc<str> {
 /// [`interned`]. The scenario tag is stamped here when present, so the
 /// drain's scenario pass is a no-op for http samples — it never
 /// `Arc::make_mut`-clones the map shared by the 5 per-request samples.
-fn http_tags(req: &Request, status: &str, scenario: &Arc<str>) -> TagMap {
-    http_tags_for(&req.url, req.method.as_str(), status, scenario)
+fn http_tags(req: &Request, status: &str, scenario: &Arc<str>, extra: Option<&HashMap<String, String>>) -> TagMap {
+    http_tags_for(&req.url, req.method.as_str(), status, scenario, extra)
 }
 
 /// [`http_tags`] with explicit URL/method (redirect hops reuse it).
-fn http_tags_for(url: &str, method: &str, status: &str, scenario: &Arc<str>) -> TagMap {
+///
+/// `extra` carries k6 `params.tags` for the request — merged over the
+/// defaults so a user `name`/`url`/… tag wins (k6 semantics: params.tags
+/// add to AND override the auto tags; the `name` tag is the common case,
+/// grouping `http_req_duration` for a specific request).
+fn http_tags_for(
+    url: &str,
+    method: &str,
+    status: &str,
+    scenario: &Arc<str>,
+    extra: Option<&HashMap<String, String>>,
+) -> TagMap {
     let mut tags = TagMap::with_capacity(6);
     let url_arc: Arc<str> = Arc::from(url);
     tags.insert(interned("url"), url_arc.clone());
@@ -661,6 +672,11 @@ fn http_tags_for(url: &str, method: &str, status: &str, scenario: &Arc<str>) -> 
     if !scenario.is_empty() {
         // Refcount bump — the Arc was created once at bridge registration.
         tags.insert(interned("scenario"), scenario.clone());
+    }
+    if let Some(extra) = extra {
+        for (k, v) in extra {
+            tags.insert(k.clone(), v.clone());
+        }
     }
     tags
 }
@@ -678,6 +694,7 @@ fn push_http_samples(
     size: u64,
     sent: usize,
     scenario: &Arc<str>,
+    extra_tags: Option<&HashMap<String, String>>,
 ) {
     push_http_samples_for(
         sink,
@@ -688,6 +705,7 @@ fn push_http_samples(
         size,
         sent,
         scenario,
+        extra_tags,
     );
 }
 
@@ -695,7 +713,13 @@ fn push_http_samples(
 /// parity: each hop is its own request — the test.k6.io 302 chain counted
 /// 136 http_reqs for 68 iterations while Tropel recorded only the final
 /// 64). Called BEFORE the final response's samples so hop order matches k6.
-fn push_redirect_hops(sink: &Mutex<Vec<Sample>>, resp: &Response, method: &str, scenario: &Arc<str>) {
+fn push_redirect_hops(
+    sink: &Mutex<Vec<Sample>>,
+    resp: &Response,
+    method: &str,
+    scenario: &Arc<str>,
+    extra_tags: Option<&HashMap<String, String>>,
+) {
     for hop in &resp.redirects {
         push_http_samples_for(
             sink,
@@ -706,6 +730,7 @@ fn push_redirect_hops(sink: &Mutex<Vec<Sample>>, resp: &Response, method: &str, 
             hop.size,
             0, // redirect hops carry no request body
             scenario,
+            extra_tags,
         );
     }
 }
@@ -721,9 +746,16 @@ fn push_http_samples_for(
     size: u64,
     sent: usize,
     scenario: &Arc<str>,
+    extra_tags: Option<&HashMap<String, String>>,
 ) {
     let now = SystemTime::now();
-    let tags = Arc::new(http_tags_for(url, method, &status_code.to_string(), scenario));
+    let tags = Arc::new(http_tags_for(
+        url,
+        method,
+        &status_code.to_string(),
+        scenario,
+        extra_tags,
+    ));
 
     let is_failed = !(200..400).contains(&status_code);
     let mut v = sink.lock().unwrap();
@@ -764,6 +796,31 @@ fn push_http_samples_for(
     });
 }
 
+/// k6 `params.compression`: gzip/deflate the request body (flate2). Returns
+/// the compressed bytes, or `None` when the requested algorithm is unsupported
+/// (k6 accepts "gzip", "deflate", or both comma-separated; anything else is
+/// silently ignored — matching k6, which warns but proceeds uncompressed).
+/// Only called when a body exists (the shim always sends one for POST etc.).
+fn compress_k6_body(kind: &str, data: &[u8]) -> Option<Vec<u8>> {
+    use flate2::write::{DeflateEncoder, GzEncoder};
+    use flate2::Compression;
+    use std::io::Write;
+    if data.is_empty() {
+        return None;
+    }
+    if kind.contains("gzip") {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
+        enc.write_all(data).ok()?;
+        enc.finish().ok()
+    } else if kind.contains("deflate") {
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::fast());
+        enc.write_all(data).ok()?;
+        enc.finish().ok()
+    } else {
+        None
+    }
+}
+
 /// Send a ws command to the session's writer task without silently dropping
 /// frames. `try_send` + a short bounded retry: the writer task lives on the
 /// separate I/O runtime (not the VU's reactor), so parking this VU thread for
@@ -791,9 +848,14 @@ fn try_send_cmd(
 /// connection refused, …). Failed requests must still appear in the summary:
 /// `http_reqs` increments and `http_req_failed` (Rate) becomes 1.0 — matching
 /// the declarative runner's error branch and k6 semantics.
-fn push_http_failure(sink: &Mutex<Vec<Sample>>, req: &Request, scenario: &Arc<str>) {
+fn push_http_failure(
+    sink: &Mutex<Vec<Sample>>,
+    req: &Request,
+    scenario: &Arc<str>,
+    extra_tags: Option<&HashMap<String, String>>,
+) {
     let now = SystemTime::now();
-    let tags = Arc::new(http_tags(req, "0", scenario));
+    let tags = Arc::new(http_tags(req, "0", scenario, extra_tags));
 
     let mut v = sink.lock().unwrap();
     v.push(Sample {
@@ -988,15 +1050,77 @@ fn register_http_bridges<'js>(
                           url: String,
                           headers_json: String,
                           body: String,
-                          _timeout_ms: f64,
-                          response_type: String|
+                          response_type: String,
+                          extras_json: String|
                           -> rquickjs::Object<'js> {
-                        let headers = parse_headers_tolerant(&headers_json);
-                        let req_body = if body.is_empty() {
+                        // Backlog line 140: the shim packs per-request
+                        // params.timeout/tags/auth/redirects/compression into
+                        // ONE JSON string (the bridge closure is arity-capped
+                        // at ctx + 6 script args). Unpack them here and apply
+                        // each: timeout bounds the request, tags merge into
+                        // the http_req_* sample tags, auth becomes
+                        // Request.auth (the client impl builds the signer),
+                        // redirects controls follow_redirects, and compression
+                        // gzip/deflates the request body.
+                        let extras: serde_json::Value = serde_json::from_str(&extras_json)
+                            .unwrap_or(serde_json::Value::Null);
+                        let timeout_ms: f64 = extras
+                            .get("timeoutMs")
+                            .and_then(|t| t.as_f64())
+                            .unwrap_or(0.0);
+                        let extra_tags: HashMap<String, String> = extras
+                            .get("tags")
+                            .and_then(|t| t.as_object())
+                            .map(|o| {
+                                o.iter()
+                                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let auth: Option<AuthConfig> = extras
+                            .get("auth")
+                            .filter(|a| !a.is_null())
+                            .and_then(|a| serde_json::from_value(a.clone()).ok());
+                        // k6 params.redirects: 0 = don't follow, -1 = follow
+                        // all, N = follow up to N hops. Our Request only has a
+                        // bool; N>0 and -1 both mean follow.
+                        let redirects: i64 = extras
+                            .get("redirects")
+                            .and_then(|r| r.as_i64())
+                            .unwrap_or(-1);
+                        let compression: String = extras
+                            .get("compression")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        let mut headers = parse_headers_tolerant(&headers_json);
+                        // k6 params.compression: "gzip" / "deflate" — compress
+                        // the request body and stamp Content-Encoding. Only
+                        // when a body exists (k6 compresses the body, and an
+                        // empty-body GET has nothing to compress).
+                        let mut req_body = if body.is_empty() {
                             None
                         } else {
                             Some(Body::Raw(body))
                         };
+                        if !compression.is_empty() {
+                            if let Some(Body::Raw(text)) = &req_body {
+                                if let Some(compressed) =
+                                    compress_k6_body(&compression, text.as_bytes())
+                                {
+                                    req_body = Some(Body::Binary(compressed));
+                                    headers.insert(
+                                        "Content-Encoding".to_string(),
+                                        if compression.contains("gzip") {
+                                            "gzip".to_string()
+                                        } else {
+                                            "deflate".to_string()
+                                        },
+                                    );
+                                }
+                            }
+                        }
                         // A genuinely invalid method token must not silently
                         // become GET (a write-path "PURGE" must not degrade
                         // into a read-path GET that reports green). Surfaced
@@ -1023,10 +1147,18 @@ fn register_http_bridges<'js>(
                             headers,
                             query_params: HashMap::new(),
                             body: req_body,
-                            auth: None,
+                            auth,
                             certificate: None,
-                            follow_redirects: true,
-                            timeout: None,
+                            follow_redirects: redirects != 0,
+                            // Backlog line 140: timeout was parsed by the shim
+                            // then DISCARDED here (`_timeout_ms`) — wire it
+                            // through so a per-request timeout actually bounds
+                            // the request.
+                            timeout: if timeout_ms > 0.0 {
+                                Some(Duration::from_millis(timeout_ms as u64))
+                            } else {
+                                None
+                            },
                             response_type: tropel_sdk::ResponseType::from_k6(&response_type),
                         };
                         // Execute on the dedicated I/O runtime via the shared
@@ -1059,7 +1191,7 @@ fn register_http_bridges<'js>(
                                 // k6 parity: every redirect hop counts as its
                                 // own request (test.k6.io 302 chain = 2 reqs
                                 // per iteration, not 1).
-                                push_redirect_hops(&sink_req, &resp, req.method.as_str(), &scenario_req);
+                                push_redirect_hops(&sink_req, &resp, req.method.as_str(), &scenario_req, Some(&extra_tags));
                                 push_http_samples(
                                     &sink_req,
                                     &req,
@@ -1068,6 +1200,7 @@ fn register_http_bridges<'js>(
                                     resp.size,
                                     sent,
                                     &scenario_req,
+                                    Some(&extra_tags),
                                 );
                                 build_k6_response_object(
                                     &ctx,
@@ -1080,7 +1213,7 @@ fn register_http_bridges<'js>(
                             }
                             Err(e) => {
                                 tracing::debug!("k6 http request failed: {}", e);
-                                push_http_failure(&sink_req, &req, &scenario_req);
+                                push_http_failure(&sink_req, &req, &scenario_req, Some(&extra_tags));
                                 build_k6_response_object(
                                     &ctx,
                                     0,
@@ -1120,17 +1253,64 @@ fn register_http_bridges<'js>(
                             .get("headers_json")
                             .and_then(|v| v.as_str())
                             .unwrap_or("{}");
-                        let headers = parse_headers_tolerant(headers_json);
+                        let mut headers = parse_headers_tolerant(headers_json);
                         let body = entry
                             .get("body")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
-                        let request_body = if body.is_empty() {
+                        // Backlog line 140: batch entries carry the same
+                        // per-request params.tags/auth/redirects/compression
+                        // as the single-request bridge (the shim packs them
+                        // into the entry object).
+                        let extra_tags: HashMap<String, String> = entry
+                            .get("tags_json")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| serde_json::from_str(s).ok())
+                            .unwrap_or_default();
+                        // auth_json is DOUBLE-ENCODED: the shim sends
+                        // JSON.stringify(auth) — a JSON string whose CONTENT is
+                        // the tagged auth object. from_value(Value::String)
+                        // would try to deserialize the internally-tagged
+                        // AuthConfig enum from a string and fail silently
+                        // (auth → None, the exact silent-drop this backlog
+                        // line kills) — read the inner string instead.
+                        let auth: Option<AuthConfig> = entry
+                            .get("auth_json")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| *s != "null")
+                            .and_then(|s| serde_json::from_str(s).ok());
+                        let redirects: i64 = entry
+                            .get("redirects")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(-1);
+                        let compression: String = entry
+                            .get("compression")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let mut request_body = if body.is_empty() {
                             None
                         } else {
                             Some(Body::Raw(body))
                         };
+                        if !compression.is_empty() {
+                            if let Some(Body::Raw(text)) = &request_body {
+                                if let Some(compressed) =
+                                    compress_k6_body(&compression, text.as_bytes())
+                                {
+                                    request_body = Some(Body::Binary(compressed));
+                                    headers.insert(
+                                        "Content-Encoding".to_string(),
+                                        if compression.contains("gzip") {
+                                            "gzip".to_string()
+                                        } else {
+                                            "deflate".to_string()
+                                        },
+                                    );
+                                }
+                            }
+                        }
                         let timeout_ms = entry
                             .get("timeout_ms")
                             .and_then(|v| v.as_f64())
@@ -1160,9 +1340,9 @@ fn register_http_bridges<'js>(
                             headers,
                             query_params: HashMap::new(),
                             body: request_body,
-                            auth: None,
+                            auth,
                             certificate: None,
-                            follow_redirects: true,
+                            follow_redirects: redirects != 0,
                             timeout,
                             response_type: tropel_sdk::ResponseType::from_k6(response_type),
                         };
@@ -1175,7 +1355,7 @@ fn register_http_bridges<'js>(
                                     method
                                 ))),
                             };
-                            (key, req, resp)
+                            (key, req, resp, extra_tags)
                         }
                     });
 
@@ -1186,7 +1366,7 @@ fn register_http_bridges<'js>(
 
                     let mut response_map = serde_json::Map::new();
                     if let Ok(results) = responses {
-                        for (key, req, result) in results {
+                        for (key, req, result, extra_tags) in results {
                             let key_str = match key {
                                 serde_json::Value::String(s) => s,
                                 serde_json::Value::Number(n) => n.to_string(),
@@ -1208,7 +1388,7 @@ fn register_http_bridges<'js>(
                                     // k6 parity: every redirect hop counts as
                                     // its own request, same as the single-
                                     // request path.
-                                    push_redirect_hops(&batch_sink, &resp, req.method.as_str(), &scenario_batch);
+                                    push_redirect_hops(&batch_sink, &resp, req.method.as_str(), &scenario_batch, Some(&extra_tags));
                                     push_http_samples(
                                         &batch_sink,
                                         &req,
@@ -1217,6 +1397,7 @@ fn register_http_bridges<'js>(
                                         resp.size,
                                         sent,
                                         &scenario_batch,
+                                        Some(&extra_tags),
                                     );
                                     let body_text = String::from_utf8(resp.body).unwrap_or_default();
                                     serde_json::json!({
@@ -1230,7 +1411,7 @@ fn register_http_bridges<'js>(
                                 }
                                 Err(e) => {
                                     tracing::debug!("k6 batch request failed: {}", e);
-                                    push_http_failure(&batch_sink, &req, &scenario_batch);
+                                    push_http_failure(&batch_sink, &req, &scenario_batch, Some(&extra_tags));
                                     serde_json::json!({
                                         "code": 0,
                                         "status": 0,
@@ -1314,7 +1495,7 @@ impl K6DriverInstance {
                 ),
             );
 
-            // exec.scenario.name() / executor()
+            // exec.scenario.name / executor (value properties — line 141)
             let es_name = exec_state.clone();
             let _ = globals.set(
                 "__tropel_exec_scenario_name",
@@ -1857,19 +2038,26 @@ impl K6DriverInstance {
         if !self.globals_seeded {
             self.globals_seeded = true;
 
+            // Numeric, matching __VU and the __tropel_exec_vu_id bridge (a
+            // string here would hit the same arithmetic bug as the old __VU:
+            // `__tropel_vu_id % len` → NaN).
             let _ = self
                 .js_ctx
-                .set_global_str("__tropel_vu_id", &ctx.vu_id.to_string())
+                .set_global_json("__tropel_vu_id", &serde_json::json!(ctx.vu_id))
                 .await;
             let _ = self
                 .js_ctx
                 .set_global_str("__tropel_scenario", &ctx.scenario_name)
                 .await;
             // k6-compatible: __VU is 1-based (like k6); __ITER is 0-based and
-            // refreshed below each iteration.
+            // refreshed below each iteration. Backlog line 142: these must be
+            // NUMBERS, not strings — `__ITER === 0` (the once-per-VU setup
+            // guard) never fired on "0" and `__VU + 1` produced "11" on
+            // string concatenation. set_global_json parses the JSON number
+            // natively (no eval, no string round trip).
             let _ = self
                 .js_ctx
-                .set_global_str("__VU", &(ctx.vu_id + 1).to_string())
+                .set_global_json("__VU", &serde_json::json!(ctx.vu_id + 1))
                 .await;
 
             // Set env vars as JS globals. k6 scripts read `__ENV` (and
@@ -1912,14 +2100,15 @@ impl K6DriverInstance {
             });
         }
 
-        // Per-iteration mutable globals.
+        // Per-iteration mutable globals. Backlog line 142: numbers, not
+        // strings (see the __VU comment above).
         let _ = self
             .js_ctx
-            .set_global_str("__tropel_iteration_num", &ctx.iteration.to_string())
+            .set_global_json("__tropel_iteration_num", &serde_json::json!(ctx.iteration))
             .await;
         let _ = self
             .js_ctx
-            .set_global_str("__ITER", &ctx.iteration.to_string())
+            .set_global_json("__ITER", &serde_json::json!(ctx.iteration))
             .await;
 
         // Refresh the per-iteration exec.* counters read by the __tropel_exec_*
@@ -2169,9 +2358,10 @@ async fn eval_module_export_json(
     // Minimal globals a k6 script may reference while building its options.
     // `__ENV` carries the job's env vars so options computed from them
     // (e.g. `const baseURL = __ENV.BASE_URL`) resolve instead of silently
-    // becoming undefined.
-    let _ = js_ctx.set_global_str("__VU", "0").await;
-    let _ = js_ctx.set_global_str("__ITER", "0").await;
+    // becoming undefined. Backlog line 142: __VU/__ITER are NUMBERS in k6
+    // (script code doing `__ITER === 0` or `__VU + 1` must not see strings).
+    let _ = js_ctx.set_global_json("__VU", &serde_json::json!(0)).await;
+    let _ = js_ctx.set_global_json("__ITER", &serde_json::json!(0)).await;
     let env_json = serde_json::to_value(env).unwrap_or_else(|_| serde_json::json!({}));
     let _ = js_ctx.set_global_json("__ENV", &env_json).await;
     let _ = js_ctx.set_global_json("__tropel_env", &env_json).await;
@@ -2223,8 +2413,9 @@ async fn eval_module_handle_summary(
     })?;
 
     // Minimal globals a k6 script may reference while building its summary.
-    let _ = js_ctx.set_global_str("__VU", "0").await;
-    let _ = js_ctx.set_global_str("__ITER", "0").await;
+    // Backlog line 142: numbers, not strings (see options eval above).
+    let _ = js_ctx.set_global_json("__VU", &serde_json::json!(0)).await;
+    let _ = js_ctx.set_global_json("__ITER", &serde_json::json!(0)).await;
     let env_json = serde_json::to_value(env).unwrap_or_else(|_| serde_json::json!({}));
     let _ = js_ctx.set_global_json("__ENV", &env_json).await;
     let _ = js_ctx.set_global_json("__tropel_env", &env_json).await;
@@ -2279,9 +2470,9 @@ async fn eval_module_call_export(
 
     // Minimal globals a k6 script may reference at module top level while
     // defining setup()/teardown() (same set as the options/handleSummary
-    // evals).
-    let _ = js_ctx.set_global_str("__VU", "0").await;
-    let _ = js_ctx.set_global_str("__ITER", "0").await;
+    // evals). Backlog line 142: numbers, not strings.
+    let _ = js_ctx.set_global_json("__VU", &serde_json::json!(0)).await;
+    let _ = js_ctx.set_global_json("__ITER", &serde_json::json!(0)).await;
     let env_json = serde_json::to_value(env).unwrap_or_else(|_| serde_json::json!({}));
     let _ = js_ctx.set_global_json("__ENV", &env_json).await;
     let _ = js_ctx.set_global_json("__tropel_env", &env_json).await;
@@ -3100,6 +3291,144 @@ mod tests {
     }
 
     #[test]
+    fn test_http_params_extras_reach_the_bridge() {
+        // Backlog line 140: params.tags/auth/redirects/cookies/compression
+        // were silently dropped and timeout was parsed then discarded. The
+        // shim must pack ALL of them into the 6th bridge arg (the extras JSON
+        // string — the closure is arity-capped), with auth translated into
+        // the tagged AuthConfig form the Rust side deserializes.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+                .expect("k6 shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__captured = [];
+                globalThis.__tropel_k6_http_request = function (method, url, headersJson, body, responseType, extrasJson) {
+                    globalThis.__captured.push({ extras: JSON.parse(extrasJson) });
+                    return { code: 200, status: 200, body: '{}', headers: {}, responseTime: 5 };
+                };
+                http.get('https://example.com/x', {
+                    tags: { name: 'my-request', foo: 'bar' },
+                    auth: { token: 's3cret' },
+                    redirects: 0,
+                    compression: 'gzip',
+                    timeout: '2s',
+                });
+            "#,
+            )
+            .expect("script should eval");
+
+            let extras: String = ctx
+                .eval("JSON.stringify(__captured[0].extras)")
+                .expect("read captured extras");
+            // timeout: '2s' must be parsed to ms and actually shipped.
+            assert!(
+                extras.contains("\"timeoutMs\":2000"),
+                "timeout parsed then dropped: {extras}"
+            );
+            assert!(extras.contains("\"name\":\"my-request\""), "tags dropped: {extras}");
+            assert!(extras.contains("\"foo\":\"bar\""), "tags dropped: {extras}");
+            assert!(extras.contains("\"redirects\":0"), "redirects dropped: {extras}");
+            assert!(extras.contains("\"compression\":\"gzip\""), "compression dropped: {extras}");
+            // auth must be the tagged AuthConfig form ({type:'bearer',…}), not
+            // k6's bare {token} — that's what the Rust AuthConfig enum parses.
+            assert!(
+                extras.contains("\"type\":\"bearer\"") && extras.contains("\"token\":\"s3cret\""),
+                "auth not translated to tagged AuthConfig: {extras}"
+            );
+            // No auth param → null (the bridge must not invent one).
+            ctx.eval::<(), _>(
+                r#"
+                http.get('https://example.com/y', {});
+            "#,
+            )
+            .expect("script should eval");
+            let second: String = ctx
+                .eval("JSON.stringify(__captured[1].extras)")
+                .expect("read second captured extras");
+            assert!(second.contains("\"auth\":null"), "auth not null when absent: {second}");
+        });
+    }
+
+    #[test]
+    fn test_http_batch_entries_carry_per_request_params() {
+        // Backlog line 140 (batch half): batch entries must carry the same
+        // per-request tags/auth/redirects/compression/timeout as the single-
+        // request path — and auth_json is DOUBLE-ENCODED by the shim
+        // (JSON.stringify inside the entry), so the Rust bridge must parse
+        // the inner string (from_value(Value::String) on an internally-tagged
+        // enum fails silently → auth dropped).
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+                .expect("k6 shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__captured = [];
+                globalThis.__tropel_k6_http_batch = function (requestsJson) {
+                    globalThis.__captured.push(JSON.parse(requestsJson));
+                    return '{}';
+                };
+                http.batch([
+                    ['GET', 'https://example.com/1', null, {
+                        tags: { name: 'b1' },
+                        auth: { username: 'u', password: 'p' },
+                        redirects: 0,
+                        timeout: '1s',
+                    }],
+                    { 'https://example.com/2': { method: 'POST', body: 'x' } },
+                ]);
+            "#,
+            )
+            .expect("script should eval");
+
+            let entries: String = ctx
+                .eval("JSON.stringify(__captured[0])")
+                .expect("read batch entries");
+            // Entry 1: every per-request param present.
+            assert!(entries.contains("\"tags_json\":\"{\\\"name\\\":\\\"b1\\\"}\""), "batch tags missing: {entries}");
+            assert!(entries.contains("\"redirects\":0"), "batch redirects missing: {entries}");
+            assert!(entries.contains("\"timeout_ms\":1000"), "batch timeout missing: {entries}");
+            // auth_json is a STRING containing the tagged auth JSON — the
+            // Rust side must parse the inner string.
+            assert!(
+                entries.contains("\\\"type\\\":\\\"basic\\\""),
+                "batch auth not translated to tagged AuthConfig: {entries}"
+            );
+            // Entry 2 (no params): no auth, no tags, default redirects.
+            assert!(entries.contains("\"auth_json\":\"null\""), "batch auth not null when absent: {entries}");
+        });
+    }
+
+    #[test]
+    fn test_compress_k6_body_gzip_and_deflate() {
+        // Backlog line 140: compression param was dropped; the helper must
+        // produce valid gzip/deflate and pass through the uncompressed bytes
+        // (no-op) for an unsupported algorithm.
+        let data = b"{\"hello\":\"world\"}".repeat(3);
+        let gz = compress_k6_body("gzip", &data).expect("gzip should compress");
+        assert_ne!(gz, data, "gzip must change the bytes");
+        let mut dec = flate2::read::GzDecoder::new(gz.as_slice());
+        use std::io::Read;
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        assert_eq!(out, data, "gzip round-trip must restore the body");
+
+        let df = compress_k6_body("deflate", &data).expect("deflate should compress");
+        let mut dec2 = flate2::read::DeflateDecoder::new(df.as_slice());
+        let mut out2 = Vec::new();
+        dec2.read_to_end(&mut out2).unwrap();
+        assert_eq!(out2, data, "deflate round-trip must restore the body");
+
+        // Unsupported algorithm → None (k6 proceeds uncompressed).
+        assert!(compress_k6_body("br", &data).is_none(), "unsupported must be None");
+        assert!(compress_k6_body("gzip", b"").is_none(), "empty body must be None");
+    }
+
+    #[test]
     fn test_pm_send_request_headers_not_mutated_and_multipart_boundary() {
         // Backlog line 138 (pm.js half): pm.sendRequest aliased
         // `headers = options.headers`, so the formdata branch stamped the
@@ -3157,6 +3486,161 @@ mod tests {
     }
 
     #[test]
+    fn test_pm_response_members_are_value_properties() {
+        // Backlog line 143: pm.response.code/status/responseTime/headers/
+        // cookies are VALUE properties in Postman, not functions. The old
+        // function-object form made `pm.expect(pm.response.code).to.eql(200)`
+        // compare a Function to 200 (never eql) and `pm.response.headers.get('X')`
+        // throw a TypeError (headers was a function). Only text()/json() are
+        // methods in Postman.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
+                .expect("pm shim should eval");
+            // Stub the response bridges with known values.
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_pm_response_code = function () { return 200; };
+                globalThis.__tropel_pm_response_status = function () { return 'OK'; };
+                globalThis.__tropel_pm_response_time = function () { return 42.5; };
+                globalThis.__tropel_pm_response_headers = function () {
+                    return { 'Content-Type': 'application/json' };
+                };
+                globalThis.__tropel_pm_response_header = function (key) {
+                    if (String(key).toLowerCase() === 'content-type') return 'application/json';
+                    return null;
+                };
+                globalThis.__tropel_pm_response_cookies = function () {
+                    return { session: 'abc123' };
+                };
+                globalThis.__type_code = typeof pm.response.code;
+                globalThis.__type_headers = typeof pm.response.headers;
+                globalThis.__type_cookies = typeof pm.response.cookies;
+                globalThis.__code = pm.response.code;
+                globalThis.__status = pm.response.status;
+                globalThis.__rtime = pm.response.responseTime;
+                globalThis.__hdr = pm.response.headers.get('content-type');
+                globalThis.__hdr_all = JSON.stringify(pm.response.headers.toObject());
+                globalThis.__ck = pm.response.cookies[0].value;
+                globalThis.__ck_get = pm.response.cookies.get('session').value;
+                // The two canonical idioms that the function-form broke.
+                // Coerce to String so the result is always eval-able as Rust
+                // String (a raw boolean/string mix fails String::from_js).
+                globalThis.__eql_ok = String((function () {
+                    try { pm.expect(pm.response.code).to.eql(200); return true; }
+                    catch (e) { return 'threw: ' + e.message; }
+                })());
+                globalThis.__status_ok = String((function () {
+                    try { pm.expect(pm.response).to.have.status(200); return true; }
+                    catch (e) { return 'threw: ' + e.message; }
+                })());
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(ctx.eval::<String, _>("__type_code").unwrap(), "number", "pm.response.code must be a number value, not a function");
+            assert_eq!(ctx.eval::<String, _>("__type_headers").unwrap(), "object", "pm.response.headers must be a Headers object");
+            assert_eq!(ctx.eval::<String, _>("__type_cookies").unwrap(), "object", "pm.response.cookies must be a list");
+            assert_eq!(ctx.eval::<i64, _>("__code").unwrap(), 200);
+            assert_eq!(ctx.eval::<String, _>("__status").unwrap(), "OK");
+            assert_eq!(ctx.eval::<f64, _>("__rtime").unwrap(), 42.5);
+            assert_eq!(
+                ctx.eval::<String, _>("__hdr").unwrap(),
+                "application/json",
+                "pm.response.headers.get() must work (was a TypeError)"
+            );
+            assert!(
+                ctx.eval::<String, _>("__hdr_all").unwrap().contains("Content-Type"),
+                "headers.toObject() must expose the map"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__ck").unwrap(),
+                "abc123",
+                "cookies[0].value must read as a value property"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__ck_get").unwrap(),
+                "abc123",
+                "cookies.get('session') must find by name"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__eql_ok").unwrap(),
+                "true",
+                "pm.expect(pm.response.code).to.eql(200) must pass (compared a Function before)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__status_ok").unwrap(),
+                "true",
+                "pm.expect(pm.response).to.have.status(200) must pass"
+            );
+        });
+    }
+
+    #[test]
+    fn test_pm_expect_eql_is_deep_equal() {
+        // Backlog line 144: pm.expect(...).to.eql() was strict === while
+        // .equal() delegated to eql — inverted vs chai. Deep-equal means a
+        // freshly-parsed response body can eql a literal; strict equal must
+        // NOT deep-compare (=== semantics).
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__deep_ok = String((function () {
+                    // Key order differs — === would fail, deep eql must pass.
+                    try { pm.expect({ b: 2, a: { x: [1, 2] } }).to.eql({ a: { x: [1, 2] }, b: 2 }); return true; }
+                    catch (e) { return 'threw: ' + e.message; }
+                })());
+                globalThis.__deep_neg = String((function () {
+                    // .not.to.eql with differing values must pass.
+                    try { pm.expect({ a: 1 }).not.to.eql({ a: 2 }); return true; }
+                    catch (e) { return 'threw: ' + e.message; }
+                })());
+                globalThis.__strict_ok = String((function () {
+                    // .equal stays strict: same-primitive passes.
+                    try { pm.expect(200).to.equal(200); return true; }
+                    catch (e) { return 'threw: ' + e.message; }
+                })());
+                globalThis.__strict_distinct = String((function () {
+                    // .equal must NOT deep-compare objects (chai semantics).
+                    try { pm.expect({ a: 1 }).to.equal({ a: 1 }); return 'passed'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__eql_json_body = String((function () {
+                    // The canonical Postman idiom: parsed body vs literal.
+                    var body = JSON.parse('{"userId":1,"name":"ada"}');
+                    try { pm.expect(body).to.eql({ name: 'ada', userId: 1 }); return true; }
+                    catch (e) { return 'threw: ' + e.message; }
+                })());
+                globalThis.__json_body_ok = String((function () {
+                    // to.have.jsonBody must deep-compare too (was key-order
+                    // sensitive JSON.stringify comparison).
+                    var saved = globalThis.__tropel_pm_response_json;
+                    globalThis.__tropel_pm_response_json = function () {
+                        return '{"name":"ada","userId":1}';
+                    };
+                    try { pm.expect({}).to.have.jsonBody({ userId: 1, name: 'ada' }); return true; }
+                    catch (e) { return 'threw: ' + e.message; }
+                    finally { globalThis.__tropel_pm_response_json = saved; }
+                })());
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(ctx.eval::<String, _>("__deep_ok").unwrap(), "true", "eql must deep-compare (key order irrelevant)");
+            assert_eq!(ctx.eval::<String, _>("__deep_neg").unwrap(), "true", "not.to.eql must deep-compare");
+            assert_eq!(ctx.eval::<String, _>("__strict_ok").unwrap(), "true", "equal must still accept identical primitives");
+            assert_eq!(ctx.eval::<String, _>("__strict_distinct").unwrap(), "threw", "equal must stay strict (no deep-compare)");
+            assert_eq!(ctx.eval::<String, _>("__eql_json_body").unwrap(), "true", "parsed JSON body must eql a literal object");
+            assert_eq!(ctx.eval::<String, _>("__json_body_ok").unwrap(), "true", "to.have.jsonBody must deep-compare (key order insensitive)");
+        });
+    }
+
+    #[test]
     fn test_exec_selection_installs_named_export() {
         // A scenario naming `exec: "browse"` must run the `browse` export,
         // NOT the default export (k6 multi-scenario semantics).
@@ -3183,6 +3667,66 @@ mod tests {
                 module.get::<_, rquickjs::Function>("nope").is_err(),
                 "missing exec export must error"
             );
+        });
+    }
+
+    #[test]
+    fn test_exec_members_are_value_properties() {
+        // Backlog line 141: exec.vu.idInTest etc. must be VALUE properties
+        // (k6 semantics), not functions. The old function-object form broke
+        // `if (exec.vu.iterationInScenario === 0)` (always truthy) and
+        // `data[exec.vu.idInTest % len]` (NaN → undefined). exec.test must
+        // exist so exec.test.abort() doesn't TypeError.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/exec/exec.js"))
+                .expect("exec shim should eval");
+            // Stub the native bridges with known values.
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_exec_scenario_name = function () { return 'api_load'; };
+                globalThis.__tropel_exec_scenario_executor = function () { return 'shared-iterations'; };
+                globalThis.__tropel_exec_vu_id = function () { return 3; };
+                globalThis.__tropel_exec_iteration = function () { return 0; };
+                globalThis.__tropel_exec_iterations_completed = function () { return 42; };
+                globalThis.__tropel_exec_vus_active = function () { return 2; };
+                globalThis.__tropel_test_abort = function (msg) { globalThis.__aborted = msg; };
+                globalThis.__aborted = null;
+            "#,
+            )
+            .expect("stub should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__type_id = typeof exec.vu.idInTest;
+                globalThis.__type_iter = typeof exec.vu.iterationInScenario;
+                // The two idioms the function-form broke:
+                globalThis.__is_first_iter = (exec.vu.iterationInScenario === 0);
+                var data = ['a', 'b', 'c', 'd'];
+                globalThis.__indexed = data[exec.vu.idInTest % data.length];
+                globalThis.__id = exec.vu.idInTest;
+                globalThis.__completed = exec.instance.iterationsCompleted;
+                globalThis.__vus = exec.instance.vusActive;
+                globalThis.__scen = exec.scenario.name;
+                globalThis.__exec = exec.scenario.executor;
+                // exec.test.abort must exist and reach the bridge.
+                globalThis.__test_type = typeof exec.test.abort;
+                exec.test.abort('stop now');
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(ctx.eval::<String, _>("__type_id").unwrap(), "number", "exec.vu.idInTest must be a number value, not a function");
+            assert_eq!(ctx.eval::<String, _>("__type_iter").unwrap(), "number", "exec.vu.iterationInScenario must be a number value");
+            assert!(ctx.eval::<bool, _>("__is_first_iter").unwrap(), "iterationInScenario === 0 must fire (was always truthy as a function)");
+            assert_eq!(ctx.eval::<String, _>("__indexed").unwrap(), "d", "data[idInTest % len] must index (was NaN → undefined)");
+            assert_eq!(ctx.eval::<i64, _>("__id").unwrap(), 3);
+            assert_eq!(ctx.eval::<i64, _>("__completed").unwrap(), 42);
+            assert_eq!(ctx.eval::<i64, _>("__vus").unwrap(), 2);
+            assert_eq!(ctx.eval::<String, _>("__scen").unwrap(), "api_load");
+            assert_eq!(ctx.eval::<String, _>("__exec").unwrap(), "shared-iterations");
+            assert_eq!(ctx.eval::<String, _>("__test_type").unwrap(), "function", "exec.test.abort must be a function");
+            assert_eq!(ctx.eval::<String, _>("__aborted").unwrap(), "stop now", "exec.test.abort must reach the native bridge");
         });
     }
 
@@ -3614,5 +4158,29 @@ mod tests {
         let mut inst = driver.init(script, None, None).await.unwrap();
         let mut ctx = VuContext::new(0, 0, "default".into());
         inst.run_iteration(&mut ctx).await.expect("iteration must succeed with undefined data");
+    }
+
+    #[tokio::test]
+    async fn test_vu_and_iter_globals_are_numbers() {
+        // Backlog line 142: __VU/__ITER must be NUMBERS (k6), not strings.
+        // The old set_global_str made `__ITER === 0` never true (the
+        // once-per-VU guard never fired), `__VU + 1` produce "11" (string
+        // concat), and typeof was "string". __VU is also 1-based (k6).
+        let driver = K6Driver;
+        let script = br#"
+            export default function () {
+                if (typeof __VU !== 'number') throw new Error('__VU not a number: ' + typeof __VU);
+                if (typeof __ITER !== 'number') throw new Error('__ITER not a number: ' + typeof __ITER);
+                if (__VU !== 1) throw new Error('__VU must be 1-based, got ' + __VU);
+                if (__VU + 1 !== 2) throw new Error('__VU arithmetic broken: ' + (__VU + 1));
+                if (__ITER !== 0) throw new Error('__ITER must start at 0, got ' + __ITER);
+                // The idiom the string form broke: `=== 0` must fire.
+                globalThis.__guard = (globalThis.__guard || 0) + (__ITER === 0 ? 1 : 0);
+                if (globalThis.__guard !== 1) throw new Error('__ITER === 0 guard never fired');
+            }
+        "#;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        inst.run_iteration(&mut ctx).await.expect("iteration must succeed with numeric __VU/__ITER");
     }
 }

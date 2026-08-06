@@ -38,8 +38,20 @@ function k6HTTPRequest(method, url, body, params) {
             canonical.url,
             headersJson,
             canonical.body,
-            canonical.timeoutMs,
-            canonical.responseType
+            canonical.responseType,
+            // Backlog line 140: timeout/tags/auth/redirects/compression packed
+            // into ONE JSON string — the native bridge closure is arity-
+            // capped (rquickjs Func supports ctx + 6 script args), so the
+            // per-request params share a single argument. The legacy PM
+            // fallback below keeps its own contract (extra params unsupported
+            // there).
+            JSON.stringify({
+                timeoutMs: canonical.timeoutMs,
+                tags: canonical.tags,
+                auth: canonical.auth,
+                redirects: canonical.redirects,
+                compression: canonical.compression
+            })
         );
     } else if (typeof __tropel_pm_send_request === 'function') {
         resultJson = __tropel_pm_send_request(
@@ -148,6 +160,26 @@ function normalizeK6Request(method, url, body, params) {
         timeoutMs = timeout;
     }
 
+    // k6 params.cookies: {name: value} — merged into the Cookie header
+    // (k6 sends cookies as a Cookie header), combined with any explicit
+    // Cookie header the script set. `headers` is already a per-request copy,
+    // so this can't leak into the caller's module-scope params.
+    var cookies = params.cookies;
+    if (cookies && typeof cookies === 'object') {
+        var cookieParts = [];
+        for (var ck in cookies) {
+            if (cookies.hasOwnProperty(ck) && cookies[ck] !== undefined && cookies[ck] !== null) {
+                cookieParts.push(encodeURIComponent(ck) + '=' + encodeURIComponent(String(cookies[ck])));
+            }
+        }
+        if (cookieParts.length > 0) {
+            var existingCookie = headers['Cookie'] || headers['cookie'] || '';
+            headers['Cookie'] = existingCookie
+                ? existingCookie + '; ' + cookieParts.join('; ')
+                : cookieParts.join('; ');
+        }
+    }
+
     var serialized = serializeK6Body(body, headers);
     return {
         method: method,
@@ -156,7 +188,51 @@ function normalizeK6Request(method, url, body, params) {
         body: serialized.body,
         timeoutMs: timeoutMs,
         responseType: responseType,
+        // Backlog line 140: tags/auth/redirects/compression were silently
+        // dropped and timeout was parsed then discarded. The native bridge
+        // now receives all of them (auth translated to the tagged AuthConfig
+        // form the Rust side deserializes).
+        tags: params.tags || {},
+        auth: toAuthConfig(params.auth),
+        redirects: params.redirects !== undefined ? params.redirects : -1,
+        compression: params.compression || '',
     };
+}
+
+// Translate k6's `params.auth` object (no type discriminator) into the
+// tagged AuthConfig form the native bridge deserializes. k6 infers the type
+// from which fields are present: token → bearer, access_token → oauth2,
+// access_key → aws-sigv4, username → basic (k6's documented shapes).
+function toAuthConfig(auth) {
+    if (!auth || typeof auth !== 'object') return null;
+    if (auth.token !== undefined) {
+        return { type: 'bearer', token: String(auth.token) };
+    }
+    if (auth.access_token !== undefined) {
+        return {
+            type: 'oauth2',
+            access_token: String(auth.access_token),
+            token_type: auth.token_type !== undefined ? String(auth.token_type) : null,
+        };
+    }
+    if (auth.access_key !== undefined) {
+        return {
+            type: 'aws-sigv4',
+            access_key: String(auth.access_key),
+            secret_key: auth.secret_key !== undefined ? String(auth.secret_key) : '',
+            region: auth.region !== undefined ? String(auth.region) : null,
+            service: auth.service !== undefined ? String(auth.service) : null,
+            session_token: auth.session_token !== undefined ? String(auth.session_token) : null,
+        };
+    }
+    if (auth.username !== undefined) {
+        return {
+            type: 'basic',
+            username: String(auth.username),
+            password: auth.password !== undefined ? String(auth.password) : '',
+        };
+    }
+    return null;
 }
 
 function serializeK6Body(body, headers) {
@@ -332,6 +408,12 @@ http.batch = function (requests) {
                 body: canonical.body,
                 timeout_ms: canonical.timeoutMs,
                 response_type: canonical.responseType,
+                // Backlog line 140: batch entries carry the same per-request
+                // params the single-request bridge consumes.
+                tags_json: JSON.stringify(canonical.tags),
+                auth_json: canonical.auth !== null ? JSON.stringify(canonical.auth) : 'null',
+                redirects: canonical.redirects,
+                compression: canonical.compression,
             });
         }
 

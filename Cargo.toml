@@ -87,6 +87,8 @@ base64 = "0.23.0"
 hex = "0.4.3"
 percent-encoding = "2.3.2"
 serde_urlencoded = "0.7"
+# Request-body compression (k6 params.compression: gzip/deflate)
+flate2 = "1.1.9"
 
 # UUID / random
 uuid = { version = "1.24.0", features = ["v4"] }
