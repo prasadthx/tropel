@@ -22,11 +22,34 @@ use tropel_core::{Result, TropelError};
 /// thread on its result never touches (or deadlocks) a VU runtime's reactor.
 static IO_RT: OnceLock<Runtime> = OnceLock::new();
 
+/// Default I/O worker count: scale to the host's cores so TLS handshakes,
+/// response decode and reactor work aren't capped at an arbitrary 4 threads
+/// on a 16-core box. Override with `TROPEL_IO_WORKERS` (clamped to [1, 512];
+/// values beyond the core count only add scheduler contention).
+fn default_io_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
+/// Pure sizing logic — separate from env access so tests exercise it without
+/// mutating process-global state (which would race under parallel test runs).
+fn workers_from_override(override_str: Option<&str>) -> usize {
+    override_str
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or_else(default_io_workers)
+        .clamp(1, 512)
+}
+
+fn io_worker_threads() -> usize {
+    workers_from_override(std::env::var("TROPEL_IO_WORKERS").ok().as_deref())
+}
+
 fn io_rt() -> &'static Runtime {
     IO_RT.get_or_init(|| {
         Builder::new_multi_thread()
             .enable_all()
-            .worker_threads(4) // async → a few threads drive thousands of reqs; tune later
+            .worker_threads(io_worker_threads())
             .thread_name("tropel-io")
             .build()
             .expect("build tropel-io runtime")
@@ -62,6 +85,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workers_from_override_defaults_to_cores() {
+        // No override → host core count (no env mutation, deterministic).
+        let expected = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        assert_eq!(workers_from_override(None), expected);
+        // Unparseable override → same default.
+        assert_eq!(workers_from_override(Some("bogus")), expected);
+    }
+
+    #[test]
+    fn workers_from_override_clamps_bounds() {
+        assert_eq!(workers_from_override(Some("999")), 512);
+        assert_eq!(workers_from_override(Some("0")), 1);
+        assert_eq!(workers_from_override(Some(" 8 ")), 8);
+    }
 
     #[test]
     fn execute_blocking_resolves_future() {
