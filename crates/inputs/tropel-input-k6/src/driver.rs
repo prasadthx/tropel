@@ -41,7 +41,7 @@ use rquickjs::function::Func;
 use rquickjs::loader::{ImportAttributes, Loader, Resolver};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -2307,12 +2307,12 @@ fn is_typescript_ext(path: &Path) -> bool {
 /// Bootstrap vendored JS libraries into a fresh context.
 /// Mirrors the engine's `create_vu_js_context()` setup.
 /// Base shim libraries (no native dependencies) concatenated at COMPILE TIME
-/// (concat!) into one bundle evaluated with a single bootstrap eval per VU.
-/// Each separate bootstrap_library() call resets the JS interrupt timer,
-/// parses the source, and pumps the promise queue, so one eval per phase cuts
-/// the per-VU bootstrap overhead ~4× with zero runtime allocation. (rquickjs
-/// 0.12 exposes no public script-bytecode API to share compiled shims across
-/// VU contexts, so a single eval per phase is the safe win.)
+/// (concat!) into one bundle. Per VU the bundle is loaded from the process-
+/// wide bytecode cache (compiled ONCE, then `JS_ReadObject`+run) instead of
+/// being re-parsed + re-compiled — at 1000 VUs that saves ~130 MB of QuickJS
+/// parsing. Each separate eval also resets the JS interrupt timer and pumps
+/// the promise queue, so one eval per phase cuts the per-VU bootstrap
+/// overhead ~4× beyond the bytecode win.
 const K6_BASE_SHIM_BUNDLE: &str = concat!(
     "// ==== shim: chai-shim ====\n",
     include_str!("../../../../js/chai/chai-shim.js"),
@@ -2343,25 +2343,100 @@ const K6_NATIVE_SHIM_BUNDLE: &str = concat!(
     include_str!("../../../../js/k6-shim/open-data-shim.js"),
 );
 
-async fn bootstrap_js_libs(ctx: &mut JsContext) -> Result<()> {
-    // Phase 1: Base shim libraries (no native dependencies) — single eval.
-    if let Err(e) = ctx.bootstrap_library(K6_BASE_SHIM_BUNDLE).await {
-        tracing::warn!("Failed to bootstrap JS base shim bundle: {}", e);
+/// Process-wide cache of a compiled k6 shim bundle's QuickJS bytecode.
+///
+/// Compiled ONCE by the first context (qjsc-style `JS_Eval` COMPILE_ONLY +
+/// `JS_WriteObject`), then every subsequent context loads the blob and runs
+/// it instead of re-parsing + re-compiling the ~130 KB of shim source per VU.
+/// QuickJS bytecode is tied to the build (version + feature flags), not to a
+/// particular context, so one compilation is valid for every VU context in
+/// this process.
+///
+/// One cache exists per bundle (base + native-dependent): the native bundle
+/// can only run AFTER `tropel_native::install_all`, so they are separate
+/// blobs and must never be cross-served.
+struct ShimBytecodeCache {
+    bytecode: OnceLock<Option<Vec<u8>>>,
+    /// True once compilation failed — every context then falls back to the
+    /// per-VU source eval path instead of retrying the compile each time.
+    compile_failed: AtomicBool,
+    /// True once the cached bytecode failed to RUN in a context. A run
+    /// failure is deterministic (same bytecode + same bundle), so after the
+    /// first failure all subsequent contexts short-circuit straight to the
+    /// source eval fallback.
+    run_failed: AtomicBool,
+}
+
+impl ShimBytecodeCache {
+    const fn new() -> Self {
+        Self {
+            bytecode: OnceLock::new(),
+            compile_failed: AtomicBool::new(false),
+            run_failed: AtomicBool::new(false),
+        }
     }
+
+    /// Bootstrap `bundle` into `ctx`: run the cached bytecode when available
+    /// and known-good, otherwise fall back to a source eval (and remember the
+    /// failure so the doomed path is not retried per VU).
+    async fn bootstrap(&self, ctx: &mut JsContext, bundle: &'static str) {
+        let bytecode = self.bytecode.get_or_init(|| {
+            if self.compile_failed.load(Ordering::Relaxed) {
+                return None;
+            }
+            match ctx.compile_global_bytecode(bundle) {
+                Ok(bc) => {
+                    tracing::info!(
+                        "Compiled k6 shim bundle to bytecode once ({} bytes) — reusing across VUs",
+                        bc.len()
+                    );
+                    Some(bc)
+                }
+                Err(e) => {
+                    self.compile_failed.store(true, Ordering::Relaxed);
+                    tracing::warn!(
+                        "k6 shim bytecode compilation failed ({}); falling back to per-VU source eval",
+                        e
+                    );
+                    None
+                }
+            }
+        });
+
+        if let (Some(bc), false) = (bytecode, self.run_failed.load(Ordering::Relaxed)) {
+            if let Err(e) = ctx.run_global_bytecode(bc).await {
+                self.run_failed.store(true, Ordering::Relaxed);
+                tracing::warn!(
+                    "Failed to run k6 shim bytecode: {} (disabling bytecode path; falling back to source eval)",
+                    e
+                );
+                if let Err(e2) = ctx.bootstrap_library(bundle).await {
+                    tracing::warn!("Failed to bootstrap k6 shim bundle: {}", e2);
+                }
+            }
+        } else if let Err(e) = ctx.bootstrap_library(bundle).await {
+            tracing::warn!("Failed to bootstrap k6 shim bundle: {}", e);
+        }
+    }
+}
+
+/// Bytecode caches for the two k6 shim bundles (see [`ShimBytecodeCache`]).
+static K6_BASE_BYTECODE: ShimBytecodeCache = ShimBytecodeCache::new();
+static K6_NATIVE_BYTECODE: ShimBytecodeCache = ShimBytecodeCache::new();
+
+async fn bootstrap_js_libs(ctx: &mut JsContext) -> Result<()> {
+    // Phase 1: Base shim libraries (no native dependencies) — compiled to
+    // bytecode ONCE per process, run in every context thereafter.
+    K6_BASE_BYTECODE.bootstrap(ctx, K6_BASE_SHIM_BUNDLE).await;
 
     // Phase 2: Install native module functions (needed by pm-api and k6-shim)
     if let Err(e) = tropel_native::install_all(ctx).await {
         tracing::warn!("Failed to install native modules: {}", e);
     }
 
-    // Phase 3: Bootstrapping libraries that depend on native functions —
-    // single eval (same rationale as phase 1).
-    if let Err(e) = ctx.bootstrap_library(K6_NATIVE_SHIM_BUNDLE).await {
-        tracing::warn!(
-            "Failed to bootstrap JS native-dependent shim bundle: {}",
-            e
-        );
-    }
+    // Phase 3: Bootstrapping libraries that depend on native functions — a
+    // SEPARATE bytecode cache (it must run after install_all above).
+    K6_NATIVE_BYTECODE.bootstrap(ctx, K6_NATIVE_SHIM_BUNDLE).await;
 
     // Install __tropel_native_sleep (blocks the OS thread, safe under thread-per-core)
     ctx.with_ctx(|rq_ctx| {

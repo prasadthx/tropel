@@ -112,11 +112,18 @@ fn load_config(path: &PathBuf) -> Result<JobConfig> {
         .map_err(|e| TropelError::Parse(format!("invalid job config: {e}")))
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
+    // The old `#[tokio::main(worker_threads = 2)]` capped the process at 2
+    // async workers even in `local --agents N` mode, where the controller
+    // AND N agent engines share this process. Build a runtime that scales
+    // with available parallelism instead (backlog line 119).
+    let rt = tropel_distributed::build_runtime().map_err(TropelError::Io)?;
+    rt.block_on(run(args))
+}
 
+async fn run(args: Args) -> Result<()> {
     match args.command {
         Cmd::Controller {
             config,

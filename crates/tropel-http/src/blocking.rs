@@ -14,8 +14,33 @@
 //! the I/O runtime's reactor, so no deadlock).
 
 use std::sync::{mpsc::sync_channel, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::runtime::{Builder, Runtime};
 use tropel_core::{Result, TropelError};
+
+/// How long the caller spins (polling the rendezvous channel with `try_recv`,
+/// a lock-free check with no syscall) before parking on `recv`.
+///
+/// Rationale: `execute_blocking` is the hot path for every k6/pm/ws host call
+/// (~1 per request). For fast responses — the common case in high-RPS local
+/// and synthetic runs — the spawned future often completes within this window,
+/// so the caller never issues the park/wake futex pair: zero syscalls instead
+/// of two per request (~200 k syscalls/s at 100 k req/s).
+///
+/// The spin must be short enough that a slow request doesn't waste much CPU:
+/// the window only overlaps the tail of the handoff (spawn + reactor wake),
+/// not the full network latency, and the multi-thread `io_rt` runs the future
+/// on OTHER threads while we spin, so the request always progresses.
+const SPIN_WINDOW: Duration = Duration::from_micros(40);
+
+// Per-thread spin heuristic: once a request on this thread takes longer than
+// the spin window, spinning is a losing bet (the next request likely will too
+// — latency is stable per endpoint) — skip the spin and park directly, so a
+// slow endpoint never burns the full window on every request. The flag is
+// re-armed when a request completes within the window.
+thread_local! {
+    static SKIP_SPIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// A dedicated multi-thread runtime that ONLY drives host I/O futures.
 /// It is separate from the per-core VU worker runtimes, so blocking a VU
@@ -44,6 +69,9 @@ fn workers_from_override(override_str: Option<&str>) -> usize {
 fn io_worker_threads() -> usize {
     workers_from_override(std::env::var("TROPEL_IO_WORKERS").ok().as_deref())
 }
+
+/// Error message when the spawned I/O task dies before producing a result.
+const IO_TASK_DROPPED: &str = "io task dropped";
 
 fn io_rt() -> &'static Runtime {
     IO_RT.get_or_init(|| {
@@ -76,10 +104,54 @@ where
     io_rt().spawn(async move {
         let _ = tx.send(fut.await); // ignore if receiver dropped
     });
-    // Plain thread park: NO tokio runtime entered here → no panic; future runs
-    // on io_rt's reactor → no deadlock.
-    rx.recv()
-        .map_err(|_| TropelError::Http("io task dropped".into()))?
+
+    // Adaptive spin-then-park: for fast responses the result lands in the
+    // channel before a park syscall would be worth it. `try_recv` is lock-free
+    // (no syscall), so the spin window costs CPU only; a slow request parks
+    // exactly like before, and once a thread observes a slow request it skips
+    // spinning until a fast one re-arms it (latency is stable per endpoint, so
+    // spinning after a slow response is a losing bet). NO tokio runtime is
+    // entered on the caller either way → no "runtime within runtime" panic;
+    // the future runs on io_rt's reactor → no deadlock.
+    let spin_deadline = Instant::now() + SPIN_WINDOW;
+    let mut spun = false;
+    if !SKIP_SPIN.with(|s| s.get()) {
+        loop {
+            match rx.try_recv() {
+                Ok(r) => {
+                    SKIP_SPIN.with(|s| s.set(false)); // fast → keep spinning
+                    return r;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if Instant::now() < spin_deadline {
+                        spun = true;
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(TropelError::Http(IO_TASK_DROPPED.into()));
+                }
+            }
+            break;
+        }
+        if spun {
+            // The request outlasted the window — record that so the next one
+            // on this thread parks immediately instead of re-spinning.
+            SKIP_SPIN.with(|s| s.set(true));
+        }
+    }
+    // Plain thread park: no tokio runtime entered here → no panic; future runs
+    // on io_rt's reactor → no deadlock. Time the park: if a previously-slow
+    // thread completes within the window (endpoint got fast again), re-arm the
+    // spin — otherwise the flag would latch true forever and the "re-arm on
+    // fast completion" promise in the doc comment would be unreachable.
+    let park_start = Instant::now();
+    let result = rx.recv().map_err(|_| TropelError::Http(IO_TASK_DROPPED.into()))?;
+    if park_start.elapsed() < SPIN_WINDOW {
+        SKIP_SPIN.with(|s| s.set(false));
+    }
+    result
 }
 
 #[cfg(test)]
@@ -114,6 +186,17 @@ mod tests {
             execute_blocking(async { Err::<i32, _>(TropelError::Http("boom".into())) });
         let err = result.unwrap_err();
         assert_eq!(format!("{}", err), "HTTP error: boom");
+    }
+
+    #[test]
+    fn execute_blocking_tight_loop_no_starvation() {
+        // The spin window must never starve or reorder results: run a tight
+        // loop of trivial futures and assert every result comes back intact
+        // (a buggy spin would hang or drop values here).
+        for i in 0..2_000 {
+            let v = execute_blocking(async move { Ok::<i32, TropelError>(i) }).unwrap();
+            assert_eq!(v, i, "result mismatch at iteration {i}");
+        }
     }
 
     #[test]

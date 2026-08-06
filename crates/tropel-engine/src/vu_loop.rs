@@ -584,13 +584,40 @@ pub(crate) async fn run_scenario_vus(
     control_port: Option<u16>,
     rps_limiter: Option<Arc<tropel_http::RpsLimiter>>,
 ) -> (u32, u64) {
-    let http_cfg_c = http_cfg.clone();
-    let tls_cfg_c = tls_cfg.clone();
-    let rps_limiter_c = rps_limiter.clone();
+    // Expected statuses are read by every VU's VURunner — snapshot them once
+    // and share (the closure no longer captures the whole HttpConfig, which
+    // is consumed into the shared client build below).
+    let expected_statuses_c = http_cfg.expected_statuses.clone();
     let scenario_c = scenario.clone();
     let protocols_c = protocols.clone();
     let pool_c = pool.clone();
     let sc_name_c = sc_name.clone();
+
+    // Build ONE HttpClient per scenario and share it (Arc) across every VU.
+    // HttpClient::with_tls_and_rps constructs TWO reqwest::Clients (primary +
+    // no-redirect twin), each with its own connection pool, DNS resolver and
+    // TLS context — ~2-3 fds and significant state before a socket even
+    // opens. reqwest::Client is an Arc-backed handle designed for concurrent
+    // use, so a per-VU build duplicated all of that VU-times for zero benefit
+    // (the old per-VU `HttpClient::with_tls_and_rps` in the spawn closure).
+    // The per-VU cost is now a cheap struct clone (Arc bumps + small config
+    // snapshots) sharing the pooled clients. Thread-per-VU itself is
+    // deliberate (a blocking script `sleep()` must never freeze a co-located
+    // VU — there is no co-located VU), so this cuts the client/RSS/fd part of
+    // the per-VU cost without touching the scheduling model.
+    let shared_client = match HttpClient::with_tls_and_rps(&http_cfg, &tls_cfg, rps_limiter.clone()) {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            tracing::error!(
+                "Scenario '{}': Failed to create shared HTTP client: {}",
+                sc_name,
+                e
+            );
+            // Signal a VU-init failure so the engine fails the run loudly
+            // instead of treating this as a clean zero-work run.
+            return (1, 0);
+        }
+    };
 
     // Pre-flatten the item tree ONCE per scenario and share the Arcs with
     // every VU — a large collection must not be re-flattened/re-cloned per
@@ -619,9 +646,7 @@ pub(crate) async fn run_scenario_vus(
         control_port,
         move |sched, vu_id, shared| {
             let shared = shared.clone();
-            let http_cfg = http_cfg_c.clone();
-            let tls_cfg = tls_cfg_c.clone();
-            let rps_vu = rps_limiter_c.clone();
+            let http_client_vu = shared_client.clone();
             let scenario = scenario_c.clone();
             let protocols_vu = protocols_c.clone();
             let pool = pool_c.clone();
@@ -630,6 +655,7 @@ pub(crate) async fn run_scenario_vus(
             // Per-VU Arc bumps (cheap) so the Fn closure isn't moved out of.
             let flattened_vu = flattened_c.clone();
             let names_vu = names_c.clone();
+            let expected_statuses_vu = expected_statuses_c.clone();
 
             // 1-VU-per-task: pin this VU to its own dedicated worker thread so
             // a blocking script `sleep()` (std::thread::sleep) never freezes a
@@ -640,14 +666,9 @@ pub(crate) async fn run_scenario_vus(
                 // can't leak and the engine's drain loop can't hang forever.
                 let _lease = VuLease::acquire(&sched);
 
-                let client = match HttpClient::with_tls_and_rps(&http_cfg, &tls_cfg, rps_vu) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!("VU {}: Failed to create HTTP client: {}", vu_id, e);
-                        shared.vu_init_failures.fetch_add(1, Ordering::SeqCst);
-                        return;
-                    }
-                };
+                // Cheap struct clone of the shared client (Arc bumps + small
+                // config snapshots) — the pooled reqwest Clients are shared.
+                let client = http_client_vu.as_ref().clone();
                 let bridge_client = Arc::new(client.clone());
                 let mut runner = VURunner::new(
                     scenario,
@@ -657,7 +678,7 @@ pub(crate) async fn run_scenario_vus(
                     vu_id,
                     sc_name_vu.clone(),
                 )
-                    .with_expected_statuses(http_cfg.expected_statuses.clone())
+                    .with_expected_statuses(expected_statuses_vu)
                     .with_protocols(protocols_vu.clone())
                     .with_exec_context(
                         executor_name,
@@ -727,11 +748,27 @@ pub(crate) async fn run_driver_vus(
     let input_p_c = input_p.clone();
     let registry_c = registry.clone();
     let sc_exec_c = sc_exec.clone();
-    let http_cfg_c = http_cfg.clone();
-    let tls_cfg_c = tls_cfg.clone();
-    let rps_limiter_c = rps_limiter.clone();
     let pool_c = pool.clone();
     let sc_name_c = sc_name.clone();
+
+    // Build ONE HttpClient per scenario and share it (Arc) across every VU
+    // (same rationale as run_scenario_vus): the two reqwest::Clients inside
+    // it carry connection pools / DNS resolver / TLS context — Arc-backed
+    // handles designed for concurrent use, so per-VU construction would
+    // duplicate all of that VU-times. Per-VU cost is now a cheap struct clone.
+    let shared_client = match HttpClient::with_tls_and_rps(&http_cfg, &tls_cfg, rps_limiter.clone()) {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            tracing::error!(
+                "Scenario '{}': Failed to create shared HTTP client: {}",
+                sc_name,
+                e
+            );
+            // Signal a VU-init failure so the engine fails the run loudly
+            // instead of treating this as a clean zero-work run.
+            return (1, 0);
+        }
+    };
 
     run_vus(
         sc_name,
@@ -752,9 +789,7 @@ pub(crate) async fn run_driver_vus(
             let input_p = input_p_c.clone();
             let registry = registry_c.clone();
             let sc_exec = sc_exec_c.clone();
-            let http_cfg = http_cfg_c.clone();
-            let tls_cfg = tls_cfg_c.clone();
-            let rps_vu = rps_limiter_c.clone();
+            let http_client_vu = shared_client.clone();
             let pool = pool_c.clone();
             let sc_name_vu = sc_name_c.clone();
             let executor_name = shared.executor_name.clone();
@@ -793,14 +828,9 @@ pub(crate) async fn run_driver_vus(
                     }
                 };
 
-                let client = match HttpClient::with_tls_and_rps(&http_cfg, &tls_cfg, rps_vu) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!("VU {}: Failed to create HTTP client: {}", vu_id, e);
-                        shared.vu_init_failures.fetch_add(1, Ordering::SeqCst);
-                        return;
-                    }
-                };
+                // Cheap struct clone of the shared client (Arc bumps + small
+                // config snapshots) — the pooled reqwest Clients are shared.
+                let client = http_client_vu.as_ref().clone();
                 let http_client_handle: Arc<dyn DriverHttpClient + Send + Sync> =
                     Arc::new(DriverHttpClientImpl { client });
 

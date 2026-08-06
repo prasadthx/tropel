@@ -46,6 +46,35 @@ pub use cloud::{generate_k8s_manifests, run_cloud};
 pub use controller::run_controller;
 pub use protocol::{AssignMsg, HelloMsg, SnapshotMsg, generate_token};
 
+/// Build the tokio runtime for the distributed binaries.
+///
+/// `tropel-cloud-run local --agents N` runs the controller AND N in-process
+/// agent engines in one process, and `tropel-agent` runs a full engine too —
+/// a hardcoded `worker_threads = 2` (the old `#[tokio::main]` in both bins)
+/// starved that: at `--agents 4` there were 2 async workers juggling the
+/// controller, 4 agent loops, and 4 engines' orchestration. Default scales
+/// with available parallelism (the same default `#[tokio::main(flavor =
+/// "multi_thread")]` would pick); `TROPEL_TOKIO_WORKERS` overrides (clamped
+/// to [2, 256] — a floor of 2 keeps controller+agent I/O responsive on
+/// 1-core CI, and beyond 256 only adds contention). VU threads run on their
+/// own thread-per-core pool, so this outer runtime only ever multiplexes
+/// async orchestration.
+pub fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    let workers = std::env::var("TROPEL_TOKIO_WORKERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        })
+        .clamp(2, 256);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+}
+
 /// Whether any token source was provided (`--token`, `--token-file`, or the
 /// `TROPEL_TOKEN` env var). Callers use this to decide between resolving a
 /// real token and auto-generating one — auto-generation must only happen

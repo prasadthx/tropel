@@ -15,16 +15,24 @@ pub struct VariableScope {
     pub globals: HashMap<String, serde_json::Value>,
 }
 
+/// The `{{var}}` placeholder regex, compiled ONCE per process. `VariableResolver`
+/// is constructed per iteration / per VU on the hot path (see the runner), so a
+/// `Regex::new` on every construction was pure waste — compiled once, a `Regex`
+/// is `Sync` and reused by all threads.
+static VAR_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+
+fn var_re() -> &'static Regex {
+    VAR_RE.get_or_init(|| Regex::new(r"\{\{([^}]+)\}\}").expect("valid variable regex"))
+}
+
 /// Resolves {{variable}} references with scope precedence.
 pub struct VariableResolver {
-    var_re: Regex,
     dynamic_catalog: DynamicCatalog,
 }
 
 impl VariableResolver {
     pub fn new() -> Self {
         Self {
-            var_re: Regex::new(r"\{\{([^}]+)\}\}").unwrap(),
             dynamic_catalog: DynamicCatalog::new(),
         }
     }
@@ -66,8 +74,7 @@ impl VariableResolver {
         let after_dynamic = self.dynamic_catalog.resolve(input);
 
         // Then resolve scoped variables ({{var_name}})
-        let result = self
-            .var_re
+        let result = var_re()
             .replace_all(&after_dynamic, |caps: &regex::Captures| {
                 let var_name = caps.get(1).unwrap().as_str().trim();
 

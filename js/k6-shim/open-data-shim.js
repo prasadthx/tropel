@@ -6,7 +6,8 @@
 //        mode "t" (default) -> UTF-8 string
 //        mode "b"           -> base64-encoded bytes
 //   __tropel_k6_shared_array_len(name)            -> element count, or -1 if absent
-//   __tropel_k6_shared_array_get(name, index)     -> JSON of ONE element, or "" if absent/OOB
+//   __tropel_k6_shared_array_get(name, index)     -> native JS value of ONE
+//        element, or undefined if absent/OOB (no JSON.parse round trip)
 //   __tropel_k6_shared_array_set(name, json)      -> store the computed array once
 //
 // k6 semantics implemented here:
@@ -90,14 +91,15 @@ function SharedArrayView(name, offset, length) {
     this.length = length;
 }
 
-// Fetch one element (JSON-encoded) through the native accessor and decode it.
+// Fetch one element through the native accessor. The bridge materializes a
+// native JS value directly in the QuickJS heap, so there is no JSON round
+// trip (the old design serialized the element to a string and re-parsed it
+// with JSON.parse on every read). undefined when absent/out-of-range.
 SharedArrayView.prototype._get = function (index) {
     var i = Number(index);
     if (i < 0 || i >= this.length) return undefined;
     if (typeof __tropel_k6_shared_array_get !== 'function') return undefined;
-    var json = __tropel_k6_shared_array_get(this._name, this._offset + i);
-    if (json === '') return undefined;
-    return JSON.parse(json);
+    return __tropel_k6_shared_array_get(this._name, this._offset + i);
 };
 
 SharedArrayView.prototype.at = function (index) {

@@ -23,8 +23,7 @@ struct Args {
     token_file: Option<PathBuf>,
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
     if args.controller.is_empty() {
@@ -32,6 +31,13 @@ async fn main() -> Result<()> {
             "--controller must not be empty".into(),
         ));
     }
-    let token = resolve_token(args.token, args.token_file)?;
-    tropel_distributed::run_agent(&args.controller, &token).await
+    // An agent runs a FULL load-test engine, not just a socket loop — the
+    // old hardcoded `#[tokio::main(worker_threads = 2)]` starved it. Build a
+    // runtime that scales with available parallelism instead (backlog
+    // line 119).
+    let rt = tropel_distributed::build_runtime().map_err(TropelError::Io)?;
+    rt.block_on(async {
+        let token = resolve_token(args.token, args.token_file)?;
+        tropel_distributed::run_agent(&args.controller, &token).await
+    })
 }

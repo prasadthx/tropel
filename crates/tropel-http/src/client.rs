@@ -751,6 +751,8 @@ impl HttpClient {
                     status_text,
                     headers,
                     body: hop_body,
+                    text_cache: std::cell::OnceCell::new(),
+                    json_cache: std::cell::OnceCell::new(),
                     response_time: hop_total,
                     timings: Some(hop_timings),
                     cookies,
@@ -906,6 +908,8 @@ impl HttpClient {
             status_text,
             headers,
             body: body_vec,
+            text_cache: std::cell::OnceCell::new(),
+            json_cache: std::cell::OnceCell::new(),
             response_time: total_duration,
             timings: Some(timings),
             cookies,
@@ -965,7 +969,8 @@ fn check_literal_blacklist(blacklist: &[IpCidr], url: &str) -> Result<()> {
 }
 
 /// HTTP response data (mirrors `tropel_core::Response` but from reqwest).
-/// Body text and JSON are NOT eagerly parsed — see `body_text()` / `body_json()`.
+/// Body text and JSON are lazily decoded ONCE and memoized — see
+/// `body_text()` / `body_json()`.
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
     /// The URL that produced THIS response. For a redirect chain, each hop
@@ -976,6 +981,10 @@ pub struct HttpResponse {
     pub status_text: String,
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
+    /// Memoized UTF-8 decode of `body` (see `body_text()`).
+    pub text_cache: std::cell::OnceCell<Option<String>>,
+    /// Memoized JSON parse of `body` (see `body_json()`).
+    pub json_cache: std::cell::OnceCell<Option<serde_json::Value>>,
     pub response_time: Duration,
     pub timings: Option<Timings>,
     pub cookies: Vec<Cookie>,
@@ -997,6 +1006,8 @@ impl From<&HttpResponse> for tropel_core::types::Response {
             status_text: resp.status_text.clone(),
             headers: resp.headers.clone(),
             body: resp.body.clone(),
+            text_cache: std::cell::OnceCell::new(),
+            json_cache: std::cell::OnceCell::new(),
             response_time: resp.response_time,
             timings: resp.timings.clone(),
             cookies: resp.cookies.clone(),
@@ -1009,25 +1020,34 @@ impl From<&HttpResponse> for tropel_core::types::Response {
 }
 
 impl HttpResponse {
-    /// Decode the body as UTF-8 text (lazy — parses on each call).
+    /// Decode the body as UTF-8 text (lazy — decodes once, then memoized).
     pub fn body_text(&self) -> Option<String> {
-        if self.body.is_empty() {
-            None
-        } else {
-            String::from_utf8(self.body.clone()).ok()
-        }
+        self.text_cache
+            .get_or_init(|| {
+                if self.body.is_empty() {
+                    None
+                } else {
+                    String::from_utf8(self.body.clone()).ok()
+                }
+            })
+            .clone()
     }
 
-    /// Parse the body as JSON using simd-json (lazy — parses on each call).
+    /// Parse the body as JSON using simd-json (lazy — parses once, then
+    /// memoized).
     ///
     /// Parses directly from raw bytes, skipping the `String::from_utf8`
     /// intermediate step. Uses `simd-json` for ~2-4x faster parsing.
     pub fn body_json(&self) -> Option<serde_json::Value> {
-        if self.body.is_empty() {
-            return None;
-        }
-        let mut body_bytes = self.body.clone();
-        simd_json::serde::from_slice(&mut body_bytes).ok()
+        self.json_cache
+            .get_or_init(|| {
+                if self.body.is_empty() {
+                    return None;
+                }
+                let mut body_bytes = self.body.clone();
+                simd_json::serde::from_slice(&mut body_bytes).ok()
+            })
+            .clone()
     }
 }
 

@@ -27,7 +27,7 @@ use bytes::{Buf, BufMut};
 use prost::Message as _;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
 use serde::de::DeserializeSeed;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
@@ -55,13 +55,58 @@ const MAX_INLINE_PROTO: usize = 1024 * 1024;
 /// Compiled descriptor pools, keyed by `(proto source, include dir)`.
 type PoolKey = (String, Option<String>);
 
+/// Max compiled proto pools and tonic channels kept per scenario protocol.
+///
+/// Both caches are keyed by inputs a caller controls (`(proto, dir)` and
+/// authority). Without a cap, a hostile/adversarial scenario that varies the
+/// inline proto text or authority per request would grow them without bound
+/// (each unique inline proto = a full protox compile retained forever). The
+/// hot path never has more than a handful of entries (one proto, one or few
+/// hosts), so the caps are far above real use — they exist purely as a memory
+/// safety valve, evicting the oldest entry FIFO when full.
+const MAX_CACHED_POOLS: usize = 64;
+const MAX_CACHED_CHANNELS: usize = 128;
+
 /// `Arc<dyn Protocol>`).
 #[derive(Default)]
 pub struct GrpcProtocol {
     /// Compiled descriptor pools, keyed by `(proto source, include dir)`.
     pools: Mutex<HashMap<PoolKey, Arc<DescriptorPool>>>,
+    /// Insertion order for the pool cache (FIFO eviction key).
+    pool_order: Mutex<VecDeque<PoolKey>>,
     /// Tonic channels pooled by authority (`scheme://host:port`).
     channels: Mutex<HashMap<String, Channel>>,
+    /// Insertion order for the channel cache (FIFO eviction key).
+    channel_order: Mutex<VecDeque<String>>,
+}
+
+/// Insert into a bounded cache: when the map is at capacity, evict the oldest
+/// entry (FIFO, tracked by `order`) before inserting the new one. The cache
+/// is keyed by caller-controlled inputs, so this is the memory-safety valve
+/// against unbounded growth — a scenario that varies the key per request can
+/// never retain more than `max` entries.
+fn cache_insert_bounded<K, V>(
+    map: &mut HashMap<K, V>,
+    order: &mut VecDeque<K>,
+    key: K,
+    value: V,
+    max: usize,
+) where
+    K: Eq + std::hash::Hash + Clone,
+{
+    // A zero-capacity cache retains nothing (the eviction path below needs an
+    // entry in `order` to pop; with max == 0 there is never room).
+    if max == 0 {
+        return;
+    }
+    if !map.contains_key(&key) && map.len() >= max {
+        if let Some(oldest) = order.pop_front() {
+            map.remove(&oldest);
+        }
+    }
+    if map.insert(key.clone(), value).is_none() {
+        order.push_back(key);
+    }
 }
 
 /// A tonic `Codec` that encodes/decodes prost-reflect `DynamicMessage`s.
@@ -202,11 +247,18 @@ impl Protocol for GrpcProtocol {
                 Some(p) => p,
                 None => {
                     let compiled = Arc::new(compile_proto(&proto_src, proto_dir.as_deref())?);
-                    self.pools
-                        .lock()
-                        .unwrap()
-                        .entry(key)
-                        .or_insert_with(|| compiled.clone());
+                    let mut pools = self.pools.lock().unwrap();
+                    let mut order = self.pool_order.lock().unwrap();
+                    // Bounded: a caller that varies the inline proto per
+                    // request can never retain more than MAX_CACHED_POOLS
+                    // compiled pools (FIFO eviction of the oldest).
+                    cache_insert_bounded(
+                        &mut pools,
+                        &mut order,
+                        key,
+                        compiled.clone(),
+                        MAX_CACHED_POOLS,
+                    );
                     compiled
                 }
             }
@@ -308,11 +360,18 @@ impl Protocol for GrpcProtocol {
                                 "gRPC connect to {host}:{port}: {e}"
                             ))
                         })?;
-                    self.channels
-                        .lock()
-                        .unwrap()
-                        .entry(authority)
-                        .or_insert_with(|| connected.clone());
+                    let mut channels = self.channels.lock().unwrap();
+                    let mut order = self.channel_order.lock().unwrap();
+                    // Bounded: a caller that varies the authority per request
+                    // can never retain more than MAX_CACHED_CHANNELS live
+                    // connections (FIFO eviction of the oldest).
+                    cache_insert_bounded(
+                        &mut channels,
+                        &mut order,
+                        authority,
+                        connected.clone(),
+                        MAX_CACHED_CHANNELS,
+                    );
                     connected
                 }
             }
@@ -445,6 +504,8 @@ impl Protocol for GrpcProtocol {
             status_text: if ok { "OK".into() } else { "ERROR".into() },
             headers: HashMap::new(),
             body: body_bytes.clone(),
+            text_cache: std::cell::OnceCell::new(),
+            json_cache: std::cell::OnceCell::new(),
             response_time: duration,
             timings: None,
             cookies: vec![],
@@ -695,3 +756,58 @@ fn grpc_factory() -> Box<dyn Protocol> {
 }
 
 inventory::submit!(ProtocolRegistration::new("grpc", grpc_factory));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_cache_evicts_oldest_fifo() {
+        let mut map: HashMap<i32, &str> = HashMap::new();
+        let mut order: VecDeque<i32> = VecDeque::new();
+
+        // Fill to capacity.
+        cache_insert_bounded(&mut map, &mut order, 1, "a", 3);
+        cache_insert_bounded(&mut map, &mut order, 2, "b", 3);
+        cache_insert_bounded(&mut map, &mut order, 3, "c", 3);
+        assert_eq!(map.len(), 3);
+        assert_eq!(order.len(), 3);
+
+        // Over capacity: the OLDEST (1) is evicted, the new key is kept.
+        cache_insert_bounded(&mut map, &mut order, 4, "d", 3);
+        assert_eq!(map.len(), 3);
+        assert!(!map.contains_key(&1), "oldest entry must be evicted");
+        assert_eq!(map.get(&4), Some(&"d"));
+        assert_eq!(order.front(), Some(&2), "eviction order must advance");
+
+        // Re-inserting an EXISTING key updates the value but not the order
+        // (no duplicate in the FIFO, no spurious eviction).
+        cache_insert_bounded(&mut map, &mut order, 2, "b2", 3);
+        assert_eq!(map.len(), 3);
+        assert_eq!(order.len(), 3);
+        assert_eq!(map.get(&2), Some(&"b2"));
+        assert_eq!(order.front(), Some(&2));
+
+        // Steady-state: after two more inserts, the oldest entries are gone.
+        // Order before this point is [2, 3, 4] (key 2 was re-inserted but its
+        // FIFO position did NOT refresh). Insert 5 evicts 2, insert 6 evicts
+        // 3 — survivors are {4, 5, 6}.
+        cache_insert_bounded(&mut map, &mut order, 5, "e", 3);
+        cache_insert_bounded(&mut map, &mut order, 6, "f", 3);
+        assert_eq!(map.len(), 3);
+        assert!(!map.contains_key(&2), "re-inserted key 2 is still the FIFO front and must be evicted first");
+        assert!(!map.contains_key(&3));
+        assert_eq!(map.get(&4), Some(&"d"));
+        assert_eq!(map.get(&5), Some(&"e"));
+        assert_eq!(map.get(&6), Some(&"f"));
+    }
+
+    #[test]
+    fn bounded_cache_zero_capacity_evicts_on_every_insert() {
+        let mut map: HashMap<i32, i32> = HashMap::new();
+        let mut order: VecDeque<i32> = VecDeque::new();
+        cache_insert_bounded(&mut map, &mut order, 1, 10, 0);
+        assert!(map.is_empty(), "zero capacity must never retain entries");
+        assert!(order.is_empty());
+    }
+}

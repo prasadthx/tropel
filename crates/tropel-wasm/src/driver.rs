@@ -953,6 +953,8 @@ mod tests {
                 status_text: "OK".into(),
                 headers: HashMap::new(),
                 body: b"hello".to_vec(),
+                text_cache: std::cell::OnceCell::new(),
+                json_cache: std::cell::OnceCell::new(),
                 response_time: Duration::from_millis(5),
                 timings: None,
                 cookies: vec![],

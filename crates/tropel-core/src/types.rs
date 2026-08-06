@@ -1,6 +1,7 @@
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -366,12 +367,15 @@ impl Body {
     }
 }
 
-/// HTTP response with lazy body decoding.
+/// HTTP response with lazy, memoized body decoding.
 ///
 /// The body is stored as raw `Vec<u8>`. `body_text()` and `body_json()`
-/// parse on first access — avoiding the cost of `String::from_utf8` and
-/// `serde_json::from_str` on every response when scripts rarely inspect
-/// the body.
+/// decode on first access and memoize the result in a `OnceCell`, so
+/// repeated script access (assert + extract + log on the same response —
+/// the normal Postman/k6 pattern) decodes ONCE instead of re-cloning a
+/// multi-MB body and re-parsing it on every call. The caches are
+/// `#[serde(skip)]` (never serialized): a distributed/spool round-trip
+/// carries only the raw `body` bytes and the cache is rebuilt on demand.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
     /// The URL that produced THIS response. For a redirect chain each hop
@@ -383,6 +387,12 @@ pub struct Response {
     pub status_text: String,
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
+    /// Memoized UTF-8 decode of `body` (see `body_text()`).
+    #[serde(skip)]
+    pub text_cache: OnceCell<Option<String>>,
+    /// Memoized JSON parse of `body` (see `body_json()`).
+    #[serde(skip)]
+    pub json_cache: OnceCell<Option<serde_json::Value>>,
     pub response_time: Duration,
     pub timings: Option<Timings>,
     pub cookies: Vec<Cookie>,
@@ -396,26 +406,35 @@ pub struct Response {
 }
 
 impl Response {
-    /// Decode the body as UTF-8 text (lazy — parses on each call).
+    /// Decode the body as UTF-8 text (lazy — decodes once, then memoized).
     pub fn body_text(&self) -> Option<String> {
-        if self.body.is_empty() {
-            None
-        } else {
-            String::from_utf8(self.body.clone()).ok()
-        }
+        self.text_cache
+            .get_or_init(|| {
+                if self.body.is_empty() {
+                    None
+                } else {
+                    String::from_utf8(self.body.clone()).ok()
+                }
+            })
+            .clone()
     }
 
-    /// Parse the body as JSON using simd-json (lazy — parses on each call).
+    /// Parse the body as JSON using simd-json (lazy — parses once, then
+    /// memoized).
     ///
     /// Parses directly from the raw `Vec<u8>` body, skipping the intermediate
     /// `String::from_utf8` step that `body_text()` requires. Uses `simd-json`
     /// for ~2-4x faster parsing on typical payloads.
     pub fn body_json(&self) -> Option<serde_json::Value> {
-        if self.body.is_empty() {
-            return None;
-        }
-        let mut body_bytes = self.body.clone();
-        simd_json::serde::from_slice(&mut body_bytes).ok()
+        self.json_cache
+            .get_or_init(|| {
+                if self.body.is_empty() {
+                    return None;
+                }
+                let mut body_bytes = self.body.clone();
+                simd_json::serde::from_slice(&mut body_bytes).ok()
+            })
+            .clone()
     }
 }
 

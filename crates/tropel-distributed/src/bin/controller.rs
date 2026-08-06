@@ -31,11 +31,18 @@ struct Args {
     token_file: Option<PathBuf>,
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
+    // The old `#[tokio::main(worker_threads = 2)]` capped the controller at
+    // 2 async workers while it multiplexes N agent connections plus the
+    // merge/report phase. Build a runtime that scales with available
+    // parallelism instead (backlog line 119).
+    let rt = tropel_distributed::build_runtime().map_err(TropelError::Io)?;
+    rt.block_on(run(args))
+}
 
+async fn run(args: Args) -> Result<()> {
     let raw = std::fs::read_to_string(&args.config)
         .map_err(TropelError::Io)?;
     let config: JobConfig = serde_json::from_str(&raw)
