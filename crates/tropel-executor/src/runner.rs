@@ -18,6 +18,11 @@ use tropel_pm::bridge::{PmState, SharedPmState};
 pub struct IterationResult {
     pub samples: Vec<Sample>,
     pub iteration_index: u64,
+    /// Number of prerequest/test scripts that errored this iteration. Surfaced
+    /// as failed `checks` samples AND counted all the way to the CLI, so a run
+    /// where every script throws exits non-zero instead of reporting success.
+    /// `u64` matches the run-wide counter type (no cast noise).
+    pub script_failures: u64,
 }
 
 /// Configuration for a VU runner.
@@ -220,6 +225,11 @@ impl VURunner {
                         Self::run_script(&mut self.js_ctx, script, source_url).await
                     {
                         tracing::warn!("VU {} prerequest script error: {}", iteration_index, e);
+                        // Backlog line 98: script failures were swallowed —
+                        // no failed check, no metric, exit 0. Record a failed
+                        // check so the failure is visible in the summary and
+                        // drives a non-zero exit.
+                        record_script_failure(&mut result, &format!("{}.prerequest", item.name));
                     }
                 }
 
@@ -535,6 +545,9 @@ impl VURunner {
                         Self::run_script(&mut self.js_ctx, script, source_url).await
                     {
                         tracing::warn!("VU {} test script error: {}", iteration_index, e);
+                        // Backlog line 98: record a failed check so the
+                        // failure is visible and drives a non-zero exit.
+                        record_script_failure(&mut result, &format!("{}.test", item.name));
                     }
                 }
 
@@ -617,6 +630,24 @@ impl VURunner {
     pub fn state_handle(&self) -> SharedPmState {
         self.pm_state.clone()
     }
+}
+
+/// Record a failed `checks` sample for a script that errored (backlog line
+/// 98: script failures were swallowed — a warn! with no failed check, no
+/// metric, and exit 0). The check tag carries the script name so the failure
+/// is attributable, and [`IterationResult::script_failures`] is incremented
+/// so the count propagates to the engine and drives a non-zero exit.
+fn record_script_failure(result: &mut IterationResult, script_name: &str) {
+    result.script_failures = result.script_failures.saturating_add(1);
+    let mut tags = TagMap::with_capacity(1);
+    tags.insert("check", format!("script: {}", script_name));
+    result.samples.push(Sample {
+        metric: "checks".into(),
+        value: 0.0,
+        tags: Arc::new(tags),
+        timestamp: std::time::SystemTime::now(),
+        sample_type: SampleType::Rate,
+    });
 }
 
 /// Depth-first flatten of the scenario item tree into the ordered execution
@@ -876,6 +907,29 @@ mod tests {
         runner.pm_state().lock().unwrap().environment = script_set;
         let scope = runner.build_scope(None, &static_env);
         (runner, scope)
+    }
+
+    #[test]
+    fn record_script_failure_emits_failed_check_and_counts() {
+        // Backlog line 98: a script error used to be warn-only — no failed
+        // check, no metric, exit 0. The helper must emit a failed checks
+        // Rate sample (visible in the summary) AND increment the counter
+        // that drives the non-zero exit.
+        let mut result = IterationResult::default();
+        record_script_failure(&mut result, "get-token.prerequest");
+
+        assert_eq!(result.script_failures, 1);
+        let failed = result
+            .samples
+            .iter()
+            .find(|s| s.metric == "checks")
+            .expect("a failed checks sample must be recorded");
+        assert_eq!(failed.value, 0.0);
+        assert_eq!(failed.sample_type, SampleType::Rate);
+        assert_eq!(
+            failed.tags.get("check"),
+            Some("script: get-token.prerequest")
+        );
     }
 
     #[test]

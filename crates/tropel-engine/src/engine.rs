@@ -449,7 +449,7 @@ impl Engine {
                             input_path,
                             e
                         );
-                        return 0;
+                        return (0, 0);
                     }
                 };
 
@@ -460,7 +460,7 @@ impl Engine {
                 // to its registered protocol (the runner's scheme lookup).
                 let protocols: Arc<HashMap<String, Arc<dyn Protocol>>> =
                     Arc::new(registry_sc.instantiate_protocols());
-                let failures = match resolved {
+                let (init_failures, script_failures) = match resolved {
                     ResolvedInput::Scenario(scenario) => {
                         run_scenario_vus(
                             sc_name,
@@ -510,7 +510,7 @@ impl Engine {
                 };
 
                 tracing::info!("Scenario '{}': completed", sc_name_log);
-                failures
+                (init_failures, script_failures)
             });
 
             scenario_handles.push(handle);
@@ -521,10 +521,14 @@ impl Engine {
         // can fail the run loudly AFTER the summary/teardown run — returning
         // Err here would skip the end-of-run reporting (and the output
         // teardown) exactly when the user most needs to see what DID run.
+        // Script failures (backlog line 98) are counted the same way: a run
+        // where every script throws must exit non-zero.
         let mut total_vu_init_failures = 0u32;
+        let mut total_script_failures = 0u64;
         for handle in scenario_handles {
-            if let Ok(failures) = handle.await {
-                total_vu_init_failures += failures;
+            if let Ok((init_failures, script_failures)) = handle.await {
+                total_vu_init_failures += init_failures;
+                total_script_failures += script_failures;
             }
         }
 
@@ -590,6 +594,10 @@ impl Engine {
             // the CLI treats this as a hard failure (non-zero exit) after the
             // summary prints.
             vu_init_failures: total_vu_init_failures,
+            // Number of script executions (prerequest/test/driver iteration)
+            // that errored during the run. Non-zero means scripts kept
+            // failing; the CLI exits non-zero (backlog line 98).
+            script_failures: total_script_failures,
         })
     }
 
@@ -718,6 +726,12 @@ pub struct EngineResult {
     /// creation). Non-zero means the requested load was NOT delivered — the
     /// CLI exits non-zero after printing the summary.
     pub vu_init_failures: u32,
+    /// Number of script executions (prerequest/test scripts, driver
+    /// iterations) that errored during the run. Non-zero means scripts kept
+    /// failing — the CLI exits non-zero after printing the summary (backlog
+    /// line 98: script failures used to be swallowed — warn only, no failed
+    /// check, exit 0).
+    pub script_failures: u64,
 }
 
 

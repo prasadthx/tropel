@@ -586,6 +586,26 @@ async fn run_command(cli: Cli) -> Result<()> {
         )));
     }
 
+    // Script failures (backlog line 98): a run where every prerequest/test
+    // script (or driver iteration) threw used to exit 0 with a clean summary.
+    // Now each failure is a failed check AND this counter — exit non-zero so
+    // CI pipelines see the failure. The summary has already printed.
+    //
+    // Deliberate semantics: ANY script failure (even a single transient one)
+    // makes the run exit non-zero, NOT gated behind a `checks` threshold — a
+    // script that throws is a broken test artifact, not an SLO outcome. A
+    // flaky script therefore fails CI loudly, which is the point.
+    if result.script_failures > 0 {
+        tracing::error!(
+            "{} script execution(s) failed during the run (see errors above) — exiting non-zero",
+            result.script_failures
+        );
+        return Err(TropelError::Other(format!(
+            "{} script execution(s) failed during the run",
+            result.script_failures
+        )));
+    }
+
     // Evaluate thresholds and drive exit code. Uses the engine's EFFECTIVE
     // threshold set (job thresholds merged with script-declared ones, e.g.
     // k6 `export const options` thresholds) so k6 SLOs are reported too.

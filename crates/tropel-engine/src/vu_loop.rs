@@ -13,7 +13,7 @@ use crate::worker::VUWorkerPool;
 use async_trait::async_trait;
 use rand::RngExt;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tropel_core::config::{ExecutionConfig, HttpConfig, ThinkTimeConfig, ThresholdConfig, TlsConfig};
@@ -35,6 +35,11 @@ use tropel_pm::bridge::SharedPmState;
 struct VuIterationOutcome {
     samples: Vec<Sample>,
     abort_message: Option<String>,
+    /// Number of script executions (prerequest/test/driver iteration) that
+    /// errored this iteration. Aggregated into the run-wide counter so a run
+    /// where scripts keep throwing exits non-zero (backlog line 98). `u64`
+    /// matches the run-wide counter type (no cast noise).
+    script_failures: u64,
 }
 
 /// A per-iteration execution source. The shared VU loop calls this once per
@@ -81,6 +86,10 @@ impl VuIterationSource for ScenarioVuSource {
         VuIterationOutcome {
             samples: iter_result.samples,
             abort_message,
+            // Backlog line 98: prerequest/test script errors now surface as
+            // failed checks inside samples AND count here so the run exits
+            // non-zero when scripts keep failing.
+            script_failures: iter_result.script_failures,
         }
     }
 }
@@ -115,6 +124,7 @@ impl VuIterationSource for DriverVuSource {
             self.sched.active_vus().await,
         );
         let result = self.instance.run_iteration(&mut ctx).await;
+        let mut script_failures = 0u64;
         if let Err(e) = result {
             tracing::warn!(
                 "VU {} iteration {} failed: {}",
@@ -122,6 +132,22 @@ impl VuIterationSource for DriverVuSource {
                 iteration_index,
                 e
             );
+            // Backlog line 98: a driver iteration that errored was only
+            // warned — iterations still counted it and the run exited 0.
+            // Record a failed check + count so the failure is visible and
+            // drives a non-zero exit. Tag prefix matches the runner's
+            // `script: <name>` convention (a driver iteration is a script
+            // execution too).
+            script_failures = 1;
+            let mut tags = TagMap::with_capacity(1);
+            tags.insert("check", format!("script: driver {} iteration", self.vu_id));
+            ctx.samples.push(Sample {
+                metric: "checks".into(),
+                value: 0.0,
+                tags: Arc::new(tags),
+                timestamp: std::time::SystemTime::now(),
+                sample_type: tropel_core::types::SampleType::Rate,
+            });
         }
         let abort_message = if ctx.abort_requested {
             Some(format!(
@@ -137,6 +163,7 @@ impl VuIterationSource for DriverVuSource {
         VuIterationOutcome {
             samples: std::mem::take(&mut ctx.samples),
             abort_message,
+            script_failures,
         }
     }
 }
@@ -248,6 +275,16 @@ async fn run_vu_loop(
                 .await;
             let iter_dur = iter_start_time.elapsed();
 
+            // Backlog line 98: aggregate per-iteration script failures into
+            // the run-wide counter so the CLI can exit non-zero when scripts
+            // keep erroring (the failure is also visible as a failed check
+            // sample in `outcome.samples`).
+            if outcome.script_failures > 0 {
+                shared
+                    .script_failures
+                    .fetch_add(outcome.script_failures, Ordering::SeqCst);
+            }
+
             let now = std::time::SystemTime::now();
             let empty_tags = Arc::new(TagMap::new());
             let mut iter_samples = outcome.samples;
@@ -316,6 +353,11 @@ struct VuRunShared {
     /// exhaustion) becomes a LOUD error instead of the summary reporting the
     /// requested count.
     vu_init_failures: Arc<AtomicU32>,
+    /// Run-wide count of script executions that errored (prerequest/test
+    /// scripts and driver iterations). Aggregated from every VU's
+    /// [`VuIterationOutcome::script_failures`] so a run where scripts keep
+    /// throwing exits non-zero instead of reporting success (backlog line 98).
+    script_failures: Arc<AtomicU64>,
 }
 
 /// Shared VU-run scaffolding used by both the scenario and driver paths:
@@ -338,7 +380,7 @@ async fn run_vus<F>(
     test_start: Instant,
     control_port: Option<u16>,
     run_vu: F,
-) -> u32
+) -> (u32, u64)
 where
     F: Fn(Arc<VUScheduler>, u32, &VuRunShared) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
 {
@@ -390,6 +432,7 @@ where
     );
 
     let vu_init_failures = Arc::new(AtomicU32::new(0));
+    let script_failures = Arc::new(AtomicU64::new(0));
     let shared = VuRunShared {
         metrics: metrics.clone(),
         sc_tags: sc_tags.clone(),
@@ -400,6 +443,7 @@ where
         think_time: think_time_cfg,
         executor_name,
         vu_init_failures: vu_init_failures.clone(),
+        script_failures: script_failures.clone(),
     };
 
     executor
@@ -475,7 +519,7 @@ where
     if let Some(handle) = control_server {
         handle.abort();
     }
-    init_failures
+    (init_failures, script_failures.load(Ordering::SeqCst))
 }
 
 // ── Driver HTTP client adapter ──
@@ -495,9 +539,10 @@ impl DriverHttpClient for DriverHttpClientImpl {
 
 /// Run a declarative (Postman-style) scenario: each VU builds its own
 /// HttpClient + VURunner + JS context and drives the shared loop through
-/// [`ScenarioVuSource`]. Returns the number of VUs that failed to START
-/// (so the engine can fail the run loudly when the requested load is not
-/// delivered).
+/// [`ScenarioVuSource`]. Returns `(vu_init_failures, script_failures)` —
+/// VUs that failed to START (so the engine can fail the run loudly when the
+/// requested load is not delivered) and script executions that errored (so a
+/// run where every script throws exits non-zero; backlog line 98).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_scenario_vus(
     sc_name: String,
@@ -517,7 +562,7 @@ pub(crate) async fn run_scenario_vus(
     protocols: Arc<HashMap<String, Arc<dyn Protocol>>>,
     control_port: Option<u16>,
     rps_limiter: Option<Arc<tropel_http::RpsLimiter>>,
-) -> u32 {
+) -> (u32, u64) {
     let http_cfg_c = http_cfg.clone();
     let tls_cfg_c = tls_cfg.clone();
     let rps_limiter_c = rps_limiter.clone();
@@ -621,9 +666,9 @@ pub(crate) async fn run_scenario_vus(
 
 /// Run an imperative (k6-style) driver: each VU re-resolves the driver from
 /// the registry, inits a fresh instance, wraps its own HttpClient, and drives
-/// the shared loop through [`DriverVuSource`]. Returns the number of VUs
-/// that failed to START (so the engine can fail the run loudly when the
-/// requested load is not delivered).
+/// the shared loop through [`DriverVuSource`]. Returns
+/// `(vu_init_failures, script_failures)` — VUs that failed to START and
+/// driver iterations that errored (backlog line 98).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_driver_vus(
     sc_name: String,
@@ -645,13 +690,13 @@ pub(crate) async fn run_driver_vus(
     registry: Arc<ExtensionRegistry>,
     control_port: Option<u16>,
     rps_limiter: Option<Arc<tropel_http::RpsLimiter>>,
-) -> u32 {
+) -> (u32, u64) {
     let driver_id = driver.id().to_string();
     let input_bytes = match std::fs::read(input_path) {
         Ok(b) => b,
         Err(e) => {
             tracing::error!("Scenario '{}': failed to read input: {}", sc_name, e);
-            return 0;
+            return (0, 0);
         }
     };
     let input_p = std::path::Path::new(input_path).to_path_buf();
