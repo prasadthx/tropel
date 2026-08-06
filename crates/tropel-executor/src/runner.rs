@@ -231,8 +231,12 @@ impl VURunner {
                 // Script-only items (transpiled TS/ES module scripts) don't have
                 // a request — they handle HTTP via pm.sendRequest internally.
                 if let Some(request) = &item.request {
-                    // Resolve variables across the entire request
-                    let resolved_url = resolver.resolve_deep(&request.url, &scope, 5);
+                    // Resolve variables across the entire request. The URL gets
+                    // percent-encoded values so a data value containing `&` or
+                    // `=` cannot split the query into extra params (backlog
+                    // line 96); headers/query_params keep raw substitution
+                    // (the HTTP layer encodes query params itself).
+                    let resolved_url = resolver.resolve_url_deep(&request.url, &scope, 5);
 
                     // Resolve headers, query params, body
                     let resolved_headers: HashMap<String, String> = request
@@ -648,12 +652,27 @@ fn resolve_body(
 ) -> tropel_core::types::Body {
     match body {
         tropel_core::types::Body::Raw(s) => {
-            tropel_core::types::Body::Raw(resolver.resolve_deep(s, scope, 5))
+            // A Raw body that looks like JSON must resolve with JSON-string
+            // escaping so a data value containing a quote/backslash/newline
+            // does not produce a broken document (backlog line 96: the Json
+            // arm guarded against this but the Raw arm the Postman parser
+            // actually produces did not). Non-JSON raw bodies (XML, plain
+            // text) stay literal — escaping would corrupt them.
+            let trimmed = s.trim_start();
+            let looks_like_json = trimmed.starts_with('{') || trimmed.starts_with('[');
+            if looks_like_json {
+                tropel_core::types::Body::Raw(resolver.resolve_json_deep(s, scope, 5))
+            } else {
+                tropel_core::types::Body::Raw(resolver.resolve_deep(s, scope, 5))
+            }
         }
         tropel_core::types::Body::Json(val) => {
             // Resolve variables in JSON values by stringifying and re-parsing
+            // with JSON-string escaping, so a substituted value cannot break
+            // the document (previously a quote in the data fell back to the
+            // UNRESOLVED value — the substitution silently never happened).
             let s = serde_json::to_string(val).unwrap_or_default();
-            let resolved = resolver.resolve_deep(&s, scope, 5);
+            let resolved = resolver.resolve_json_deep(&s, scope, 5);
             tropel_core::types::Body::Json(
                 serde_json::from_str(&resolved).unwrap_or_else(|_| val.clone()),
             )
@@ -677,10 +696,13 @@ fn resolve_body(
             tropel_core::types::Body::Binary(data.clone())
         }
         tropel_core::types::Body::GraphQL { query, variables } => {
+            // GraphQL query text is not JSON — raw substitution; the
+            // variables map IS JSON and gets the same quote-safe resolution
+            // as the Json arm (backlog line 96).
             let resolved_query = resolver.resolve_deep(query, scope, 5);
             let resolved_vars = variables.as_ref().map(|vars| {
                 let s = serde_json::to_string(vars).unwrap_or_default();
-                let resolved = resolver.resolve_deep(&s, scope, 5);
+                let resolved = resolver.resolve_json_deep(&s, scope, 5);
                 serde_json::from_str(&resolved).unwrap_or_else(|_| vars.clone())
             });
             tropel_core::types::Body::GraphQL {
@@ -757,6 +779,46 @@ mod tests {
             vec!["top", "f1-a", "f1-sub-1", "f1-sub-2", "f1-b"],
             "depth-first folder descent, empty folders skipped, got: {names:?}"
         );
+    }
+
+    #[test]
+    fn resolve_body_raw_json_escapes_quoted_values() {
+        // Backlog line 96: the Postman parser produces Raw bodies for JSON
+        // request bodies. A data value with a quote used to produce broken
+        // JSON (the Json arm guarded; the Raw arm did not).
+        let resolver = tropel_variables::VariableResolver::new();
+        let scope = tropel_variables::VariableScope {
+            env: HashMap::from([("name".into(), "he said \"hi\"".into())]),
+            ..Default::default()
+        };
+
+        let raw = tropel_core::types::Body::Raw(r#"{"s":"{{name}}"}"#.to_string());
+        let resolved = resolve_body(&raw, &resolver, &scope);
+        match resolved {
+            tropel_core::types::Body::Raw(s) => {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&s).expect("resolved raw JSON body must stay valid");
+                assert_eq!(parsed["s"], "he said \"hi\"");
+            }
+            other => panic!("Raw body must stay Raw, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_body_plain_raw_stays_literal() {
+        // Non-JSON raw bodies (XML, plain text) must NOT be JSON-escaped —
+        // escaping would corrupt them.
+        let resolver = tropel_variables::VariableResolver::new();
+        let scope = tropel_variables::VariableScope {
+            env: HashMap::from([("msg".into(), "hi\"there".into())]),
+            ..Default::default()
+        };
+        let raw = tropel_core::types::Body::Raw("<m>{{msg}}</m>".to_string());
+        let resolved = resolve_body(&raw, &resolver, &scope);
+        match resolved {
+            tropel_core::types::Body::Raw(s) => assert_eq!(s, "<m>hi\"there</m>"),
+            other => panic!("Raw body must stay Raw, got {:?}", other),
+        }
     }
 
     #[test]
