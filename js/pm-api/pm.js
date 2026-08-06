@@ -395,12 +395,14 @@ pm.test = function (name, fn) {
         var result = fn();
         var passed = result !== false;
         if (typeof __tropel_pm_test === 'function') {
-            __tropel_pm_test(name, passed);
+            // 3rd arg (tags) always passed — rquickjs enforces arity, so a
+            // 2-arg call against the 3-param bridge would throw (line 149).
+            __tropel_pm_test(name, passed, '');
         }
         return passed;
     } catch (e) {
         if (typeof __tropel_pm_test === 'function') {
-            __tropel_pm_test(name + ' (error)', false);
+            __tropel_pm_test(name + ' (error)', false, '');
         }
         console.error('pm.test error:', e);
         return false;
@@ -1051,37 +1053,51 @@ function group(name, fn) {
     }
 }
 
-// ── check(val, conds) — k6-style checks ──
+// ── check(val, conds, tags) — k6-style checks ──
 // Evaluates conditions against a value. Each condition is a named
-// predicate (function) or expected value. Records each as a checks
-// Rate metric (pass/fail). Returns true if ALL checks pass.
-function check(val, conds) {
-    if (!conds || typeof conds !== 'object') {
-        return true;
+// predicate (function) or a boolean constant (ToBoolean-coerced, k6
+// parity — NOT val === condition). Records each as a checks Rate metric
+// (pass/fail) with the RAW name as the `check` tag (no "check " prefix,
+// k6 parity) plus the optional 3rd-arg tags. Returns true if ALL checks
+// pass. Backlog line 149: check(1, null)/check(1, 'x') used to return
+// true (nonsense-as-success) — k6 throws for a null/non-object conds;
+// and a throwing predicate must record a failed check THEN propagate
+// (k6 fails the iteration with that error).
+function check(val, conds, tags) {
+    if (conds === null || conds === undefined || typeof conds !== 'object') {
+        throw new TypeError('check() requires an object as its second argument');
     }
     var allPassed = true;
+    var tagsJson = '';
+    if (tags && typeof tags === 'object') {
+        try { tagsJson = JSON.stringify(tags); } catch (e) { tagsJson = ''; }
+    }
     var names = Object.keys(conds);
     for (var i = 0; i < names.length; i++) {
         var name = names[i];
         var condition = conds[name];
         var passed = false;
 
-        try {
-            if (typeof condition === 'function') {
-                // Predicate function — call with the value
+        if (typeof condition === 'function') {
+            // Predicate function — call with the value. On throw, record
+            // the failed check, then let the error propagate (k6 parity).
+            try {
                 passed = !!condition(val);
-            } else {
-                // Direct comparison
-                passed = val === condition;
+            } catch (e) {
+                if (typeof __tropel_pm_test === 'function') {
+                    __tropel_pm_test(name, false, tagsJson);
+                }
+                throw e;
             }
-        } catch (e) {
-            // Error during evaluation — count as failed
-            console.error('check error for "' + name + '":', e);
+        } else {
+            // Non-function condition: boolean constant (k6 ToBoolean).
+            passed = !!condition;
         }
 
-        // Record the check pass/fail via the existing test bridge
+        // Record the check pass/fail via the existing test bridge — raw
+        // name (k6 does not prefix) + optional tags.
         if (typeof __tropel_pm_test === 'function') {
-            __tropel_pm_test('check ' + name, passed);
+            __tropel_pm_test(name, passed, tagsJson);
         }
 
         if (!passed) {

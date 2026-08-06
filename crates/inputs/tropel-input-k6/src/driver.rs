@@ -1449,11 +1449,19 @@ impl K6DriverInstance {
             let sink_test = sink.clone();
             let _ = globals.set(
                 "__tropel_pm_test",
-                Func::from(move |name: String, passed: bool| {
+                // 3rd arg: optional k6 check() tags JSON (backlog line 149).
+                Func::from(move |name: String, passed: bool, tags_json: Option<String>| {
                     let mut v = sink_test.lock().unwrap();
                     let now = SystemTime::now();
-                    let mut tags = TagMap::with_capacity(1);
+                    let mut tags = TagMap::with_capacity(2);
                     tags.insert("check", name);
+                    if let Some(j) = tags_json {
+                        if let Ok(extra) = serde_json::from_str::<HashMap<String, String>>(&j) {
+                            for (k, val) in extra {
+                                tags.insert(k, val);
+                            }
+                        }
+                    }
                     v.push(Sample {
                         metric: "checks".into(),
                         value: if passed { 1.0 } else { 0.0 },
@@ -4045,6 +4053,92 @@ mod tests {
             assert_eq!(
                 close2_events, "[\"1006:server gone\"]",
                 "server close must dispatch once even with a defensive user close(): {close2_events}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_check_throws_on_nonsense_and_forwards_tags() {
+        // Backlog line 149: check() accepted nonsense as success —
+        // check(1, null) and check(1, 'x') returned true (k6 throws); it
+        // dropped k6's 3rd tags arg; prefixed names with "check "; and
+        // swallowed a throwing predicate (k6 records a failed check then
+        // propagates the error to fail the iteration).
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__recorded = [];
+                globalThis.__tropel_pm_test = function (name, passed, tagsJson) {
+                    globalThis.__recorded.push({
+                        name: name,
+                        passed: passed,
+                        tags: tagsJson ? JSON.parse(tagsJson) : null
+                    });
+                };
+
+                // 1) Nonsense conds must THROW, not return true.
+                globalThis.__null_threw = false;
+                try { check(1, null); } catch (e) { globalThis.__null_threw = e instanceof TypeError; }
+                globalThis.__str_threw = false;
+                try { check(1, 'x'); } catch (e) { globalThis.__str_threw = e instanceof TypeError; }
+
+                // 2) Raw names (no "check " prefix) + 3rd tags arg forwarded.
+                check(1, { 'status is 200': function (v) { return v === 1; } }, { tag1: 'a', tag2: 'b' });
+                // 3) Non-function conditions are boolean constants (k6 parity).
+                check(1, { constTrue: true, constFalse: false });
+
+                // 4) Throwing predicate: records a failed check, then propagates.
+                globalThis.__threw_after = null;
+                try {
+                    check(1, { boom: function () { throw new Error('boom-check'); } });
+                } catch (e) {
+                    globalThis.__threw_after = e.message;
+                }
+            "#,
+            )
+            .expect("script should eval");
+
+            assert!(
+                ctx.eval::<bool, _>("__null_threw").unwrap(),
+                "check(1, null) must throw a TypeError (k6 parity), not return true"
+            );
+            assert!(
+                ctx.eval::<bool, _>("__str_threw").unwrap(),
+                "check(1, 'x') must throw a TypeError (k6 parity), not return true"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__recorded[0].name").unwrap(),
+                "status is 200",
+                "check name must NOT be prefixed with 'check '"
+            );
+            let tags: String = ctx
+                .eval("JSON.stringify(__recorded[0].tags)")
+                .expect("read recorded tags");
+            assert_eq!(
+                tags, "{\"tag1\":\"a\",\"tag2\":\"b\"}",
+                "k6 3rd tags arg must reach the bridge: {tags}"
+            );
+            assert!(
+                ctx.eval::<bool, _>("__recorded[1].passed").unwrap(),
+                "non-function truthy condition must pass (ToBoolean k6 parity)"
+            );
+            assert!(
+                !ctx.eval::<bool, _>("__recorded[2].passed").unwrap(),
+                "non-function falsy condition must fail (ToBoolean k6 parity)"
+            );
+            // Throwing predicate: failed check recorded, then error propagates.
+            assert!(
+                !ctx.eval::<bool, _>("__recorded[3].passed").unwrap(),
+                "throwing predicate must record a failed check"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__threw_after").unwrap(),
+                "boom-check",
+                "throwing predicate must propagate (k6 fails the iteration)"
             );
         });
     }

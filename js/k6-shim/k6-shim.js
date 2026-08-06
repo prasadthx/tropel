@@ -712,27 +712,37 @@ function fail(msg) {
 // block-scopes function declarations, so a `function` here would be invisible
 // outside the if-block whenever the fallback actually ran.
 if (typeof check !== 'function') {
-    var check = function (val, conds) {
-        if (!conds || typeof conds !== 'object') {
-            return true;
+    // Backlog line 149: k6 parity — null/non-object conds throw, raw
+    // check names (no "check " prefix), 3rd tags arg forwarded, and a
+    // throwing predicate records a failed check then propagates.
+    var check = function (val, conds, tags) {
+        if (conds === null || conds === undefined || typeof conds !== 'object') {
+            throw new TypeError('check() requires an object as its second argument');
         }
         var allPassed = true;
+        var tagsJson = '';
+        if (tags && typeof tags === 'object') {
+            try { tagsJson = JSON.stringify(tags); } catch (e) { tagsJson = ''; }
+        }
         var names = Object.keys(conds);
         for (var i = 0; i < names.length; i++) {
             var name = names[i];
             var condition = conds[name];
             var passed = false;
-            try {
-                if (typeof condition === 'function') {
+            if (typeof condition === 'function') {
+                try {
                     passed = !!condition(val);
-                } else {
-                    passed = val === condition;
+                } catch (e) {
+                    if (typeof __tropel_pm_test === 'function') {
+                        __tropel_pm_test(name, false, tagsJson);
+                    }
+                    throw e;
                 }
-            } catch (e) {
-                console.error('check error for "' + name + '":', e);
+            } else {
+                passed = !!condition;
             }
             if (typeof __tropel_pm_test === 'function') {
-                __tropel_pm_test('check ' + name, passed);
+                __tropel_pm_test(name, passed, tagsJson);
             }
             if (!passed) {
                 allPassed = false;

@@ -769,9 +769,14 @@ impl PmBridge {
             let state_clone = state.clone();
             let _ = globals.set(
                 "__tropel_pm_test",
-                Func::from(move |name: String, passed: bool| {
+                // 3rd arg: optional k6 check() tags JSON (backlog line 149).
+                Func::from(move |name: String, passed: bool, tags_json: Option<String>| {
+                    let extra = tags_json
+                        .as_deref()
+                        .and_then(|j| serde_json::from_str::<HashMap<String, String>>(j).ok())
+                        .unwrap_or_default();
                     let mut st = state_clone.lock().unwrap();
-                    st.record_test(&name, passed);
+                    st.record_test_tagged(&name, passed, extra);
                 }),
             );
 

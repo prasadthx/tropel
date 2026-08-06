@@ -119,6 +119,18 @@ impl PmState {
 
     /// Record a test (assertion) result.
     pub fn record_test(&mut self, name: &str, passed: bool) {
+        self.record_test_tagged(name, passed, HashMap::new());
+    }
+
+    /// Record a test/check with optional extra tags (backlog line 149:
+    /// k6's check() 3rd `tags` arg). The `check` tag always carries the raw
+    /// check name — k6 does NOT prefix it with "check ".
+    pub fn record_test_tagged(
+        &mut self,
+        name: &str,
+        passed: bool,
+        extra: HashMap<String, String>,
+    ) {
         self.assertions.total += 1;
         if passed {
             self.assertions.passed += 1;
@@ -126,10 +138,15 @@ impl PmState {
             self.assertions.failed += 1;
         }
 
+        let mut tags = TagMap::with_capacity(extra.len() + 1);
+        tags.insert("check", name.to_string());
+        for (k, v) in extra {
+            tags.insert(k, v);
+        }
         self.samples.push(Sample {
             metric: "checks".into(),
             value: if passed { 1.0 } else { 0.0 },
-            tags: Arc::new(TagMap::from_pairs([("check", name.to_string())])),
+            tags: Arc::new(tags),
             timestamp: std::time::SystemTime::now(),
             sample_type: tropel_core::types::SampleType::Rate,
         });
