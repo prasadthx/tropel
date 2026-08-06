@@ -43,7 +43,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -235,11 +235,21 @@ inventory::submit!(DriverRegistration::new("k6", || Box::new(K6Driver))
 // O(VUs × size)).
 //
 // Keyed by name only — matches k6 (the name is the identity).
-static SHARED_ARRAY_CACHE: OnceLock<Mutex<HashMap<String, Arc<Vec<serde_json::Value>>>>> =
-    OnceLock::new();
+//
+// Locking model: an `Arc` SNAPSHOT under an `RwLock`. The map is written
+// once per SharedArray name (rare) and read per element (hot). Readers do
+// ONE shared read-lock acquisition to clone the `Arc` (a refcount bump, no
+// string copy), then drop the guard and read their private snapshot
+// LOCK-FREE — so the per-element path never holds a lock during key
+// building / element serialization, and concurrent readers never collide
+// (the old `Mutex` serialized every VU thread on every element read — the
+// one place all VUs collided). Writers clone the small map and swap it in.
+static SHARED_ARRAY_CACHE: OnceLock<
+    RwLock<Arc<HashMap<String, Arc<Vec<serde_json::Value>>>>>,
+> = OnceLock::new();
 
-fn shared_array_cache() -> &'static Mutex<HashMap<String, Arc<Vec<serde_json::Value>>>> {
-    SHARED_ARRAY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn shared_array_cache() -> &'static RwLock<Arc<HashMap<String, Arc<Vec<serde_json::Value>>>>> {
+    SHARED_ARRAY_CACHE.get_or_init(|| RwLock::new(Arc::new(HashMap::new())))
 }
 
 /// Register the k6 file-access native bridges on a JS context:
@@ -251,9 +261,8 @@ fn shared_array_cache() -> &'static Mutex<HashMap<String, Arc<Vec<serde_json::Va
 ///   file throws a JS `Error` (k6 behavior).
 /// - `__tropel_k6_shared_array_len(name)` — element count, or `-1` if absent
 ///   (the shim runs the factory only when absent).
-/// - `__tropel_k6_shared_array_get(name, i)` — JSON of ONE element, or `""`
-///   when absent/out-of-range (the shim parses just this element on demand,
-///   so no VU context ever materializes the whole array).
+/// - `__tropel_k6_shared_array_get(name, i)` — native JS value of ONE element,
+///   or `undefined` when absent/out-of-range (no per-element JSON parse).
 /// - `__tropel_k6_shared_array_set(name, json)` — parse the computed array
 ///   ONCE and share it as a process-global `Arc<Vec<Value>>`.
 ///
@@ -310,59 +319,126 @@ fn register_k6_file_bridges(ctx: &mut JsContext, script_dir: Option<PathBuf>) {
             ),
         );
 
-        // `len` returns -1 when the name is absent (factory must run) or the
-        // element count when cached — the JS shim decides between the two.
-        let len_prefix = cache_prefix.clone();
-        let _ = globals.set(
-            "__tropel_k6_shared_array_len",
-            Func::from(move |name: String| -> i32 {
-                let key = format!("{}|{}", len_prefix, name);
-                shared_array_cache()
-                    .lock()
-                    .map(|c| c.get(&key).map(|v| v.len() as i32).unwrap_or(-1))
-                    .unwrap_or(-1)
-            }),
-        );
-
-        // Element accessor — returns the JSON encoding of ONE element, or ""
-        // when absent/out-of-range. The JS shim parses just this element on
-        // demand, so no context ever materializes the whole array.
-        let get_prefix = cache_prefix.clone();
-        let _ = globals.set(
-            "__tropel_k6_shared_array_get",
-            Func::from(move |name: String, i: i32| -> String {
-                let key = format!("{}|{}", get_prefix, name);
-                shared_array_cache()
-                    .lock()
-                    .map(|c| {
-                        c.get(&key)
-                            .and_then(|v| {
-                                if i >= 0 && (i as usize) < v.len() {
-                                    Some(v[i as usize].to_string())
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_default()
-                    })
-                    .unwrap_or_default()
-            }),
-        );
-
-        // Parse the computed array ONCE (first VU) and share it as an Arc.
-        let set_prefix = cache_prefix.clone();
-        let _ = globals.set(
-            "__tropel_k6_shared_array_set",
-            Func::from(move |name: String, json: String| {
-                let key = format!("{}|{}", set_prefix, name);
-                if let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(&json) {
-                    if let Ok(mut c) = shared_array_cache().lock() {
-                        c.insert(key, Arc::new(parsed));
-                    }
-                }
-            }),
-        );
+        // The SharedArray bridges live in a generic fn (below) so the element
+        // accessor can return a native `Value<'js>` instead of a JSON string.
+        register_shared_array_bridges(rq_ctx, cache_prefix);
     });
+}
+
+/// Convert a parsed `serde_json::Value` into a native QuickJS value.
+///
+/// Elements are stored as parsed JSON in the shared cache; this builds the
+/// corresponding JS value directly in the QuickJS heap (objects, arrays,
+/// primitives, null), so the accessor bridge returns a native value and the
+/// shim needs no `JSON.parse` per element.
+fn json_to_value<'js>(ctx: &rquickjs::Ctx<'js>, v: &serde_json::Value) -> rquickjs::Value<'js> {
+    match v {
+        serde_json::Value::Null => rquickjs::Value::new_null(ctx.clone()),
+        serde_json::Value::Bool(b) => rquickjs::IntoJs::into_js(*b, ctx)
+            .unwrap_or_else(|_| rquickjs::Value::new_undefined(ctx.clone())),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                rquickjs::IntoJs::into_js(i, ctx)
+                    .unwrap_or_else(|_| rquickjs::Value::new_undefined(ctx.clone()))
+            } else if let Some(f) = n.as_f64() {
+                rquickjs::IntoJs::into_js(f, ctx)
+                    .unwrap_or_else(|_| rquickjs::Value::new_undefined(ctx.clone()))
+            } else {
+                rquickjs::Value::new_undefined(ctx.clone())
+            }
+        }
+        serde_json::Value::String(s) => rquickjs::IntoJs::into_js(s.as_str(), ctx)
+            .unwrap_or_else(|_| rquickjs::Value::new_undefined(ctx.clone())),
+        serde_json::Value::Array(items) => match rquickjs::Array::new(ctx.clone()) {
+            Ok(arr) => {
+                for (i, item) in items.iter().enumerate() {
+                    let _ = arr.set(i, json_to_value(ctx, item));
+                }
+                arr.into_value()
+            }
+            Err(_) => rquickjs::Value::new_undefined(ctx.clone()),
+        },
+        serde_json::Value::Object(map) => match rquickjs::Object::new(ctx.clone()) {
+            Ok(obj) => {
+                for (k, val) in map {
+                    let _ = obj.set(k.as_str(), json_to_value(ctx, val));
+                }
+                obj.into_value()
+            }
+            Err(_) => rquickjs::Value::new_undefined(ctx.clone()),
+        },
+    }
+}
+
+/// Register the SharedArray native bridges on a JS context. Lives in a
+/// generic fn — not an inline closure — because the element-accessor bridge's
+/// closure must name the QuickJS lifetime `'js` to return a native
+/// `Value<'js>` (eliminating the per-element `to_string` + `JSON.parse` round
+/// trip), and closures cannot declare lifetimes.
+fn register_shared_array_bridges<'js>(rq_ctx: &rquickjs::Ctx<'js>, cache_prefix: String) {
+    let globals = rq_ctx.globals();
+
+    // `len` returns -1 when the name is absent (factory must run) or the
+    // element count when cached — the JS shim decides between the two. Uses
+    // the same Arc-snapshot pattern as `get`: clone the Arc under a shared
+    // read lock, drop the guard, read lock-free.
+    let len_prefix = cache_prefix.clone();
+    let _ = globals.set(
+        "__tropel_k6_shared_array_len",
+        Func::from(move |name: String| -> i32 {
+            let key = format!("{}|{}", len_prefix, name);
+            let snapshot = shared_array_cache()
+                .read()
+                .map(|c| c.clone())
+                .unwrap_or_default();
+            snapshot.get(&key).map(|v| v.len() as i32).unwrap_or(-1)
+        }),
+    );
+
+    // Element accessor — returns a NATIVE JS value for ONE element, or
+    // `undefined` when absent/out-of-range. The shim consumes the value
+    // directly (no `JSON.parse` per element), so no context ever materializes
+    // the whole array or re-parses it.
+    let get_prefix = cache_prefix.clone();
+    let _ = globals.set(
+        "__tropel_k6_shared_array_get",
+        Func::from(
+            move |ctx: rquickjs::Ctx<'js>,
+                  name: String,
+                  i: i32|
+                  -> rquickjs::Value<'js> {
+                let key = format!("{}|{}", get_prefix, name);
+                // Snapshot: one shared read lock to clone the Arc (refcount
+                // bump), then drop the guard and read lock-free.
+                let snapshot = shared_array_cache()
+                    .read()
+                    .map(|c| c.clone())
+                    .unwrap_or_default();
+                match snapshot.get(&key) {
+                    Some(v) if i >= 0 && (i as usize) < v.len() => {
+                        json_to_value(&ctx, &v[i as usize])
+                    }
+                    _ => rquickjs::Value::new_undefined(ctx.clone()),
+                }
+            },
+        ),
+    );
+
+    // Parse the computed array ONCE (first VU) and share it as an Arc.
+    let set_prefix = cache_prefix.clone();
+    let _ = globals.set(
+        "__tropel_k6_shared_array_set",
+        Func::from(move |name: String, json: String| {
+            let key = format!("{}|{}", set_prefix, name);
+            if let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(&json) {
+                if let Ok(mut c) = shared_array_cache().write() {
+                    // Clone the small map and swap it in (the snapshot model);
+                    // per-name writes are rare (once per SharedArray).
+                    Arc::make_mut(&mut c).insert(key, Arc::new(parsed));
+                }
+            }
+        }),
+    );
 }
 
 /// The k6 `open()` + `k6/data` SharedArray shim (globals `open` and
