@@ -28,6 +28,115 @@ pm.environment = {
         if (typeof __tropel_pm_environment_clear === 'function') {
             __tropel_pm_environment_clear();
         }
+    },
+    // Backlog line 145: Postman's pm.environment exposes has()/toObject()/
+    // replaceIn() alongside get/set/unset/clear.
+    has: function (key) {
+        if (typeof __tropel_pm_environment_has === 'function') {
+            return __tropel_pm_environment_has(key);
+        }
+        return pm.environment.get(key) !== null;
+    },
+    toObject: function () {
+        if (typeof __tropel_pm_environment_to_object === 'function') {
+            return __tropel_pm_environment_to_object() || {};
+        }
+        return {};
+    },
+    replaceIn: function (text) {
+        return pm.variables.replaceIn(text);
+    }
+};
+
+// ── pm.collectionVariables ──
+// Backlog line 145: one of the top-3 most-used pm.* members was entirely
+// missing. Collection-scoped store; values round-trip JSON-encoded through
+// the bridge like pm.variables (JSON.parse restores the correct type).
+pm.collectionVariables = {
+    get: function (key) {
+        if (typeof __tropel_pm_collection_vars_get === 'function') {
+            var raw = __tropel_pm_collection_vars_get(key);
+            if (raw === null || raw === undefined) return undefined;
+            try { return JSON.parse(raw); } catch (e) { return raw; }
+        }
+        return undefined;
+    },
+    set: function (key, value) {
+        if (typeof __tropel_pm_collection_vars_set === 'function') {
+            __tropel_pm_collection_vars_set(key, value === undefined ? '' : String(value));
+        }
+    },
+    unset: function (key) {
+        if (typeof __tropel_pm_collection_vars_unset === 'function') {
+            __tropel_pm_collection_vars_unset(key);
+        }
+    },
+    has: function (key) {
+        if (typeof __tropel_pm_collection_vars_has === 'function') {
+            return __tropel_pm_collection_vars_has(key);
+        }
+        return false;
+    },
+    toObject: function () {
+        if (typeof __tropel_pm_collection_vars_to_object === 'function') {
+            var map = __tropel_pm_collection_vars_to_object() || {};
+            var out = {};
+            for (var k in map) {
+                if (map.hasOwnProperty(k)) {
+                    try { out[k] = JSON.parse(map[k]); } catch (e) { out[k] = map[k]; }
+                }
+            }
+            return out;
+        }
+        return {};
+    },
+    replaceIn: function (text) {
+        return pm.variables.replaceIn(text);
+    }
+};
+
+// ── pm.globals ──
+// Backlog line 145: global-scoped variable store, lowest-precedence scope.
+pm.globals = {
+    get: function (key) {
+        if (typeof __tropel_pm_globals_get === 'function') {
+            var raw = __tropel_pm_globals_get(key);
+            if (raw === null || raw === undefined) return undefined;
+            try { return JSON.parse(raw); } catch (e) { return raw; }
+        }
+        return undefined;
+    },
+    set: function (key, value) {
+        if (typeof __tropel_pm_globals_set === 'function') {
+            __tropel_pm_globals_set(key, value === undefined ? '' : String(value));
+        }
+    },
+    unset: function (key) {
+        if (typeof __tropel_pm_globals_unset === 'function') {
+            __tropel_pm_globals_unset(key);
+        }
+    },
+    has: function (key) {
+        if (typeof __tropel_pm_globals_has === 'function') {
+            return __tropel_pm_globals_has(key);
+        }
+        return false;
+    },
+    toObject: function () {
+        if (typeof __tropel_pm_globals_to_object === 'function') {
+            var map = __tropel_pm_globals_to_object() || {};
+            var out = {};
+            for (var k in map) {
+                if (map.hasOwnProperty(k)) {
+                    try { out[k] = JSON.parse(map[k]); } catch (e) { out[k] = map[k]; }
+                }
+            }
+            return out;
+        }
+        return {};
+    },
+    replaceIn: function (text) {
+        return pm.variables.replaceIn(text);
     }
 };
 
@@ -195,7 +304,51 @@ pm.response.header = function (key) {
     return null;
 };
 
+// Backlog line 145: pm.response.to.be.* — Postman's chainable response
+// assertions (chai-postman). Each getter/method THROWS on failure so it can
+// be used inside pm.test() (the throw fails the single check).
+function assertStatusClass(classCode, label) {
+    var c = pm.response.code;
+    var lo = classCode * 100;
+    var hi = lo + 99;
+    if (c < lo || c > hi) {
+        throw new Error('expected response to be ' + label + ' (' + lo + '-' + hi + '), got ' + c);
+    }
+}
+
 pm.response.to = {
+    be: {
+        get success() { assertStatusClass(2, 'success'); },
+        get ok() { assertStatusClass(2, 'ok'); },
+        get redirection() { assertStatusClass(3, 'redirection'); },
+        get clientError() { assertStatusClass(4, 'clientError'); },
+        get serverError() { assertStatusClass(5, 'serverError'); },
+        get error() {
+            var c = pm.response.code;
+            if (c < 400) {
+                throw new Error('expected response to be an error (>=400), got ' + c);
+            }
+        },
+        get info() { assertStatusClass(1, 'info'); },
+        json: function () {
+            // Postman parity: to.be.json passes when the body parses as JSON.
+            // Content-type is informational — a text/plain body that parses
+            // still counts (Postman's chai-postman checks the body first).
+            pm.response.json(); // throws on invalid JSON body
+        },
+        html: function () {
+            var ct = String(pm.response.headers.get('content-type') || '').toLowerCase();
+            if (ct.indexOf('html') === -1) {
+                throw new Error('expected response to be HTML, content-type is ' + ct);
+            }
+        },
+        text: function () {
+            var ct = String(pm.response.headers.get('content-type') || '').toLowerCase();
+            if (ct.indexOf('text') === -1 && ct.indexOf('json') === -1 && ct.indexOf('xml') === -1) {
+                throw new Error('expected response to be text, content-type is ' + ct);
+            }
+        }
+    },
     have: {
         status: function (code) {
             // Backlog line 143: pm.response.code is a VALUE now.
@@ -204,6 +357,30 @@ pm.response.to = {
                 throw new Error(
                     'expected response to have status ' + code + ' but got ' + actual
                 );
+            }
+        },
+        header: function (key, value) {
+            var actual = pm.response.header(key);
+            if (value === undefined) {
+                if (actual === null || actual === undefined) {
+                    throw new Error('expected response to have header ' + key);
+                }
+            } else if (String(actual) !== String(value)) {
+                throw new Error(
+                    'expected header ' + key + ' to be ' + String(value) + ', got ' + String(actual)
+                );
+            }
+        },
+        body: function (substring) {
+            var body = pm.response.text();
+            if (body.indexOf(substring) === -1) {
+                throw new Error('expected response body to contain ' + shortJson(substring));
+            }
+        },
+        jsonBody: function (expected) {
+            var body = pm.response.json();
+            if (!deepEqual(body, expected)) {
+                throw new Error('expected response JSON body to match');
             }
         }
     }
@@ -224,6 +401,14 @@ pm.test = function (name, fn) {
         }
         console.error('pm.test error:', e);
         return false;
+    }
+};
+
+// Backlog line 145: pm.test.skip(name, fn) marks a test skipped WITHOUT
+// running it. Skipped tests are not pass/fail checks.
+pm.test.skip = function (name) {
+    if (typeof __tropel_pm_test_skip === 'function') {
+        __tropel_pm_test_skip(name);
     }
 };
 
@@ -343,6 +528,178 @@ pm.expect = function (actual) {
             }
         }
     };
+};
+
+// ── pm.request ──
+// Backlog line 145: prerequest scripts could not add an auth header or sign a
+// request because pm.request didn't exist AND the runner rebuilt the wire
+// request from the static collection item, discarding mutations. The runner
+// now reads PmState.request (seeded from item.request before prerequest) when
+// building the outgoing request, so mutations made here go out on the wire.
+// Live getters/setters delegate to the __tropel_pm_request_* bridges
+// (registered lazily, like exec.js).
+pm.request = {};
+
+Object.defineProperty(pm.request, 'url', {
+    get: function () {
+        if (typeof __tropel_pm_request_url === 'function') return __tropel_pm_request_url();
+        return '';
+    },
+    set: function (url) {
+        if (typeof __tropel_pm_request_url_set === 'function') __tropel_pm_request_url_set(String(url));
+    },
+    enumerable: true,
+    configurable: true
+});
+
+Object.defineProperty(pm.request, 'method', {
+    get: function () {
+        if (typeof __tropel_pm_request_method === 'function') return __tropel_pm_request_method();
+        return 'GET';
+    },
+    set: function (method) {
+        if (typeof __tropel_pm_request_method_set === 'function') __tropel_pm_request_method_set(String(method));
+    },
+    enumerable: true,
+    configurable: true
+});
+
+// Postman's pm.request.headers is a HeaderList: .add({key,value}) is THE
+// canonical prerequest idiom for attaching an Authorization header.
+pm.request.headers = {
+    add: function (header) {
+        if (!header || header.key === undefined || header.key === null) return;
+        if (typeof __tropel_pm_request_header_set === 'function') {
+            __tropel_pm_request_header_set(String(header.key), header.value == null ? '' : String(header.value));
+        }
+    },
+    upsert: function (header) {
+        pm.request.headers.add(header);
+    },
+    get: function (key) {
+        if (typeof __tropel_pm_request_header_get === 'function') {
+            var v = __tropel_pm_request_header_get(key);
+            return v !== null && v !== undefined ? v : undefined;
+        }
+        return undefined;
+    },
+    remove: function (key) {
+        if (typeof __tropel_pm_request_header_unset === 'function') {
+            __tropel_pm_request_header_unset(key);
+        }
+    },
+    all: function () {
+        if (typeof __tropel_pm_request_headers === 'function') {
+            var map = __tropel_pm_request_headers() || {};
+            var arr = [];
+            for (var k in map) {
+                if (map.hasOwnProperty(k)) arr.push({ key: k, value: map[k] });
+            }
+            return arr;
+        }
+        return [];
+    },
+    each: function (cb) {
+        var all = pm.request.headers.all();
+        for (var i = 0; i < all.length; i++) cb(all[i]);
+    },
+    toObject: function () {
+        if (typeof __tropel_pm_request_headers === 'function') {
+            return __tropel_pm_request_headers() || {};
+        }
+        return {};
+    }
+};
+
+// pm.request.body — raw text form backed by the request body bridge.
+// Postman's canonical idiom is `pm.request.body.raw = '...'`, which requires
+// a STABLE object whose `raw` accessor is bridge-wired (a getter returning a
+// fresh object each read would silently swallow the mutation).
+var _pmRequestBody = { mode: 'raw' };
+Object.defineProperty(_pmRequestBody, 'raw', {
+    get: function () {
+        if (typeof __tropel_pm_request_body === 'function') {
+            var b = __tropel_pm_request_body();
+            if (b !== null && b !== undefined) return b;
+        }
+        return '';
+    },
+    set: function (raw) {
+        if (typeof __tropel_pm_request_body_set === 'function') {
+            __tropel_pm_request_body_set(raw == null ? '' : String(raw));
+        }
+    },
+    enumerable: true,
+    configurable: true
+});
+Object.defineProperty(pm.request, 'body', {
+    get: function () { return _pmRequestBody; },
+    set: function (body) {
+        // Accept a plain string OR an object {mode, raw} — both are common
+        // Postman spellings.
+        var raw = body == null ? '' : (typeof body === 'object' ? (body.raw != null ? String(body.raw) : '') : String(body));
+        if (typeof __tropel_pm_request_body_set === 'function') {
+            __tropel_pm_request_body_set(raw);
+        }
+        _pmRequestBody.mode = body && body.mode ? body.mode : 'raw';
+    },
+    enumerable: true,
+    configurable: true
+});
+
+// pm.request.auth — accepts the tagged AuthConfig JSON shape so a prerequest
+// script can sign the outgoing request (the primary purpose of pm.request).
+// Backed by a stored copy so reads echo the last-set config (a collection
+// may inspect it in a test script).
+var _pmRequestAuth = null;
+Object.defineProperty(pm.request, 'auth', {
+    get: function () { return _pmRequestAuth; },
+    set: function (auth) {
+        _pmRequestAuth = auth;
+        // JSON.stringify(undefined) is not a string — skip the bridge (and
+        // the Rust parse) when clearing auth; use {type:'noauth'} to clear
+        // explicitly, exactly like Postman.
+        if (auth === undefined || auth === null) return;
+        if (typeof __tropel_pm_request_auth_set === 'function') {
+            __tropel_pm_request_auth_set(JSON.stringify(auth));
+        }
+    },
+    enumerable: true,
+    configurable: true
+});
+
+// ── pm.cookies ──
+// Backlog line 145: Postman's pm.cookies reads the cookie jar for the current
+// domain. In a headless load runner the closest proxy is the response's
+// Set-Cookie map (__tropel_pm_response_cookies).
+pm.cookies = {
+    get: function (name) {
+        var jar = pm.cookies.toObject();
+        return jar[name];
+    },
+    has: function (name) {
+        return pm.cookies.toObject().hasOwnProperty(name);
+    },
+    toObject: function () {
+        if (typeof __tropel_pm_response_cookies === 'function') {
+            return __tropel_pm_response_cookies() || {};
+        }
+        return {};
+    },
+    list: function () {
+        var jar = pm.cookies.toObject();
+        var arr = [];
+        for (var k in jar) {
+            if (jar.hasOwnProperty(k)) arr.push({ name: k, value: jar[k] });
+        }
+        return arr;
+    }
+};
+
+// Backlog line 145: pm.expect.fail — chai's static fail: always throws.
+// Used by collections to force a failure inside a pm.test block.
+pm.expect.fail = function (message) {
+    throw new Error(message || 'expect.fail() called');
 };
 
 // Truncate a value for ERROR MESSAGES only (never for metric tags). Keeps
@@ -583,6 +940,14 @@ pm.sendRequest = function (options, callback) {
 };
 
 // ── pm.execution ──
+// Backlog line 145: postman.setNextRequest is the LEGACY flow-control global
+// that nearly all real collections use (pm.execution.setNextRequest is the
+// newer spelling). Both delegate to the same bridge.
+var postman = postman || {};
+postman.setNextRequest = function (requestName) {
+    pm.execution.setNextRequest(requestName);
+};
+
 pm.execution = {
     setNextRequest: function (requestName) {
         if (typeof __tropel_pm_set_next_request === 'function') {

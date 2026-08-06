@@ -47,9 +47,13 @@ impl PmApi {
 
     // ── Variables ──
 
-    /// Get a variable (searches environment, then collection, then globals).
+    /// Get a variable (searches iteration data, then environment, then
+    /// collection, then globals — Postman precedence, backlog line 145).
     pub fn variables_get(&self, key: &str) -> Option<Value> {
         let state = self.state.lock().unwrap();
+        if let Some(val) = state.iteration_data.as_ref().and_then(|d| d.get(key)) {
+            return Some(val.clone());
+        }
         if let Some(val) = state.environment.get(key) {
             return Some(Value::String(val.clone()));
         }

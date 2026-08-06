@@ -240,7 +240,20 @@ impl VURunner {
                 // Execute HTTP request only if this item has one.
                 // Script-only items (transpiled TS/ES module scripts) don't have
                 // a request — they handle HTTP via pm.sendRequest internally.
-                if let Some(request) = &item.request {
+                if item.request.is_some() {
+                    // Backlog line 145: the prerequest script may have MUTATED
+                    // the outgoing request via pm.request.* (added an auth
+                    // header, changed the URL/method/body). state.request was
+                    // seeded from item.request before the prerequest ran — read
+                    // THAT so the mutations actually go out on the wire instead
+                    // of being discarded by rebuilding from the collection
+                    // snapshot.
+                    let request = {
+                        let st = self.pm_state.lock().unwrap();
+                        st.request.clone().unwrap_or_else(|| {
+                            item.request.clone().expect("guarded by item.request.is_some()")
+                        })
+                    };
                     // Resolve variables across the entire request. The URL gets
                     // percent-encoded values so a data value containing `&` or
                     // `=` cannot split the query into extra params (backlog

@@ -3,7 +3,7 @@ use rquickjs::function::Func;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tropel_core::types::{Body, Method, Request};
+use tropel_core::types::{AuthConfig, Body, Method, Request};
 use tropel_core::Result;
 use tropel_http::client::HttpClient;
 use tropel_js::JsContext;
@@ -24,6 +24,57 @@ fn variable_value_to_string(val: &Value) -> String {
 /// the number `123` or boolean `true`.
 fn string_to_json_encoded(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_default()
+}
+
+/// Resolve a variable across ALL scopes with Postman precedence:
+/// iteration data > environment > collection > globals (backlog line 145).
+///
+/// Returns the value JSON-encoded for the JS shim to `JSON.parse()` back to
+/// the correct type. Extracted as a pure function so the precedence contract
+/// is unit-testable without a live JS context.
+fn variables_lookup(
+    key: &str,
+    iteration_data: Option<&HashMap<String, Value>>,
+    environment: &HashMap<String, String>,
+    collection_vars: &HashMap<String, Value>,
+    globals: &HashMap<String, Value>,
+) -> Option<String> {
+    // Postman precedence: data (iteration) > env > collection > globals.
+    // Backlog line 145: iteration data used to be ignored entirely, so a CSV
+    // row could never override an environment/collection value.
+    if let Some(val) = iteration_data.and_then(|d| d.get(key)) {
+        return Some(variable_value_to_string(val));
+    }
+    // Environment variables are HashMap<String, String>
+    if let Some(val) = environment.get(key) {
+        return Some(string_to_json_encoded(val));
+    }
+    // Collection and global variables are serde_json::Value
+    if let Some(val) = collection_vars.get(key) {
+        return Some(variable_value_to_string(val));
+    }
+    globals.get(key).map(variable_value_to_string)
+}
+
+/// Parse an HTTP method string (case-insensitive) into a `Method`.
+/// Falls back to `Custom` for non-standard tokens (PURGE, LINK, …).
+fn parse_method(s: &str) -> Method {
+    let t = s.trim();
+    if t.is_empty() {
+        return Method::GET;
+    }
+    match t.to_uppercase().as_str() {
+        "GET" => Method::GET,
+        "HEAD" => Method::HEAD,
+        "POST" => Method::POST,
+        "PUT" => Method::PUT,
+        "PATCH" => Method::PATCH,
+        "DELETE" => Method::DELETE,
+        "OPTIONS" => Method::OPTIONS,
+        "TRACE" => Method::TRACE,
+        "CONNECT" => Method::CONNECT,
+        other => Method::Custom(other.to_string()),
+    }
 }
 
 /// Return the response body as a JSON string for the `pm.response.json()`
@@ -230,15 +281,13 @@ impl PmBridge {
                 "__tropel_pm_variables_get",
                 Func::from(move |key: String| -> Option<String> {
                     let st = state_clone.lock().unwrap();
-                    // Environment variables are HashMap<String, String>
-                    if let Some(val) = st.environment.get(&key) {
-                        return Some(string_to_json_encoded(val));
-                    }
-                    // Collection and global variables are serde_json::Value
-                    if let Some(val) = st.collection_vars.get(&key) {
-                        return Some(variable_value_to_string(val));
-                    }
-                    st.globals.get(&key).map(variable_value_to_string)
+                    variables_lookup(
+                        &key,
+                        st.iteration_data.as_ref(),
+                        &st.environment,
+                        &st.collection_vars,
+                        &st.globals,
+                    )
                 }),
             );
 
@@ -260,6 +309,307 @@ impl PmBridge {
                     st.collection_vars.remove(&key);
                     st.environment.remove(&key);
                     st.globals.remove(&key);
+                }),
+            );
+
+            // ── Environment: has / toObject ──
+            // Backlog line 145: Postman's pm.environment exposes has() and
+            // toObject() alongside get/set/unset.
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_environment_has",
+                Func::from(move |key: String| -> bool {
+                    let st = state_clone.lock().unwrap();
+                    st.environment.contains_key(&key)
+                }),
+            );
+
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_environment_to_object",
+                Func::from(move || -> HashMap<String, String> {
+                    let st = state_clone.lock().unwrap();
+                    st.environment.clone()
+                }),
+            );
+
+            // ── Collection Variables (pm.collectionVariables) ──
+            // Backlog line 145: one of the top-3 most-used pm.* members was
+            // entirely missing. Values are JSON-encoded for type-safe
+            // round-tripping, same as variables.
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_collection_vars_get",
+                Func::from(move |key: String| -> Option<String> {
+                    let st = state_clone.lock().unwrap();
+                    st.collection_vars.get(&key).map(variable_value_to_string)
+                }),
+            );
+
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_collection_vars_set",
+                Func::from(move |key: String, value: String| {
+                    let mut st = state_clone.lock().unwrap();
+                    st.collection_vars
+                        .insert(key, serde_json::Value::String(value));
+                }),
+            );
+
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_collection_vars_unset",
+                Func::from(move |key: String| {
+                    let mut st = state_clone.lock().unwrap();
+                    st.collection_vars.remove(&key);
+                }),
+            );
+
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_collection_vars_has",
+                Func::from(move |key: String| -> bool {
+                    let st = state_clone.lock().unwrap();
+                    st.collection_vars.contains_key(&key)
+                }),
+            );
+
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_collection_vars_to_object",
+                Func::from(move || -> HashMap<String, String> {
+                    let st = state_clone.lock().unwrap();
+                    st.collection_vars
+                        .iter()
+                        .map(|(k, v)| (k.clone(), variable_value_to_string(v)))
+                        .collect()
+                }),
+            );
+
+            // ── Global Variables (pm.globals) ──
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_globals_get",
+                Func::from(move |key: String| -> Option<String> {
+                    let st = state_clone.lock().unwrap();
+                    st.globals.get(&key).map(variable_value_to_string)
+                }),
+            );
+
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_globals_set",
+                Func::from(move |key: String, value: String| {
+                    let mut st = state_clone.lock().unwrap();
+                    st.globals.insert(key, serde_json::Value::String(value));
+                }),
+            );
+
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_globals_unset",
+                Func::from(move |key: String| {
+                    let mut st = state_clone.lock().unwrap();
+                    st.globals.remove(&key);
+                }),
+            );
+
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_globals_has",
+                Func::from(move |key: String| -> bool {
+                    let st = state_clone.lock().unwrap();
+                    st.globals.contains_key(&key)
+                }),
+            );
+
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_globals_to_object",
+                Func::from(move || -> HashMap<String, String> {
+                    let st = state_clone.lock().unwrap();
+                    st.globals
+                        .iter()
+                        .map(|(k, v)| (k.clone(), variable_value_to_string(v)))
+                        .collect()
+                }),
+            );
+
+            // ── Request (pm.request) ──
+            // Backlog line 145: prerequest scripts could not add an auth
+            // header or sign a request because pm.request didn't exist AND
+            // the runner rebuilt the wire request from the static collection
+            // item, discarding any state.request mutations. The runner now
+            // reads state.request (seeded from item.request before prerequest)
+            // when building the outgoing request, so these bridges actually
+            // change what goes out on the wire.
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_request_url",
+                Func::from(move || -> String {
+                    let st = state_clone.lock().unwrap();
+                    st.request.as_ref().map(|r| r.url.clone()).unwrap_or_default()
+                }),
+            );
+
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_request_url_set",
+                Func::from(move |url: String| {
+                    let mut st = state_clone.lock().unwrap();
+                    if let Some(r) = st.request.as_mut() {
+                        r.url = url;
+                    }
+                }),
+            );
+
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_request_method",
+                Func::from(move || -> String {
+                    let st = state_clone.lock().unwrap();
+                    st.request
+                        .as_ref()
+                        .map(|r| r.method.to_string())
+                        .unwrap_or_else(|| "GET".to_string())
+                }),
+            );
+
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_request_method_set",
+                Func::from(move |method: String| {
+                    let mut st = state_clone.lock().unwrap();
+                    if let Some(r) = st.request.as_mut() {
+                        r.method = parse_method(&method);
+                    }
+                }),
+            );
+
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_request_headers",
+                Func::from(move || -> HashMap<String, String> {
+                    let st = state_clone.lock().unwrap();
+                    st.request
+                        .as_ref()
+                        .map(|r| r.headers.clone())
+                        .unwrap_or_default()
+                }),
+            );
+
+            // Case-insensitive read (Postman's HeaderList.get is case-insensitive).
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_request_header_get",
+                Func::from(move |key: String| -> Option<String> {
+                    let st = state_clone.lock().unwrap();
+                    st.request.as_ref().and_then(|r| {
+                        r.headers
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(&key))
+                            .map(|(_, v)| v.clone())
+                    })
+                }),
+            );
+
+            // Upsert case-insensitively: replace an existing differently-cased
+            // header rather than creating a duplicate (Postman HeaderList.add).
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_request_header_set",
+                Func::from(move |key: String, value: String| {
+                    let mut st = state_clone.lock().unwrap();
+                    if let Some(r) = st.request.as_mut() {
+                        let existing = r
+                            .headers
+                            .keys()
+                            .find(|k| k.eq_ignore_ascii_case(&key))
+                            .cloned();
+                        match existing {
+                            Some(ek) => {
+                                r.headers.insert(ek, value);
+                            }
+                            None => {
+                                r.headers.insert(key, value);
+                            }
+                        }
+                    }
+                }),
+            );
+
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_request_header_unset",
+                Func::from(move |key: String| {
+                    let mut st = state_clone.lock().unwrap();
+                    if let Some(r) = st.request.as_mut() {
+                        r.headers.retain(|k, _| !k.eq_ignore_ascii_case(&key));
+                    }
+                }),
+            );
+
+            // Body as raw text (get) / raw text (set).
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_request_body",
+                Func::from(move || -> Option<String> {
+                    let st = state_clone.lock().unwrap();
+                    st.request.as_ref().and_then(|r| match &r.body {
+                        Some(Body::Raw(s)) => Some(s.clone()),
+                        Some(Body::Json(v)) => Some(serde_json::to_string(v).unwrap_or_default()),
+                        _ => None,
+                    })
+                }),
+            );
+
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_request_body_set",
+                Func::from(move |body: String| {
+                    let mut st = state_clone.lock().unwrap();
+                    if let Some(r) = st.request.as_mut() {
+                        r.body = Some(Body::Raw(body));
+                    }
+                }),
+            );
+
+            // Auth: accepts the internally-tagged AuthConfig JSON form
+            // ({"type":"bearer","token":...}) — the same shape the
+            // postman/k6 inputs produce. A prerequest script can therefore
+            // sign the outgoing request (the primary purpose of pm.request).
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_request_auth_set",
+                Func::from(move |auth_json: String| {
+                    let parsed = serde_json::from_str::<AuthConfig>(&auth_json);
+                    let mut st = state_clone.lock().unwrap();
+                    if let Some(r) = st.request.as_mut() {
+                        match parsed {
+                            Ok(auth) => r.auth = Some(auth),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "pm.request.auth: could not parse auth config: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }),
+            );
+
+            // ── Test skip (pm.test.skip) ──
+            // Backlog line 145: pm.test.skip(name, fn) marks a test skipped
+            // WITHOUT running it — a collection using it used to throw
+            // "pm.test.skip is not a function" and fail the whole run. Skipped
+            // tests are not pass/fail checks, so nothing is recorded.
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_test_skip",
+                Func::from(move |name: String| {
+                    let mut st = state_clone.lock().unwrap();
+                    st.assertions.skipped += 1;
+                    tracing::debug!("pm.test.skip: {}", name);
                 }),
             );
 
@@ -803,6 +1153,38 @@ mod tests {
         let num = serde_json::json!(123);
         let parsed: serde_json::Value = serde_json::from_str(&variable_value_to_string(&num)).unwrap();
         assert!(parsed.is_number());
+    }
+
+    /// Regression (backlog line 145): `pm.variables.get` must resolve with
+    /// Postman precedence — iteration data beats environment beats collection
+    /// beats globals. The old code skipped iteration data entirely, so a CSV
+    /// row could never override an environment/collection value.
+    #[test]
+    fn test_variables_lookup_postman_precedence() {
+        let data = HashMap::from([("k".to_string(), Value::String("from-data".into()))]);
+        let env = HashMap::from([("k".to_string(), "from-env".to_string())]);
+        let collection = HashMap::from([("k".to_string(), Value::String("from-collection".into()))]);
+        let globals = HashMap::from([("k".to_string(), Value::String("from-globals".into()))]);
+
+        // Full shadow chain: data wins.
+        let got = variables_lookup("k", Some(&data), &env, &collection, &globals);
+        assert_eq!(got.as_deref(), Some("\"from-data\""), "iteration data must beat env/collection/globals");
+
+        // No data: env wins.
+        let got = variables_lookup("k", None, &env, &collection, &globals);
+        assert_eq!(got.as_deref(), Some("\"from-env\""), "environment must beat collection/globals");
+
+        // No data, no env: collection wins.
+        let got = variables_lookup("k", None, &HashMap::new(), &collection, &globals);
+        assert_eq!(got.as_deref(), Some("\"from-collection\""), "collection must beat globals");
+
+        // Only globals.
+        let got = variables_lookup("k", None, &HashMap::new(), &HashMap::new(), &globals);
+        assert_eq!(got.as_deref(), Some("\"from-globals\""), "globals last resort");
+
+        // No scope has it.
+        let got = variables_lookup("missing", Some(&data), &env, &collection, &globals);
+        assert_eq!(got, None, "unknown key resolves to None");
     }
 
     /// Regression (backlog line 68): `pm.response.json()` returned

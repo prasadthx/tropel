@@ -68,6 +68,52 @@ async fn start_echo_server(seen: Arc<Mutex<Vec<String>>>) -> std::net::SocketAdd
     addr
 }
 
+/// Server that records the `Authorization` header value it sees on each
+/// request (used to prove prerequest-added pm.request headers reach the wire).
+async fn start_auth_capture_server(seen: Arc<Mutex<Vec<String>>>) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else { break };
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    head.extend_from_slice(&buf[..n]);
+                    if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&head).to_string();
+                for line in text.lines() {
+                    // Match the header name case-insensitively but capture the
+                    // VALUE in its ORIGINAL case (lowercasing the whole line
+                    // would corrupt "Bearer s3cret" into "bearer s3cret").
+                    if line.to_ascii_lowercase().starts_with("authorization:") {
+                        if let Some(idx) = line.find(':') {
+                            seen.lock().unwrap().push(line[idx + 1..].trim().to_string());
+                        }
+                    }
+                }
+                let body = r#"{"ok":true}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    addr
+}
+
 /// Write a minimal Postman collection to a temp file and return its path.
 ///
 /// The single request sends `X-E2E: {{header}}`; its prerequest script sets
@@ -207,6 +253,100 @@ async fn end_to_end_two_vu_with_header_check_and_threshold() -> Result<()> {
 
     // Sanity: both VUs actually made requests.
     assert!(m.http_reqs >= 2, "http_reqs >= 2, got {}", m.http_reqs);
+
+    let _ = std::fs::remove_file(&coll);
+    Ok(())
+}
+
+/// Backlog line 145: a prerequest script using `pm.request.headers.add(...)`
+/// to attach an Authorization header must ACTUALLY send that header — the
+/// primary purpose of pm.request. The runner used to rebuild the wire request
+/// from the static collection item, silently discarding every mutation; this
+/// test pins the fix by asserting the server received the prerequest header.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prerequest_pm_request_header_reaches_the_wire() -> Result<()> {
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let srv = start_auth_capture_server(seen.clone()).await;
+
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("tropel-e2e-prereq-hdr-{}.json", std::process::id()));
+    let url = format!("http://{srv}/");
+    let collection = serde_json::json!({
+        "info": {
+            "name": "prereq-hdr",
+            "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+        },
+        "item": [{
+            "name": "req1",
+            "request": {
+                "method": "GET",
+                "url": url,
+                "header": []
+            },
+            "event": [
+                {
+                    "listen": "prerequest",
+                    "script": {
+                        "exec": [
+                            // Literal token: the point of this test is that the
+                            // prerequest pm.request mutation REACHES THE WIRE,
+                            // not env resolution (pm.environment.get reads
+                            // script-set state, not JobConfig env).
+                            "pm.request.headers.add({ key: 'Authorization', value: 'Bearer fixed-token' });"
+                        ],
+                        "type": "text/javascript"
+                    }
+                },
+                {
+                    "listen": "test",
+                    "script": {
+                        "exec": [
+                            "pm.test('status is 200', function () { pm.response.to.have.status(200); });"
+                        ],
+                        "type": "text/javascript"
+                    }
+                }
+            ]
+        }]
+    });
+    let coll = path.to_string_lossy().to_string();
+    std::fs::write(&path, serde_json::to_string(&collection).unwrap()).unwrap();
+
+    let config = JobConfig {
+        input: coll.clone(),
+        input_type: Some("postman".to_string()),
+        execution: ExecutionConfig::ConstantVus {
+            vus: 2,
+            duration: "3s".to_string(),
+            graceful_stop: Some("10s".to_string()),
+            think_time: ThinkTimeConfig::default(),
+        },
+        env: HashMap::new(),
+        thresholds: HashMap::new(),
+        output: OutputConfig {
+            reporters: vec![],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let engine = Engine::new(ExtensionRegistry::new());
+    let result = engine.run(&config).await?;
+
+    {
+        let seen_guard = seen.lock().unwrap();
+        assert!(
+            seen_guard.iter().any(|v| v == "Bearer fixed-token"),
+            "server saw Authorization headers {:?}; the prerequest pm.request.headers.add was dropped by the runner",
+            *seen_guard
+        );
+    }
+    assert!(
+        result.metrics.checks_failed == 0,
+        "all checks passed, got {} failed of {} total",
+        result.metrics.checks_failed,
+        result.metrics.checks_total
+    );
 
     let _ = std::fs::remove_file(&coll);
     Ok(())

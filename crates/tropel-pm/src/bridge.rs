@@ -78,6 +78,9 @@ pub struct AssertionCounters {
     pub total: u64,
     pub passed: u64,
     pub failed: u64,
+    /// Tests marked skipped via pm.test.skip (backlog line 145) — not
+    /// pass/fail, but tracked so reports can show them.
+    pub skipped: u64,
 }
 
 impl PmState {

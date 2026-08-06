@@ -3641,6 +3641,196 @@ mod tests {
     }
 
     #[test]
+    fn test_pm_collection_vars_globals_request_cookies() {
+        // Backlog line 145: pm.collectionVariables / pm.globals / pm.request /
+        // pm.cookies / pm.expect.fail / pm.test.skip / postman.setNextRequest
+        // were all missing — collections using them threw TypeError and failed
+        // the run. pm.request mutations must feed back through the bridges.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                // Variable-store stubs.
+                globalThis.__tropel_pm_collection_vars_get = function (k) {
+                    if (k === 'base') return '"https://api.example.com"';
+                    return null;
+                };
+                globalThis.__tropel_pm_collection_vars_set = function (k, v) { globalThis.__cv_set = k + '=' + v; };
+                globalThis.__tropel_pm_collection_vars_unset = function (k) { globalThis.__cv_unset = k; };
+                globalThis.__tropel_pm_collection_vars_has = function (k) { return k === 'base'; };
+                globalThis.__tropel_pm_collection_vars_to_object = function () { return { base: '"x"', n: '3' }; };
+                globalThis.__tropel_pm_globals_get = function (k) { return k === 'g' ? '"global"' : null; };
+                globalThis.__tropel_pm_globals_set = function (k, v) { globalThis.__g_set = k + '=' + v; };
+                globalThis.__tropel_pm_globals_unset = function (k) { globalThis.__g_unset = k; };
+                globalThis.__tropel_pm_globals_has = function (k) { return k === 'g'; };
+                globalThis.__tropel_pm_globals_to_object = function () { return { g: '"global"' }; };
+                globalThis.__tropel_pm_environment_has = function (k) { return k === 'env'; };
+                globalThis.__tropel_pm_environment_to_object = function () { return { env: 'e' }; };
+
+                // pm.request stubs — capture what the shim sends back.
+                globalThis.__tropel_pm_request_url = function () { return 'http://x/old'; };
+                globalThis.__tropel_pm_request_url_set = function (u) { globalThis.__r_url = u; };
+                globalThis.__tropel_pm_request_method = function () { return 'GET'; };
+                globalThis.__tropel_pm_request_method_set = function (m) { globalThis.__r_method = m; };
+                globalThis.__tropel_pm_request_headers = function () { return { Authorization: 'Bearer old' }; };
+                globalThis.__tropel_pm_request_header_get = function (k) { return k.toLowerCase() === 'authorization' ? 'Bearer old' : null; };
+                globalThis.__tropel_pm_request_header_set = function (k, v) { globalThis.__r_hdr = k + '=' + v; };
+                globalThis.__tropel_pm_request_header_unset = function (k) { globalThis.__r_hdr_unset = k; };
+                globalThis.__tropel_pm_request_body = function () { return 'old-body'; };
+                globalThis.__tropel_pm_request_body_set = function (b) { globalThis.__r_body = b; };
+                globalThis.__tropel_pm_request_auth_set = function (a) { globalThis.__r_auth = a; };
+
+                // Response cookies + test-skip + setNextRequest stubs.
+                globalThis.__tropel_pm_response_cookies = function () { return { sid: 'abc' }; };
+                globalThis.__tropel_pm_test_skip = function (n) { globalThis.__skipped = n; };
+                globalThis.__tropel_pm_set_next_request = function (n) { globalThis.__next_req = n; };
+
+                // collectionVariables / globals surface.
+                globalThis.__cv_get = pm.collectionVariables.get('base');
+                globalThis.__cv_has = pm.collectionVariables.has('base');
+                globalThis.__cv_obj = JSON.stringify(pm.collectionVariables.toObject());
+                pm.collectionVariables.set('k', 'v');
+                pm.collectionVariables.unset('k');
+                globalThis.__g_get = pm.globals.get('g');
+                globalThis.__g_has = pm.globals.has('g');
+                globalThis.__env_has = pm.environment.has('env');
+                globalThis.__env_obj = JSON.stringify(pm.environment.toObject());
+
+                // pm.request mutation idioms. Capture AFTER each write so
+                // later calls (upsert/remove) can't clobber the captured value.
+                pm.request.url = 'http://x/new';
+                globalThis.__r_url = globalThis.__r_url;
+                pm.request.method = 'POST';
+                globalThis.__r_method = globalThis.__r_method;
+                pm.request.headers.add({ key: 'Authorization', value: 'Bearer new' });
+                globalThis.__r_hdr_add = globalThis.__r_hdr;
+                pm.request.headers.upsert({ key: 'X-Extra', value: '1' });
+                globalThis.__r_hdr_upsert = globalThis.__r_hdr;
+                pm.request.headers.remove('X-Extra');
+                globalThis.__r_hdr_unset = globalThis.__r_hdr_unset;
+                pm.request.body = 'new-body';
+                pm.request.body.raw = 'raw-body';
+                globalThis.__r_body = globalThis.__r_body;
+                pm.request.auth = { type: 'bearer', token: 't' };
+                globalThis.__r_auth = globalThis.__r_auth;
+                globalThis.__r_get_hdr = pm.request.headers.get('authorization');
+                // Canonical Postman body idiom: pm.request.body.raw = ...
+                globalThis.__r_body_raw = pm.request.body.raw;
+
+                // pm.cookies surface.
+                globalThis.__ck_get = pm.cookies.get('sid');
+                globalThis.__ck_has = pm.cookies.has('sid');
+                globalThis.__ck_obj = JSON.stringify(pm.cookies.toObject());
+
+                // pm.expect.fail always throws.
+                globalThis.__expect_fail_threw = String((function () {
+                    try { pm.expect.fail('boom'); return 'no'; } catch (e) { return 'threw'; }
+                })());
+
+                // pm.test.skip records without running.
+                pm.test.skip('slow-test');
+
+                // postman.setNextRequest legacy global delegates.
+                postman.setNextRequest('login');
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(ctx.eval::<String, _>("__cv_get").unwrap(), "https://api.example.com", "pm.collectionVariables.get");
+            assert!(ctx.eval::<bool, _>("__cv_has").unwrap(), "pm.collectionVariables.has");
+            assert_eq!(ctx.eval::<String, _>("__cv_obj").unwrap(), r#"{"base":"x","n":3}"#, "toObject must JSON-decode values");
+            assert_eq!(ctx.eval::<String, _>("__cv_set").unwrap(), "k=v", "collectionVariables.set must reach the bridge");
+            assert_eq!(ctx.eval::<String, _>("__cv_unset").unwrap(), "k", "collectionVariables.unset must reach the bridge");
+            assert_eq!(ctx.eval::<String, _>("__g_get").unwrap(), "global", "pm.globals.get");
+            assert!(ctx.eval::<bool, _>("__g_has").unwrap(), "pm.globals.has");
+            assert!(ctx.eval::<bool, _>("__env_has").unwrap(), "pm.environment.has");
+            assert_eq!(ctx.eval::<String, _>("__env_obj").unwrap(), r#"{"env":"e"}"#, "environment.toObject");
+
+            assert_eq!(ctx.eval::<String, _>("__r_url").unwrap(), "http://x/new", "pm.request.url setter must reach the bridge");
+            assert_eq!(ctx.eval::<String, _>("__r_method").unwrap(), "POST", "pm.request.method setter must reach the bridge");
+            assert_eq!(ctx.eval::<String, _>("__r_hdr_add").unwrap(), "Authorization=Bearer new", "pm.request.headers.add must reach the bridge");
+            assert_eq!(ctx.eval::<String, _>("__r_hdr_upsert").unwrap(), "X-Extra=1", "pm.request.headers.upsert must reach the bridge");
+            assert_eq!(ctx.eval::<String, _>("__r_hdr_unset").unwrap(), "X-Extra", "pm.request.headers.remove must reach the bridge");
+            assert_eq!(ctx.eval::<String, _>("__r_body").unwrap(), "raw-body", "pm.request.body setter must reach the bridge (last write: body.raw)");
+            assert_eq!(ctx.eval::<String, _>("__r_body_raw").unwrap(), "old-body", "pm.request.body.raw getter must read through the bridge");
+            assert_eq!(ctx.eval::<String, _>("__r_auth").unwrap(), r#"{"type":"bearer","token":"t"}"#, "pm.request.auth must JSON-encode the config");
+            assert_eq!(ctx.eval::<String, _>("__r_get_hdr").unwrap(), "Bearer old", "pm.request.headers.get must be case-insensitive");
+
+            assert_eq!(ctx.eval::<String, _>("__ck_get").unwrap(), "abc", "pm.cookies.get");
+            assert!(ctx.eval::<bool, _>("__ck_has").unwrap(), "pm.cookies.has");
+            assert_eq!(ctx.eval::<String, _>("__ck_obj").unwrap(), r#"{"sid":"abc"}"#, "pm.cookies.toObject");
+            assert_eq!(ctx.eval::<String, _>("__expect_fail_threw").unwrap(), "threw", "pm.expect.fail must always throw");
+            assert_eq!(ctx.eval::<String, _>("__skipped").unwrap(), "slow-test", "pm.test.skip must record via the bridge");
+            assert_eq!(ctx.eval::<String, _>("__next_req").unwrap(), "login", "postman.setNextRequest must delegate");
+        });
+    }
+
+    #[test]
+    fn test_pm_response_to_be_status_classes() {
+        // Backlog line 145: pm.response.to.be.* — the chai-postman status-class
+        // getters and to.have.header/body/jsonBody. Getters THROW on failure
+        // (so pm.test() records the single failed check).
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_pm_response_code = function () { return 404; };
+                globalThis.__tropel_pm_response_header = function (k) {
+                    if (String(k).toLowerCase() === 'content-type') return 'application/json';
+                    return null;
+                };
+                globalThis.__tropel_pm_response_headers = function () {
+                    return { 'Content-Type': 'application/json' };
+                };
+                globalThis.__tropel_pm_response_json = function () { return '{"a":1}'; };
+                globalThis.__tropel_pm_response_body = function () { return 'not found'; };
+
+                globalThis.__be_success = String((function () {
+                    try { pm.response.to.be.success; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__be_client_error = String((function () {
+                    try { pm.response.to.be.clientError; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__be_server_error = String((function () {
+                    try { pm.response.to.be.serverError; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__be_error = String((function () {
+                    try { pm.response.to.be.error; return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__be_json = String((function () {
+                    try { pm.response.to.be.json(); return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__have_hdr = String((function () {
+                    try { pm.response.to.have.header('Content-Type', 'application/json'); return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__have_body = String((function () {
+                    try { pm.response.to.have.body('not'); return 'passed'; } catch (e) { return 'threw'; }
+                })());
+                globalThis.__have_json_body = String((function () {
+                    try { pm.response.to.have.jsonBody({ a: 1 }); return 'passed'; } catch (e) { return 'threw'; }
+                })());
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(ctx.eval::<String, _>("__be_success").unwrap(), "threw", "404 must NOT be success");
+            assert_eq!(ctx.eval::<String, _>("__be_client_error").unwrap(), "passed", "404 must be clientError");
+            assert_eq!(ctx.eval::<String, _>("__be_server_error").unwrap(), "threw", "404 must NOT be serverError");
+            assert_eq!(ctx.eval::<String, _>("__be_error").unwrap(), "passed", "404 must be error (>=400)");
+            assert_eq!(ctx.eval::<String, _>("__be_json").unwrap(), "passed", "content-type json + valid body must pass to.be.json()");
+            assert_eq!(ctx.eval::<String, _>("__have_hdr").unwrap(), "passed", "to.have.header must pass when header matches");
+            assert_eq!(ctx.eval::<String, _>("__have_body").unwrap(), "passed", "to.have.body must pass when substring present");
+            assert_eq!(ctx.eval::<String, _>("__have_json_body").unwrap(), "passed", "to.have.jsonBody must deep-compare");
+        });
+    }
+
+    #[test]
     fn test_exec_selection_installs_named_export() {
         // A scenario naming `exec: "browse"` must run the `browse` export,
         // NOT the default export (k6 multi-scenario semantics).
