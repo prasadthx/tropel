@@ -576,8 +576,20 @@ K6Socket.prototype.close = function (code, reason) {
     if (typeof __tropel_k6_ws_close !== 'function') {
         throw new Error('ws.close requires the native ws bridge (__tropel_k6_ws_close)');
     }
-    __tropel_k6_ws_close(this._id, code || 1000, reason || '');
-    this._closed = true;
+    var closeCode = code || 1000;
+    var closeReason = reason || '';
+    __tropel_k6_ws_close(this._id, closeCode, closeReason);
+    // Backlog line 148: a LOCAL close() must still dispatch the 'close'
+    // handler. The old code only set _closed, so the synchronous pump
+    // (while !settled && !socket._closed) exited at the next iteration and
+    // `socket.on('close', ...)` never fired — the k6 idiom of calling
+    // socket.close() inside on('open')/'message' leaked the final cleanup
+    // callback. Guarded so a server-close that already fired the handler
+    // can't double-dispatch.
+    if (!this._closed) {
+        this._closed = true;
+        this._emit('close', closeCode, closeReason);
+    }
     return this;
 };
 
@@ -656,9 +668,17 @@ ws.connect = function (url, params, callback) {
             } else if (evt.type === 'pong') {
                 socket._emit('pong');
             } else if (evt.type === 'close') {
+                // Mark closed BEFORE dispatching so a defensive
+                // socket.close() inside the close handler cannot
+                // double-dispatch (backlog line 148: _closed is the
+                // authoritative flag for both local and remote closes).
+                socket._closed = true;
                 socket._emit('close', evt.code, evt.reason);
                 settled = true;
             } else if (evt.type === 'error') {
+                // Same guard: once errored, a later local close() must not
+                // fire 'close' a second time.
+                socket._closed = true;
                 socket._emit('error', evt.message);
                 settled = true;
             }

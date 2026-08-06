@@ -3929,6 +3929,127 @@ mod tests {
     }
 
     #[test]
+    fn test_ws_local_close_dispatches_close_handler() {
+        // Backlog line 148: the event-driven k6/ws API (socket.on/send/ping/
+        // close/setTimeout + native __tropel_k6_ws_* bridges) is implemented,
+        // but a LOCAL socket.close() only set _closed — the synchronous pump
+        // then exited at the next iteration and `socket.on('close', ...)`
+        // never fired. The k6 idiom of closing inside on('open')/'message'
+        // leaked the final cleanup callback.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+                .expect("k6 shim should eval");
+            // Stub the native ws bridges — no real socket needed.
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__ws_step_calls = 0;
+                globalThis.__tropel_k6_ws_connect = function (url, headersJson) {
+                    return JSON.stringify({ id: 42, error: null });
+                };
+                globalThis.__tropel_k6_ws_step = function (id, timeoutMs) {
+                    globalThis.__ws_step_calls++;
+                    // First step delivers 'open'; a local close() ends the
+                    // pump right after, so later steps are never reached.
+                    if (globalThis.__ws_step_calls === 1) {
+                        return JSON.stringify({ type: 'open' });
+                    }
+                    return JSON.stringify({ type: 'none' });
+                };
+                globalThis.__tropel_k6_ws_send = function (id, data) { globalThis.__ws_sent = data; return '{"ok":true}'; };
+                globalThis.__tropel_k6_ws_ping = function (id) { globalThis.__ws_pinged = true; return '{"ok":true}'; };
+                globalThis.__tropel_k6_ws_close = function (id, code, reason) {
+                    globalThis.__ws_close_bridge = code + ':' + reason;
+                    return '{"ok":true}';
+                };
+                globalThis.__tropel_k6_ws_finish = function (id) { globalThis.__ws_finished = id; return '{"ok":true}'; };
+
+                globalThis.__ws_close_events = [];
+                var ret = ws.connect('ws://localhost:1/', {}, function (socket) {
+                    socket.on('open', function () {
+                        socket.send('hi');
+                        socket.ping();
+                        socket.close(1000, 'bye');
+                    });
+                    socket.on('close', function (code, reason) {
+                        globalThis.__ws_close_events.push(code + ':' + reason);
+                    });
+                });
+                // ws.connect returns the socket (k6 semantics).
+                globalThis.__ret_is_socket = ret && typeof ret.on === 'function';
+                // Capture BEFORE the second scenario runs (its defensive
+                // socket.close() would otherwise clobber __ws_close_bridge
+                // via the unconditional native bridge call).
+                globalThis.__ws_close_bridge_a = globalThis.__ws_close_bridge;
+
+                // Second scenario: SERVER closes first, and the close handler
+                // defensively calls socket.close() again. The pump marks the
+                // socket closed BEFORE dispatching, so 'close' must fire once.
+                globalThis.__ws_step_calls = 0;
+                globalThis.__tropel_k6_ws_step = function (id, timeoutMs) {
+                    globalThis.__ws_step_calls++;
+                    if (globalThis.__ws_step_calls === 1) {
+                        return JSON.stringify({ type: 'close', code: 1006, reason: 'server gone' });
+                    }
+                    return JSON.stringify({ type: 'none' });
+                };
+                globalThis.__ws_close2 = [];
+                ws.connect('ws://localhost:2/', {}, function (socket) {
+                    socket.on('close', function (code, reason) {
+                        globalThis.__ws_close2.push(code + ':' + reason);
+                        socket.close(1000, 'defensive'); // must not double-dispatch
+                    });
+                });
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(
+                ctx.eval::<String, _>("__ws_close_bridge_a").unwrap(),
+                "1000:bye",
+                "native close bridge must receive code+reason"
+            );
+            let close_events: String = ctx
+                .eval("JSON.stringify(__ws_close_events)")
+                .expect("read close events");
+            assert_eq!(
+                close_events, "[\"1000:bye\"]",
+                "local close() must dispatch the close handler exactly once: {close_events}"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__ws_sent").unwrap(),
+                "hi",
+                "socket.send must reach the native bridge"
+            );
+            assert!(
+                ctx.eval::<bool, _>("__ws_pinged").unwrap(),
+                "socket.ping must reach the native bridge"
+            );
+            assert_eq!(
+                ctx.eval::<i64, _>("__ws_finished").unwrap(),
+                42,
+                "ws.connect must tear the session down in its finally block"
+            );
+            assert!(
+                ctx.eval::<bool, _>("__ret_is_socket").unwrap(),
+                "ws.connect must return the K6Socket"
+            );
+            assert!(
+                ctx.eval::<i64, _>("__ws_step_calls").unwrap() >= 1,
+                "event pump must have run"
+            );
+            let close2_events: String = ctx
+                .eval("JSON.stringify(__ws_close2)")
+                .expect("read server-close events");
+            assert_eq!(
+                close2_events, "[\"1006:server gone\"]",
+                "server close must dispatch once even with a defensive user close(): {close2_events}"
+            );
+        });
+    }
+
+    #[test]
     fn test_pm_response_to_be_status_classes() {
         // Backlog line 145: pm.response.to.be.* — the chai-postman status-class
         // getters and to.have.header/body/jsonBody. Getters THROW on failure
