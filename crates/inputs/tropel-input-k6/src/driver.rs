@@ -50,7 +50,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tropel_js::JsContext;
-use tropel_sdk::{AuthConfig, Body, Method, Request, Response, Sample, SampleType, TagMap};
+use tropel_sdk::{AuthConfig, Body, Method, Request, Response, Sample, SampleType, TagMap, Timings};
 use tropel_sdk::{Driver, DriverDeclaredOptions, DriverHttpClient, DriverInstance, DriverRegistration, VuContext};
 use tropel_sdk::{Result, TropelError};
 
@@ -693,6 +693,7 @@ fn push_http_samples(
     duration: Duration,
     size: u64,
     sent: usize,
+    timings: Option<&Timings>,
     scenario: &Arc<str>,
     extra_tags: Option<&HashMap<String, String>>,
 ) {
@@ -704,6 +705,7 @@ fn push_http_samples(
         duration,
         size,
         sent,
+        timings,
         scenario,
         extra_tags,
     );
@@ -729,6 +731,7 @@ fn push_redirect_hops(
             hop.response_time,
             hop.size,
             0, // redirect hops carry no request body
+            hop.timings.as_ref(),
             scenario,
             extra_tags,
         );
@@ -745,6 +748,7 @@ fn push_http_samples_for(
     duration: Duration,
     size: u64,
     sent: usize,
+    timings: Option<&Timings>,
     scenario: &Arc<str>,
     extra_tags: Option<&HashMap<String, String>>,
 ) {
@@ -766,6 +770,32 @@ fn push_http_samples_for(
         timestamp: now,
         sample_type: SampleType::Trend,
     });
+    // Backlog line 150: the k6 path now emits the same connection-phase
+    // sub-timing samples as the declarative runner — real blocked/dns/
+    // connecting/waiting/receiving (from reqwest's resolver + connector
+    // hooks); tls_handshaking/sending stay 0 (folded into connecting /
+    // waiting by reqwest, same as the declarative path). Emitted with the
+    // same tags so thresholds like http_req_waiting:p(95) resolve.
+    if let Some(t) = timings {
+        let sub = [
+            ("http_req_blocked", t.blocked),
+            ("http_req_dns", t.dns),
+            ("http_req_connecting", t.connecting),
+            ("http_req_tls_handshaking", t.tls_handshaking),
+            ("http_req_sending", t.sending),
+            ("http_req_waiting", t.waiting),
+            ("http_req_receiving", t.receiving),
+        ];
+        for (name, dur) in &sub {
+            v.push(Sample {
+                metric: (*name).into(),
+                value: dur.as_micros() as f64,
+                tags: tags.clone(),
+                timestamp: now,
+                sample_type: SampleType::Trend,
+            });
+        }
+    }
     v.push(Sample {
         metric: "http_reqs".into(),
         value: 1.0,
@@ -818,6 +848,31 @@ fn compress_k6_body(kind: &str, data: &[u8]) -> Option<Vec<u8>> {
         enc.finish().ok()
     } else {
         None
+    }
+}
+
+/// k6-style error codes for `res.error_code`. k6 defines a 1xxx series:
+/// 1000 generic, 1010 non-TCP network error, 1020 malformed HTTP, 1050
+/// timeout, 1100 DNS, 1200 TCP connect, 1300 TLS, 1600 HTTP/2, 1990
+/// unknown. reqwest surfaces most failures as strings, so we map by
+/// substring (best-effort, k6 parity for the common `if (res.error)` idiom
+/// plus `res.error_code` for programmatic branching).
+fn k6_error_code(msg: &str) -> i32 {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("dns") || m.contains("nodename") || m.contains("resolve") {
+        1100
+    } else if m.contains("timed out") || m.contains("timeout") || m.contains("deadline") {
+        1050
+    } else if m.contains("tls") || m.contains("certificate") || m.contains("handshake") {
+        1300
+    } else if m.contains("http2") || m.contains("h2") {
+        1600
+    } else if m.contains("connect") || m.contains("refused") || m.contains("reset") {
+        1200
+    } else if m.contains("url") || m.contains("uri") {
+        1010
+    } else {
+        1000
     }
 }
 
@@ -969,25 +1024,58 @@ impl DriverInstance for K6DriverInstance {
 /// `res.json()` parse). `Object::new` + `set` materialize the envelope
 /// directly in the JS heap; the body becomes a single JS string. The shim
 /// treats a native object and the legacy JSON string identically.
+///
+/// Backlog line 150: the object now carries REAL `timings` (blocked/dns/
+/// connecting/tls_handshaking/sending/waiting/receiving/duration in ms, from
+/// the reqwest resolver+connector hooks), k6's `error` ("" on success) /
+/// `error_code` (0 on success, 1xxx series on transport failure), and for
+/// `responseType: "binary"` the body is a native JS ArrayBuffer instead of a
+/// UTF-8 string (binary payloads are no longer silently destroyed).
 fn build_k6_response_object<'js>(
     ctx: &rquickjs::Ctx<'js>,
     code: u16,
     status_text: String,
-    body: String,
+    body: Vec<u8>,
     headers: &HashMap<String, String>,
     response_time_ms: f64,
+    timings: Option<&Timings>,
+    error: &str,
+    error_code: i32,
+    response_type: &str,
 ) -> rquickjs::Object<'js> {
     let obj = rquickjs::Object::new(ctx.clone()).expect("Object::new for k6 response");
     let _ = obj.set("code", code as i32);
     let _ = obj.set("status", code as i32);
     let _ = obj.set("status_text", status_text);
-    let _ = obj.set("body", body);
+    let _ = obj.set("error", error);
+    let _ = obj.set("error_code", error_code);
     let headers_obj = rquickjs::Object::new(ctx.clone()).expect("Object::new for k6 headers");
     for (k, v) in headers {
         let _ = headers_obj.set(k.as_str(), v.as_str());
     }
     let _ = obj.set("headers", headers_obj);
     let _ = obj.set("response_time", response_time_ms);
+    // Real connection-phase timings (k6 keys + Tropel's extra `dns`).
+    if let Some(t) = timings {
+        let timings_obj = rquickjs::Object::new(ctx.clone()).expect("Object::new for k6 timings");
+        let _ = timings_obj.set("blocked", t.blocked.as_secs_f64() * 1000.0);
+        let _ = timings_obj.set("dns", t.dns.as_secs_f64() * 1000.0);
+        let _ = timings_obj.set("connecting", t.connecting.as_secs_f64() * 1000.0);
+        let _ = timings_obj.set("tls_handshaking", t.tls_handshaking.as_secs_f64() * 1000.0);
+        let _ = timings_obj.set("sending", t.sending.as_secs_f64() * 1000.0);
+        let _ = timings_obj.set("waiting", t.waiting.as_secs_f64() * 1000.0);
+        let _ = timings_obj.set("receiving", t.receiving.as_secs_f64() * 1000.0);
+        let _ = timings_obj.set("duration", response_time_ms);
+        let _ = obj.set("timings", timings_obj);
+    }
+    // `responseType: "binary"` → native ArrayBuffer body (raw bytes survive);
+    // otherwise UTF-8 text. `none` (k6) sends an empty body.
+    if response_type.eq_ignore_ascii_case("binary") {
+        let ab = rquickjs::ArrayBuffer::new(ctx.clone(), body).expect("ArrayBuffer for k6 binary body");
+        let _ = obj.set("body", ab);
+    } else {
+        let _ = obj.set("body", String::from_utf8_lossy(&body).into_owned());
+    }
     obj
 }
 
@@ -1093,14 +1181,29 @@ fn register_http_bridges<'js>(
                             .and_then(|c| c.as_str())
                             .unwrap_or("")
                             .to_string();
+                        // Backlog line 150: the shim base64-encodes binary
+                        // request bodies (ArrayBuffer / Uint8Array / http.file
+                        // data) and flags bodyB64 — the bridge is arity-capped
+                        // at String, so raw bytes ride as base64 and are
+                        // decoded here to Body::Binary.
+                        let body_b64: bool = extras
+                            .get("bodyB64")
+                            .and_then(|b| b.as_bool())
+                            .unwrap_or(false);
 
                         let mut headers = parse_headers_tolerant(&headers_json);
                         // k6 params.compression: "gzip" / "deflate" — compress
                         // the request body and stamp Content-Encoding. Only
                         // when a body exists (k6 compresses the body, and an
                         // empty-body GET has nothing to compress).
-                        let mut req_body = if body.is_empty() {
+                        let mut req_body: Option<Body> = if body.is_empty() {
                             None
+                        } else if body_b64 {
+                            use base64::Engine as _;
+                            base64::engine::general_purpose::STANDARD
+                                .decode(&body)
+                                .ok()
+                                .map(Body::Binary)
                         } else {
                             Some(Body::Raw(body))
                         };
@@ -1136,9 +1239,13 @@ fn register_http_bridges<'js>(
                                 &ctx,
                                 0,
                                 format!("invalid HTTP method {}", method),
-                                String::new(),
+                                Vec::new(),
                                 &HashMap::new(),
                                 0.0,
+                                None,
+                                &format!("invalid HTTP method {}", method),
+                                1000,
+                                &response_type,
                             );
                         };
                         let req = Request {
@@ -1199,6 +1306,7 @@ fn register_http_bridges<'js>(
                                     resp.response_time,
                                     resp.size,
                                     sent,
+                                    resp.timings.as_ref(),
                                     &scenario_req,
                                     Some(&extra_tags),
                                 );
@@ -1206,21 +1314,30 @@ fn register_http_bridges<'js>(
                                     &ctx,
                                     resp.status_code,
                                     resp.status_text,
-                                    String::from_utf8(resp.body).unwrap_or_default(),
+                                    resp.body,
                                     &resp.headers,
                                     resp.response_time.as_secs_f64() * 1000.0,
+                                    resp.timings.as_ref(),
+                                    "",
+                                    0,
+                                    &response_type,
                                 )
                             }
                             Err(e) => {
                                 tracing::debug!("k6 http request failed: {}", e);
                                 push_http_failure(&sink_req, &req, &scenario_req, Some(&extra_tags));
+                                let err = e.to_string();
                                 build_k6_response_object(
                                     &ctx,
                                     0,
-                                    format!("HTTP error: {}", e),
-                                    String::new(),
+                                    format!("HTTP error: {}", err),
+                                    Vec::new(),
                                     &HashMap::new(),
                                     0.0,
+                                    None,
+                                    &err,
+                                    k6_error_code(&err),
+                                    &response_type,
                                 )
                             }
                         }
@@ -1289,8 +1406,20 @@ fn register_http_bridges<'js>(
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
-                        let mut request_body = if body.is_empty() {
+                        // Backlog line 150: binary batch bodies arrive base64
+                        // (the shim flags body_b64), decoded here to raw bytes.
+                        let body_b64: bool = entry
+                            .get("body_b64")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let mut request_body: Option<Body> = if body.is_empty() {
                             None
+                        } else if body_b64 {
+                            use base64::Engine as _;
+                            base64::engine::general_purpose::STANDARD
+                                .decode(&body)
+                                .ok()
+                                .map(Body::Binary)
                         } else {
                             Some(Body::Raw(body))
                         };
@@ -1396,29 +1525,66 @@ fn register_http_bridges<'js>(
                                         resp.response_time,
                                         resp.size,
                                         sent,
+                                        resp.timings.as_ref(),
                                         &scenario_batch,
                                         Some(&extra_tags),
                                     );
-                                    let body_text = String::from_utf8(resp.body).unwrap_or_default();
-                                    serde_json::json!({
+                                    // Backlog line 150: batch responses now
+                                    // carry real timings + error/error_code
+                                    // (k6 parity), and binary bodies arrive
+                                    // base64 (body_b64) since JSON can't hold
+                                    // raw bytes — the shim decodes to an
+                                    // ArrayBuffer. Timings serialize to ms.
+                                    let mut resp_json = serde_json::json!({
                                         "code": resp.status_code,
                                         "status": resp.status_code,
                                         "status_text": resp.status_text,
-                                        "body": body_text,
                                         "headers": resp.headers,
                                         "response_time": resp.response_time.as_secs_f64() * 1000.0,
-                                    })
+                                        "error": "",
+                                        "error_code": 0,
+                                    });
+                                    if let Some(t) = &resp.timings {
+                                        resp_json["timings"] = serde_json::json!({
+                                            "blocked": t.blocked.as_secs_f64() * 1000.0,
+                                            "dns": t.dns.as_secs_f64() * 1000.0,
+                                            "connecting": t.connecting.as_secs_f64() * 1000.0,
+                                            "tls_handshaking": t.tls_handshaking.as_secs_f64() * 1000.0,
+                                            "sending": t.sending.as_secs_f64() * 1000.0,
+                                            "waiting": t.waiting.as_secs_f64() * 1000.0,
+                                            "receiving": t.receiving.as_secs_f64() * 1000.0,
+                                            "duration": resp.response_time.as_secs_f64() * 1000.0,
+                                        });
+                                    }
+                                    // `response_type` (a &str borrowed from
+                                    // `entry`) is not capturable into this
+                                    // async block; the Request already carries
+                                    // the parsed ResponseType — use it.
+                                    if req.response_type == tropel_sdk::ResponseType::Binary {
+                                        use base64::Engine as _;
+                                        resp_json["body"] = serde_json::Value::String(
+                                            base64::engine::general_purpose::STANDARD.encode(&resp.body),
+                                        );
+                                        resp_json["body_b64"] = serde_json::Value::Bool(true);
+                                    } else {
+                                        resp_json["body"] =
+                                            serde_json::Value::String(String::from_utf8_lossy(&resp.body).into_owned());
+                                    }
+                                    resp_json
                                 }
                                 Err(e) => {
                                     tracing::debug!("k6 batch request failed: {}", e);
                                     push_http_failure(&batch_sink, &req, &scenario_batch, Some(&extra_tags));
+                                    let err = e.to_string();
                                     serde_json::json!({
                                         "code": 0,
                                         "status": 0,
-                                        "status_text": format!("HTTP error: {}", e),
+                                        "status_text": format!("HTTP error: {}", err),
                                         "body": "",
                                         "headers": {},
                                         "response_time": 0,
+                                        "error": err,
+                                        "error_code": k6_error_code(&err),
                                     })
                                 }
                             };
@@ -4141,6 +4307,234 @@ mod tests {
                 "throwing predicate must propagate (k6 fails the iteration)"
             );
         });
+    }
+
+    #[test]
+    fn test_timings_error_binary_and_http_file() {
+        // Backlog line 150: the k6 path emitted no sub-timing samples, res.
+        // timings.* were 0 except waiting/duration, res.error/error_code did
+        // not exist, binary bodies were destroyed (ArrayBuffer → ''), and
+        // http.file() was missing. This exercises the shim + bridge contract:
+        // real timings flow to res.timings, errors set res.error/error_code,
+        // binary responses become ArrayBuffer, and http.file() uploads base64
+        // bytes flagged bodyB64.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+                .expect("k6 shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__captured = null;
+                globalThis.__tropel_k6_http_request = function (method, url, headersJson, body, responseType, extrasJson) {
+                    globalThis.__captured = {
+                        method: method,
+                        url: url,
+                        body: body,
+                        responseType: responseType,
+                        extras: JSON.parse(extrasJson)
+                    };
+                    // Success path with real timings.
+                    return {
+                        code: 200,
+                        status: 200,
+                        status_text: 'OK',
+                        headers: { 'Content-Type': 'text/plain' },
+                        response_time: 150.0,
+                        error: '',
+                        error_code: 0,
+                        timings: {
+                            blocked: 1.0, dns: 2.0, connecting: 3.0,
+                            tls_handshaking: 0, sending: 0,
+                            waiting: 100.0, receiving: 50.0, duration: 150.0
+                        },
+                        body: 'hello'
+                    };
+                };
+
+                // 1) Real timings + error/error_code on success.
+                var res1 = http.get('http://example.com/');
+                globalThis.__t_waiting = res1.timings.waiting;
+                globalThis.__t_blocked = res1.timings.blocked;
+                globalThis.__t_receiving = res1.timings.receiving;
+                globalThis.__err = res1.error;
+                globalThis.__ecode = res1.error_code;
+
+                // 2) Binary response body via body_b64 → ArrayBuffer.
+                var b64bytes = '';
+                // base64("\x00\x01\xFF") = "AAH/"
+                globalThis.__tropel_k6_http_request = function (m, u, h, b, rt, ex) {
+                    return { code: 200, status_text: 'OK', headers: {}, response_time: 5,
+                             body: 'AAH/', body_b64: true, error: '', error_code: 0 };
+                };
+                var res2 = http.get('http://example.com/bin', { responseType: 'binary' });
+                globalThis.__bin = res2.body instanceof ArrayBuffer;
+                globalThis.__bin_len = res2.body instanceof ArrayBuffer ? res2.body.byteLength : -1;
+                var bytes = new Uint8Array(res2.body);
+                globalThis.__bin_0 = bytes[0];
+                globalThis.__bin_1 = bytes[1];
+                globalThis.__bin_2 = bytes[2];
+
+                // 3) http.file() with binary data → base64 + bodyB64 flag.
+                var file = http.file(new Uint8Array([104, 105, 33]), 'hello.bin', 'application/octet-stream');
+                globalThis.__file_data_len = file.data.byteLength;
+                globalThis.__file_name = file.filename;
+                globalThis.__file_ct = file.content_type;
+                // Re-arm the CAPTURING stub before the upload: the binary
+                // stub above does not capture, so reading __captured here
+                // without re-arming would see the stale GET from step 1.
+                globalThis.__tropel_k6_http_request = function (method, url, headersJson, body, responseType, extrasJson) {
+                    globalThis.__captured = {
+                        method: method,
+                        url: url,
+                        body: body,
+                        responseType: responseType,
+                        extras: JSON.parse(extrasJson)
+                    };
+                    return { code: 200, status_text: 'OK', headers: {}, response_time: 5,
+                             error: '', error_code: 0, body: 'ok' };
+                };
+                http.post('http://example.com/upload', file);
+                globalThis.__up_body = globalThis.__captured.body;
+                globalThis.__up_b64 = globalThis.__captured.extras.bodyB64;
+
+                // 4) Transport failure → res.error / res.error_code set.
+                globalThis.__tropel_k6_http_request = function (m, u, h, b, rt, ex) {
+                    return { code: 0, status: 0, status_text: 'HTTP error: dns lookup failed',
+                             headers: {}, response_time: 0, error: 'dns lookup failed',
+                             error_code: 1100, body: '' };
+                };
+                var res3 = http.get('http://nope.invalid/');
+                globalThis.__err3 = res3.error;
+                globalThis.__ecode3 = res3.error_code;
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(
+                ctx.eval::<f64, _>("__t_waiting").unwrap(),
+                100.0,
+                "res.timings.waiting must carry the REAL TTFB (was duration)"
+            );
+            assert_eq!(
+                ctx.eval::<f64, _>("__t_blocked").unwrap(),
+                1.0,
+                "res.timings.blocked must carry the real pool-wait value"
+            );
+            assert_eq!(
+                ctx.eval::<f64, _>("__t_receiving").unwrap(),
+                50.0,
+                "res.timings.receiving must carry the real body-receive value"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__err").unwrap(),
+                "",
+                "res.error must be '' on success (k6 parity)"
+            );
+            assert_eq!(
+                ctx.eval::<i64, _>("__ecode").unwrap(),
+                0,
+                "res.error_code must be 0 on success (k6 parity)"
+            );
+            assert!(
+                ctx.eval::<bool, _>("__bin").unwrap(),
+                "binary response body must surface as an ArrayBuffer"
+            );
+            assert_eq!(
+                ctx.eval::<i64, _>("__bin_len").unwrap(),
+                3,
+                "binary response body must keep its byte length"
+            );
+            assert_eq!(ctx.eval::<i64, _>("__bin_0").unwrap(), 0, "byte 0");
+            assert_eq!(ctx.eval::<i64, _>("__bin_1").unwrap(), 1, "byte 1");
+            assert_eq!(ctx.eval::<i64, _>("__bin_2").unwrap(), 255, "byte 2");
+            assert_eq!(
+                ctx.eval::<i64, _>("__file_data_len").unwrap(),
+                3,
+                "http.file().data must keep the raw bytes"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__file_name").unwrap(),
+                "hello.bin",
+                "http.file() must preserve the filename"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__file_ct").unwrap(),
+                "application/octet-stream",
+                "http.file() must preserve the content type"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__up_body").unwrap(),
+                "aGkh",
+                "http.file() binary upload must base64-encode the bytes for the bridge"
+            );
+            assert!(
+                ctx.eval::<bool, _>("__up_b64").unwrap(),
+                "binary upload must flag bodyB64 so Rust decodes to raw bytes"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__err3").unwrap(),
+                "dns lookup failed",
+                "transport failure must set res.error (k6 `if (res.error)` idiom)"
+            );
+            assert_eq!(
+                ctx.eval::<i64, _>("__ecode3").unwrap(),
+                1100,
+                "transport failure must set a k6-style error_code (DNS=1100)"
+            );
+        });
+    }
+
+    #[test]
+    fn test_push_http_samples_emits_sub_timing_metrics() {
+        // Backlog line 150: the k6 path emitted ONLY http_req_duration /
+        // http_reqs / http_req_failed / data_* — no waiting/blocked/connecting
+        // samples, so k6 thresholds like http_req_waiting:p(95) could never
+        // resolve. push_http_samples_for now emits all seven connection-phase
+        // Trend samples from the real Timings.
+        let sink = std::sync::Mutex::new(Vec::<Sample>::new());
+        let scenario: Arc<str> = Arc::from("s");
+        let timings = Timings {
+            blocked: Duration::from_micros(100),
+            dns: Duration::from_micros(200),
+            connecting: Duration::from_micros(300),
+            tls_handshaking: Duration::ZERO,
+            sending: Duration::ZERO,
+            waiting: Duration::from_micros(4000),
+            receiving: Duration::from_micros(500),
+            total: Duration::from_micros(5100),
+        };
+        push_http_samples_for(
+            &sink,
+            "http://example.com/",
+            "GET",
+            200,
+            Duration::from_micros(5100),
+            42,
+            7,
+            Some(&timings),
+            &scenario,
+            None,
+        );
+        let samples = sink.lock().unwrap();
+        let names: Vec<&str> = samples.iter().map(|s| s.metric.as_ref()).collect();
+        for m in [
+            "http_req_duration",
+            "http_req_blocked",
+            "http_req_dns",
+            "http_req_connecting",
+            "http_req_tls_handshaking",
+            "http_req_sending",
+            "http_req_waiting",
+            "http_req_receiving",
+        ] {
+            assert!(names.contains(&m), "k6 path must emit {m}, got {names:?}");
+        }
+        let waiting = samples.iter().find(|s| s.metric == "http_req_waiting").unwrap();
+        assert_eq!(waiting.value, 4000.0, "waiting must carry the microsecond TTFB");
+        let blocked = samples.iter().find(|s| s.metric == "http_req_blocked").unwrap();
+        assert_eq!(blocked.value, 100.0, "blocked must carry the microsecond pool-wait");
+        assert_eq!(samples.len(), 12, "5 base + 7 sub-timing samples");
     }
 
     #[test]

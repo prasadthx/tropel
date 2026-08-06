@@ -50,7 +50,9 @@ function k6HTTPRequest(method, url, body, params) {
                 tags: canonical.tags,
                 auth: canonical.auth,
                 redirects: canonical.redirects,
-                compression: canonical.compression
+                compression: canonical.compression,
+                // Backlog line 150: binary request bodies ride as base64.
+                bodyB64: canonical.bodyB64
             })
         );
     } else if (typeof __tropel_pm_send_request === 'function') {
@@ -89,6 +91,14 @@ function k6HTTPRequest(method, url, body, params) {
     var respHeaders = result.headers || {};
     var respTime = result.responseTime || result.response_time || 0;
 
+    // Backlog line 150: batch responses with binary bodies carry base64 +
+    // body_b64 (JSON can't hold raw bytes) — decode to an ArrayBuffer so
+    // res.body instanceof ArrayBuffer behaves like the native single-request
+    // bridge (which sets a real ArrayBuffer directly).
+    if (result.body_b64 && typeof respBody === 'string' && respBody !== '') {
+        respBody = base64ToBytes(respBody).buffer;
+    }
+
     // Normalize headers from {key: value} or array format into a fresh
     // object. Keys are kept EXACTLY as the native bridge delivered them (Go
     // MIME canonical form: Content-Type, X-Request-Id) — the old
@@ -112,7 +122,10 @@ function k6HTTPRequest(method, url, body, params) {
         }
     }
 
-    var timings = {
+    // Backlog line 150: prefer the REAL connection-phase timings the native
+    // bridge now delivers; fall back to the old duration-only approximation
+    // when a legacy/PM bridge returns no timings object.
+    var timings = result.timings || {
         blocked: 0,
         connecting: 0,
         tls_handshaking: 0,
@@ -121,8 +134,26 @@ function k6HTTPRequest(method, url, body, params) {
         receiving: 0,
         duration: respTime
     };
+    // Ensure every k6 key exists (native timings include Tropel's extra dns).
+    if (typeof timings === 'object') {
+        timings = {
+            blocked: timings.blocked || 0,
+            connecting: timings.connecting || 0,
+            tls_handshaking: timings.tls_handshaking || 0,
+            sending: timings.sending || 0,
+            waiting: timings.waiting || respTime,
+            receiving: timings.receiving || 0,
+            duration: timings.duration || respTime
+        };
+    }
 
-    return new K6Response(respCode, respBody, normalizedHeaders, timings, url);
+    var resp = new K6Response(respCode, respBody, normalizedHeaders, timings, url);
+    // Backlog line 150: k6 Response.error ("" on success) / error_code (0 on
+    // success, 1xxx on transport failure) — `if (res.error)` now detects
+    // failures like k6.
+    resp.error = result.error || '';
+    resp.error_code = result.error_code || 0;
+    return resp;
 }
 
 function normalizeK6Request(method, url, body, params) {
@@ -186,6 +217,7 @@ function normalizeK6Request(method, url, body, params) {
         url: url,
         headers: serialized.headers,
         body: serialized.body,
+        bodyB64: serialized.binary,
         timeoutMs: timeoutMs,
         responseType: responseType,
         // Backlog line 140: tags/auth/redirects/compression were silently
@@ -235,18 +267,98 @@ function toAuthConfig(auth) {
     return null;
 }
 
+// Backlog line 150: http.file() — k6's binary-file body factory. Returns a
+// K6File with `data` (string | ArrayBuffer | Uint8Array), `filename`, and
+// `content_type`. Used directly as a body or inside a multipart object; the
+// bytes are base64-encoded for the native bridge (which decodes to raw).
+function K6File(data, filename, contentType) {
+    this.data = data;
+    this.filename = filename;
+    this.content_type = contentType;
+}
+
+function k6FileToBytes(file) {
+    var d = file.data;
+    if (typeof d === 'string') {
+        return { base64: false, text: d };
+    }
+    if (typeof Uint8Array !== 'undefined' && d instanceof Uint8Array) {
+        return { base64: true, bytes: d };
+    }
+    if (d instanceof ArrayBuffer) {
+        return { base64: true, bytes: new Uint8Array(d) };
+    }
+    return { base64: false, text: String(d) };
+}
+
+function bytesToBase64(bytes) {
+    var out = '';
+    for (var i = 0; i < bytes.length; i += 3) {
+        var b0 = bytes[i];
+        var b1 = i + 1 < bytes.length ? bytes[i + 1] : 0;
+        var b2 = i + 2 < bytes.length ? bytes[i + 2] : 0;
+        var n = (b0 << 16) | (b1 << 8) | b2;
+        out += 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'[n >> 18 & 63]
+            + 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'[n >> 12 & 63]
+            + 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'[n >> 6 & 63]
+            + 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'[n & 63];
+    }
+    var pad = bytes.length % 3;
+    if (pad === 1) out = out.slice(0, -2) + '==';
+    else if (pad === 2) out = out.slice(0, -1) + '=';
+    return out;
+}
+
+function base64ToBytes(b64) {
+    var alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    var out = new Uint8Array(Math.floor(b64.length * 3 / 4));
+    var o = 0, buffer = 0, bits = 0;
+    for (var i = 0; i < b64.length; i++) {
+        var c = b64[i];
+        if (c === '=') break;
+        var idx = alphabet.indexOf(c);
+        if (idx < 0) continue;
+        buffer = (buffer << 6) | idx;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out[o++] = (buffer >> bits) & 255;
+        }
+    }
+    return out.subarray(0, o);
+}
+
 function serializeK6Body(body, headers) {
     var bodyStr = '';
+    var bodyB64 = false;
     if (body !== null && body !== undefined) {
         if (typeof body === 'string') {
             bodyStr = body;
+        } else if (body instanceof K6File) {
+            var fb = k6FileToBytes(body);
+            if (fb.base64) {
+                bodyStr = bytesToBase64(fb.bytes);
+                bodyB64 = true;
+            } else {
+                bodyStr = fb.text;
+            }
+            // k6 stamps the file's content type on the request when the body
+            // IS the file.
+            if (body.content_type && !headers['Content-Type'] && !headers['content-type']) {
+                headers['Content-Type'] = body.content_type;
+            }
         } else if (body instanceof ArrayBuffer) {
-            bodyStr = '';
+            bodyStr = bytesToBase64(new Uint8Array(body));
+            bodyB64 = true;
+        } else if (typeof Uint8Array !== 'undefined' && body instanceof Uint8Array) {
+            bodyStr = bytesToBase64(body);
+            bodyB64 = true;
         } else {
             var contentType = headers['Content-Type'] || headers['content-type'];
             if (contentType && contentType.indexOf('multipart/form-data') !== -1 && typeof body === 'object') {
                 var multipart = buildMultipartFormData(body);
                 bodyStr = multipart.body;
+                bodyB64 = multipart.binary;
                 // ALWAYS stamp the full generated content-type. The old
                 // `!headers['Content-Type']` guard was false exactly when the
                 // user declared multipart/form-data (they set the type but not
@@ -276,18 +388,33 @@ function serializeK6Body(body, headers) {
         }
     }
 
-    return { body: bodyStr, headers: headers };
+    return { body: bodyStr, headers: headers, binary: bodyB64 };
 }
 
 function buildMultipartFormData(object) {
     var boundary = '----TropelFormBoundary' + Math.random().toString(36).slice(2);
     var body = '';
+    var binary = false;
 
     for (var key in object) {
         if (!object.hasOwnProperty(key)) continue;
         var value = object[key];
         if (value === undefined || value === null) {
             value = '';
+        } else if (value instanceof K6File) {
+            // Backlog line 150: file parts carry a filename + content-type and
+            // the raw bytes (base64 for the native bridge, which decodes).
+            var fb = k6FileToBytes(value);
+            var partData = fb.base64 ? bytesToBase64(fb.bytes) : fb.text;
+            binary = binary || fb.base64;
+            body += '--' + boundary + '\r\n';
+            body += 'Content-Disposition: form-data; name="' + escapeMultipartFieldName(key)
+                + '"; filename="' + escapeMultipartFieldName(value.filename || 'file') + '"\r\n';
+            if (value.content_type) {
+                body += 'Content-Type: ' + value.content_type + '\r\n';
+            }
+            body += '\r\n' + partData + '\r\n';
+            continue;
         } else if (typeof value !== 'string') {
             try {
                 value = JSON.stringify(value);
@@ -301,7 +428,7 @@ function buildMultipartFormData(object) {
     }
     body += '--' + boundary + '--\r\n';
 
-    return { body: body, contentType: 'multipart/form-data; boundary=' + boundary };
+    return { body: body, contentType: 'multipart/form-data; boundary=' + boundary, binary: binary };
 }
 
 function serializeUrlEncoded(object) {
@@ -358,6 +485,13 @@ http.put = function (url, body, params) { return k6HTTPRequest('PUT', url, body,
 http.del = function (url, params) { return k6HTTPRequest('DELETE', url, null, params); };
 http.delete = function (url, params) { return k6HTTPRequest('DELETE', url, null, params); };
 http.patch = function (url, body, params) { return k6HTTPRequest('PATCH', url, body, params); };
+
+// Backlog line 150: k6's http.file(data, filename, contentType) → K6File.
+// The bytes survive the String-typed bridge as base64 (decoded to raw on the
+// Rust side), so binary uploads are finally possible.
+http.file = function (data, filename, contentType) {
+    return new K6File(data, filename, contentType);
+};
 http.head = function (url, params) { return k6HTTPRequest('HEAD', url, null, params); };
 http.options = function (url, params) { return k6HTTPRequest('OPTIONS', url, null, params); };
 http.request = function (method, url, body, params) { return k6HTTPRequest(method, url, body, params); };
@@ -414,6 +548,8 @@ http.batch = function (requests) {
                 auth_json: canonical.auth !== null ? JSON.stringify(canonical.auth) : 'null',
                 redirects: canonical.redirects,
                 compression: canonical.compression,
+                // Backlog line 150: binary batch bodies arrive base64.
+                body_b64: canonical.bodyB64,
             });
         }
 
@@ -443,7 +579,13 @@ http.batch = function (requests) {
             }
             var code = raw.code || raw.status_code || raw.status || 0;
             var rtime = raw.responseTime || raw.response_time || 0;
-            var timings = {
+            // Backlog line 150: batch entries carry real timings + error +
+            // error_code + (binary) body_b64 — mirror the single path.
+            var bodyVal = raw.body || '';
+            if (raw.body_b64 && typeof bodyVal === 'string' && bodyVal !== '') {
+                bodyVal = base64ToBytes(bodyVal).buffer;
+            }
+            var timings = raw.timings || {
                 blocked: 0,
                 connecting: 0,
                 tls_handshaking: 0,
@@ -452,7 +594,20 @@ http.batch = function (requests) {
                 receiving: 0,
                 duration: rtime
             };
-            var resp = new K6Response(code, raw.body || '', normalizedHeaders, timings, entry.url);
+            if (typeof timings === 'object') {
+                timings = {
+                    blocked: timings.blocked || 0,
+                    connecting: timings.connecting || 0,
+                    tls_handshaking: timings.tls_handshaking || 0,
+                    sending: timings.sending || 0,
+                    waiting: timings.waiting || rtime,
+                    receiving: timings.receiving || 0,
+                    duration: timings.duration || rtime
+                };
+            }
+            var resp = new K6Response(code, bodyVal, normalizedHeaders, timings, entry.url);
+            resp.error = raw.error || '';
+            resp.error_code = raw.error_code || 0;
             if (isArrayInput) {
                 results.push(resp);
             } else {
