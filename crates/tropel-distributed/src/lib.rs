@@ -54,25 +54,40 @@ pub use protocol::{AssignMsg, HelloMsg, SnapshotMsg, generate_token};
 /// starved that: at `--agents 4` there were 2 async workers juggling the
 /// controller, 4 agent loops, and 4 engines' orchestration. Default scales
 /// with available parallelism (the same default `#[tokio::main(flavor =
-/// "multi_thread")]` would pick); `TROPEL_TOKIO_WORKERS` overrides (clamped
-/// to [2, 256] — a floor of 2 keeps controller+agent I/O responsive on
-/// 1-core CI, and beyond 256 only adds contention). VU threads run on their
-/// own thread-per-core pool, so this outer runtime only ever multiplexes
-/// async orchestration.
+/// "multi_thread")]` would pick). An explicit `TROPEL_TOKIO_WORKERS` is
+/// honored as-is (clamped only to a sane [1, 256]); the auto default has a
+/// floor of 2 so controller+agent I/O stays responsive on 1-core CI. VU
+/// threads run on their own thread-per-core pool, so this outer runtime
+/// only ever multiplexes async orchestration.
 pub fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    let workers = std::env::var("TROPEL_TOKIO_WORKERS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-        })
-        .clamp(2, 256);
+    let workers = distributed_workers_from_override(
+        std::env::var("TROPEL_TOKIO_WORKERS")
+            .ok()
+            .as_deref(),
+    );
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .enable_all()
         .build()
+}
+
+/// Resolve the outer-runtime worker count from an optional env override.
+///
+/// Pure function (no env access) so tests can exercise the parse/clamp
+/// paths without mutating process-global state — mirrors
+/// `tropel_http::blocking::workers_from_override`. An explicit override is
+/// honored as-is, clamped only to a sane `[1, 256]` (a bogus huge value or
+/// `0` is meaningless — an operator choosing 1 gets 1). The auto default
+/// scales with `available_parallelism` (fallback 4) but has a floor of 2 so
+/// controller+agent I/O stays responsive on 1-core CI.
+fn distributed_workers_from_override(override_val: Option<&str>) -> usize {
+    match override_val.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(n) => n.clamp(1, 256),
+        None => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, 256),
+    }
 }
 
 /// Whether any token source was provided (`--token`, `--token-file`, or the
@@ -203,6 +218,35 @@ mod tests {
     use std::time::{Duration, Instant};
     use tropel_core::config::JobConfig;
     use tropel_metrics::collector::MetricsResult;
+
+    #[test]
+    fn workers_override_honored_explicitly() {
+        // Line-119 regression: an explicit override of 1 must stay 1 (the
+        // floor of 2 applies only to the auto default).
+        assert_eq!(distributed_workers_from_override(Some("1")), 1);
+        assert_eq!(distributed_workers_from_override(Some("8")), 8);
+    }
+
+    #[test]
+    fn workers_override_clamped() {
+        assert_eq!(distributed_workers_from_override(Some("0")), 1);
+        assert_eq!(distributed_workers_from_override(Some("9999")), 256);
+        assert_eq!(distributed_workers_from_override(Some("  4  ")), 4);
+        // An unparseable override falls through to the auto default
+        // (cores-based), NOT the floor of 2.
+        assert_eq!(
+            distributed_workers_from_override(Some("bogus")),
+            distributed_workers_from_override(None)
+        );
+    }
+
+    #[test]
+    fn workers_default_scales_to_cores_with_floor() {
+        let n = distributed_workers_from_override(None);
+        let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(4);
+        assert!(n >= 2 && n <= 256, "default out of range: {n}");
+        assert!(n <= cores.max(2).min(256));
+    }
 
     #[tokio::test]
     async fn report_and_thresholds_honors_summary_export() {
