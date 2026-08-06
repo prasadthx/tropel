@@ -328,6 +328,11 @@ pub struct DriverDeclaredOptions {
     pub hosts: Option<HashMap<String, String>>,
     /// Blocked IPs / CIDRs (k6 `options.blacklistIPs`).
     pub blacklist_ips: Option<Vec<String>>,
+    /// Skip TLS certificate verification (k6 `options.insecureSkipTLSVerify`)
+    /// — the most common staging idiom. `Some(true)` disables certificate
+    /// validation on the HTTP client's TLS config; `None` leaves the job's
+    /// TlsConfig untouched.
+    pub insecure_skip_tls_verify: Option<bool>,
 }
 
 /// A driver instance ready to run iterations.

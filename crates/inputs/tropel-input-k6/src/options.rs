@@ -821,6 +821,29 @@ mod tests {
     }
 
     #[test]
+    fn test_insecure_skip_tls_verify_survives() {
+        // Backlog line 132: insecureSkipTLSVerify was unmodelled (zero repo
+        // hits), so the most common staging idiom was silently dropped — a
+        // script declaring ONLY this option must still yield Some(decl) with
+        // the flag set, even without any load profile.
+        let opts = parse(r#"{"insecureSkipTLSVerify": true}"#);
+        let decl = opts.to_declared().expect("insecureSkipTLSVerify alone must survive");
+        assert!(decl.execution.is_none());
+        assert_eq!(decl.insecure_skip_tls_verify, Some(true));
+
+        // Explicitly false must also survive (not collapse into None).
+        let opts = parse(r#"{"insecureSkipTLSVerify": false}"#);
+        let decl = opts.to_declared().expect("insecureSkipTLSVerify=false must survive");
+        assert_eq!(decl.insecure_skip_tls_verify, Some(false));
+
+        // And it rides along with a normal load profile.
+        let opts = parse(r#"{"vus": 2, "duration": "10s", "insecureSkipTLSVerify": true}"#);
+        let decl = opts.to_declared().expect("declared options");
+        assert_eq!(decl.insecure_skip_tls_verify, Some(true));
+        assert!(decl.execution.is_some());
+    }
+
+    #[test]
     fn test_camel_case_aliases() {
         let opts = parse(
             r#"{"vus": 3, "duration": "1m", "gracefulStop": "45s", "gracefulRampDown": "20s"}"#,

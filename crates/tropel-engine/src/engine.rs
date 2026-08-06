@@ -64,7 +64,7 @@ impl Engine {
         );
 
         let mut http_config = config.http.clone();
-        let tls_config = config.tls.clone();
+        let mut tls_config = config.tls.clone();
         let mut thresholds = config.thresholds.clone();
         // One shared read-only copy of the iteration dataset; every VU clones
         // the Arc (not the Vec of rows), so memory is O(dataset) not
@@ -149,6 +149,19 @@ impl Engine {
                     }
                     if let Some(bl) = decl.blacklist_ips {
                         http_config.blacklist_ips = bl;
+                    }
+                    // Script-declared TLS verification skip (k6
+                    // `options.insecureSkipTLSVerify`) — the most common
+                    // staging idiom. Applied to the HTTP client's TLS config;
+                    // like the sibling script-declared HTTP/DNS options, a
+                    // declared value takes precedence over the config-file
+                    // default (CLI has no --insecure flag).
+                    if let Some(skip) = decl.insecure_skip_tls_verify {
+                        tls_config.insecure_skip_verify = skip;
+                        tracing::info!(
+                            "Script-declared insecureSkipTLSVerify={} applied to TLS config",
+                            skip
+                        );
                     }
                     if http_config.dns_ttl.is_some()
                         || http_config.dns_select.is_some()
