@@ -156,7 +156,10 @@ pm.variables = {
     },
     set: function (key, value) {
         if (typeof __tropel_pm_variables_set === 'function') {
-            __tropel_pm_variables_set(key, value);
+            // Backlog line 146: every other store coerces String(value);
+            // variables.set passed the RAW value, so a number like 42 hit
+            // the bridge's strict String param and threw TypeError.
+            __tropel_pm_variables_set(key, value === undefined ? '' : String(value));
         }
     },
     unset: function (key) {
@@ -955,7 +958,14 @@ pm.execution = {
         }
     },
     skipRequest: function () {
-        pm.execution.setNextRequest(null);
+        // Backlog line 146: skipRequest must skip ONLY the current request
+        // and move to the next item. Routing it through setNextRequest(null)
+        // (a) threw — null into a strict String param — and (b) inherited
+        // setNextRequest's "stop the whole run" semantics. Use the dedicated
+        // __tropel_pm_skip_request bridge instead.
+        if (typeof __tropel_pm_skip_request === 'function') {
+            __tropel_pm_skip_request();
+        }
     },
     stopOnError: function () {
         if (typeof __tropel_pm_skip_tests === 'function') {

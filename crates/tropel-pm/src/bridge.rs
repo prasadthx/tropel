@@ -39,6 +39,9 @@ pub struct PmState {
     pub iteration_data: Option<HashMap<String, Value>>,
     /// Whether to skip the remaining tests.
     pub skip_tests: bool,
+    /// Backlog line 146: pm.execution.skipRequest() — skip the CURRENT item
+    /// (no request send, no test script) and move to the next one.
+    pub skip_request: bool,
     /// Group nesting stack — tracks active groups for group_duration metrics.
     /// Innermost group is at the top (last element).
     pub group_stack: Vec<String>,
@@ -99,6 +102,7 @@ impl PmState {
             request_names: Arc::new(Vec::new()),
             iteration_data: None,
             skip_tests: false,
+            skip_request: false,
             group_stack: Vec::new(),
             current_group: None,
             vu_id: 0,

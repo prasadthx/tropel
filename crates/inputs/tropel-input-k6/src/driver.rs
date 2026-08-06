@@ -3769,6 +3769,103 @@ mod tests {
     }
 
     #[test]
+    fn test_pm_variables_set_coerces_and_skip_request() {
+        // Backlog line 146: pm.variables.set('id', 42) threw TypeError (the
+        // shim passed the RAW value into a strict String bridge param) while
+        // environment.set/collectionVariables.set/globals.set all coerced;
+        // pm.execution.skipRequest() threw (routed null into a String) AND
+        // semantically stopped the whole run instead of skipping the current
+        // item; and variable values were silently retyped by JSON.parse
+        // ("1.10" → 1.1). All three are fixed here.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                // Bridge stubs — variables_get returns JSON-encoded strings
+                // (the real bridge JSON-encodes so the shim can restore the
+                // type), set/skipRequest capture what the shim sends.
+                globalThis.__tropel_pm_variables_get = function (k) {
+                    if (k === 'id') return '"42"';
+                    if (k === 'one10') return '"1.10"';
+                    return null;
+                };
+                globalThis.__tropel_pm_variables_set = function (k, v) { globalThis.__v_set = k + '=' + v; };
+                globalThis.__tropel_pm_variables_unset = function (k) { globalThis.__v_unset = k; };
+                globalThis.__tropel_pm_skip_request = function () { globalThis.__skipped = true; };
+                globalThis.__tropel_pm_set_next_request = function (n) { globalThis.__next_req = n; };
+
+                // 1) Number value must not throw, must be coerced like the
+                // other stores, and must reach the bridge as a string.
+                pm.variables.set('id', 42);
+                globalThis.__v_set_num = globalThis.__v_set;
+
+                // 2) get must restore types WITHOUT retyping string values:
+                // "42" stays the string "42" (not number 42) and "1.10"
+                // stays the string "1.10" (not number 1.1).
+                globalThis.__v_get_num = pm.variables.get('id');
+                globalThis.__v_get_num_type = typeof globalThis.__v_get_num;
+                globalThis.__v_get_one10 = pm.variables.get('one10');
+                globalThis.__v_get_one10_type = typeof globalThis.__v_get_one10;
+
+                // 3) skipRequest must call the dedicated bridge (no throw,
+                // no setNextRequest(null) routing).
+                pm.execution.skipRequest();
+                globalThis.__skipped_after = globalThis.__skipped;
+                globalThis.__next_req_after_skip = globalThis.__next_req === undefined ? 'unset' : String(globalThis.__next_req);
+
+                // 4) setNextRequest(null) must not throw (null → Option<String>).
+                pm.execution.setNextRequest(null);
+                globalThis.__next_req_null = globalThis.__next_req === undefined || globalThis.__next_req === null ? 'null-or-unset' : String(globalThis.__next_req);
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(
+                ctx.eval::<String, _>("__v_set_num").unwrap(),
+                "id=42",
+                "pm.variables.set must coerce a number to a string like environment.set"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__v_get_num").unwrap(),
+                "42",
+                "pm.variables.get must return the string \"42\", never the number 42"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__v_get_num_type").unwrap(),
+                "string",
+                "numeric-looking string must not be retyped to a number"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__v_get_one10").unwrap(),
+                "1.10",
+                "\"1.10\" must round-trip as the string \"1.10\", not the number 1.1"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__v_get_one10_type").unwrap(),
+                "string",
+                "trailing-zero string must not be silently retyped by JSON.parse"
+            );
+            assert!(
+                ctx.eval::<bool, _>("__skipped_after").unwrap(),
+                "pm.execution.skipRequest must reach the dedicated __tropel_pm_skip_request bridge"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__next_req_after_skip").unwrap(),
+                "unset",
+                "skipRequest must NOT route through setNextRequest"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__next_req_null").unwrap(),
+                "null-or-unset",
+                "setNextRequest(null) must not throw (Option<String> bridge param)"
+            );
+        });
+    }
+
+    #[test]
     fn test_pm_response_to_be_status_classes() {
         // Backlog line 145: pm.response.to.be.* — the chai-postman status-class
         // getters and to.have.header/body/jsonBody. Getters THROW on failure

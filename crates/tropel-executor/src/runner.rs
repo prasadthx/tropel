@@ -215,6 +215,7 @@ impl VURunner {
                     let mut state = self.pm_state.lock().unwrap();
                     state.request = item.request.clone();
                     state.skip_tests = false;
+                    state.skip_request = false;
                     state.current_request_name = item.name.clone();
                 }
 
@@ -237,10 +238,22 @@ impl VURunner {
                 let data_row_ref = data_row.as_ref();
                 let scope = self.build_scope(data_row_ref.cloned(), env_vars);
 
+                // Backlog line 146: pm.execution.skipRequest() may have been
+                // called by the prerequest script. Postman semantics: skip the
+                // CURRENT item only — no request send, no test script — and
+                // move on to the next one. (The old shim routed it through
+                // setNextRequest(null), which threw and stopped the whole run.)
+                let skip_item = {
+                    let mut state = self.pm_state.lock().unwrap();
+                    let s = state.skip_request;
+                    state.skip_request = false;
+                    s
+                };
+
                 // Execute HTTP request only if this item has one.
                 // Script-only items (transpiled TS/ES module scripts) don't have
                 // a request — they handle HTTP via pm.sendRequest internally.
-                if item.request.is_some() {
+                if !skip_item && item.request.is_some() {
                     // Backlog line 145: the prerequest script may have MUTATED
                     // the outgoing request via pm.request.* (added an auth
                     // header, changed the URL/method/body). state.request was
@@ -551,16 +564,18 @@ impl VURunner {
                     }
                 }
 
-                // Run test script
-                if let Some(script) = &item.test {
-                    let source_url = Some(format!("{}.test.js", item.name));
-                    if let Err(e) =
-                        Self::run_script(&mut self.js_ctx, script, source_url).await
-                    {
-                        tracing::warn!("VU {} test script error: {}", iteration_index, e);
-                        // Backlog line 98: record a failed check so the
-                        // failure is visible and drives a non-zero exit.
-                        record_script_failure(&mut result, &format!("{}.test", item.name));
+                // Run test script (skipped when pm.execution.skipRequest() ran)
+                if !skip_item {
+                    if let Some(script) = &item.test {
+                        let source_url = Some(format!("{}.test.js", item.name));
+                        if let Err(e) =
+                            Self::run_script(&mut self.js_ctx, script, source_url).await
+                        {
+                            tracing::warn!("VU {} test script error: {}", iteration_index, e);
+                            // Backlog line 98: record a failed check so the
+                            // failure is visible and drives a non-zero exit.
+                            record_script_failure(&mut result, &format!("{}.test", item.name));
+                        }
                     }
                 }
 

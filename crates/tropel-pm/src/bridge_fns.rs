@@ -757,10 +757,16 @@ impl PmBridge {
             let state_clone = state.clone();
             let _ = globals.set(
                 "__tropel_pm_set_next_request",
-                Func::from(move |request_id: String| {
+                Func::from(move |request_id: Option<String>| {
                     let mut st = state_clone.lock().unwrap();
 
-                    // skipRequest passes null — clear any pending jump
+                    // skipRequest passes null — clear any pending jump.
+                    // Backlog line 146: the old `request_id: String` param
+                    // threw on JS null; Option<String> accepts it as None.
+                    let Some(request_id) = request_id else {
+                        st.next_request = None;
+                        return;
+                    };
                     if request_id == "null" || request_id.is_empty() {
                         st.next_request = None;
                         return;
@@ -785,6 +791,21 @@ impl PmBridge {
                 Func::from(move || {
                     let mut st = state_clone.lock().unwrap();
                     st.skip_tests = true;
+                }),
+            );
+
+            // ── skipRequest (backlog line 146) ──
+            // pm.execution.skipRequest() must skip ONLY the current item and
+            // move to the next — the old shim routed it through
+            // setNextRequest(null), which threw on the strict String param
+            // AND semantically "stopped the whole run". The runner reads this
+            // flag after the prerequest script and skips send + test script.
+            let state_clone = state.clone();
+            let _ = globals.set(
+                "__tropel_pm_skip_request",
+                Func::from(move || {
+                    let mut st = state_clone.lock().unwrap();
+                    st.skip_request = true;
                 }),
             );
 
