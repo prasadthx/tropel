@@ -152,37 +152,44 @@ pm.test = function (name, fn) {
 };
 
 // ── pm.expect (wraps chai expect if available, else simple assert) ──
+//
+// Assertions THROW on failure and never auto-record a check. Postman/chai
+// semantics: only `pm.test(name, fn)` records a check — wrapping an expect
+// must produce exactly ONE check named by the pm.test call. Auto-recording
+// here double-counted every pm.test-wrapped assertion, and embedding
+// JSON.stringify(actual) in the recorded name made `pm.expect(pm.response.json())`
+// stamp the ENTIRE response body as a metric tag (unbounded cardinality at
+// 10 k iterations). When used inside pm.test, the throw is caught and the
+// single check fails with the pm.test name. Standalone (outside pm.test)
+// expects surface as a script error and do NOT produce a checks-metric
+// entry — matching Postman, where check metrics come only from pm.test()
+// and check().
 pm.expect = function (actual) {
     return {
         to: {
             eql: function (expected) {
-                var passed = actual === expected;
-                var name = 'expect ' + JSON.stringify(actual) + ' to eql ' + JSON.stringify(expected);
-                if (typeof __tropel_pm_test === 'function') {
-                    __tropel_pm_test(name, passed);
+                if (actual !== expected) {
+                    throw new Error(
+                        'expected ' + shortJson(actual) + ' to eql ' + shortJson(expected)
+                    );
                 }
-                if (!passed) throw new Error(name + ' failed');
             },
             equal: function (expected) {
                 return this.eql(expected);
             },
             include: function (expected) {
-                var passed = String(actual).indexOf(String(expected)) !== -1;
-                var name = 'expect to include ' + JSON.stringify(expected);
-                if (typeof __tropel_pm_test === 'function') {
-                    __tropel_pm_test(name, passed);
+                if (String(actual).indexOf(String(expected)) === -1) {
+                    throw new Error('expected value to include ' + shortJson(expected));
                 }
-                if (!passed) throw new Error(name + ' failed');
             },
             be: {
                 // chai-style type assertions: pm.expect(x).to.be.an('array')
                 an: function (type) {
-                    var passed = typeOf(actual) === type;
-                    var name = 'expect to be an ' + type;
-                    if (typeof __tropel_pm_test === 'function') {
-                        __tropel_pm_test(name, passed);
+                    if (typeOf(actual) !== type) {
+                        throw new Error(
+                            'expected value to be an ' + type + ', got ' + typeOf(actual)
+                        );
                     }
-                    if (!passed) throw new Error(name + ' failed, got ' + typeOf(actual));
                 },
                 a: function (type) {
                     return this.an(type);
@@ -196,12 +203,9 @@ pm.expect = function (actual) {
                     if (has && value !== undefined) {
                         passed = obj[prop] === value;
                     }
-                    var name = 'expect to have property ' + prop;
-                    if (typeof __tropel_pm_test === 'function') {
-                        __tropel_pm_test(name, passed);
+                    if (!passed) {
+                        throw new Error('expected value to have property ' + prop);
                     }
-                    if (!passed) throw new Error(name + ' failed');
-                    return passed;
                 },
                 status: function (code) {
                     // Must THROW on mismatch (Postman/chai semantics) — a
@@ -214,48 +218,51 @@ pm.expect = function (actual) {
                 },
                 header: function (key, value) {
                     var header = pm.response.header(key);
-                    var passed = header === value;
-                    var name = 'expect header ' + key + ' = ' + value;
-                    if (typeof __tropel_pm_test === 'function') {
-                        __tropel_pm_test(name, passed);
+                    if (header !== value) {
+                        throw new Error('expected header ' + key + ' to be ' + shortJson(value) + ', got ' + shortJson(header));
                     }
-                    if (!passed) throw new Error(name + ' failed');
-                    return passed;
                 },
                 jsonBody: function (expected) {
                     var body = pm.response.json();
-                    var passed = JSON.stringify(body) === JSON.stringify(expected);
-                    var name = 'expect response body to match';
-                    if (typeof __tropel_pm_test === 'function') {
-                        __tropel_pm_test(name, passed);
+                    if (JSON.stringify(body) !== JSON.stringify(expected)) {
+                        throw new Error('expected response body to match');
                     }
-                    if (!passed) throw new Error(name + ' failed');
-                    return passed;
                 }
             },
             match: function (regex) {
-                var passed = regex.test(String(actual));
-                var name = 'expect to match ' + regex;
-                if (typeof __tropel_pm_test === 'function') {
-                    __tropel_pm_test(name, passed);
+                if (!regex.test(String(actual))) {
+                    throw new Error('expected value to match ' + regex);
                 }
-                if (!passed) throw new Error(name + ' failed');
             }
         },
         not: {
             to: {
                 eql: function (expected) {
-                    var passed = actual !== expected;
-                    var name = 'expect ' + JSON.stringify(actual) + ' not to eql ' + JSON.stringify(expected);
-                    if (typeof __tropel_pm_test === 'function') {
-                        __tropel_pm_test(name, passed);
+                    if (actual === expected) {
+                        throw new Error(
+                            'expected ' + shortJson(actual) + ' not to eql ' + shortJson(expected)
+                        );
                     }
-                    if (!passed) throw new Error(name + ' failed');
                 }
             }
         }
     };
 };
+
+// Truncate a value for ERROR MESSAGES only (never for metric tags). Keeps
+// failure logs readable when the actual value is a large response body.
+function shortJson(v) {
+    var s;
+    try {
+        s = JSON.stringify(v);
+    } catch (e) {
+        s = String(v);
+    }
+    if (s && s.length > 120) {
+        return s.slice(0, 117) + '...';
+    }
+    return s;
+}
 
 // ── pm.iterationData ──
 pm.iterationData = {
