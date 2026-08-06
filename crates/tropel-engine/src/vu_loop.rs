@@ -104,6 +104,12 @@ struct DriverVuSource {
     vu_id: u32,
     sc_name: String,
     sched: Arc<VUScheduler>,
+    /// The merged run env, cloned ONCE at construction. `VuContext.env` is
+    /// only consumed by the k6 driver's sync_globals() to seed
+    /// __ENV/__tropel_env, which happens on the FIRST iteration only — so
+    /// ctx.env is populated exactly once and never deep-cloned per iteration.
+    env: HashMap<String, String>,
+    env_attached: bool,
 }
 
 #[async_trait]
@@ -112,10 +118,17 @@ impl VuIterationSource for DriverVuSource {
         &mut self,
         iteration_index: u64,
         data_row: Option<HashMap<String, serde_json::Value>>,
-        vu_env: &HashMap<String, String>,
+        _vu_env: &HashMap<String, String>,
     ) -> VuIterationOutcome {
         let mut ctx = VuContext::new(self.vu_id, iteration_index, self.sc_name.clone());
-        ctx.env = vu_env.clone();
+        // Env is immutable for the whole run; sync_globals only reads it on the
+        // first iteration (to seed __ENV/__tropel_env once). Attach the cached
+        // copy once and skip the per-iteration deep clone. `_vu_env` is the
+        // same map every call, so this is a strict optimization — not a
+        // semantics change.
+        if !self.env_attached {
+            ctx.env = self.env.clone();
+        }
         ctx.data_row = data_row;
         ctx.http_client = Some(self.http_client.clone());
         ctx.set_exec_context(
@@ -124,6 +137,14 @@ impl VuIterationSource for DriverVuSource {
             self.sched.active_vus().await,
         );
         let result = self.instance.run_iteration(&mut ctx).await;
+        // Latch `env_attached` ONLY after a successful iteration: if the first
+        // run_iteration fails BEFORE sync_globals seeds __ENV/__tropel_env
+        // (e.g. a bridge-registration error), the env must be re-attached on
+        // the next attempt so the seed reads the real env — otherwise iteration
+        // 2 would seed __ENV from an empty ctx.env for the whole run.
+        if !self.env_attached && result.is_ok() {
+            self.env_attached = true;
+        }
         let mut script_failures = 0u64;
         if let Err(e) = result {
             tracing::warn!(
@@ -791,6 +812,8 @@ pub(crate) async fn run_driver_vus(
                     vu_id,
                     sc_name: sc_name_vu,
                     sched: sched.clone(),
+                    env: shared.vu_env.clone(),
+                    env_attached: false,
                 };
                 run_vu_loop(sched, &shared, vu_id, &mut source).await;
             });

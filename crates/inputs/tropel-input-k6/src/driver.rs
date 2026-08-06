@@ -156,6 +156,7 @@ impl Driver for K6Driver {
             ws_sessions: Arc::new(Mutex::new(HashMap::new())),
             ws_next_id: Arc::new(AtomicU64::new(0)),
             ws_bridges_registered: false,
+            globals_seeded: false,
         }))
     }
 
@@ -407,6 +408,13 @@ pub struct K6DriverInstance {
     ws_next_id: Arc<AtomicU64>,
     /// Whether the ws bridges (__tropel_k6_ws_*) have been registered.
     ws_bridges_registered: bool,
+    /// Whether the per-VU IMMUTABLE globals (__VU, __tropel_vu_id,
+    /// __tropel_scenario, __ENV, __tropel_env) have been seeded. The env is
+    /// constant for the whole run, so re-serializing it every iteration was
+    /// pure waste; sync_globals() seeds these once on the first iteration and
+    /// only refreshes the per-iteration values (__ITER, data row, exec.*)
+    /// thereafter.
+    globals_seeded: bool,
 }
 
 /// Execution-context values exposed to scripts via `exec.*` (k6 API).
@@ -710,6 +718,34 @@ impl DriverInstance for K6DriverInstance {
     }
 }
 
+/// Build a native JS response object for the k6 shim, avoiding the old
+/// Rust → escaped-JSON-string → JS `JSON.parse` round trip (3-4 full body
+/// copies: `from_utf8`, `json!`, `.to_string()`, `JSON.parse`, then another
+/// `res.json()` parse). `Object::new` + `set` materialize the envelope
+/// directly in the JS heap; the body becomes a single JS string. The shim
+/// treats a native object and the legacy JSON string identically.
+fn build_k6_response_object<'js>(
+    ctx: &rquickjs::Ctx<'js>,
+    code: u16,
+    status_text: String,
+    body: String,
+    headers: &HashMap<String, String>,
+    response_time_ms: f64,
+) -> rquickjs::Object<'js> {
+    let obj = rquickjs::Object::new(ctx.clone()).expect("Object::new for k6 response");
+    let _ = obj.set("code", code as i32);
+    let _ = obj.set("status", code as i32);
+    let _ = obj.set("status_text", status_text);
+    let _ = obj.set("body", body);
+    let headers_obj = rquickjs::Object::new(ctx.clone()).expect("Object::new for k6 headers");
+    for (k, v) in headers {
+        let _ = headers_obj.set(k.as_str(), v.as_str());
+    }
+    let _ = obj.set("headers", headers_obj);
+    let _ = obj.set("response_time", response_time_ms);
+    obj
+}
+
 impl K6DriverInstance {
     /// Lazily register the `__tropel_k6_http_request` native function.
     /// This function wraps the per-VU HttpClient so the k6 shim can
@@ -733,13 +769,14 @@ impl K6DriverInstance {
             let _ = globals.set(
                 "__tropel_k6_http_request",
                 Func::from(
-                    move |method: String,
+                    move |ctx: rquickjs::Ctx<'js>,
+                          method: String,
                           url: String,
                           headers_json: String,
                           body: String,
                           _timeout_ms: f64,
                           response_type: String|
-                          -> String {
+                          -> rquickjs::Object<'js> {
                         let headers = parse_headers_tolerant(&headers_json);
                         let req_body = if body.is_empty() {
                             None
@@ -757,14 +794,14 @@ impl K6DriverInstance {
                         // refers to the original String (the parsed binding is
                         // only visible after the statement).
                         let Some(parsed_method) = Method::parse(&method) else {
-                            return serde_json::json!({
-                                "code": 0,
-                                "status": 0,
-                                "status_text": format!("invalid HTTP method {}", method),
-                                "body": "",
-                                "headers": {},
-                                "response_time": 0,
-                            }).to_string();
+                            return build_k6_response_object(
+                                &ctx,
+                                0,
+                                format!("invalid HTTP method {}", method),
+                                String::new(),
+                                &HashMap::new(),
+                                0.0,
+                            );
                         };
                         let req = Request {
                             url,
@@ -817,29 +854,26 @@ impl K6DriverInstance {
                                     resp.size,
                                     sent,
                                 );
-                                let body_text = String::from_utf8(resp.body).unwrap_or_default();
-                                serde_json::json!({
-                                    "code": resp.status_code,
-                                    "status": resp.status_code,
-                                    "status_text": resp.status_text,
-                                    "body": body_text,
-                                    "headers": resp.headers,
-                                    "response_time": resp.response_time.as_secs_f64() * 1000.0,
-                                })
-                                .to_string()
+                                build_k6_response_object(
+                                    &ctx,
+                                    resp.status_code,
+                                    resp.status_text,
+                                    String::from_utf8(resp.body).unwrap_or_default(),
+                                    &resp.headers,
+                                    resp.response_time.as_secs_f64() * 1000.0,
+                                )
                             }
                             Err(e) => {
                                 tracing::debug!("k6 http request failed: {}", e);
                                 push_http_failure(&sink, &req);
-                                serde_json::json!({
-                                    "code": 0,
-                                    "status": 0,
-                                    "status_text": format!("HTTP error: {}", e),
-                                    "body": "",
-                                    "headers": {},
-                                    "response_time": 0,
-                                })
-                                .to_string()
+                                build_k6_response_object(
+                                    &ctx,
+                                    0,
+                                    format!("HTTP error: {}", e),
+                                    String::new(),
+                                    &HashMap::new(),
+                                    0.0,
+                                )
                             }
                         }
                     },
@@ -1600,51 +1634,73 @@ impl K6DriverInstance {
 
     /// Sync VuContext state into JS globals so the script can read
     /// environment variables, data rows, etc.
+    ///
+    /// Split into a one-time seed of the per-VU IMMUTABLE globals (__VU,
+    /// __tropel_vu_id, __tropel_scenario, __ENV, __tropel_env — the env is
+    /// constant for the whole run) and a per-iteration refresh of the mutable
+    /// ones (__ITER, __tropel_iteration_num, __tropel_data_row, exec.*). This
+    /// removes the previous per-iteration cost of serializing the env twice
+    /// and compile+eval'ing a JSON.parse on every iteration.
     async fn sync_globals(&mut self, ctx: &VuContext) -> Result<()> {
-        let _ = self
-            .js_ctx
-            .set_global_str("__tropel_vu_id", &ctx.vu_id.to_string())
-            .await;
+        if !self.globals_seeded {
+            self.globals_seeded = true;
+
+            let _ = self
+                .js_ctx
+                .set_global_str("__tropel_vu_id", &ctx.vu_id.to_string())
+                .await;
+            let _ = self
+                .js_ctx
+                .set_global_str("__tropel_scenario", &ctx.scenario_name)
+                .await;
+            // k6-compatible: __VU is 1-based (like k6); __ITER is 0-based and
+            // refreshed below each iteration.
+            let _ = self
+                .js_ctx
+                .set_global_str("__VU", &(ctx.vu_id + 1).to_string())
+                .await;
+
+            // Set env vars as JS globals. k6 scripts read `__ENV` (and
+            // Tropel's own `__tropel_env`); both get the same object. Always
+            // set __ENV so `__ENV` is never undefined inside the script.
+            let env_value = serde_json::to_value(&ctx.env).unwrap_or_default();
+            let _ = self.js_ctx.set_global_json("__ENV", &env_value).await;
+            let _ = self
+                .js_ctx
+                .set_global_json("__tropel_env", &env_value)
+                .await;
+
+            // Seed the per-VU IMMUTABLE exec.* fields once too (scenario name,
+            // executor name, vu id never change for a VU) — the per-iteration
+            // refresh below only touches the mutable counters, saving two
+            // string clones per iteration.
+            let mut es = self.exec_state.lock().unwrap();
+            es.scenario_name = ctx.scenario_name.clone();
+            es.executor_name = ctx.executor_name.clone();
+            es.vu_id = ctx.vu_id;
+        }
+
+        // Per-iteration mutable globals.
         let _ = self
             .js_ctx
             .set_global_str("__tropel_iteration_num", &ctx.iteration.to_string())
             .await;
         let _ = self
             .js_ctx
-            .set_global_str("__tropel_scenario", &ctx.scenario_name)
-            .await;
-        // k6-compatible globals: __VU (1-based, like k6) and __ITER (0-based)
-        let _ = self
-            .js_ctx
-            .set_global_str("__VU", &(ctx.vu_id + 1).to_string())
-            .await;
-        let _ = self
-            .js_ctx
             .set_global_str("__ITER", &ctx.iteration.to_string())
             .await;
 
-        // Refresh the shared exec.* state read by the __tropel_exec_* bridges.
+        // Refresh the per-iteration exec.* counters read by the __tropel_exec_*
+        // bridges (iteration / iterations_completed / vus_active change every
+        // iteration; scenario_name / executor_name / vu_id were seeded once).
         {
             let mut es = self.exec_state.lock().unwrap();
-            es.scenario_name = ctx.scenario_name.clone();
-            es.executor_name = ctx.executor_name.clone();
-            es.vu_id = ctx.vu_id;
             es.iteration = ctx.iteration;
             es.iterations_completed = ctx.iterations_completed;
             es.vus_active = ctx.vus_active;
         }
 
-        // Set env vars as JS globals. k6 scripts read `__ENV` (and Tropel's
-        // own `__tropel_env`); both get the same object. Always set __ENV so
-        // `__ENV` is never undefined inside the script.
-        let env_value = serde_json::to_value(&ctx.env).unwrap_or_default();
-        let _ = self.js_ctx.set_global_json("__ENV", &env_value).await;
-        let _ = self
-            .js_ctx
-            .set_global_json("__tropel_env", &env_value)
-            .await;
-
-        // Set data row
+        // Set data row (changes per iteration)
         if let Some(ref row) = ctx.data_row {
             let _ = self
                 .js_ctx

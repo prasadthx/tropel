@@ -546,15 +546,14 @@ impl JsContext {
         let name = name.to_string();
 
         self.ctx.with(move |ctx| {
-            // Parse JSON as a JS value
+            // Native JSON parser (JS_ParseJSON) — ONE serialization pass, no
+            // double-escape, and no compile+eval of a built `JSON.parse("…")`
+            // string on every call (the old path ran QuickJS's parser + JIT
+            // each time). `json_parse` takes a Vec<u8>, so the String is
+            // moved in directly.
             let val: rquickjs::Value = ctx
-                .eval(format!(
-                    "JSON.parse({})",
-                    serde_json::to_string(&s).unwrap_or_default()
-                ))
-                .map_err(|e| {
-                    JsError::Conversion(format!("JSON parse in JS context error: {}", e))
-                })?;
+                .json_parse(s)
+                .map_err(|e| JsError::Conversion(format!("JSON parse in JS context error: {}", e)))?;
 
             let globals = ctx.globals();
             globals
