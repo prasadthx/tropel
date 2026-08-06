@@ -181,11 +181,16 @@ pub(crate) fn parse_metric_ref(metric_ref: &str) -> (&str, Vec<(&str, &str)>, Op
     let before = &metric_ref[..brace_start.unwrap_or(metric_ref.len())];
     let after = &metric_ref[brace_close.map(|bc| bc + 1).unwrap_or(metric_ref.len())..];
 
-    // Find stat: prefer after `}` (more common), fall back to before `{`
-    let (name, stat) = if let Some(dot) = after.rfind('.') {
+    // Find stat: prefer after `}` (more common), fall back to before `{`.
+    // Must be the last dot OUTSIDE a `(...)` pair — a decimal percentile
+    // like `.p(99.9)` contains a dot inside the parens, and a naive
+    // `rfind('.')` would split `http_req_duration.p(99.9)` at the decimal
+    // point (name "http_req_duration.p(99", stat "9"), silently degrading
+    // p(99.9) thresholds to the mean / a non-existent metric.
+    let (name, stat) = if let Some(dot) = rfind_dot_outside_parens(after) {
         // Stat is after `}` — name is the part before `{`
         (before, Some(&after[dot + 1..]))
-    } else if let Some(dot) = before.rfind('.') {
+    } else if let Some(dot) = rfind_dot_outside_parens(before) {
         // Stat is before `{` — strip it from the name
         (&before[..dot], Some(&before[dot + 1..]))
     } else {
@@ -194,6 +199,24 @@ pub(crate) fn parse_metric_ref(metric_ref: &str) -> (&str, Vec<(&str, &str)>, Op
     };
 
     (name, tags, stat)
+}
+
+/// Index of the last `'.'` in `s` that is NOT inside a `(...)` pair, or
+/// `None` when every dot is parenthesized. Backs [`parse_metric_ref`]: the
+/// stat suffix is `.p(99.9)`, whose decimal point sits inside the parens —
+/// a plain `rfind('.')` would treat that decimal as the stat separator and
+/// mangle the metric reference.
+fn rfind_dot_outside_parens(s: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, b) in s.bytes().enumerate().rev() {
+        match b {
+            b')' => depth += 1,
+            b'(' => depth -= 1,
+            b'.' if depth <= 0 => return Some(i),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Evaluate a single threshold expression against real metrics.
@@ -680,6 +703,53 @@ mod tests {
             "p(90) should be an exact histogram percentile, got {}",
             result.1
         );
+    }
+
+    #[test]
+    fn test_decimal_percentile_exact_from_histogram() {
+        // Backlog line 135 regression: p(99.9) must resolve EXACTLY from the
+        // retained histogram, never the mean. parse_metric_ref splits the
+        // stat at the last dot OUTSIDE parens — a naive rfind('.') split
+        // `.p(99.9)` at the decimal point (stat "9", name "…p(99"), which
+        // would fall back to the mean / a non-existent metric.
+        let metrics = make_histogram_metrics();
+        let result = evaluate_single_threshold("http_req_duration.p(99.9) < 2000", &metrics);
+        assert!(result.0, "p99.9 of 100..1000 is ~1000, should be < 2000");
+        assert!(
+            result.1 > 950.0,
+            "p(99.9) must be an exact high percentile (~1000), got {}",
+            result.1
+        );
+        assert_ne!(result.1, 550.0, "must not fall back to the mean");
+
+        // Tag-scoped decimal percentile resolves through the after-`}` path.
+        use crate::histogram::LatencyHistogram;
+        let mut h = LatencyHistogram::new();
+        for i in 1..=10u64 {
+            h.record_micros(i * 100);
+        }
+        let mut m = MetricsResult::default();
+        m.metrics.push(MetricSummary {
+            key: "http_req_duration{status=200}".into(),
+            tags: vec![("status".into(), "200".into())],
+            metric_type: MetricType::Trend,
+            count: 10,
+            sum: 5500.0,
+            mean: 550.0,
+            min: 100,
+            max: 1000,
+            p50: 500,
+            p90: 900,
+            p95: 950,
+            p99: 990,
+            last: 0.0,
+            rate: 0.0,
+            histogram: Some(h),
+        });
+        let result =
+            evaluate_single_threshold("http_req_duration{status=200}.p(99.9) < 2000", &m);
+        assert!(result.0);
+        assert!(result.1 > 950.0, "tag-scoped p(99.9) must be exact, got {}", result.1);
     }
 
     #[test]

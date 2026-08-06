@@ -315,16 +315,13 @@ impl Protocol for WebSocketProtocol {
     }
 }
 
-/// Parse a duration string (`"1s"`, `"500ms"`, `"100"` = ms) into a `Duration`.
+/// Parse a duration string (`"1s"`, `"500ms"`, `"1m30s"`, `"100"` = 100 s)
+/// into a `Duration`. Delegates to the canonical `tropel_core::parse_duration`
+/// so every consumer shares ONE implementation and the same unit semantics
+/// (the old local copy treated a bare number as MILLISECONDS — a third
+/// divergent impl, backlog line 136).
 fn parse_duration(s: &str) -> Option<Duration> {
-    let s = s.trim();
-    if let Some(ms) = s.strip_suffix("ms") {
-        return ms.trim().parse::<u64>().ok().map(Duration::from_millis);
-    }
-    if let Some(secs) = s.strip_suffix('s') {
-        return secs.trim().parse::<f64>().ok().map(Duration::from_secs_f64);
-    }
-    s.parse::<u64>().ok().map(Duration::from_millis)
+    tropel_sdk::parse_duration(s).ok()
 }
 
 /// Inventory factory — must be a `fn` pointer for `inventory::submit!`.

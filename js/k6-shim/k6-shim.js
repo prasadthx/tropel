@@ -258,25 +258,37 @@ http.options = function (url, params) { return k6HTTPRequest('OPTIONS', url, nul
 http.request = function (method, url, body, params) { return k6HTTPRequest(method, url, body, params); };
 
 // http.batch — sequential execution (QuickJS has no async)
+//
+// k6 semantics (backlog line 137): an ARRAY of requests returns an ARRAY of
+// responses (index-preserving — Array.isArray true, .forEach/spread/
+// destructuring work); an OBJECT of named requests returns an OBJECT keyed
+// by name. The old implementation always returned a keyed object, so the
+// documented batch idiom (`res[0].status`) silently broke.
 http.batch = function (requests) {
     if (!requests) {
         throw new Error('http.batch requires an array or object of requests');
     }
 
+    var isArrayInput = Array.isArray(requests);
     var entries = [];
+    var keys = [];
 
-    if (Array.isArray(requests)) {
+    if (isArrayInput) {
         for (var bi = 0; bi < requests.length; bi++) {
-            entries.push(normalizeBatchEntry(requests[bi], bi));
+            var e = normalizeBatchEntry(requests[bi], bi);
+            entries.push(e);
+            keys.push(e.key != null ? e.key : bi);
         }
     } else if (typeof requests === 'object') {
         var names = Object.keys(requests);
         for (var ni = 0; ni < names.length; ni++) {
-            entries.push(normalizeBatchEntry(requests[names[ni]], names[ni]));
+            var e = normalizeBatchEntry(requests[names[ni]], names[ni]);
+            entries.push(e);
+            keys.push(e.key != null ? e.key : names[ni]);
         }
     }
 
-    var results = {};
+    var results = isArrayInput ? [] : {};
 
     if (typeof __tropel_k6_http_batch === 'function') {
         var normalized = [];
@@ -284,7 +296,7 @@ http.batch = function (requests) {
             var entry = entries[ei];
             var canonical = normalizeK6Request(entry.method, entry.url, entry.body, entry.params);
             normalized.push({
-                key: entry.key != null ? entry.key : String(ei),
+                key: String(keys[ei]),
                 method: canonical.method,
                 url: canonical.url,
                 headers_json: JSON.stringify(canonical.headers),
@@ -298,7 +310,7 @@ http.batch = function (requests) {
         var batchResult = JSON.parse(batchResultJson);
         for (var ei = 0; ei < entries.length; ei++) {
             var entry = entries[ei];
-            var key = entry.key != null ? String(entry.key) : String(ei);
+            var key = String(keys[ei]);
             // Wrap each entry as a K6Response so `.json()`, `.status`, `.body`
             // behave like the sequential path (k6 returns Response objects).
             var raw = batchResult[key] || {};
@@ -329,14 +341,22 @@ http.batch = function (requests) {
                 receiving: 0,
                 duration: rtime
             };
-            results[key] = new K6Response(code, raw.body || '', normalizedHeaders, timings, entry.url);
+            var resp = new K6Response(code, raw.body || '', normalizedHeaders, timings, entry.url);
+            if (isArrayInput) {
+                results.push(resp);
+            } else {
+                results[key] = resp;
+            }
         }
     } else {
         for (var ei = 0; ei < entries.length; ei++) {
             var entry = entries[ei];
-            var key = entry.key != null ? String(entry.key) : String(ei);
             var resp = k6HTTPRequest(entry.method, entry.url, entry.body, entry.params);
-            results[key] = resp;
+            if (isArrayInput) {
+                results.push(resp);
+            } else {
+                results[String(keys[ei])] = resp;
+            }
         }
     }
 

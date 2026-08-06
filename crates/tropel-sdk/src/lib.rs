@@ -112,7 +112,7 @@ pub use tropel_ext::traits::{Output, OutputRegistration};
 // Error types
 // ═══════════════════════════════════════════════════════════════════
 
-pub use tropel_core::{Result, TropelError};
+pub use tropel_core::{parse_duration, Result, TropelError};
 
 // ═══════════════════════════════════════════════════════════════════
 // Re-export inventory so adapter crates don't need their own dep
