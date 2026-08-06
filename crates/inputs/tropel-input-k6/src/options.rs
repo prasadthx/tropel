@@ -68,6 +68,12 @@ pub struct K6Options {
     /// Blocked IPs / CIDRs (k6 `blacklistIPs`).
     #[serde(alias = "blacklistIPs")]
     pub blacklist_ips: Option<Vec<String>>,
+    /// Skip TLS certificate verification (k6 `insecureSkipTLSVerify`) — the
+    /// most common staging idiom, and security-relevant. When `Some(true)`,
+    /// the engine disables certificate validation on the HTTP client's TLS
+    /// config. Previously unmodelled, so it was silently dropped.
+    #[serde(alias = "insecureSkipTLSVerify")]
+    pub insecure_skip_tls_verify: Option<bool>,
 }
 
 /// k6 `options.dns` — DNS cache TTL, address selection and family policy.
@@ -209,14 +215,52 @@ impl K6Options {
                         rps: self.rps,
                         hosts: self.hosts.clone(),
                         blacklist_ips: self.blacklist_ips.clone(),
+                        insecure_skip_tls_verify: self.insecure_skip_tls_verify,
                     });
                 }
             }
         }
 
-        let execution = self.to_execution()?;
+        let execution = self.to_execution();
+        // Return None only when NOTHING usable is declared (an empty script).
+        // When the script declares only safety options — thresholds, DNS,
+        // hosts, blacklist, rps, discardResponseBodies, summaryTrendStats —
+        // with no load profile (the standard CI shape where --vus/--duration
+        // come from the CLI), those options MUST survive. The old `?` on
+        // to_execution() short-circuited the whole method to None and
+        // silently discarded every one of them.
+        let has_anything = execution.is_some()
+            || !thresholds.is_empty()
+            || self.discard_response_bodies.is_some()
+            || self.summary_trend_stats.as_ref().is_some_and(|s| !s.is_empty())
+            || self.dns.is_some()
+            || self.no_connection_reuse.is_some()
+            || self.no_vu_connection_reuse.is_some()
+            || self.rps.is_some()
+            || self.hosts.as_ref().is_some_and(|h| !h.is_empty())
+            || self.blacklist_ips.as_ref().is_some_and(|b| !b.is_empty())
+            || self.insecure_skip_tls_verify.is_some();
+        if !has_anything {
+            return None;
+        }
+        if execution.is_none() {
+            tracing::debug!(
+                "k6 script declares no load profile — keeping {} declared \
+                 safety option(s) (thresholds/DNS/hosts/rps); load profile \
+                 comes from the CLI/config",
+                thresholds.len()
+                    + usize::from(self.dns.is_some())
+                    + usize::from(self.rps.is_some())
+                    + usize::from(self.hosts.is_some())
+                    + usize::from(self.blacklist_ips.is_some())
+                    + usize::from(self.no_connection_reuse.is_some())
+                    + usize::from(self.no_vu_connection_reuse.is_some())
+                    + usize::from(self.discard_response_bodies.is_some())
+                    + usize::from(self.insecure_skip_tls_verify.is_some())
+            );
+        }
         Some(DriverDeclaredOptions {
-            execution: Some(execution),
+            execution,
             scenarios: None,
             thresholds,
             discard_response_bodies: self.discard_response_bodies,
@@ -229,6 +273,7 @@ impl K6Options {
             rps: self.rps,
             hosts: self.hosts.clone(),
             blacklist_ips: self.blacklist_ips.clone(),
+            insecure_skip_tls_verify: self.insecure_skip_tls_verify,
         })
     }
 
@@ -737,6 +782,42 @@ mod tests {
     fn test_empty_options_is_none() {
         let opts = parse(r#"{}"#);
         assert!(opts.to_declared().is_none());
+    }
+
+    #[test]
+    fn test_safety_options_survive_without_load_profile() {
+        // The standard CI shape: thresholds/DNS/hosts/rps live in the script,
+        // --vus/--duration come from the CLI. to_declared() must NOT return
+        // None just because no load profile is declared — every safety
+        // control must survive with execution: None.
+        let opts = parse(
+            r#"{
+                "thresholds": {"http_req_duration": ["p(95)<500"]},
+                "dns": {"ttl": "1m", "select": "roundRobin", "policy": "any"},
+                "hosts": {"test.k6.io": "1.2.3.4"},
+                "blacklistIPs": ["10.0.0.0/8"],
+                "rps": 100,
+                "noConnectionReuse": true,
+                "discardResponseBodies": true,
+                "summaryTrendStats": ["avg", "p(99)"]
+            }"#,
+        );
+        let decl = opts.to_declared().expect("safety options must not be discarded");
+        assert!(decl.execution.is_none());
+        assert!(decl.scenarios.is_none());
+        assert_eq!(decl.thresholds.len(), 1);
+        assert_eq!(decl.dns_ttl.as_deref(), Some("1m"));
+        assert_eq!(decl.dns_select.as_deref(), Some("roundRobin"));
+        assert_eq!(decl.dns_policy.as_deref(), Some("any"));
+        assert_eq!(decl.hosts.as_ref().and_then(|h| h.get("test.k6.io")), Some(&"1.2.3.4".to_string()));
+        assert_eq!(decl.blacklist_ips.as_deref(), Some(&["10.0.0.0/8".to_string()][..]));
+        assert_eq!(decl.rps, Some(100.0));
+        assert_eq!(decl.no_connection_reuse, Some(true));
+        assert_eq!(decl.discard_response_bodies, Some(true));
+        assert_eq!(
+            decl.summary_trend_stats.as_deref(),
+            Some(&["avg".to_string(), "p(99)".to_string()][..])
+        );
     }
 
     #[test]

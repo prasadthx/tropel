@@ -73,16 +73,20 @@ impl Engine {
         let data_rows = std::sync::Arc::new(config.iteration_data.clone());
         let test_start = Instant::now();
 
-        // Script-declared load profile (k6 `export const options`). Applied only
-        // when the user did not set an explicit load profile — i.e. no
-        // vus/duration/mode/stages/iterations CLI flags (or a config file that
-        // marked execution_explicit). This is what makes a k6 script's own
-        // vus/duration/stages/scenarios/thresholds drive the run instead of
-        // being silently ignored.
+        // Script-declared options (k6 `export const options`). The safety
+        // controls — thresholds, DNS, hosts, blacklist, rps,
+        // discardResponseBodies, summaryTrendStats — are merged ALWAYS, even
+        // when the load profile comes from the CLI (the standard CI shape:
+        // thresholds in the script, --vus/--duration on the CLI; the old gate
+        // skipped the whole block and every script safety control evaporated).
+        // Only the script's own load profile (execution/scenarios) is gated
+        // on execution_explicit so explicit CLI/config profiles win.
+        let script_load_profile_allowed =
+            !config.execution_explicit && config.scenarios.is_empty();
         let mut declared_scenarios: Option<HashMap<String, ScenarioConfig>> = None;
         let mut declared_execution: Option<ExecutionConfig> = None;
         let mut declared_trend_stats: Option<Vec<String>> = None;
-        if !config.execution_explicit && config.scenarios.is_empty() {
+        {
             let input_path = std::path::Path::new(&config.input);
             let bytes = std::fs::read(&config.input).ok();
             if let (Some(bytes), Ok(ResolvedInput::Driver(driver))) = (
@@ -161,17 +165,26 @@ impl Engine {
                     for (k, v) in &decl.thresholds {
                         thresholds.entry(k.clone()).or_insert_with(|| v.clone());
                     }
-                    if let Some(scs) = decl.scenarios {
-                        if !scs.is_empty() {
-                            tracing::info!(
-                                "Using script-declared scenarios: {}",
-                                scs.keys().cloned().collect::<Vec<_>>().join(", ")
-                            );
-                            declared_scenarios = Some(scs);
+                    if script_load_profile_allowed {
+                        if let Some(scs) = decl.scenarios {
+                            if !scs.is_empty() {
+                                tracing::info!(
+                                    "Using script-declared scenarios: {}",
+                                    scs.keys().cloned().collect::<Vec<_>>().join(", ")
+                                );
+                                declared_scenarios = Some(scs);
+                            }
+                        } else if let Some(exec) = decl.execution {
+                            tracing::info!("Using script-declared execution: {:?}", exec);
+                            declared_execution = Some(exec);
                         }
-                    } else if let Some(exec) = decl.execution {
-                        tracing::info!("Using script-declared execution: {:?}", exec);
-                        declared_execution = Some(exec);
+                    } else if decl.scenarios.is_some() || decl.execution.is_some() {
+                        // Explicit CLI/config profile wins; the script's own
+                        // load profile is intentionally ignored (its safety
+                        // options above are still applied).
+                        tracing::debug!(
+                            "CLI/config load profile wins — script-declared load profile ignored"
+                        );
                     }
                 }
             }
