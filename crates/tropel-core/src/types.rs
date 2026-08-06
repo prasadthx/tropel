@@ -29,20 +29,29 @@ pub enum Method {
     Custom(String),
 }
 
+impl Method {
+    /// Return the method as a `&str` without allocating (the standard nine
+    /// are static strings; `Custom` returns its stored token). Hot-path
+    /// alternative to `to_string()` — avoids a String alloc per request.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Method::GET => "GET",
+            Method::HEAD => "HEAD",
+            Method::POST => "POST",
+            Method::PUT => "PUT",
+            Method::PATCH => "PATCH",
+            Method::DELETE => "DELETE",
+            Method::OPTIONS => "OPTIONS",
+            Method::TRACE => "TRACE",
+            Method::CONNECT => "CONNECT",
+            Method::Custom(m) => m.as_str(),
+        }
+    }
+}
+
 impl std::fmt::Display for Method {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Method::GET => write!(f, "GET"),
-            Method::HEAD => write!(f, "HEAD"),
-            Method::POST => write!(f, "POST"),
-            Method::PUT => write!(f, "PUT"),
-            Method::PATCH => write!(f, "PATCH"),
-            Method::DELETE => write!(f, "DELETE"),
-            Method::OPTIONS => write!(f, "OPTIONS"),
-            Method::TRACE => write!(f, "TRACE"),
-            Method::CONNECT => write!(f, "CONNECT"),
-            Method::Custom(m) => write!(f, "{}", m),
-        }
+        write!(f, "{}", self.as_str())
     }
 }
 

@@ -476,19 +476,53 @@ enum WsCommand {
 // threads — which the thread-per-core loop guarantees.
 unsafe impl Send for K6DriverInstance {}
 
+/// Lock-free interning for the static http tag keys/values: one `Arc<str>`
+/// allocation per key for the whole process instead of one per request.
+/// `OnceLock::get_or_init` is a relaxed atomic load after warm-up; the
+/// returned clone is a refcount bump, not a string copy.
+fn interned(s: &'static str) -> Arc<str> {
+    static URL: OnceLock<Arc<str>> = OnceLock::new();
+    static METHOD: OnceLock<Arc<str>> = OnceLock::new();
+    static STATUS: OnceLock<Arc<str>> = OnceLock::new();
+    static NAME: OnceLock<Arc<str>> = OnceLock::new();
+    static GROUP: OnceLock<Arc<str>> = OnceLock::new();
+    static HTTP: OnceLock<Arc<str>> = OnceLock::new();
+    static SCENARIO: OnceLock<Arc<str>> = OnceLock::new();
+    match s {
+        "url" => URL.get_or_init(|| Arc::from("url")).clone(),
+        "method" => METHOD.get_or_init(|| Arc::from("method")).clone(),
+        "status" => STATUS.get_or_init(|| Arc::from("status")).clone(),
+        "name" => NAME.get_or_init(|| Arc::from("name")).clone(),
+        "group" => GROUP.get_or_init(|| Arc::from("group")).clone(),
+        "http" => HTTP.get_or_init(|| Arc::from("http")).clone(),
+        "scenario" => SCENARIO.get_or_init(|| Arc::from("scenario")).clone(),
+        other => Arc::from(other),
+    }
+}
+
 /// Build the standard http_req_* tag set (url/method/status/name/group).
-fn http_tags(req: &Request, status: &str) -> TagMap {
-    http_tags_for(&req.url, &req.method.to_string(), status)
+/// The url value is allocated ONCE and shared by both `url` and `name`
+/// (refcount bump, not a second string copy); static keys come from
+/// [`interned`]. The scenario tag is stamped here when present, so the
+/// drain's scenario pass is a no-op for http samples — it never
+/// `Arc::make_mut`-clones the map shared by the 5 per-request samples.
+fn http_tags(req: &Request, status: &str, scenario: &Arc<str>) -> TagMap {
+    http_tags_for(&req.url, req.method.as_str(), status, scenario)
 }
 
 /// [`http_tags`] with explicit URL/method (redirect hops reuse it).
-fn http_tags_for(url: &str, method: &str, status: &str) -> TagMap {
-    let mut tags = TagMap::with_capacity(5);
-    tags.insert("url", url.to_string());
-    tags.insert("method", method.to_string());
-    tags.insert("status", status.to_string());
-    tags.insert("name", url.to_string());
-    tags.insert("group", "http");
+fn http_tags_for(url: &str, method: &str, status: &str, scenario: &Arc<str>) -> TagMap {
+    let mut tags = TagMap::with_capacity(6);
+    let url_arc: Arc<str> = Arc::from(url);
+    tags.insert(interned("url"), url_arc.clone());
+    tags.insert(interned("method"), Arc::from(method));
+    tags.insert(interned("status"), Arc::from(status));
+    tags.insert(interned("name"), url_arc);
+    tags.insert(interned("group"), interned("http"));
+    if !scenario.is_empty() {
+        // Refcount bump — the Arc was created once at bridge registration.
+        tags.insert(interned("scenario"), scenario.clone());
+    }
     tags
 }
 
@@ -504,15 +538,17 @@ fn push_http_samples(
     duration: Duration,
     size: u64,
     sent: usize,
+    scenario: &Arc<str>,
 ) {
     push_http_samples_for(
         sink,
         &req.url,
-        &req.method.to_string(),
+        req.method.as_str(),
         status_code,
         duration,
         size,
         sent,
+        scenario,
     );
 }
 
@@ -520,7 +556,7 @@ fn push_http_samples(
 /// parity: each hop is its own request — the test.k6.io 302 chain counted
 /// 136 http_reqs for 68 iterations while Tropel recorded only the final
 /// 64). Called BEFORE the final response's samples so hop order matches k6.
-fn push_redirect_hops(sink: &Mutex<Vec<Sample>>, resp: &Response, method: &str) {
+fn push_redirect_hops(sink: &Mutex<Vec<Sample>>, resp: &Response, method: &str, scenario: &Arc<str>) {
     for hop in &resp.redirects {
         push_http_samples_for(
             sink,
@@ -530,6 +566,7 @@ fn push_redirect_hops(sink: &Mutex<Vec<Sample>>, resp: &Response, method: &str) 
             hop.response_time,
             hop.size,
             0, // redirect hops carry no request body
+            scenario,
         );
     }
 }
@@ -544,9 +581,10 @@ fn push_http_samples_for(
     duration: Duration,
     size: u64,
     sent: usize,
+    scenario: &Arc<str>,
 ) {
     let now = SystemTime::now();
-    let tags = Arc::new(http_tags_for(url, method, &status_code.to_string()));
+    let tags = Arc::new(http_tags_for(url, method, &status_code.to_string(), scenario));
 
     let is_failed = !(200..400).contains(&status_code);
     let mut v = sink.lock().unwrap();
@@ -614,9 +652,9 @@ fn try_send_cmd(
 /// connection refused, …). Failed requests must still appear in the summary:
 /// `http_reqs` increments and `http_req_failed` (Rate) becomes 1.0 — matching
 /// the declarative runner's error branch and k6 semantics.
-fn push_http_failure(sink: &Mutex<Vec<Sample>>, req: &Request) {
+fn push_http_failure(sink: &Mutex<Vec<Sample>>, req: &Request, scenario: &Arc<str>) {
     let now = SystemTime::now();
-    let tags = Arc::new(http_tags(req, "0"));
+    let tags = Arc::new(http_tags(req, "0", scenario));
 
     let mut v = sink.lock().unwrap();
     v.push(Sample {
@@ -685,8 +723,14 @@ impl DriverInstance for K6DriverInstance {
         if !ctx.scenario_name.is_empty() {
             let scenario = ctx.scenario_name.clone();
             for s in &mut bridge_samples {
-                let tags = std::sync::Arc::make_mut(&mut s.tags);
-                if tags.get("scenario").is_none() {
+                // Check BEFORE make_mut: the http_req_* samples already carry
+                // the scenario tag (stamped at tag-creation time in
+                // http_tags_for), so make_mut never fires for them — no 4x
+                // deep-clone of the map shared by the 5 per-request samples.
+                // Only samples from other bridges (checks, custom metrics —
+                // each an independent refcount-1 Arc) reach make_mut here.
+                if s.tags.get("scenario").is_none() {
+                    let tags = std::sync::Arc::make_mut(&mut s.tags);
                     tags.insert("scenario", scenario.clone());
                 }
             }
@@ -768,7 +812,7 @@ impl K6DriverInstance {
         // cannot declare — the registration lives in the generic free fn
         // below. Behavior is identical; only the marshalling changes.
         self.js_ctx.with_ctx(|rq_ctx| {
-            register_http_bridges(rq_ctx, http_client.clone(), sink.clone());
+            register_http_bridges(rq_ctx, http_client.clone(), sink.clone(), &ctx.scenario_name);
         });
 
         self.http_bridge_registered = true;
@@ -786,10 +830,17 @@ fn register_http_bridges<'js>(
     rq_ctx: &rquickjs::Ctx<'js>,
     http_client: Arc<dyn DriverHttpClient + Send + Sync>,
     sink: Arc<Mutex<Vec<Sample>>>,
+    scenario: &str,
 ) {
     let globals = rq_ctx.globals();
     let http_client_request = http_client.clone();
     let sink_req = sink.clone();
+    // The scenario name is constant per VU — capture it once here (as an
+    // Arc<str> so http tag builders stamp it at CREATION time via a refcount
+    // bump, zero per-request alloc) so the drain then skips these samples
+    // entirely: no Arc::make_mut, no 4x deep-clone of the map shared by the
+    // 5 per-request samples.
+    let scenario_req = Arc::from(scenario);
     let _ = globals.set(
         "__tropel_k6_http_request",
         Func::from(
@@ -869,7 +920,7 @@ fn register_http_bridges<'js>(
                                 // k6 parity: every redirect hop counts as its
                                 // own request (test.k6.io 302 chain = 2 reqs
                                 // per iteration, not 1).
-                                push_redirect_hops(&sink_req, &resp, &req.method.to_string());
+                                push_redirect_hops(&sink_req, &resp, req.method.as_str(), &scenario_req);
                                 push_http_samples(
                                     &sink_req,
                                     &req,
@@ -877,6 +928,7 @@ fn register_http_bridges<'js>(
                                     resp.response_time,
                                     resp.size,
                                     sent,
+                                    &scenario_req,
                                 );
                                 build_k6_response_object(
                                     &ctx,
@@ -889,7 +941,7 @@ fn register_http_bridges<'js>(
                             }
                             Err(e) => {
                                 tracing::debug!("k6 http request failed: {}", e);
-                                push_http_failure(&sink_req, &req);
+                                push_http_failure(&sink_req, &req, &scenario_req);
                                 build_k6_response_object(
                                     &ctx,
                                     0,
@@ -905,6 +957,7 @@ fn register_http_bridges<'js>(
             );
 
     let batch_sink = sink.clone();
+    let scenario_batch = Arc::from(scenario);
             let _ = globals.set(
                 "__tropel_k6_http_batch",
                 Func::from(move |requests_json: String| -> String {
@@ -1016,7 +1069,7 @@ fn register_http_bridges<'js>(
                                     // k6 parity: every redirect hop counts as
                                     // its own request, same as the single-
                                     // request path.
-                                    push_redirect_hops(&batch_sink, &resp, &req.method.to_string());
+                                    push_redirect_hops(&batch_sink, &resp, req.method.as_str(), &scenario_batch);
                                     push_http_samples(
                                         &batch_sink,
                                         &req,
@@ -1024,6 +1077,7 @@ fn register_http_bridges<'js>(
                                         resp.response_time,
                                         resp.size,
                                         sent,
+                                        &scenario_batch,
                                     );
                                     let body_text = String::from_utf8(resp.body).unwrap_or_default();
                                     serde_json::json!({
@@ -1037,7 +1091,7 @@ fn register_http_bridges<'js>(
                                 }
                                 Err(e) => {
                                     tracing::debug!("k6 batch request failed: {}", e);
-                                    push_http_failure(&batch_sink, &req);
+                                    push_http_failure(&batch_sink, &req, &scenario_batch);
                                     serde_json::json!({
                                         "code": 0,
                                         "status": 0,
