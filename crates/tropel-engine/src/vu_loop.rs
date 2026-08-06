@@ -110,6 +110,11 @@ struct DriverVuSource {
     /// ctx.env is populated exactly once and never deep-cloned per iteration.
     env: HashMap<String, String>,
     env_attached: bool,
+    /// The script's `setup()` return value (serialized JSON), computed once
+    /// per scenario by `Driver::setup` before VUs spawn and threaded into
+    /// every VU's `VuContext.setup_data` so `export default function (data)`
+    /// receives it (k6 lifecycle). `None` when the script declares no setup.
+    setup_data: Option<String>,
 }
 
 #[async_trait]
@@ -131,6 +136,7 @@ impl VuIterationSource for DriverVuSource {
         }
         ctx.data_row = data_row;
         ctx.http_client = Some(self.http_client.clone());
+        ctx.setup_data = self.setup_data.clone();
         ctx.set_exec_context(
             self.executor_name.clone(),
             self.sched.total_iterations().await,
@@ -770,7 +776,18 @@ pub(crate) async fn run_driver_vus(
         }
     };
 
-    run_vus(
+    // k6 lifecycle: run the script's `setup()` ONCE per scenario, BEFORE any
+    // VU spawns. The serialized return value is threaded into every VU's
+    // context (so `export default function (data)` receives it) and later
+    // passed to `teardown(data)`. `None` when the script declares no setup —
+    // VUs then see `undefined` data, matching k6. The env passed to setup is
+    // the same merged env the VUs run with (base + scenario overrides).
+    let mut setup_env = base_env.clone();
+    setup_env.extend(sc_env.clone());
+    let setup_data = driver.setup(&input_bytes, Some(&input_p), &setup_env).await;
+    let setup_data_c = setup_data.clone();
+
+    let run_vus_result = run_vus(
         sc_name,
         start_delay,
         sc_env,
@@ -793,6 +810,10 @@ pub(crate) async fn run_driver_vus(
             let pool = pool_c.clone();
             let sc_name_vu = sc_name_c.clone();
             let executor_name = shared.executor_name.clone();
+            // The setup data is cloned into the async block (the outer Fn
+            // closure must not be moved out of — same pattern as every other
+            // capture above).
+            let setup_data_vu = setup_data_c.clone();
 
             // 1-VU-per-task: pin this VU to its own dedicated worker thread (see
             // run_scenario_vus for the rationale — blocking sleep() must never
@@ -844,13 +865,29 @@ pub(crate) async fn run_driver_vus(
                     sched: sched.clone(),
                     env: shared.vu_env.clone(),
                     env_attached: false,
+                    setup_data: setup_data_vu,
                 };
                 run_vu_loop(sched, &shared, vu_id, &mut source).await;
             });
             handle
         },
     )
-    .await
+    .await;
+
+    // k6 lifecycle: run the script's `teardown(data)` ONCE after all VUs
+    // finish, with the `setup()` return value as data. Failures are the
+    // driver's to log (a throwing teardown never changes the run's exit
+    // status — k6 parity).
+    driver
+        .teardown(&input_bytes, Some(&input_p), setup_data.as_deref(), &setup_env)
+        .await;
+
+    // `run_vus` returns (vu_init_failures, script_failures) — VUs that
+    // failed to START and driver iterations that errored. Propagate them so
+    // the engine can fail the run loudly (silent truncation / throwing
+    // scripts must not report green).
+    let (init_failures, script_failures) = run_vus_result;
+    (init_failures, script_failures)
 }
 // Helpers
 // ══════════════════════════════════════════════════════════════════

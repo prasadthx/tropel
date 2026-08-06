@@ -99,6 +99,14 @@ pub struct VuContext {
     pub abort_message: Option<String>,
     /// HTTP client handle for sending requests.
     pub http_client: Option<std::sync::Arc<dyn DriverHttpClient + Send + Sync>>,
+    /// Serialized JSON value returned by the script's `setup()` function
+    /// (k6 lifecycle). The engine runs `Driver::setup` ONCE per scenario
+    /// before spawning VUs and threads the result into every VU's context,
+    /// so the iteration entry point can receive it as its `data` argument
+    /// (`export default function (data) { … }`). `None` when the script
+    /// declares no `setup` export — the driver passes `undefined`, matching
+    /// k6.
+    pub setup_data: Option<String>,
 }
 
 impl VuContext {
@@ -116,6 +124,7 @@ impl VuContext {
             abort_requested: false,
             abort_message: None,
             http_client: None,
+            setup_data: None,
         }
     }
 
@@ -237,6 +246,45 @@ pub trait Driver: Send + Sync {
         _env: &HashMap<String, String>,
     ) -> Option<HashMap<String, String>> {
         None
+    }
+
+    /// Run the script's `setup()` function (k6) once before VUs start.
+    ///
+    /// The engine calls this ONCE per scenario before spawning VUs. The
+    /// returned value is serialized JSON of whatever `setup()` returned
+    /// (k6 requires it to be JSON-serializable); it is threaded to every
+    /// VU's [`VuContext::setup_data`] so the iteration entry point receives
+    /// it as `data`, and is also passed to [`Driver::teardown`] after the
+    /// run. `None` means the script has no `setup` export (data is
+    /// `undefined`, matching k6).
+    ///
+    /// `env` carries the job's environment variables so `setup()` can read
+    /// `__ENV` (a common k6 pattern).
+    ///
+    /// The default implementation declares no setup.
+    async fn setup(
+        &self,
+        _bytes: &[u8],
+        _source_path: Option<&std::path::Path>,
+        _env: &HashMap<String, String>,
+    ) -> Option<String> {
+        None
+    }
+
+    /// Run the script's `teardown(data)` function (k6) once after the run.
+    ///
+    /// Called by the engine after all VUs finish, with the `setup()` return
+    /// value as `data`. Failures are logged by the driver (k6 parity: a
+    /// throwing teardown warns but never changes the run's exit status).
+    ///
+    /// The default implementation is a no-op.
+    async fn teardown(
+        &self,
+        _bytes: &[u8],
+        _source_path: Option<&std::path::Path>,
+        _setup_data_json: Option<&str>,
+        _env: &HashMap<String, String>,
+    ) {
     }
 }
 

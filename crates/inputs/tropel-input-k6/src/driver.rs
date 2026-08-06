@@ -213,6 +213,69 @@ impl Driver for K6Driver {
             .await
             .ok()?
     }
+
+    async fn setup(
+        &self,
+        bytes: &[u8],
+        source_path: Option<&Path>,
+        env: &HashMap<String, String>,
+    ) -> Option<String> {
+        // Run the script's `export function setup()` (k6) ONCE per scenario,
+        // before any VU spawns. The engine threads the serialized return
+        // value into every VU (so `export default function (data)` receives
+        // it) and passes it to `teardown(data)` after the run. Returns
+        // `None` when the script declares no `setup` export (VUs see
+        // `undefined`, matching k6). A throwing setup is LOGGED and yields
+        // `None` — the engine falls back to no data rather than aborting
+        // (never silently: a throwing setup is a broken artifact and must be
+        // visible, even though the run proceeds with undefined data).
+        //
+        // Note: the throwaway context registers the file/SharedArray bridges
+        // but not the HTTP bridges, so `http.get()` inside setup() throws →
+        // logged + data becomes undefined (k6 setup may use HTTP; a future
+        // iteration could register the http bridge here too).
+        let original = std::str::from_utf8(bytes).ok()?;
+        let module_source = prepare_module_source(original, source_path).ok()?;
+        let script_dir = source_path.and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        match eval_module_call_export(&module_source, "setup", None, env, script_dir).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("k6 setup() failed: {}", e);
+                None
+            }
+        }
+    }
+
+    async fn teardown(
+        &self,
+        bytes: &[u8],
+        source_path: Option<&Path>,
+        setup_data_json: Option<&str>,
+        env: &HashMap<String, String>,
+    ) {
+        // Run the script's `export function teardown(data)` (k6) ONCE after
+        // all VUs finish, with the `setup()` return value as `data`. A
+        // missing export is a silent no-op (k6); a throwing teardown is
+        // logged but never affects the run's exit status (k6 parity).
+        let Some(original) = std::str::from_utf8(bytes).ok() else {
+            return;
+        };
+        let Ok(module_source) = prepare_module_source(original, source_path) else {
+            return;
+        };
+        let script_dir = source_path.and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        if let Err(e) = eval_module_call_export(
+            &module_source,
+            "teardown",
+            setup_data_json,
+            env,
+            script_dir,
+        )
+        .await
+        {
+            tracing::warn!("k6 teardown() failed: {}", e);
+        }
+    }
 }
 
 // Register K6Driver for compile-time discovery.
@@ -784,7 +847,7 @@ impl DriverInstance for K6DriverInstance {
         let iter_result = self
             .js_ctx
             .run_script_cached(
-                "return __tropel_iteration()",
+                "return __tropel_iteration(__tropel_setup)",
                 Some("k6-iteration.js".to_string()),
             )
             .await;
@@ -1827,6 +1890,26 @@ impl K6DriverInstance {
             es.scenario_name = ctx.scenario_name.clone();
             es.executor_name = ctx.executor_name.clone();
             es.vu_id = ctx.vu_id;
+
+            // k6 lifecycle: `export default function (data)` receives the
+            // script's `setup()` return value. The engine ran setup() once
+            // per scenario and threaded the serialized result into
+            // ctx.setup_data — parse it into a native JS value ONCE here
+            // (it is immutable for the whole run) so every iteration call
+            // below passes it without re-serializing. When the script
+            // declares no setup, `__tropel_setup` stays undefined, matching
+            // k6 (data === undefined).
+            let setup_value = ctx
+                .setup_data
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+            self.js_ctx.with_ctx(|rq_ctx| {
+                let val = match &setup_value {
+                    Some(v) => json_to_value(rq_ctx, v),
+                    None => rquickjs::Value::new_undefined(rq_ctx.clone()),
+                };
+                let _ = rq_ctx.globals().set("__tropel_setup", val);
+            });
         }
 
         // Per-iteration mutable globals.
@@ -2155,6 +2238,109 @@ async fn eval_module_handle_summary(
             Ok(None)
         }
     }
+}
+
+/// Evaluate an ES module and CALL a named exported function, serializing its
+/// return value as JSON.
+///
+/// Backs the k6 lifecycle functions `setup()` (no argument) and
+/// `teardown(data)` (the setup return value as argument). Mirrors
+/// [`eval_module_handle_summary`]'s throwaway-context setup: file bridges +
+/// module loader + shims installed so a script that touches `open()`,
+/// SharedArray, or k6 API at module top level doesn't throw while the
+/// export is read. Returns `Ok(None)` when the export is absent/not a
+/// function (k6: no setup/teardown declared); `Err` when the call itself
+/// throws (setup/teardown body error) so the caller decides how to surface
+/// it (setup → None + warn, teardown → warn only, k6 parity).
+async fn eval_module_call_export(
+    source: &str,
+    export: &str,
+    arg_json: Option<&str>,
+    env: &HashMap<String, String>,
+    script_dir: Option<PathBuf>,
+) -> Result<Option<String>> {
+    let mut js_ctx = JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
+        .await
+        .map_err(|e| TropelError::Other(format!("JS context creation failed: {}", e)))?;
+
+    register_k6_file_bridges(&mut js_ctx, script_dir.clone());
+    js_ctx.set_module_loader(
+        K6ModuleResolver {
+            script_dir: script_dir.clone(),
+        },
+        K6ModuleLoader,
+    );
+    js_ctx.bootstrap_library(OPEN_DATA_SHIM).await.map_err(|e| {
+        TropelError::Other(format!("k6 open/SharedArray shim bootstrap failed: {}", e))
+    })?;
+    bootstrap_js_libs(&mut js_ctx).await.map_err(|e| {
+        TropelError::Other(format!("k6 shim bootstrap failed for {export} eval: {}", e))
+    })?;
+
+    // Minimal globals a k6 script may reference at module top level while
+    // defining setup()/teardown() (same set as the options/handleSummary
+    // evals).
+    let _ = js_ctx.set_global_str("__VU", "0").await;
+    let _ = js_ctx.set_global_str("__ITER", "0").await;
+    let env_json = serde_json::to_value(env).unwrap_or_else(|_| serde_json::json!({}));
+    let _ = js_ctx.set_global_json("__ENV", &env_json).await;
+    let _ = js_ctx.set_global_json("__tropel_env", &env_json).await;
+
+    js_ctx.reset_interrupt();
+    match js_ctx.with_ctx(|ctx| call_module_export(ctx, source, export, arg_json)) {
+        Ok(Some(s)) => Ok(Some(s)),
+        Ok(None) => Ok(None),
+        // Do NOT warn here — the callers own the error path: setup() logs a
+        // warn and returns None (data stays undefined), teardown() logs a
+        // warn and continues (k6 parity: a throwing teardown never affects
+        // the run's exit status). A second warn here would double-report.
+        Err(e) => Err(TropelError::Other(format!("k6 {export}() failed: {}", e))),
+    }
+}
+
+/// Call `setup()`/`teardown(data)` inside the given context. `arg_json` is
+/// parsed via the global `JSON.parse` (k6 data must be JSON-serializable);
+/// the return value is stringified and returned. Absent/non-function export
+/// → `Ok(None)`; a throwing call → `Err`.
+fn call_module_export(
+    ctx: &rquickjs::Ctx,
+    source: &str,
+    export: &str,
+    arg_json: Option<&str>,
+) -> std::result::Result<Option<String>, rquickjs::Error> {
+    let module = rquickjs::Module::declare(ctx.clone(), "k6-script", source)?;
+    let (module, promise) = module.eval()?;
+    promise.finish::<()>()?;
+
+    let func: rquickjs::Function = match module.get::<_, rquickjs::Function>(export) {
+        Ok(f) => f,
+        Err(_) => return Ok(None), // absent or not a function
+    };
+
+    let json_obj: rquickjs::Object = ctx.globals().get("JSON")?;
+    let result: rquickjs::Value = match arg_json {
+        Some(json) => {
+            let parse: rquickjs::Function = json_obj.get("parse")?;
+            let data: rquickjs::Value = parse.call((json,))?;
+            func.call((data,))?
+        }
+        None => func.call(())?,
+    };
+
+    // k6 allows `export async function setup()/teardown(data)`. If the call
+    // returned a Promise, finish it (pumps the job queue until settled).
+    let result: rquickjs::Value = if let Some(promise) = result.as_promise() {
+        promise.finish()?
+    } else {
+        result
+    };
+
+    if result.is_undefined() || result.is_null() {
+        return Ok(None);
+    }
+    let stringify: rquickjs::Function = json_obj.get("stringify")?;
+    let s: String = stringify.call((result,))?;
+    Ok(Some(s))
 }
 
 /// Call `handleSummary(data)` inside the given context. The data object is
@@ -3115,5 +3301,99 @@ mod tests {
             }
             other => panic!("expected SharedIterations, got {other:?}"),
         }
+    }
+
+    // ── k6 lifecycle: setup() / teardown() (backlog line 127) ──
+
+    #[tokio::test]
+    async fn test_setup_runs_and_serializes_return_value() {
+        // K6Driver::setup must run the script's `export function setup()`
+        // ONCE and return its return value serialized as JSON (the engine
+        // threads it into every VU as the default function's `data`).
+        let driver = K6Driver;
+        let script = br#"
+            export function setup() { return { token: "abc", n: 42 }; }
+            export default function() {}
+        "#;
+        let data = driver.setup(script, None, &HashMap::new()).await;
+        let json = data.expect("setup() must return serialized data");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["token"], "abc");
+        assert_eq!(v["n"], 42);
+    }
+
+    #[tokio::test]
+    async fn test_setup_absent_returns_none() {
+        // A script without `export function setup()` yields None — VUs then
+        // see `undefined` data (k6 parity), never a hard error.
+        let driver = K6Driver;
+        let script = br#"export default function() {}"#;
+        assert!(
+            driver.setup(script, None, &HashMap::new()).await.is_none(),
+            "no setup export must yield None"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_teardown_receives_setup_data() {
+        // teardown(data) must receive the setup() return value: with the
+        // correct data it completes silently; with WRONG data it throws —
+        // which is warn-only and must never surface as a panic/error (k6
+        // parity: a throwing teardown never affects the run's exit status).
+        let driver = K6Driver;
+        let script = br#"
+            export function setup() { return { token: "abc" }; }
+            export function teardown(data) {
+                if (!data || data.token !== "abc") throw new Error("teardown got wrong data");
+            }
+            export default function() {}
+        "#;
+        let data = driver.setup(script, None, &HashMap::new()).await;
+        // Happy path: correct data — no panic, no error.
+        driver
+            .teardown(script, None, data.as_deref(), &HashMap::new())
+            .await;
+        // Throwing path: wrong data — teardown throws internally, but the
+        // driver only logs (warn) and returns; no panic, no error.
+        driver
+            .teardown(script, None, Some("{\"token\":\"WRONG\"}"), &HashMap::new())
+            .await;
+        driver
+            .teardown(script, None, Some("not-json"), &HashMap::new())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_setup_data_reaches_default_function() {
+        // Full path: the engine sets VuContext.setup_data, the driver seeds
+        // __tropel_setup from it once, and the cached iteration call passes
+        // it to `export default function (data)`. If data were undefined,
+        // `data.token` would throw and run_iteration would error — so a
+        // successful iteration proves the data flowed through.
+        let driver = K6Driver;
+        let script = br#"
+            export default function (data) {
+                if (!data || data.token !== "abc") throw new Error("setup data not passed");
+            }
+        "#;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        ctx.setup_data = Some("{\"token\":\"abc\"}".to_string());
+        inst.run_iteration(&mut ctx).await.expect("iteration must succeed with setup data");
+    }
+
+    #[tokio::test]
+    async fn test_no_setup_data_is_undefined() {
+        // Without setup data, `data` must be undefined (k6 parity) — a
+        // script asserting `data === undefined` succeeds.
+        let driver = K6Driver;
+        let script = br#"
+            export default function (data) {
+                if (data !== undefined) throw new Error("expected undefined data");
+            }
+        "#;
+        let mut inst = driver.init(script, None, None).await.unwrap();
+        let mut ctx = VuContext::new(0, 0, "default".into());
+        inst.run_iteration(&mut ctx).await.expect("iteration must succeed with undefined data");
     }
 }
