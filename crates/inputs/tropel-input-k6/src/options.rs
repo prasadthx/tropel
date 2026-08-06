@@ -311,9 +311,13 @@ impl K6Options {
             });
         }
 
-        if let (Some(vus), Some(duration)) = (self.vus, &self.duration) {
+        // Backlog line 152: `duration`-only options previously yielded NO
+        // profile at all (this arm required BOTH `vus` and `duration`). k6
+        // defaults `vus` to 1, so `options: { duration: "30s" }` must produce
+        // a constant-vus profile, not silently run the CLI profile.
+        if let Some(duration) = &self.duration {
             return Some(ExecutionConfig::ConstantVus {
-                vus,
+                vus: self.vus.unwrap_or(1),
                 duration: duration.clone(),
                 graceful_stop: self.graceful_stop.clone(),
                 think_time,
@@ -386,35 +390,51 @@ impl K6Scenario {
                 graceful_stop: self.graceful_stop.clone(),
                 think_time,
             }),
-            "constant-arrival-rate" => Some(ExecutionConfig::ConstantArrivalRate {
-                rate: self.rate?,
-                time_unit: self.time_unit.clone().unwrap_or_else(|| "1s".to_string()),
-                duration: self.duration.clone()?,
-                pre_alloc_vus: self.pre_allocated_vus.unwrap_or(1),
-                max_vus: self.max_vus.unwrap_or(10),
-                graceful_stop: self.graceful_stop.clone(),
-                think_time,
-            }),
-            "ramping-arrival-rate" => Some(ExecutionConfig::RampingArrivalRate {
-                start_rate: self.start_rate.unwrap_or(0.0),
-                stages: self
-                    .stages
-                    .as_ref()
-                    .map(|s| {
-                        s.iter()
-                            .map(|st| ArrivalRateStage {
-                                duration: st.duration.clone(),
-                                target: st.target,
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                time_unit: self.time_unit.clone().unwrap_or_else(|| "1s".to_string()),
-                pre_alloc_vus: self.pre_allocated_vus.unwrap_or(1),
-                max_vus: self.max_vus.unwrap_or(10),
-                graceful_stop: self.graceful_stop.clone(),
-                think_time,
-            }),
+            // Backlog line 152: k6 REQUIRES `preAllocatedVUs` for arrival-rate
+            // executors (a missing value is a hard error there; here the
+            // scenario is skipped with a warning instead of silently running
+            // 1 VU serving the whole rate), and `maxVUs` DEFAULTS to
+            // `preAllocatedVUs` and can never be below it (the old invented
+            // `10` could under-provision `{rate:2000, preAllocatedVUs:400}`
+            // to 10 VUs, or worse if maxVUs was set lower than preAlloc).
+            "constant-arrival-rate" => {
+                let pre_alloc_vus = self.pre_allocated_vus?;
+                Some(ExecutionConfig::ConstantArrivalRate {
+                    rate: self.rate?,
+                    time_unit: self.time_unit.clone().unwrap_or_else(|| "1s".to_string()),
+                    duration: self.duration.clone()?,
+                    pre_alloc_vus,
+                    max_vus: self.max_vus.unwrap_or(pre_alloc_vus).max(pre_alloc_vus),
+                    graceful_stop: self.graceful_stop.clone(),
+                    think_time,
+                })
+            }
+            "ramping-arrival-rate" => {
+                // Same k6 parity as constant-arrival-rate (line 152):
+                // preAllocatedVUs required, maxVUs defaults to it and can
+                // never be below it.
+                let pre_alloc_vus = self.pre_allocated_vus?;
+                Some(ExecutionConfig::RampingArrivalRate {
+                    start_rate: self.start_rate.unwrap_or(0.0),
+                    stages: self
+                        .stages
+                        .as_ref()
+                        .map(|s| {
+                            s.iter()
+                                .map(|st| ArrivalRateStage {
+                                    duration: st.duration.clone(),
+                                    target: st.target,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    time_unit: self.time_unit.clone().unwrap_or_else(|| "1s".to_string()),
+                    pre_alloc_vus,
+                    max_vus: self.max_vus.unwrap_or(pre_alloc_vus).max(pre_alloc_vus),
+                    graceful_stop: self.graceful_stop.clone(),
+                    think_time,
+                })
+            }
             "externally-controlled" => Some(ExecutionConfig::ExternallyControlled {
                 vus: self.vus.unwrap_or(1),
                 max_vus: self.max_vus.unwrap_or(10),
@@ -697,6 +717,91 @@ mod tests {
                 assert_eq!(max_vus, 20);
             }
             other => panic!("expected ConstantArrivalRate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_arrival_rate_max_vus_defaults_and_clamps() {
+        // Backlog line 152: maxVUs previously defaulted to an invented 10 and
+        // could be BELOW preAllocatedVUs. k6 defaults maxVUs to
+        // preAllocatedVUs and never lets it under-provision.
+        let opts = parse(
+            r#"{
+                "scenarios": {
+                    "spam": { "executor": "constant-arrival-rate", "rate": 2000, "timeUnit": "1s", "duration": "30s", "preAllocatedVUs": 400 }
+                }
+            }"#,
+        );
+        let decl = opts.to_declared().unwrap();
+        let sc = decl.scenarios.unwrap().remove("spam").unwrap();
+        match sc.execution {
+            ExecutionConfig::ConstantArrivalRate {
+                pre_alloc_vus,
+                max_vus,
+                ..
+            } => {
+                assert_eq!(pre_alloc_vus, 400);
+                assert_eq!(
+                    max_vus, 400,
+                    "maxVUs must default to preAllocatedVUs (k6 parity), not 10"
+                );
+            }
+            other => panic!("expected ConstantArrivalRate, got {other:?}"),
+        }
+
+        // maxVUs explicitly BELOW preAllocatedVUs must clamp up.
+        let opts = parse(
+            r#"{
+                "scenarios": {
+                    "spam": { "executor": "constant-arrival-rate", "rate": 50, "duration": "30s", "preAllocatedVUs": 20, "maxVUs": 5 }
+                }
+            }"#,
+        );
+        let decl = opts.to_declared().unwrap();
+        let sc = decl.scenarios.unwrap().remove("spam").unwrap();
+        match sc.execution {
+            ExecutionConfig::ConstantArrivalRate { max_vus, .. } => {
+                assert_eq!(max_vus, 20, "maxVUs below preAllocatedVUs must clamp up");
+            }
+            other => panic!("expected ConstantArrivalRate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_arrival_rate_requires_pre_allocated_vus() {
+        // Backlog line 152: omitting preAllocatedVUs made 1 VU serve the whole
+        // rate (k6 hard-errors). The scenario must be skipped, never silently
+        // under-provisioned.
+        let opts = parse(
+            r#"{
+                "scenarios": {
+                    "spam": { "executor": "constant-arrival-rate", "rate": 2000, "duration": "30s" }
+                }
+            }"#,
+        );
+        // When the ONLY scenario is skipped and no top-level profile exists,
+        // to_declared() returns None (nothing usable declared) — both are
+        // correct outcomes; the scenario must never silently run 1 VU.
+        let declared = opts.to_declared();
+        assert!(
+            declared.as_ref().and_then(|d| d.scenarios.as_ref()).is_none(),
+            "arrival-rate scenario without preAllocatedVUs must be skipped (k6 rejects it)"
+        );
+    }
+
+    #[test]
+    fn test_duration_only_options_produce_constant_vus() {
+        // Backlog line 152: `duration`-only options previously yielded NO
+        // profile (the top-level executor required BOTH vus and duration). k6
+        // defaults vus to 1, so a profile must be produced.
+        let opts = parse(r#"{ "duration": "30s" }"#);
+        let decl = opts.to_declared().unwrap();
+        match decl.execution {
+            Some(ExecutionConfig::ConstantVus { vus, duration, .. }) => {
+                assert_eq!(vus, 1, "duration-only options must default vus to 1");
+                assert_eq!(duration, "30s");
+            }
+            other => panic!("expected ConstantVus, got {other:?}"),
         }
     }
 
