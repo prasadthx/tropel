@@ -1,4 +1,4 @@
-use crate::histogram::LatencyHistogram;
+use crate::histogram::{HistogramStats, LatencyHistogram};
 use crate::thresholds::parse_metric_ref;
 use base64::Engine as _;
 use indexmap::IndexMap;
@@ -34,6 +34,14 @@ pub enum MetricType {
 /// If the aggregator falls behind, VUs will block on send() instead of
 /// growing the queue unboundedly — preventing OOM.
 const MAX_PENDING_SAMPLES: usize = 100_000;
+
+/// Hard cap on distinct series the aggregator will retain. The runner tags
+/// every request with the FULL URL in both `url` and `name` tags, so distinct
+/// URLs × statuses scale the series map linearly; a hostile or simply
+/// high-cardinality input (unique URL per request) must not OOM the process.
+/// New series beyond the cap are dropped and counted; existing series keep
+/// recording, and `totals` (keyed by metric NAME) stay complete.
+const MAX_SERIES: usize = 100_000;
 
 /// A hashable metric key that avoids heap-allocated string formatting.
 ///
@@ -110,8 +118,14 @@ impl PartialEq for MetricKey {
 pub struct MetricSet {
     /// The type of this metric, set from the first sample recorded.
     pub metric_type: MetricType,
-    /// Latency histogram (for Trend metrics only).
-    pub histogram: LatencyHistogram,
+    /// Latency histogram — lazily allocated on the FIRST Trend sample so
+    /// Counter/Rate/Gauge series (the bulk of per-URL cardinality) never
+    /// allocate the ~16 KB structure. `record` on a Trend sample creates it
+    /// on demand.
+    pub histogram: Option<LatencyHistogram>,
+    /// Histogram ceiling captured at creation; used when the histogram is
+    /// lazily allocated on the first Trend sample.
+    histogram_max_micros: Option<u64>,
     /// For Counter/Rate: event count; for Gauge/Trend: sample count.
     pub count: f64,
     /// Sum of values (for mean calculation or rate numerator).
@@ -128,7 +142,8 @@ impl MetricSet {
     fn new(metric_type: MetricType, histogram_max_micros: Option<u64>) -> Self {
         Self {
             metric_type,
-            histogram: LatencyHistogram::with_max(histogram_max_micros),
+            histogram: None,
+            histogram_max_micros,
             count: 0.0,
             sum: 0.0,
             min: f64::MAX,
@@ -184,10 +199,50 @@ impl MetricSet {
                 // silently dropped sub-µs samples: `myTrend.add(0.25)` (ms)
                 // became 0 µs → p(95)=0, max=0. Rounding keeps fractional
                 // µs values ≥ 0.5 in the distribution.
-                self.histogram.record_micros(value.max(0.0).round() as u64);
+                let h = self
+                    .histogram
+                    .get_or_insert_with(|| LatencyHistogram::with_max(self.histogram_max_micros));
+                h.record_micros(value.max(0.0).round() as u64);
                 self.count += 1.0;
                 self.sum += value;
             }
+        }
+    }
+
+    /// Trend statistics from the lazily-allocated histogram. Returns empty
+    /// defaults when no Trend sample has been recorded yet (or the histogram
+    /// was never allocated) — callers on the results path read stats without
+    /// cloning the histogram.
+    fn trend_stats(&self) -> HistogramStats {
+        self.histogram
+            .as_ref()
+            .map(|h| h.stats())
+            .unwrap_or_default()
+    }
+
+    /// Merge another set's aggregates into this one (count/sum, Trend
+    /// histograms bucket-exact, Gauge folds min/max/last). Used to rebuild
+    /// the incremental merged accumulators after snapshot absorption.
+    fn merge_from(&mut self, other: &MetricSet) {
+        let hmax = self.histogram_max_micros;
+        self.count += other.count;
+        self.sum += other.sum;
+        if self.metric_type == MetricType::Trend {
+            if let Some(h) = other.histogram.as_ref() {
+                let mine = self
+                    .histogram
+                    .get_or_insert_with(|| LatencyHistogram::with_max(hmax));
+                mine.merge(h);
+            }
+        }
+        if self.metric_type == MetricType::Gauge {
+            if other.min < self.min {
+                self.min = other.min;
+            }
+            if other.max > self.max {
+                self.max = other.max;
+            }
+            self.last = other.last;
         }
     }
 
@@ -456,6 +511,24 @@ struct Aggregator {
     /// calls during a run — the config fields are cloned into every result,
     /// so they must not be re-inspected per call.
     retain_histograms: bool,
+    /// Cardinality cap for the series map (see [`MAX_SERIES`]). A field so
+    /// tests can shrink it; production uses the const default.
+    max_series: usize,
+    /// Incremental merged http_req_duration headline (Trend). Maintained on
+    /// every recorded sample so `build_results` (the ~2 s abort-path tick)
+    /// reads PRE-MERGED stats instead of re-cloning/re-merging every full
+    /// histogram per series per tick.
+    merged_http_dur: Option<MetricSet>,
+    /// Incremental merged iteration_duration headline (Trend).
+    merged_iter_dur: Option<MetricSet>,
+    /// Incremental merged per-URL http_req_duration series (Trend), keyed by
+    /// `url` (or `name`) tag value.
+    merged_per_url: std::collections::BTreeMap<String, MetricSet>,
+    /// Incremental merged per-(metric, group) series, keyed by
+    /// (metric name, group value).
+    merged_per_group: std::collections::BTreeMap<(String, String), MetricSet>,
+    /// Samples dropped because the `max_series` cardinality cap was reached.
+    series_dropped: u64,
 }
 
 impl Aggregator {
@@ -467,6 +540,12 @@ impl Aggregator {
             effective_thresholds: std::collections::HashMap::new(),
             histogram_max_micros: None,
             retain_histograms: false,
+            max_series: MAX_SERIES,
+            merged_http_dur: None,
+            merged_iter_dur: None,
+            merged_per_url: std::collections::BTreeMap::new(),
+            merged_per_group: std::collections::BTreeMap::new(),
+            series_dropped: 0,
         }
     }
 
@@ -520,11 +599,86 @@ impl Aggregator {
             SampleType::Trend => MetricType::Trend,
         };
 
+        // Cardinality guard: never let the series map grow past `max_series`.
+        // The runner tags every request with the full URL in BOTH `url` and
+        // `name`, so a high-cardinality input (unique URL per request) must
+        // not OOM the aggregator. New series beyond the cap are dropped
+        // (counted, not stored) — existing series keep recording, and the
+        // name-keyed `totals` map stays complete so headline counters keep
+        // accumulating under pressure. The incremental accumulators are also
+        // skipped: they are keyed by the same tags, so they are bounded by
+        // the same cap.
+        if !self.data.contains_key(&key) && self.data.len() >= self.max_series {
+            self.series_dropped += 1;
+            if self.series_dropped == 1 {
+                tracing::warn!(
+                    "metrics: series cardinality reached {}; dropping samples for new \
+                     series (check for a high-cardinality url/name tag)",
+                    self.max_series
+                );
+            }
+            if let Some(total) = self.totals.get_mut(sample.metric.as_ref()) {
+                *total += sample.value;
+            } else {
+                self.totals.insert(sample.metric.into_owned(), sample.value);
+            }
+            return;
+        }
+
         // Use the type from the first sample for this key
         let metric_set = self.data.entry(key).or_insert_with(|| {
             MetricSet::new(metric_type, self.histogram_max_micros)
         });
         metric_set.record(sample.value, &sample.sample_type);
+
+        // Maintain the incremental merged accumulators (headline http_req_
+        // duration / iteration_duration, per-URL, per-group) on EVERY sample
+        // so `build_results` — the ~2 s abort-path tick — reads pre-merged
+        // stats instead of re-cloning and re-merging every full histogram per
+        // series per tick (the O(N)-per-2s cost that filled the bounded
+        // channel and blocked `record_batch().await`).
+        let hmax = self.histogram_max_micros;
+        if sample.metric.as_ref() == "http_req_duration" {
+            let merged = self
+                .merged_http_dur
+                .get_or_insert_with(|| MetricSet::new(MetricType::Trend, hmax));
+            merged.record(sample.value, &sample.sample_type);
+
+            // Exact per-URL merge (url tag, falling back to name). The
+            // TagMap is FxHashMap-backed with nondeterministic iteration
+            // order, so pin `url` FIRST explicitly — a bare
+            // `find(url || name)` could flip the key between samples when a
+            // script sets url != name, splitting one URL into two rows.
+            if let Some(url) = sample
+                .tags
+                .iter()
+                .find(|(k, _)| *k == "url")
+                .or_else(|| sample.tags.iter().find(|(k, _)| *k == "name"))
+                .map(|(_, v)| v)
+            {
+                self.merged_per_url
+                    .entry(url.to_string())
+                    .or_insert_with(|| MetricSet::new(MetricType::Trend, hmax))
+                    .record(sample.value, &sample.sample_type);
+            }
+        } else if sample.metric.as_ref() == "iteration_duration" {
+            let merged = self
+                .merged_iter_dur
+                .get_or_insert_with(|| MetricSet::new(MetricType::Trend, hmax));
+            merged.record(sample.value, &sample.sample_type);
+        }
+
+        // Per-group merge: any series carrying a `group` tag (the runner
+        // emits `group=http` by default; named groups from `group()` /
+        // `pm.group` produce the meaningful rows).
+        if let Some(group) = sample.tags.iter().find(|(k, _)| *k == "group") {
+            let entry = self
+                .merged_per_group
+                .entry((sample.metric.to_string(), group.1.to_string()));
+            entry
+                .or_insert_with(|| MetricSet::new(metric_type, hmax))
+                .record(sample.value, &sample.sample_type);
+        }
 
         // Update totals — zero-alloc on the hot path: `get_mut` with a &str
         // borrow (String: Borrow<str>), only allocating on first sight of a
@@ -537,8 +691,6 @@ impl Aggregator {
     }
 
     fn build_results(&mut self) -> MetricsResult {
-        use std::collections::btree_map::Entry;
-
         let mut metrics = Vec::new();
         let mut http_reqs: u64 = 0;
         let mut http_req_duration: Option<MetricSummary> = None;
@@ -551,24 +703,15 @@ impl Aggregator {
         let mut data_received: f64 = 0.0;
         let mut data_sent: f64 = 0.0;
         let mut iterations: u64 = 0;
-        let mut merged_iter_dur: Option<MetricSet> = None;
         let mut vus_max: u64 = 0;
         let mut iteration_duration: Option<MetricSummary> = None;
 
-        // Merge all http_req_duration* histograms into one for the headline value
-        let mut merged_http_dur: Option<MetricSet> = None;
-        // Exact per-URL merge: one MetricSet per distinct `url` (or `name`)
-        // tag, so reporters can show true per-URL percentiles instead of
-        // approximating from a single series.
-        let mut merged_per_url: std::collections::BTreeMap<String, MetricSet> =
-            std::collections::BTreeMap::new();
-
-        // Per-group merge: one MetricSet per (metric, group) pair for series
-        // carrying a `group` tag — k6 aggregates group-scoped metrics per
-        // group in its per-group breakdown, so reporters must render merged
-        // histograms, not the raw per-(url,status) series.
-        let mut merged_per_group: std::collections::BTreeMap<(String, String), MetricSet> =
-            std::collections::BTreeMap::new();
+        // The headline merged histograms (http_req_duration / iteration_duration
+        // / per-URL / per-group) are maintained INCREMENTALLY in `record()`
+        // (and rebuilt in `absorb_snapshot`) — see `self.merged_*`. Reading
+        // them here instead of re-cloning/re-merging every full histogram per
+        // series per `results()` call is what removes the O(N)-per-2s-tick
+        // cost that filled the bounded channel and blocked `record_batch()`.
 
         // Clone full histograms into summaries only when some configured
         // threshold/summary stat needs an EXACT non-tracked percentile
@@ -656,7 +799,7 @@ impl Aggregator {
                     histogram: None,
                 },
                 MetricType::Trend => {
-                    let stats = set.histogram.stats();
+                    let stats = set.trend_stats();
                     MetricSummary {
                         key: key_str,
                         tags: summary_tags,
@@ -672,7 +815,7 @@ impl Aggregator {
                         p99: stats.p99,
                         last: 0.0,
                         rate: 0.0,
-                        histogram: retain_histograms.then(|| set.histogram.clone()),
+                        histogram: retain_histograms.then(|| set.histogram.clone()).flatten(),
                     }
                 }
             };
@@ -685,64 +828,8 @@ impl Aggregator {
             // series instead of the observed peak. MetricKey separates the
             // name from tags, so exact equality still merges every tagged
             // variant (e.g. `http_req_duration{status=200}`).
-            if key.metric.as_ref() == "http_req_duration" {
-                match &mut merged_http_dur {
-                    Some(ref mut merged) => {
-                        merged.histogram.merge(&set.histogram);
-                        merged.count += set.count;
-                        merged.sum += set.sum;
-                    }
-                    None => {
-                        merged_http_dur = Some(set.clone());
-                    }
-                }
-                // Exact per-URL merge (url tag, falling back to name).
-                if let Some(url) = key
-                    .tags
-                    .iter()
-                    .find(|(k, _)| k.as_ref() == "url" || k.as_ref() == "name")
-                    .map(|(_, v)| v.as_ref())
-                {
-                    match merged_per_url.entry(url.to_string()) {
-                        Entry::Occupied(mut e) => {
-                            let merged = e.get_mut();
-                            merged.histogram.merge(&set.histogram);
-                            merged.count += set.count;
-                            merged.sum += set.sum;
-                        }
-                        Entry::Vacant(v) => {
-                            v.insert(set.clone());
-                        }
-                    }
-                }
-            }
-
-            // Per-group merge: any series carrying a `group` tag (the runner
-            // emits `group=http` by default; named groups from `group()`/
-            // `pm.group` produce the meaningful rows) merges into one
-            // MetricSet per (metric, group) so per-group breakdowns show
-            // true aggregated histograms.
-            if let Some(group) = key.tags.iter().find(|(k, _)| k.as_ref() == "group") {
-                let g = group.1.as_ref().to_string();
-                let fam = key.metric.to_string();
-                let entry = merged_per_group.entry((fam, g));
-                match entry {
-                    Entry::Occupied(mut e) => {
-                        let merged = e.get_mut();
-                        merged.histogram.merge(&set.histogram);
-                        merged.count += set.count;
-                        merged.sum += set.sum;
-                        if set.metric_type == MetricType::Gauge {
-                            merged.min = merged.min.min(set.min);
-                            merged.max = merged.max.max(set.max);
-                            merged.last = set.last;
-                        }
-                    }
-                    Entry::Vacant(v) => {
-                        v.insert(set.clone());
-                    }
-                }
-            }
+            // The merged headline/per-URL/per-group accumulators are fed in
+            // `record()` — nothing to merge here per series.
 
             // Headline accumulators: EXACT name match only. A custom metric
             // sharing a prefix (checks_latency, errors_custom, http_reqs_total,
@@ -775,16 +862,7 @@ impl Aggregator {
             } else if key.metric.as_ref() == "iterations" {
                 iterations += set.sum as u64;
             } else if key.metric.as_ref() == "iteration_duration" {
-                match &mut merged_iter_dur {
-                    Some(ref mut merged) => {
-                        merged.histogram.merge(&set.histogram);
-                        merged.count += set.count;
-                        merged.sum += set.sum;
-                    }
-                    None => {
-                        merged_iter_dur = Some(set.clone());
-                    }
-                }
+                // Pre-merged incrementally in `record()` — see `merged_iter_dur`.
             } else if key.metric.as_ref() == "vus" {
                 // vus_max headline = OBSERVED peak of the active-VU gauge.
                 // The separate `vus_max` series carries the config's
@@ -813,12 +891,12 @@ impl Aggregator {
         // so reporters can show a true per-URL breakdown. Kept in the
         // dedicated `per_url` field (NOT `metrics`) so threshold evaluation
         // never double-counts samples that also exist as raw series.
-        let mut per_url = Vec::with_capacity(merged_per_url.len());
-        for (url, merged) in merged_per_url {
-            let stats = merged.histogram.stats();
+        let mut per_url = Vec::with_capacity(self.merged_per_url.len());
+        for (url, merged) in &self.merged_per_url {
+            let stats = merged.trend_stats();
             per_url.push(MetricSummary {
                 key: format!("http_req_duration{{url={}}}", url),
-                tags: vec![("url".to_string(), url)],
+                tags: vec![("url".to_string(), url.clone())],
                 metric_type: MetricType::Trend,
                 count: merged.count as u64,
                 sum: merged.sum,
@@ -831,18 +909,18 @@ impl Aggregator {
                 p99: stats.p99,
                 last: 0.0,
                 rate: 0.0,
-                histogram: retain_histograms.then(|| merged.histogram.clone()),
+                histogram: retain_histograms.then(|| merged.histogram.clone()).flatten(),
             });
         }
 
         // Build per-group summaries (merged histograms per (metric, group))
         // so reporters show k6-style per-group breakdowns. Kept OUT of
         // `metrics` like `per_url` so thresholds never double-count.
-        let mut per_group = Vec::with_capacity(merged_per_group.len());
-        for ((fam, group), merged) in merged_per_group {
+        let mut per_group = Vec::with_capacity(self.merged_per_group.len());
+        for ((fam, group), merged) in &self.merged_per_group {
             let summary = match merged.metric_type {
                 MetricType::Trend => {
-                    let stats = merged.histogram.stats();
+                    let stats = merged.trend_stats();
                     MetricSummary {
                         key: format!("{fam}{{group={group}}}"),
                         tags: vec![("group".to_string(), group.clone())],
@@ -858,7 +936,7 @@ impl Aggregator {
                         p99: stats.p99,
                         last: 0.0,
                         rate: 0.0,
-                        histogram: retain_histograms.then(|| merged.histogram.clone()),
+                        histogram: retain_histograms.then(|| merged.histogram.clone()).flatten(),
                     }
                 }
                 MetricType::Counter => MetricSummary {
@@ -925,9 +1003,9 @@ impl Aggregator {
             per_group.push(summary);
         }
 
-        // Build headline iteration_duration from merged histogram
-        if let Some(ref merged) = merged_iter_dur {
-            let stats = merged.histogram.stats();
+        // Build headline iteration_duration from the incremental accumulator
+        if let Some(merged) = self.merged_iter_dur.as_ref() {
+            let stats = merged.trend_stats();
             iteration_duration = Some(MetricSummary {
                 key: "iteration_duration".to_string(),
                 tags: vec![],
@@ -943,13 +1021,13 @@ impl Aggregator {
                 p99: stats.p99,
                 last: 0.0,
                 rate: 0.0,
-                histogram: retain_histograms.then(|| merged.histogram.clone()),
+                histogram: retain_histograms.then(|| merged.histogram.clone()).flatten(),
             });
         }
 
-        // Build headline http_req_duration from merged histogram
-        if let Some(ref merged) = merged_http_dur {
-            let stats = merged.histogram.stats();
+        // Build headline http_req_duration from the incremental accumulator
+        if let Some(merged) = self.merged_http_dur.as_ref() {
+            let stats = merged.trend_stats();
             http_req_duration = Some(MetricSummary {
                 key: "http_req_duration".to_string(),
                 tags: vec![],
@@ -965,23 +1043,20 @@ impl Aggregator {
                 p99: stats.p99,
                 last: 0.0,
                 rate: 0.0,
-                histogram: retain_histograms.then(|| merged.histogram.clone()),
+                histogram: retain_histograms.then(|| merged.histogram.clone()).flatten(),
             });
         }
 
-        // Fallback to totals map for counters not captured in per-key metrics
-        if http_reqs == 0 {
-            http_reqs = self.totals.get("http_reqs").copied().unwrap_or(0.0) as u64;
-        }
-        if errors == 0 {
-            errors = self.totals.get("errors").copied().unwrap_or(0.0) as u64;
-        }
-        if data_received == 0.0 {
-            data_received = self.totals.get("data_received").copied().unwrap_or(0.0);
-        }
-        if data_sent == 0.0 {
-            data_sent = self.totals.get("data_sent").copied().unwrap_or(0.0);
-        }
+        // Headline counters: take the MAX of the surviving series and the
+        // totals map. `totals` is keyed by metric NAME and accumulates EVERY
+        // sample — including series dropped by the `max_series` cardinality
+        // cap — so it is >= the per-series sum and is the exact total when
+        // the cap fired. max() keeps both paths identical when nothing was
+        // dropped (the series sum already covers every sample).
+        http_reqs = http_reqs.max(self.totals.get("http_reqs").copied().unwrap_or(0.0) as u64);
+        errors = errors.max(self.totals.get("errors").copied().unwrap_or(0.0) as u64);
+        data_received = data_received.max(self.totals.get("data_received").copied().unwrap_or(0.0));
+        data_sent = data_sent.max(self.totals.get("data_sent").copied().unwrap_or(0.0));
 
         MetricsResult {
             metrics,
@@ -1027,16 +1102,13 @@ impl Aggregator {
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
                 metric_type: set.metric_type,
-                histogram: if set.metric_type == MetricType::Trend
-                    && set.histogram.count() > 0
-                {
-                    Some(
-                        base64::engine::general_purpose::STANDARD
-                            .encode(set.histogram.to_bytes()),
-                    )
-                } else {
-                    None
-                },
+                // Lazily-allocated histogram: `None` unless a Trend sample was
+                // recorded (Counter/Rate/Gauge series carry no ~16 KB struct).
+                histogram: set
+                    .histogram
+                    .as_ref()
+                    .filter(|h| h.count() > 0)
+                    .map(|h| base64::engine::general_purpose::STANDARD.encode(h.to_bytes())),
                 count: set.count,
                 sum: set.sum,
                 min: set.min,
@@ -1070,7 +1142,10 @@ impl Aggregator {
             }
             let key = MetricKey::new(&s.metric, &tags);
 
-            let histogram = match &s.histogram {
+            // The snapshot's histogram payload — `None` for non-Trend series
+            // (build_snapshot only encodes Trend histograms), kept as `Option`
+            // to match the lazy MetricSet field (no 16 KB struct per series).
+            let histogram: Option<LatencyHistogram> = match &s.histogram {
                 Some(b64) => {
                     let raw = base64::engine::general_purpose::STANDARD
                         .decode(b64)
@@ -1081,7 +1156,7 @@ impl Aggregator {
                                 s.metric, s.tags
                             ))
                         })?;
-                    LatencyHistogram::from_bytes(&raw).ok_or_else(|| {
+                    Some(LatencyHistogram::from_bytes(&raw).ok_or_else(|| {
                         TropelError::Execution(format!(
                             "corrupt histogram in worker snapshot for '{}' tags {:?}: \
                              {} bytes do not deserialize as hdr-histogram V2",
@@ -1089,16 +1164,23 @@ impl Aggregator {
                             s.tags,
                             raw.len()
                         ))
-                    })?
+                    })?)
                 }
-                None => LatencyHistogram::default(),
+                None => None,
             };
 
             match self.data.entry(key) {
                 indexmap::map::Entry::Occupied(mut e) => {
                     let existing = e.get_mut();
                     if existing.metric_type == MetricType::Trend {
-                        existing.histogram.merge(&histogram);
+                        if let Some(h) = &histogram {
+                            existing
+                                .histogram
+                                .get_or_insert_with(|| {
+                                    LatencyHistogram::with_max(existing.histogram_max_micros)
+                                })
+                                .merge(h);
+                        }
                     }
                     existing.count += s.count;
                     existing.sum += s.sum;
@@ -1114,6 +1196,7 @@ impl Aggregator {
                     v.insert(MetricSet {
                         metric_type: s.metric_type,
                         histogram,
+                        histogram_max_micros: self.histogram_max_micros,
                         count: s.count,
                         sum: s.sum,
                         min: s.min,
@@ -1130,7 +1213,54 @@ impl Aggregator {
         if self.summary_trend_stats.is_empty() && !snap.summary_trend_stats.is_empty() {
             self.summary_trend_stats = snap.summary_trend_stats.clone();
         }
+        // Series arrive pre-aggregated here (not through `record()`), so the
+        // incremental merged accumulators must be rebuilt from `self.data` to
+        // keep `build_results`' pre-merged headlines correct.
+        self.rebuild_merged();
         Ok(())
+    }
+
+    /// Rebuild the incremental merged accumulators (headline http_req_duration
+    /// / iteration_duration, per-URL, per-group) from the raw series map.
+    /// Called after snapshot absorption (distributed path), where series are
+    /// added directly to `self.data` instead of via [`Self::record`].
+    fn rebuild_merged(&mut self) {
+        self.merged_http_dur = None;
+        self.merged_iter_dur = None;
+        self.merged_per_url.clear();
+        self.merged_per_group.clear();
+        let hmax = self.histogram_max_micros;
+        for (key, set) in &self.data {
+            if key.metric.as_ref() == "http_req_duration" {
+                let merged = self
+                    .merged_http_dur
+                    .get_or_insert_with(|| MetricSet::new(MetricType::Trend, hmax));
+                merged.merge_from(set);
+                if let Some(url) = key
+                    .tags
+                    .iter()
+                    .find(|(k, _)| k.as_ref() == "url")
+                    .or_else(|| key.tags.iter().find(|(k, _)| k.as_ref() == "name"))
+                    .map(|(_, v)| v.as_ref())
+                {
+                    self.merged_per_url
+                        .entry(url.to_string())
+                        .or_insert_with(|| MetricSet::new(MetricType::Trend, hmax))
+                        .merge_from(set);
+                }
+            } else if key.metric.as_ref() == "iteration_duration" {
+                let merged = self
+                    .merged_iter_dur
+                    .get_or_insert_with(|| MetricSet::new(MetricType::Trend, hmax));
+                merged.merge_from(set);
+            }
+            if let Some(group) = key.tags.iter().find(|(k, _)| k.as_ref() == "group") {
+                self.merged_per_group
+                    .entry((key.metric.to_string(), group.1.as_ref().to_string()))
+                    .or_insert_with(|| MetricSet::new(set.metric_type, hmax))
+                    .merge_from(set);
+            }
+        }
     }
 }
 
@@ -1542,7 +1672,7 @@ mod tests {
         }
 
         assert_eq!(set.count, 10_000.0, "count must include zero samples");
-        let stats = set.histogram.stats();
+        let stats = set.trend_stats();
         assert_eq!(stats.count, 10_000, "histogram population must match count");
         assert!(
             stats.min <= stats.max,
@@ -1575,7 +1705,7 @@ mod tests {
         set.record(2_500.0, &trend); // 2.5 ms
 
         assert_eq!(set.count, 3.0);
-        let stats = set.histogram.stats();
+        let stats = set.trend_stats();
         assert_eq!(stats.count, 3, "all samples must be in the histogram");
         assert!(
             stats.max >= 2_500,
@@ -1602,7 +1732,7 @@ mod tests {
         }
 
         assert_eq!(set.count, 100.0);
-        let stats = set.histogram.stats();
+        let stats = set.trend_stats();
         assert_eq!(stats.count, 100, "all 100 zeros must be recorded");
         assert_eq!(stats.min, 1);
         assert_eq!(stats.max, 1);
@@ -1923,5 +2053,159 @@ mod tests {
         let m = merged.http_req_duration.expect("merged duration");
         assert_eq!(m.count, 5, "all 5 samples must merge");
         assert!(m.max >= 100_000, "max must reflect the merged buckets");
+    }
+
+    #[test]
+    fn test_histogram_lazy_for_non_trend_series() {
+        // Regression (backlog line 110): every series allocated a ~16 KB
+        // LatencyHistogram regardless of type. Counter/Rate/Gauge series must
+        // keep `histogram: None` — only Trend records allocate.
+        let mut counter = MetricSet::new(MetricType::Counter, None);
+        counter.record(5.0, &SampleType::Counter);
+        assert!(counter.histogram.is_none(), "Counter must not allocate a histogram");
+
+        let mut rate = MetricSet::new(MetricType::Rate, None);
+        rate.record(1.0, &SampleType::Rate);
+        assert!(rate.histogram.is_none(), "Rate must not allocate a histogram");
+
+        let mut gauge = MetricSet::new(MetricType::Gauge, None);
+        gauge.record(3.0, &SampleType::Point);
+        assert!(gauge.histogram.is_none(), "Gauge must not allocate a histogram");
+
+        let mut trend = MetricSet::new(MetricType::Trend, None);
+        trend.record(1.5, &SampleType::Trend);
+        assert!(trend.histogram.is_some(), "Trend must allocate on first sample");
+        assert_eq!(trend.trend_stats().count, 1, "trend_stats reads the lazy histogram");
+    }
+
+    #[test]
+    fn test_max_series_cardinality_cap_drops_new_series() {
+        // Regression (backlog line 110): unbounded cardinality — the runner
+        // tags every request with the FULL URL in `url`/`name`, so a
+        // high-cardinality input (unique URL per request) must not OOM the
+        // aggregator. New series beyond `max_series` are dropped and counted;
+        // existing series keep recording; `totals` stays complete.
+        let mut agg = Aggregator::new();
+        agg.max_series = 2;
+        let ts = std::time::SystemTime::now();
+
+        for (metric, url) in [
+            ("http_req_duration", "/a"),
+            ("http_req_duration", "/b"),
+        ] {
+            let tags = Arc::new(tropel_core::types::TagMap::from_pairs([
+                ("url", url),
+                ("name", url),
+            ]));
+            agg.record(Sample {
+                metric: metric.into(),
+                value: 1.0,
+                tags,
+                timestamp: ts,
+                sample_type: SampleType::Trend,
+            });
+        }
+        assert_eq!(agg.data.len(), 2);
+
+        // A third distinct URL is dropped (counted, not stored).
+        let tags = Arc::new(tropel_core::types::TagMap::from_pairs([
+            ("url", "/c"),
+            ("name", "/c"),
+        ]));
+        agg.record(Sample {
+            metric: "http_req_duration".into(),
+            value: 1.0,
+            tags,
+            timestamp: ts,
+            sample_type: SampleType::Trend,
+        });
+        assert_eq!(agg.data.len(), 2, "series map must stay at max_series");
+        assert_eq!(agg.series_dropped, 1, "dropped series must be counted");
+
+        // Existing series still record.
+        let tags = Arc::new(tropel_core::types::TagMap::from_pairs([
+            ("url", "/a"),
+            ("name", "/a"),
+        ]));
+        agg.record(Sample {
+            metric: "http_req_duration".into(),
+            value: 2.0,
+            tags,
+            timestamp: ts,
+            sample_type: SampleType::Trend,
+        });
+        let res = agg.build_results();
+        assert_eq!(res.http_reqs, 0); // no http_reqs counter samples
+        let a = res
+            .per_url
+            .iter()
+            .find(|u| u.key.contains("/a"))
+            .expect("/a per-url series kept recording");
+        assert_eq!(a.count, 2, "existing /a series records both samples");
+    }
+
+    #[test]
+    fn test_incremental_merged_accumulators_match_data() {
+        // Regression (backlog line 110): build_results used to re-clone and
+        // re-merge every full histogram per series on every call (the ~2s
+        // threshold tick). The incremental accumulators maintained in
+        // `record()` must produce the SAME headline/per-URL/per-group stats
+        // as the old per-call merge over `self.data`.
+        let mut agg = Aggregator::new();
+        let ts = std::time::SystemTime::now();
+        for url in ["/a", "/b"] {
+            for ms in [10u64, 20, 30] {
+                let tags = Arc::new(tropel_core::types::TagMap::from_pairs([
+                    ("url", url),
+                    ("name", url),
+                    ("group", "http"),
+                ]));
+                agg.record(Sample {
+                    metric: "http_req_duration".into(),
+                    value: (ms * 1000) as f64,
+                    tags,
+                    timestamp: ts,
+                    sample_type: SampleType::Trend,
+                });
+            }
+        }
+        // iteration_duration samples (no url tag → headline only).
+        for _ in 0..2 {
+            agg.record(Sample {
+                metric: "iteration_duration".into(),
+                value: 42_000.0,
+                tags: Arc::new(tropel_core::types::TagMap::new()),
+                timestamp: ts,
+                sample_type: SampleType::Trend,
+            });
+        }
+
+        let res = agg.build_results();
+
+        let hd = res.http_req_duration.expect("headline http_req_duration");
+        assert_eq!(hd.count, 6, "all 6 duration samples merged");
+        // 10+20+30+10+20+30 ms = 120 ms = 120_000 µs.
+        assert_eq!(hd.sum, 120_000.0);
+        // p95 over [10,20,30]x2 is the max (30 ms); hdr-histogram bucket
+        // rounding lands on the bucket edge (30015), never below the true
+        // value — assert within tolerance, not exact.
+        assert!(
+            hd.p95 >= 30_000 && hd.p95 <= 30_100,
+            "p95 over 10/20/30 x2 must be ~30ms, got {}",
+            hd.p95
+        );
+
+        assert_eq!(res.per_url.len(), 2, "two distinct URLs");
+        for u in &res.per_url {
+            assert_eq!(u.count, 3, "each URL sees its 3 samples");
+        }
+
+        // Per-group: http_req_duration{group=http} plus iteration_duration
+        // has NO group tag, so only the duration series land here.
+        assert!(res.per_group.iter().any(|g| g.count == 6), "duration group merged");
+
+        let id = res.iteration_duration.expect("headline iteration_duration");
+        assert_eq!(id.count, 2);
+        assert_eq!(id.sum, 84_000.0);
     }
 }

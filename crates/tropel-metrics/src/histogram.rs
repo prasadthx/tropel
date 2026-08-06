@@ -193,7 +193,7 @@ impl Default for LatencyHistogram {
         Self::new()
     }
 }/// Snapshot of histogram statistics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HistogramStats {
     pub count: u64,
     pub min: u64,
