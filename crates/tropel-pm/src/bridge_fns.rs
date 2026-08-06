@@ -326,9 +326,17 @@ impl PmBridge {
                 "__tropel_pm_response_header",
                 Func::from(move |key: String| -> Option<String> {
                     let st = state_clone.lock().unwrap();
-                    st.response
-                        .as_ref()
-                        .and_then(|r| r.headers.get(&key).cloned())
+                    st.response.as_ref().and_then(|r| {
+                        // Postman semantics: pm.response.header('content-type')
+                        // and pm.response.headers.get('Content-Type') are
+                        // case-insensitive. The map is canonical (Content-Type)
+                        // after the client.rs fix, but a script may ask in any
+                        // case — look up case-insensitively.
+                        r.headers
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(&key))
+                            .map(|(_, v)| v.clone())
+                    })
                 }),
             );
 

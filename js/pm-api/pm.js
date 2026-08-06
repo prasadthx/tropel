@@ -349,8 +349,17 @@ pm.sendRequest = function (options, callback) {
                     }
                 }
             } else if (options.headers) {
-                // Plain object or Postman header object
-                headers = options.headers;
+                // Plain object or Postman header object — COPY it: the
+                // formdata branch below stamps Content-Type with the
+                // generated boundary, and mutating the caller's object
+                // (options are often hoisted to module scope) would leak
+                // state across iterations.
+                headers = {};
+                if (!Array.isArray(options.headers)) {
+                    for (var hk in options.headers) {
+                        if (options.headers.hasOwnProperty(hk)) headers[hk] = options.headers[hk];
+                    }
+                }
             }
 
             // Handle Postman-style body
@@ -379,9 +388,16 @@ pm.sendRequest = function (options, callback) {
                             if (options.body.formdata && Array.isArray(options.body.formdata)) {
                                 var multipart = buildMultipartBody(options.body.formdata);
                                 body = multipart.body;
-                                if (!headers['Content-Type'] && !headers['content-type']) {
-                                    headers['Content-Type'] = multipart.contentType;
-                                }
+                                // ALWAYS stamp the generated boundary — the
+                                // old `!headers['Content-Type']` guard was
+                                // false whenever the caller declared
+                                // multipart/form-data, so the boundary never
+                                // reached the request. `headers` is a copy of
+                                // options.headers (never the caller's object).
+                                // Drop any lowercase variant so only ONE
+                                // Content-Type (with the boundary) is sent.
+                                delete headers['content-type'];
+                                headers['Content-Type'] = multipart.contentType;
                             }
                             break;
                         case 'graphql':

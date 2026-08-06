@@ -77,19 +77,25 @@ function k6HTTPRequest(method, url, body, params) {
     var respHeaders = result.headers || {};
     var respTime = result.responseTime || result.response_time || 0;
 
-    // Normalize headers from {key: value} or array format
+    // Normalize headers from {key: value} or array format into a fresh
+    // object. Keys are kept EXACTLY as the native bridge delivered them (Go
+    // MIME canonical form: Content-Type, X-Request-Id) — the old
+    // toLowerCase() here made every k6 doc idiom `res.headers['Content-Type']`
+    // return undefined (backlog line 139). The copy protects K6Response from
+    // sharing the bridge's object (user mutation of res.headers must not leak
+    // back into the native response).
     var normalizedHeaders = {};
     if (Array.isArray(respHeaders)) {
         for (var hi = 0; hi < respHeaders.length; hi++) {
             var h = respHeaders[hi];
             if (h && h.key) {
-                normalizedHeaders[h.key.toLowerCase()] = h.value !== undefined ? h.value : '';
+                normalizedHeaders[h.key] = h.value !== undefined ? h.value : '';
             }
         }
     } else if (typeof respHeaders === 'object') {
         for (var hk in respHeaders) {
             if (respHeaders.hasOwnProperty(hk)) {
-                normalizedHeaders[hk.toLowerCase()] = respHeaders[hk];
+                normalizedHeaders[hk] = respHeaders[hk];
             }
         }
     }
@@ -111,7 +117,19 @@ function normalizeK6Request(method, url, body, params) {
     method = (method || 'GET').toUpperCase();
     params = params || {};
 
-    var headers = params.headers || {};
+    // COPY the caller's headers: serializeK6Body stamps Content-Type for
+    // object bodies (and the generated boundary for multipart), and real k6
+    // scripts hoist `params` to module scope — writing on the caller's
+    // object leaked iteration 1's Content-Type into every later iteration
+    // (a string body posted on iteration 2 was still labelled
+    // application/json). The copy keeps the stamp per-request.
+    var headers = {};
+    var srcHeaders = params.headers;
+    if (srcHeaders && typeof srcHeaders === 'object' && !Array.isArray(srcHeaders)) {
+        for (var hk in srcHeaders) {
+            if (srcHeaders.hasOwnProperty(hk)) headers[hk] = srcHeaders[hk];
+        }
+    }
     var timeout = params.timeout || '30s';
     // k6 params.responseType: "text" (default) | "binary" | "none"
     var responseType = params.responseType || 'text';
@@ -153,9 +171,20 @@ function serializeK6Body(body, headers) {
             if (contentType && contentType.indexOf('multipart/form-data') !== -1 && typeof body === 'object') {
                 var multipart = buildMultipartFormData(body);
                 bodyStr = multipart.body;
-                if (!headers['Content-Type'] && !headers['content-type']) {
-                    headers['Content-Type'] = multipart.contentType;
-                }
+                // ALWAYS stamp the full generated content-type. The old
+                // `!headers['Content-Type']` guard was false exactly when the
+                // user declared multipart/form-data (they set the type but not
+                // a boundary), so the generated boundary never reached the
+                // header and every multipart request was unparseable. The body
+                // was framed with OUR boundary, so the header must advertise
+                // exactly that boundary. `headers` is a per-request copy
+                // (normalizeK6Request clones params.headers), so this can't
+                // leak into the caller's object. Drop any user-declared
+                // lowercase variant — leaving it would send TWO Content-Type
+                // headers (one boundary-less) and the Rust side's case-
+                // sensitive HashMap would keep both.
+                delete headers['content-type'];
+                headers['Content-Type'] = multipart.contentType;
             } else if (contentType && contentType.indexOf('application/x-www-form-urlencoded') !== -1 && typeof body === 'object') {
                 bodyStr = serializeUrlEncoded(body);
             } else {
@@ -320,13 +349,13 @@ http.batch = function (requests) {
                 for (var hi = 0; hi < headers.length; hi++) {
                     var h = headers[hi];
                     if (h && h.key) {
-                        normalizedHeaders[h.key.toLowerCase()] = h.value !== undefined ? h.value : '';
+                        normalizedHeaders[h.key] = h.value !== undefined ? h.value : '';
                     }
                 }
             } else {
                 for (var hk in headers) {
                     if (headers.hasOwnProperty(hk)) {
-                        normalizedHeaders[hk.toLowerCase()] = headers[hk];
+                        normalizedHeaders[hk] = headers[hk];
                     }
                 }
             }

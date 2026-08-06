@@ -2938,6 +2938,225 @@ mod tests {
     }
 
     #[test]
+    fn test_http_params_headers_not_mutated_and_multipart_boundary() {
+        // Backlog line 138: serializeK6Body wrote Content-Type onto the
+        // CALLER's headers object (every real k6 script hoists params to
+        // module scope) — iteration 2 posted a string body still labelled
+        // application/json. And the `!headers['Content-Type']` multipart
+        // guard was false exactly when the user declared multipart/form-data,
+        // so the generated boundary never reached the header → every
+        // multipart request unparseable.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+                .expect("k6 shim should eval");
+            // Stub the native HTTP bridge so no real network is needed;
+            // capture exactly what the shim would hand to the bridge.
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__captured = [];
+                globalThis.__tropel_k6_http_request = function (method, url, headersJson, body) {
+                    globalThis.__captured.push({ headers: JSON.parse(headersJson), body: body });
+                    return { code: 200, status: 200, body: '{}', headers: {}, responseTime: 5 };
+                };
+            "#,
+            )
+            .expect("stub should eval");
+            ctx.eval::<(), _>(
+                r#"
+                var params = { headers: {} };
+                http.post('https://example.com/a', { a: 1 }, params);   // iter 1: object body
+                http.post('https://example.com/b', 'plain text', params); // iter 2: string body
+                var mp = { headers: { 'Content-Type': 'multipart/form-data' } };
+                http.post('https://example.com/c', { field: 'value' }, mp);
+                var mpLower = { headers: { 'content-type': 'multipart/form-data' } };
+                http.post('https://example.com/d', { f2: 'v2' }, mpLower);
+            "#,
+            )
+            .expect("script should eval");
+
+            // 1. Caller's module-scope params.headers must NOT be mutated.
+            let params_after: String = ctx
+                .eval("JSON.stringify(params.headers)")
+                .expect("read params.headers");
+            assert_eq!(
+                params_after, "{}",
+                "params.headers was mutated in place: {params_after}"
+            );
+
+            // 2. Iteration 2 (string body) must not inherit Content-Type from
+            //    iteration 1's object-body mutation.
+            let second_headers: String = ctx
+                .eval("JSON.stringify(__captured[1].headers)")
+                .expect("read captured[1] headers");
+            assert!(
+                !second_headers.to_lowercase().contains("content-type"),
+                "string-body request inherited stale Content-Type: {second_headers}"
+            );
+            let second_body: String = ctx
+                .eval("__captured[1].body")
+                .expect("read captured[1] body");
+            assert_eq!(second_body, "plain text");
+
+            // 3. Iteration 1 (object body) still gets application/json ON THE
+            //    COPY (not on the caller's object).
+            let first_headers: String = ctx
+                .eval("JSON.stringify(__captured[0].headers)")
+                .expect("read captured[0] headers");
+            assert!(
+                first_headers.to_lowercase().contains("application/json"),
+                "object body not labelled json: {first_headers}"
+            );
+
+            // 4. Multipart: the generated boundary MUST reach the header.
+            let mp_headers: String = ctx
+                .eval("JSON.stringify(__captured[2].headers)")
+                .expect("read captured[2] headers");
+            assert!(
+                mp_headers.contains("boundary="),
+                "multipart boundary missing from header: {mp_headers}"
+            );
+            let mp_body: String = ctx
+                .eval("__captured[2].body")
+                .expect("read captured[2] body");
+            assert!(
+                mp_body.contains("----TropelFormBoundary"),
+                "multipart body missing framing: {mp_body}"
+            );
+
+            // 5. A lowercase `content-type` declaration must be replaced (not
+            //    duplicated) — leaving both would send TWO Content-Type
+            //    headers, one boundary-less.
+            let mp_lower: String = ctx
+                .eval("JSON.stringify(__captured[3].headers)")
+                .expect("read captured[3] headers");
+            assert!(
+                mp_lower.contains("boundary="),
+                "lowercase multipart boundary missing: {mp_lower}"
+            );
+            assert!(
+                !mp_lower.to_lowercase().contains("\"content-type\":\"multipart/form-data\""),
+                "boundary-less content-type variant leaked into header: {mp_lower}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_response_headers_keep_canonical_case() {
+        // Backlog line 139: the shim force-lowercased response header keys
+        // (hk.toLowerCase()), so `res.headers['Content-Type']` — every k6
+        // doc example — returned undefined. The native bridge now delivers
+        // Go MIME canonical keys (Content-Type, X-Request-Id); the shim must
+        // keep them EXACTLY as-is.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/k6-shim/k6-shim.js"))
+                .expect("k6 shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__tropel_k6_http_request = function (method, url, headersJson, body) {
+                    // Canonical MIME form, exactly what client.rs now emits.
+                    return { code: 200, status: 200, body: '{}',
+                             headers: { 'Content-Type': 'application/json',
+                                        'X-Request-Id': 'abc-123',
+                                        'Location': 'https://example.com/2' },
+                             responseTime: 5 };
+                };
+                globalThis.__res = http.get('https://example.com/1', {});
+                globalThis.__ct = __res.headers['Content-Type'];
+                globalThis.__xri = __res.headers['X-Request-Id'];
+                globalThis.__loc = __res.headers['Location'];
+            "#,
+            )
+            .expect("script should eval");
+            let ct: String = ctx.eval("__ct").expect("read Content-Type");
+            assert_eq!(ct, "application/json");
+            let xri: String = ctx.eval("__xri").expect("read X-Request-Id");
+            assert_eq!(xri, "abc-123");
+            let loc: String = ctx.eval("__loc").expect("read Location");
+            assert_eq!(loc, "https://example.com/2");
+            // The keys must be stored verbatim (canonical), not lowercased.
+            let keys: String = ctx
+                .eval("JSON.stringify(Object.keys(__res.headers))")
+                .expect("read header keys");
+            assert!(
+                keys.contains("Content-Type"),
+                "canonical key Content-Type missing: {keys}"
+            );
+            assert!(
+                keys.contains("X-Request-Id") && keys.contains("Location"),
+                "canonical keys missing: {keys}"
+            );
+            let has_lowercase: bool = ctx
+                .eval("Object.keys(__res.headers).indexOf('content-type') !== -1")
+                .expect("check lowercase key absent");
+            assert!(
+                !has_lowercase,
+                "lowercase key 'content-type' present instead of canonical: {keys}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_pm_send_request_headers_not_mutated_and_multipart_boundary() {
+        // Backlog line 138 (pm.js half): pm.sendRequest aliased
+        // `headers = options.headers`, so the formdata branch stamped the
+        // generated Content-Type onto the CALLER's object, and the
+        // `!headers['Content-Type']` guard dropped the boundary whenever the
+        // caller declared multipart/form-data.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__pm_captured = [];
+                globalThis.__tropel_pm_send_request = function (method, url, headersJson, body) {
+                    globalThis.__pm_captured.push({ headers: JSON.parse(headersJson), body: body });
+                    return JSON.stringify({ code: 200, body: '{}', headers: {}, responseTime: 5 });
+                };
+                var opts = { url: 'https://example.com/u', method: 'POST',
+                             headers: { 'Content-Type': 'multipart/form-data' },
+                             body: { mode: 'formdata', formdata: [{ key: 'field', value: 'value' }] } };
+                pm.sendRequest(opts);
+                var opts2 = { url: 'https://example.com/v', method: 'POST',
+                              headers: { 'Content-Type': 'multipart/form-data' },
+                              body: { mode: 'formdata', formdata: [{ key: 'x', value: 'y' }] } };
+                pm.sendRequest(opts2);
+            "#,
+            )
+            .expect("script should eval");
+            // Caller's options.headers must not be mutated.
+            let caller_headers: String = ctx
+                .eval("JSON.stringify(opts.headers)")
+                .expect("read opts.headers");
+            assert_eq!(
+                caller_headers, "{\"Content-Type\":\"multipart/form-data\"}",
+                "caller's options.headers was mutated: {caller_headers}"
+            );
+            // Generated boundary must reach the request header.
+            let first: String = ctx
+                .eval("JSON.stringify(__pm_captured[0].headers)")
+                .expect("read captured headers");
+            assert!(
+                first.contains("boundary="),
+                "pm multipart boundary missing from header: {first}"
+            );
+            // A fresh boundary per call (not reused/stale across iterations).
+            let second: String = ctx
+                .eval("JSON.stringify(__pm_captured[1].headers)")
+                .expect("read captured headers");
+            assert!(
+                second.contains("boundary=") && second != first,
+                "pm boundary reused across calls: {second}"
+            );
+        });
+    }
+
+    #[test]
     fn test_exec_selection_installs_named_export() {
         // A scenario naming `exec: "browse"` must run the `browse` export,
         // NOT the default export (k6 multi-scenario semantics).

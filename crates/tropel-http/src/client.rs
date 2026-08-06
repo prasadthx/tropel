@@ -31,6 +31,29 @@ fn is_credential_header(key: &str) -> bool {
     CREDENTIAL_HEADERS.contains(&key)
 }
 
+/// Canonicalize an HTTP header name to Go's MIME canonical form
+/// (uppercase first letter of each dash-separated word, lowercase the
+/// rest): `content-type` → `Content-Type`, `x-request-id` →
+/// `X-Request-Id`. The `http`/reqwest crate lowercases every `HeaderName`,
+/// so without this every k6/Postman doc idiom (`res.headers['Content-Type']`,
+/// `pm.response.header('Content-Type')`) would see `undefined`.
+fn canonical_header_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut upper = true;
+    for c in name.chars() {
+        if c == '-' {
+            out.push('-');
+            upper = true;
+        } else if upper {
+            out.push(c.to_ascii_uppercase());
+            upper = false;
+        } else {
+            out.push(c.to_ascii_lowercase());
+        }
+    }
+    out
+}
+
 /// Per-certificate-identity HTTP clients (`Arc<Mutex<…>>` because
 /// `std::sync::Mutex` is not `Clone` while `HttpClient` derives `Clone`).
 type CertClientMap = Arc<Mutex<HashMap<(String, String, bool), reqwest::Client>>>;
@@ -683,11 +706,20 @@ impl HttpClient {
             .unwrap_or("Unknown")
             .to_string();
 
-        // Collect response headers
+        // Collect response headers — canonicalized to Go's MIME form
+        // (Content-Type, X-Request-Id) because reqwest's HeaderName is
+        // always lowercase; k6/Postman scripts index headers by their
+        // canonical spelling and every doc example would otherwise see
+        // undefined.
         let headers: HashMap<String, String> = response
             .headers()
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+            .map(|(k, v)| {
+                (
+                    canonical_header_name(k.as_str()),
+                    v.to_str().unwrap_or("").to_string(),
+                )
+            })
             .collect();
 
         // Parse Set-Cookie headers into structured cookies so scripts can
@@ -1249,6 +1281,25 @@ pub(crate) fn parse_duration(s: &str) -> Result<Duration> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn canonical_header_name_matches_go_mime_form() {
+        // Regression (backlog line 139): reqwest lowercases HeaderName, so
+        // response headers arrived as `content-type` and k6's canonical
+        // `res.headers['Content-Type']` (and Postman's
+        // `pm.response.header('Content-Type')`) returned undefined.
+        assert_eq!(canonical_header_name("content-type"), "Content-Type");
+        assert_eq!(canonical_header_name("x-request-id"), "X-Request-Id");
+        assert_eq!(canonical_header_name("etag"), "Etag");
+        assert_eq!(
+            canonical_header_name("www-authenticate"),
+            "Www-Authenticate"
+        );
+        // Already-canonical and single-word names are idempotent.
+        assert_eq!(canonical_header_name("Content-Type"), "Content-Type");
+        assert_eq!(canonical_header_name("location"), "Location");
+        assert_eq!(canonical_header_name("set-cookie"), "Set-Cookie");
+    }
 
     #[test]
     fn parse_set_cookie_extracts_name_value_and_attrs() {
