@@ -483,9 +483,21 @@ fn build_threshold(
 /// on these are in MILLISECONDS (k6's native unit), so a `p(95)<500` means
 /// 500 ms = 500 000 µs. Without scaling, `http_req_duration.p95 < 500`
 /// compared 500 against µs values (e.g. 292 607 µs) and every duration
-/// threshold failed ~1000×.
-const DURATION_METRICS: [&str; 6] = [
+/// threshold failed ~1000×. The six `http_req_*` sub-timings (blocked,
+/// connecting, tls_handshaking, sending, waiting, receiving) plus the
+/// runner's `http_req_dns` are ALSO recorded in µs, so they must be in this
+/// list — omitting them (backlog line 134) made `http_req_waiting:
+/// ['p(95)<400']` compare 400 against ~400 000 µs: always red, the exact
+/// bug this comment claims to fix, left half-done.
+const DURATION_METRICS: [&str; 13] = [
     "http_req_duration",
+    "http_req_blocked",
+    "http_req_dns",
+    "http_req_connecting",
+    "http_req_tls_handshaking",
+    "http_req_sending",
+    "http_req_waiting",
+    "http_req_receiving",
     "iteration_duration",
     "group_duration",
     "ws_req_duration",
@@ -536,17 +548,15 @@ fn translate_k6_expression(metric: &str, expr: &str) -> String {
             val.to_string()
         };
         let suffix = match stat {
-            s if s.starts_with("p(") => {
-                // p(95) → .p95; map unsupported buckets to the nearest supported
-                // (MetricsResult tracks p50/p90/p95/p99).
-                let pct: f64 = s[2..s.len() - 1].parse().unwrap_or(95.0);
-                match pct {
-                    x if x <= 50.0 => ".p50".to_string(),
-                    x if x <= 90.0 => ".p90".to_string(),
-                    x if x <= 95.0 => ".p95".to_string(),
-                    _ => ".p99".to_string(),
-                }
-            }
+            // Preserve the EXACT percentile — the evaluator resolves any
+            // p(N) from the retained histogram (parse_percentile /
+            // percentile_value, thresholds.rs / collector.rs). The old
+            // bucket-snap (p(99.9)→p99, p(75)→p90, p(10)→p50) discarded that
+            // precision one layer above the layer that handles it, producing
+            // false green (looser bucket) and false red (stricter bucket).
+            // The parenthesized form is REQUIRED: `.p99.9` would split on the
+            // second dot in parse_metric_ref and yield stat "9".
+            s if s.starts_with("p(") => format!(".{s}"),
             "med" | "median" => ".p50".to_string(),
             // avg / min / max / count / sum / rate map 1:1 onto evaluator stats
             other => format!(".{other}"),
@@ -699,7 +709,7 @@ mod tests {
         // ms, so they are scaled ×1000 during translation.
         assert_eq!(
             thresholds.get("http_req_duration").unwrap().expression,
-            "http_req_duration.p95 < 500000"
+            "http_req_duration.p(95) < 500000"
         );
         assert_eq!(
             thresholds.get("http_req_duration#1").unwrap().expression,
@@ -738,7 +748,7 @@ mod tests {
             "http_req_duration{scenario:api_load}",
             "p(95)<300",
         );
-        assert_eq!(expr, "http_req_duration{scenario:api_load}.p95 < 300000");
+        assert_eq!(expr, "http_req_duration{scenario:api_load}.p(95) < 300000");
     }
 
     #[test]
@@ -759,7 +769,7 @@ mod tests {
         let thresholds = opts.convert_thresholds();
         let cfg = thresholds.get("http_req_duration").unwrap();
         // p(99)<1000 ms → 1 000 000 µs.
-        assert_eq!(cfg.expression, "http_req_duration.p99 < 1000000");
+        assert_eq!(cfg.expression, "http_req_duration.p(99) < 1000000");
         assert!(cfg.abort_on_fail);
         assert_eq!(cfg.delay_abort_eval.as_deref(), Some("30s"));
     }
@@ -772,10 +782,22 @@ mod tests {
     }
 
     #[test]
-    fn test_threshold_p_99_9_maps_to_p99() {
-        // p(99.9) maps to the nearest supported bucket AND is ms→µs scaled.
+    fn test_threshold_p_99_9_preserved_exact() {
+        // Backlog line 135: p(99.9) must NOT be snapped to the looser p99
+        // bucket (false green) — the exact percentile is preserved and the
+        // evaluator resolves it from the retained histogram.
         let expr = translate_k6_expression("http_req_duration", "p(99.9)<1000");
-        assert_eq!(expr, "http_req_duration.p99 < 1000000");
+        assert_eq!(expr, "http_req_duration.p(99.9) < 1000000");
+        // p(75) must not become the stricter p90 (false red); p(10) must not
+        // become p50 (false green).
+        assert_eq!(
+            translate_k6_expression("http_req_duration", "p(75)<800"),
+            "http_req_duration.p(75) < 800000"
+        );
+        assert_eq!(
+            translate_k6_expression("http_req_duration", "p(10)<300"),
+            "http_req_duration.p(10) < 300000"
+        );
     }
 
     #[test]
@@ -818,6 +840,21 @@ mod tests {
             decl.summary_trend_stats.as_deref(),
             Some(&["avg".to_string(), "p(99)".to_string()][..])
         );
+    }
+
+    #[test]
+    fn test_sub_timing_thresholds_scaled() {
+        // Backlog line 134: the six http_req_* sub-timings are µs metrics, so
+        // a k6 `http_req_waiting: ['p(95)<400']` (400 ms) must scale ×1000 —
+        // previously it compared 400 against ~400 000 µs and was always red.
+        let expr = translate_k6_expression("http_req_waiting", "p(95)<400");
+        assert_eq!(expr, "http_req_waiting.p(95) < 400000");
+        let expr = translate_k6_expression("http_req_tls_handshaking", "avg<100");
+        assert_eq!(expr, "http_req_tls_handshaking.avg < 100000");
+        let expr = translate_k6_expression("http_req_receiving", "med<50");
+        assert_eq!(expr, "http_req_receiving.p50 < 50000");
+        let expr = translate_k6_expression("http_req_blocked", "p(90)<200");
+        assert_eq!(expr, "http_req_blocked.p(90) < 200000");
     }
 
     #[test]
