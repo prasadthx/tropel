@@ -104,7 +104,10 @@ pub struct K6Scenario {
     pub duration: Option<String>,
     pub iterations: Option<u64>,
     // ramping-vus
-    #[serde(alias = "startVus")]
+    // k6's real spelling is `startVUs` (serde aliases are byte-exact — the
+    // old `startVus` alias silently dropped the field, falling back to
+    // `vus`/1). Backlog line 128.
+    #[serde(alias = "startVUs")]
     pub start_vus: Option<u32>,
     pub stages: Option<Vec<K6Stage>>,
     // arrival rate
@@ -550,6 +553,27 @@ mod tests {
                 assert_eq!(start_vus, 2);
                 assert_eq!(stages.len(), 1);
                 assert_eq!(stages[0].target, 20);
+            }
+            other => panic!("expected RampingVus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_scenario_start_vus_k6_spelling() {
+        // Backlog line 128 regression: k6's real spelling is `startVUs` — the
+        // old `#[serde(alias = "startVus")]` was byte-exact, so the field was
+        // silently dropped and start_vus fell back to vus/1. The repo's own
+        // examples/k6/k6_sample_scenarios.js uses `startVUs: 0`.
+        let opts = parse(
+            r#"{"scenarios": {"s": {"executor": "ramping-vus", "startVUs": 0, "stages": [{"duration": "10s", "target": 10}]}}}"#,
+        );
+        let decl = opts.to_declared().expect("declared options");
+        let scenarios = decl.scenarios.expect("scenarios present");
+        let sc = scenarios.get("s").expect("scenario s");
+        match &sc.execution {
+            tropel_sdk::ExecutionConfig::RampingVus { start_vus, stages, .. } => {
+                assert_eq!(*start_vus, 0, "startVUs must be honored (not fall back to vus/1)");
+                assert_eq!(stages.len(), 1);
             }
             other => panic!("expected RampingVus, got {other:?}"),
         }
