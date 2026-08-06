@@ -13,10 +13,16 @@ use crate::subtimings::record_dns;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tropel_core::config::HttpConfig;
+
+/// k6's default DNS cache TTL when `options.dns.ttl` is unset (k6: `"5m"`).
+const K6_DEFAULT_TTL: Duration = Duration::from_secs(300);
+/// Upper bound on cached host entries — the cache has no other eviction, so
+/// a run that resolves many unique hostnames (randomized URLs, etc.) must not
+/// grow without bound. Entries are evicted expired-first, then oldest.
+const MAX_CACHE_ENTRIES: usize = 4096;
 
 /// reqwest's `Resolving` error type: boxed error that is `Send + Sync`.
 /// Plain `Box::new(e)` yields `Box<dyn Error>` which does not satisfy the
@@ -154,10 +160,15 @@ struct DnsShared {
     cache: DnsCacheMode,
     select: DnsSelect,
     policy: DnsPolicy,
-    hosts: HashMap<String, Vec<IpAddr>>,
+    hosts: HashMap<String, Vec<SocketAddr>>,
     blacklist: Vec<IpCidr>,
     cache_store: Mutex<HashMap<String, CacheEntry>>,
-    round_robin: AtomicUsize,
+    /// Per-host rotation counters for `dns.select: roundRobin`. k6 rotates
+    /// EACH HOST independently; a single global counter (the old design)
+    /// couples unrelated hosts — every lookup advances one shared cursor, so
+    /// a host's rotation offset depends on how many other hosts resolved in
+    /// between, which can pin a host to a single IP for its whole TTL.
+    rotation: Mutex<HashMap<String, usize>>,
 }
 
 /// reqwest DNS resolver implementing k6-compatible DNS options.
@@ -171,15 +182,23 @@ impl DnsResolver {
     /// fall back to sensible defaults with a warning (never a hard error, so
     /// a misconfigured `dns` block can't kill a run).
     pub fn from_config(config: &HttpConfig) -> DnsResolver {
-        let cache = parse_cache_mode(config.dns_ttl.as_deref());
+        // Backlog line 151: k6's DNS DEFAULTS are ttl=5m, select=random,
+        // policy=preferIPv4. An unconfigured script must behave like k6 — a
+        // fresh getaddrinfo per request (the old ttl off / first / any) was a
+        // silent divergence that also hammered DNS under load.
+        let cache = match config.dns_ttl.as_deref() {
+            Some(ttl) => parse_cache_mode(Some(ttl)),
+            None => DnsCacheMode::Ttl(K6_DEFAULT_TTL),
+        };
         let select = match config.dns_select.as_deref().map(str::to_ascii_lowercase).as_deref() {
             Some("roundrobin" | "round_robin" | "round-robin") => DnsSelect::RoundRobin,
             Some("random") => DnsSelect::Random,
+            None => DnsSelect::Random, // k6 default
             other => {
                 if let Some(v) = other {
-                    tracing::warn!("unknown dns.select '{v}' — using 'first'");
+                    tracing::warn!("unknown dns.select '{v}' — using 'random' (k6 default)");
                 }
-                DnsSelect::First
+                DnsSelect::Random
             }
         };
         let policy = match config
@@ -192,11 +211,12 @@ impl DnsResolver {
             Some("preferipv6" | "prefer_ipv6") => DnsPolicy::PreferV6,
             Some("onlyipv4" | "only_ipv4") => DnsPolicy::OnlyV4,
             Some("onlyipv6" | "only_ipv6") => DnsPolicy::OnlyV6,
+            None => DnsPolicy::PreferV4, // k6 default
             other => {
                 if let Some(v) = other {
-                    tracing::warn!("unknown dns.policy '{v}' — using 'any'");
+                    tracing::warn!("unknown dns.policy '{v}' — using 'preferIPv4' (k6 default)");
                 }
-                DnsPolicy::Any
+                DnsPolicy::PreferV4
             }
         };
         let hosts = parse_hosts(&config.hosts);
@@ -210,7 +230,7 @@ impl DnsResolver {
                 hosts,
                 blacklist,
                 cache_store: Mutex::new(HashMap::new()),
-                round_robin: AtomicUsize::new(0),
+                rotation: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -240,10 +260,9 @@ impl Resolve for DnsResolver {
             // 1. Static hosts map (exact or wildcard) — no DNS involved. The
             //    blacklist still applies: an explicit host override must not
             //    smuggle connections to a blocked network.
-            if let Some(ips) = hosts_lookup(&inner.hosts, &host) {
+            if let Some(addrs) = hosts_lookup(&inner.hosts, &host) {
                 record_dns(Duration::ZERO);
-                let mut addrs: Vec<SocketAddr> =
-                    ips.into_iter().map(|ip| SocketAddr::new(ip, 0)).collect();
+                let mut addrs: Vec<SocketAddr> = addrs;
                 if !inner.blacklist.is_empty() {
                     let before = addrs.len();
                     addrs.retain(|a| !inner.blacklist.iter().any(|c| c.contains(a.ip())));
@@ -254,7 +273,8 @@ impl Resolve for DnsResolver {
                         )));
                     }
                 }
-                return Ok(box_addrs(addrs));
+                let rotated = select_addrs(&host, &addrs, inner.select, &inner.rotation);
+                return Ok(box_addrs(rotated));
             }
 
             // 2. TTL cache hit? The cached list is re-selected on every hit so
@@ -263,7 +283,7 @@ impl Resolve for DnsResolver {
             //    IP for the whole TTL window.
             if let Some(entry) = cache_get(&inner, &host) {
                 record_dns(Duration::ZERO);
-                let rotated = select_addrs(&entry, inner.select, &inner.round_robin);
+                let rotated = select_addrs(&host, &entry, inner.select, &inner.rotation);
                 return Ok(box_addrs(rotated));
             }
 
@@ -314,7 +334,7 @@ impl Resolve for DnsResolver {
             //    the first address, then falls through to the rest). Never
             //    cache an empty result — a transient resolution failure
             //    shouldn't poison the cache for the whole TTL.
-            let chosen = select_addrs(&addrs, inner.select, &inner.round_robin);
+            let chosen = select_addrs(&host, &addrs, inner.select, &inner.rotation);
             if !chosen.is_empty() {
                 cache_put(&inner, &host, &chosen);
             }
@@ -348,46 +368,67 @@ fn parse_cache_mode(s: Option<&str>) -> DnsCacheMode {
     }
 }
 
-fn parse_hosts(map: &HashMap<String, String>) -> HashMap<String, Vec<IpAddr>> {
+fn parse_hosts(map: &HashMap<String, String>) -> HashMap<String, Vec<SocketAddr>> {
     let mut out = HashMap::new();
     for (host, value) in map {
-        let ips: Vec<IpAddr> = value
+        let addrs: Vec<SocketAddr> = value
             .split(',')
             .filter_map(|s| {
                 let s = s.trim();
+                // Backlog line 151: k6 accepts BOTH forms — a bare IP
+                // ("1.2.3.4", port comes from the request URL) and the
+                // "ip:port" override form ("1.2.3.4:8080") which pins the
+                // destination port. The old parse_hosts only accepted IpAddr,
+                // so the ip:port form was silently dropped.
+                if let Ok(sa) = s.parse::<SocketAddr>() {
+                    if sa.port() != 0 {
+                        return Some(sa);
+                    }
+                    // "ip:0" — treat as a bare IP below.
+                }
                 let parsed = s.parse::<IpAddr>().ok();
                 if parsed.is_none() && !s.is_empty() {
                     tracing::warn!("hosts entry '{host}' has invalid IP '{s}' — skipped");
                 }
-                parsed
+                parsed.map(|ip| SocketAddr::new(ip, 0))
             })
             .collect();
-        if ips.is_empty() {
+        if addrs.is_empty() {
             if !value.trim().is_empty() {
                 tracing::warn!("hosts entry '{host}' has no valid IPs — ignored");
             }
         } else {
-            out.insert(host.trim().to_ascii_lowercase(), ips);
+            out.insert(host.trim().to_ascii_lowercase(), addrs);
         }
     }
     out
 }
 
 /// Exact host lookup first, then `*.domain` wildcard keys.
-fn hosts_lookup(hosts: &HashMap<String, Vec<IpAddr>>, host: &str) -> Option<Vec<IpAddr>> {
+///
+/// Backlog line 151: wildcard matching was nondeterministic — it iterated the
+/// HashMap and returned the FIRST matching wildcard, so when `*.example.com`
+/// and `*.sub.example.com` both matched `x.sub.example.com`, which one won
+/// depended on hash order. Now the LONGEST matching suffix wins (k6's rule),
+/// which is deterministic and most-specific-first.
+fn hosts_lookup(hosts: &HashMap<String, Vec<SocketAddr>>, host: &str) -> Option<Vec<SocketAddr>> {
     let h = host.to_ascii_lowercase();
     if let Some(v) = hosts.get(&h) {
         return Some(v.clone());
     }
+    let mut best: Option<(usize, &Vec<SocketAddr>)> = None;
     for (key, v) in hosts {
         if let Some(suffix) = key.strip_prefix("*.") {
             let dot_suffix = format!(".{suffix}");
             if h.len() > dot_suffix.len() && h.ends_with(&dot_suffix) {
-                return Some(v.clone());
+                let specific = suffix.len();
+                if best.is_none() || specific > best.unwrap().0 {
+                    best = Some((specific, v));
+                }
             }
         }
     }
-    None
+    best.map(|(_, v)| v.clone())
 }
 
 fn apply_policy(addrs: &mut Vec<SocketAddr>, policy: DnsPolicy) {
@@ -400,19 +441,31 @@ fn apply_policy(addrs: &mut Vec<SocketAddr>, policy: DnsPolicy) {
     }
 }
 
-fn select_addrs(addrs: &[SocketAddr], select: DnsSelect, counter: &AtomicUsize) -> Vec<SocketAddr> {
+/// Select the address list to use, applying `dns.select`. Backlog line 151:
+/// rotation counters are PER HOST (k6 semantics) — the old single global
+/// `AtomicUsize` meant every host shared one cursor, so a host's rotation
+/// offset depended on how many OTHER hosts had resolved, pinning hosts to a
+/// single IP for their whole TTL. `host` keys the per-host counter map.
+fn select_addrs(
+    host: &str,
+    addrs: &[SocketAddr],
+    select: DnsSelect,
+    rotation: &Mutex<HashMap<String, usize>>,
+) -> Vec<SocketAddr> {
     match select {
         DnsSelect::First => addrs.to_vec(),
         DnsSelect::RoundRobin | DnsSelect::Random => {
             if addrs.len() <= 1 {
                 return addrs.to_vec();
             }
+            let mut map = rotation.lock().unwrap();
+            let n = map.entry(host.to_string()).or_insert(0);
             let k = match select {
-                DnsSelect::RoundRobin => counter.fetch_add(1, Ordering::Relaxed) % addrs.len(),
-                DnsSelect::Random => pseudo_random(counter.fetch_add(1, Ordering::Relaxed))
-                    % addrs.len(),
+                DnsSelect::RoundRobin => *n % addrs.len(),
+                DnsSelect::Random => pseudo_random(*n) % addrs.len(),
                 DnsSelect::First => unreachable!(),
             };
+            *n = n.wrapping_add(1);
             let mut rotated = addrs.to_vec();
             rotated.rotate_left(k);
             rotated
@@ -468,6 +521,35 @@ fn cache_put(inner: &DnsShared, host: &str, addrs: &[SocketAddr]) {
         }
     };
     if let Ok(mut store) = inner.cache_store.lock() {
+        // Backlog line 151: the cache had NO eviction — expired entries were
+        // skipped on read but never removed, so a run resolving many unique
+        // hostnames (randomized URLs, per-iteration hosts) grew the map
+        // without bound. Evict expired entries first, then the soonest-
+        // expiring survivors, down to MAX_CACHE_ENTRIES.
+        let now = Instant::now();
+        store.retain(|_, e| match e.expires_at {
+            Some(t) => t > now,
+            None => true, // `inf` entries never expire
+        });
+        if store.len() >= MAX_CACHE_ENTRIES {
+            // Evict soonest-expiring TTL'd entries FIRST; `inf` (forever)
+            // entries sort LAST so they're only evicted when there is nothing
+            // else — a forever entry must not be thrown away before a live
+            // TTL'd one. `None` gets a ~100-year horizon instead of `now`.
+            let forever = Instant::now() + Duration::from_secs(365 * 24 * 3600 * 100);
+            let mut keys_by_expiry: Vec<(String, Instant)> = store
+                .iter()
+                .filter(|(k, _)| *k != host)
+                .map(|(k, e)| (k.clone(), e.expires_at.unwrap_or(forever)))
+                .collect();
+            keys_by_expiry.sort_by_key(|(_, t)| *t);
+            // Room for the new entry: keep the map at/below the cap AFTER the
+            // insert below.
+            let to_remove = store.len() + 1 - MAX_CACHE_ENTRIES;
+            for (k, _) in keys_by_expiry.into_iter().take(to_remove) {
+                store.remove(&k);
+            }
+        }
         store.insert(
             host.to_string(),
             CacheEntry {
@@ -593,32 +675,98 @@ mod tests {
             "2.2.2.2:80".parse().unwrap(),
             "3.3.3.3:80".parse().unwrap(),
         ];
-        let counter = AtomicUsize::new(0);
-        assert_eq!(select_addrs(&addrs, DnsSelect::First, &counter)[0], addrs[0]);
+        let rotation = Mutex::new(HashMap::new());
+        assert_eq!(select_addrs("h.com", &addrs, DnsSelect::First, &rotation)[0], addrs[0]);
         assert_eq!(
-            select_addrs(&addrs, DnsSelect::RoundRobin, &counter)[0],
+            select_addrs("h.com", &addrs, DnsSelect::RoundRobin, &rotation)[0],
             addrs[0]
         );
         assert_eq!(
-            select_addrs(&addrs, DnsSelect::RoundRobin, &counter)[0],
+            select_addrs("h.com", &addrs, DnsSelect::RoundRobin, &rotation)[0],
             addrs[1]
         );
         assert_eq!(
-            select_addrs(&addrs, DnsSelect::RoundRobin, &counter)[0],
+            select_addrs("h.com", &addrs, DnsSelect::RoundRobin, &rotation)[0],
             addrs[2]
         );
         // wraps
         assert_eq!(
-            select_addrs(&addrs, DnsSelect::RoundRobin, &counter)[0],
+            select_addrs("h.com", &addrs, DnsSelect::RoundRobin, &rotation)[0],
             addrs[0]
         );
         // rotation preserves membership (no dupes / losses)
-        let r = select_addrs(&addrs, DnsSelect::Random, &counter);
+        let r = select_addrs("h.com", &addrs, DnsSelect::Random, &rotation);
         let mut sorted = r.clone();
         sorted.sort();
         let mut orig = addrs.clone();
         orig.sort();
         assert_eq!(sorted, orig);
+    }
+
+    #[test]
+    fn select_rotation_is_per_host() {
+        // Backlog line 151: the OLD single global counter coupled hosts — a
+        // lookup of host B advanced the cursor shared with host A, so A's
+        // rotation depended on how many OTHER hosts resolved (A could repeat
+        // its first IP while the shared cursor advanced past its second).
+        // Rotation must be independent per host. Both hosts have TWO
+        // addresses so the old global counter would have skipped A's second
+        // entry after B's lookup advanced the shared cursor.
+        let a = vec!["1.1.1.1:80".parse::<SocketAddr>().unwrap(), "2.2.2.2:80".parse().unwrap()];
+        let b = vec!["9.9.9.9:80".parse::<SocketAddr>().unwrap(), "8.8.8.8:80".parse().unwrap()];
+        let rotation = Mutex::new(HashMap::new());
+        assert_eq!(select_addrs("a.com", &a, DnsSelect::RoundRobin, &rotation)[0], a[0]);
+        assert_eq!(select_addrs("b.com", &b, DnsSelect::RoundRobin, &rotation)[0], b[0]);
+        // B's lookup advanced B's counter only: A still advances to its
+        // SECOND address (under the old shared cursor, B's lookup advanced
+        // the shared counter past A's second entry, so A repeated a[0]).
+        assert_eq!(select_addrs("a.com", &a, DnsSelect::RoundRobin, &rotation)[0], a[1]);
+    }
+
+    #[test]
+    fn cache_eviction_prefers_forever_entries() {
+        // Backlog line 151: over-cap eviction must NOT evict `inf` entries
+        // before live TTL'd ones (the first implementation sorted `None` as
+        // `now`, so forever entries were evicted first).
+        let shared = DnsShared {
+            cache: DnsCacheMode::Ttl(Duration::from_secs(60)),
+            select: DnsSelect::First,
+            policy: DnsPolicy::Any,
+            hosts: HashMap::new(),
+            blacklist: vec![],
+            cache_store: Mutex::new(HashMap::new()),
+            rotation: Mutex::new(HashMap::new()),
+        };
+        let addrs = vec!["1.2.3.4:80".parse().unwrap()];
+        {
+            let mut store = shared.cache_store.lock().unwrap();
+            // Fill to the cap with LIVE TTL'd entries, plus one forever entry
+            // that must survive eviction.
+            for i in 0..MAX_CACHE_ENTRIES {
+                store.insert(
+                    format!("live{i}.com"),
+                    CacheEntry {
+                        addrs: addrs.clone(),
+                        expires_at: Some(Instant::now() + Duration::from_secs(60)),
+                    },
+                );
+            }
+            store.insert(
+                "forever.com".to_string(),
+                CacheEntry {
+                    addrs: addrs.clone(),
+                    expires_at: None,
+                },
+            );
+        }
+        cache_put(&shared, "new.com", &addrs);
+        let store = shared.cache_store.lock().unwrap();
+        assert!(
+            store.contains_key("forever.com"),
+            "an `inf` entry must not be evicted before live TTL'd entries"
+        );
+        assert!(store.contains_key("new.com"));
+        assert!(store.len() <= MAX_CACHE_ENTRIES);
     }
 
     #[test]
@@ -630,7 +778,7 @@ mod tests {
             hosts: HashMap::new(),
             blacklist: vec![],
             cache_store: Mutex::new(HashMap::new()),
-            round_robin: AtomicUsize::new(0),
+            rotation: Mutex::new(HashMap::new()),
         };
         let addrs = vec!["1.2.3.4:80".parse().unwrap()];
         assert!(cache_get(&shared, "x.com").is_none());
@@ -645,6 +793,56 @@ mod tests {
         expired.cache = DnsCacheMode::Ttl(Duration::ZERO);
         cache_put(&expired, "y.com", &addrs);
         assert!(cache_get(&expired, "y.com").is_none());
+    }
+
+    #[test]
+    fn cache_evicts_expired_and_bounded() {
+        // Backlog line 151: the cache had no eviction. Now expired entries are
+        // purged on put and the map is bounded by MAX_CACHE_ENTRIES.
+        let shared = DnsShared {
+            cache: DnsCacheMode::Ttl(Duration::from_secs(60)),
+            select: DnsSelect::First,
+            policy: DnsPolicy::Any,
+            hosts: HashMap::new(),
+            blacklist: vec![],
+            cache_store: Mutex::new(HashMap::new()),
+            rotation: Mutex::new(HashMap::new()),
+        };
+        let addrs = vec!["1.2.3.4:80".parse().unwrap()];
+
+        // Seed an expired entry, then a fresh put must purge it.
+        {
+            let mut store = shared.cache_store.lock().unwrap();
+            store.insert(
+                "dead.com".to_string(),
+                CacheEntry {
+                    addrs: addrs.clone(),
+                    expires_at: Some(Instant::now() - Duration::from_secs(1)),
+                },
+            );
+        }
+        cache_put(&shared, "live.com", &addrs);
+        {
+            let store = shared.cache_store.lock().unwrap();
+            assert!(!store.contains_key("dead.com"), "expired entry must be purged");
+            assert!(store.contains_key("live.com"));
+        }
+
+        // Bounding: fill past the cap; the map must never exceed it.
+        let mut store = shared.cache_store.lock().unwrap();
+        for i in 0..MAX_CACHE_ENTRIES + 50 {
+            store.insert(
+                format!("h{i}.com"),
+                CacheEntry {
+                    addrs: addrs.clone(),
+                    expires_at: Some(Instant::now() + Duration::from_secs(60)),
+                },
+            );
+        }
+        drop(store);
+        cache_put(&shared, "final.com", &addrs);
+        let len = shared.cache_store.lock().unwrap().len();
+        assert!(len <= MAX_CACHE_ENTRIES, "cache must be bounded, got {len}");
     }
 
     #[test]
@@ -664,6 +862,47 @@ mod tests {
         assert_eq!(r.inner.policy, DnsPolicy::OnlyV4);
         assert_eq!(r.inner.hosts.get("local.test").unwrap().len(), 1);
         assert_eq!(r.inner.blacklist.len(), 1);
+    }
+
+    #[test]
+    fn unset_dns_matches_k6_defaults() {
+        // Backlog line 151: an unconfigured `dns` block must behave like k6 —
+        // ttl=5m, select=random, policy=preferIPv4 — instead of the old
+        // ttl off / first / any (which did a fresh getaddrinfo per request).
+        let r = DnsResolver::from_config(&HttpConfig::default());
+        assert_eq!(r.inner.cache, DnsCacheMode::Ttl(K6_DEFAULT_TTL));
+        assert_eq!(r.inner.select, DnsSelect::Random);
+        assert_eq!(r.inner.policy, DnsPolicy::PreferV4);
+    }
+
+    #[test]
+    fn hosts_ip_port_override_form() {
+        // Backlog line 151: k6's "ip:port" hosts value form was silently
+        // dropped (parse_hosts only accepted bare IpAddr). Now "1.2.3.4:8080"
+        // pins the destination port; a bare IP keeps port 0 (request URL port).
+        let mut map = HashMap::new();
+        map.insert("pinned.test".to_string(), "10.0.0.1:8080".to_string());
+        map.insert("plain.test".to_string(), "10.0.0.2".to_string());
+        let hosts = parse_hosts(&map);
+        let pinned = &hosts["pinned.test"];
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0], "10.0.0.1:8080".parse::<SocketAddr>().unwrap());
+        let plain = &hosts["plain.test"];
+        assert_eq!(plain[0].port(), 0, "bare IP keeps port 0 (request port applies)");
+    }
+
+    #[test]
+    fn wildcard_longest_suffix_wins() {
+        // Backlog line 151: wildcard matching was nondeterministic (HashMap
+        // order). The longest matching suffix must win deterministically.
+        let mut map = HashMap::new();
+        map.insert("*.example.com".to_string(), "10.1.1.1".to_string());
+        map.insert("*.sub.example.com".to_string(), "10.2.2.2".to_string());
+        let hosts = parse_hosts(&map);
+        let got = hosts_lookup(&hosts, "x.sub.example.com").unwrap();
+        assert_eq!(got[0].ip(), "10.2.2.2".parse::<IpAddr>().unwrap());
+        let got = hosts_lookup(&hosts, "x.example.com").unwrap();
+        assert_eq!(got[0].ip(), "10.1.1.1".parse::<IpAddr>().unwrap());
     }
 
     #[test]
