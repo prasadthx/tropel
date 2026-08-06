@@ -20,6 +20,7 @@ pub struct CollectionInfo {
     #[serde(rename = "_postman_id")]
     pub postman_id: Option<String>,
     pub name: String,
+    #[serde(default, deserialize_with = "de_opt_description")]
     pub description: Option<String>,
     pub schema: String,
 }
@@ -30,12 +31,113 @@ pub struct CollectionInfo {
 // larger variant keeps the enum small without changing serde's untagged
 // shape (Box<T> serializes exactly like T). `Request` remains the largest
 // variant, so the size-difference lint is suppressed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+//
+// Serialization stays `untagged` (a request item serializes as its
+// RequestItem object, a folder as its FolderItem object). Deserialization
+// is custom: an object carrying a `request` key is a request item, anything
+// else is a folder. This fixes the silent-fallthrough bug where a malformed
+// sub-field (object-form description, string-form script.exec, a header
+// without value, a numeric responseTime, a missing response code) made
+// `RequestItem` fail to parse, and `#[serde(untagged)]` then tried
+// `FolderItem` — which only requires `name` — so the request silently
+// became an empty folder and was dropped from the run.
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 #[allow(clippy::large_enum_variant)]
 pub enum CollectionItem {
     Request(RequestItem),
     Folder(Box<FolderItem>),
+}
+
+impl<'de> Deserialize<'de> for CollectionItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Discriminate by key presence: folders carry `item`, requests
+        // carry `request`. Folder-first: a folder that also carries a stray
+        // `request` key (some real exports put `"request": null` next to
+        // `"item": [...]`) must keep its children rather than being
+        // misclassified as a request. If a request item's sub-fields fail to
+        // parse, this errors loudly instead of silently falling through to
+        // FolderItem (the pre-fix behavior that turned the request into an
+        // empty folder and dropped it).
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let is_folder = value
+            .as_object()
+            .map(|o| o.contains_key("item"))
+            .unwrap_or(false);
+        let is_request = !is_folder
+            && value
+                .as_object()
+                .map(|o| o.contains_key("request"))
+                .unwrap_or(false);
+        if is_request {
+            RequestItem::deserialize(value)
+                .map(CollectionItem::Request)
+                .map_err(serde::de::Error::custom)
+        } else {
+            FolderItem::deserialize(value)
+                .map(|f| CollectionItem::Folder(Box::new(f)))
+                .map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+/// Accept Postman's two schema-legal `description` shapes: a plain string
+/// or an object `{"content": …, "type": …}`. Returns the text content.
+fn de_opt_description<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum DescriptionForm {
+        Str(String),
+        Obj { content: Option<String> },
+    }
+    Ok(match Option::<DescriptionForm>::deserialize(deserializer)? {
+        Some(DescriptionForm::Str(s)) => Some(s),
+        Some(DescriptionForm::Obj { content }) => content,
+        None => None,
+    })
+}
+
+/// Accept Postman's two schema-legal `script.exec` shapes: an array of
+/// lines or a single string (wrapped into a one-element array).
+fn de_exec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ExecForm {
+        Lines(Vec<String>),
+        Single(String),
+    }
+    Ok(match ExecForm::deserialize(deserializer)? {
+        ExecForm::Lines(lines) => lines,
+        ExecForm::Single(s) => vec![s],
+    })
+}
+
+/// Accept `response_time` as either a numeric milliseconds value (as
+/// exported by Postman) or a string; normalize both to a string.
+fn de_opt_response_time<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum TimeForm {
+        Num(u64),
+        Str(String),
+    }
+    Ok(match Option::<TimeForm>::deserialize(deserializer)? {
+        Some(TimeForm::Num(n)) => Some(n.to_string()),
+        Some(TimeForm::Str(s)) => Some(s),
+        None => None,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +180,7 @@ pub struct RequestDetail {
     #[serde(default)]
     pub url: Option<UrlDetail>,
     pub auth: Option<CollectionAuth>,
+    #[serde(default, deserialize_with = "de_opt_description")]
     pub description: Option<String>,
 }
 
@@ -160,6 +263,7 @@ impl<'de> Deserialize<'de> for UrlDetail {
 pub struct QueryParam {
     pub key: String,
     pub value: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_description")]
     pub description: Option<String>,
     #[serde(default)]
     pub disabled: bool,
@@ -170,6 +274,7 @@ pub struct QueryParam {
 pub struct UrlVariable {
     pub key: String,
     pub value: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_description")]
     pub description: Option<String>,
 }
 
@@ -177,7 +282,12 @@ pub struct UrlVariable {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Header {
     pub key: String,
+    // A header with no `value` is schema-legal in exports; default to empty
+    // so it cannot fail RequestItem parsing (which used to silently turn the
+    // whole request into an empty folder).
+    #[serde(default)]
     pub value: String,
+    #[serde(default, deserialize_with = "de_opt_description")]
     pub description: Option<String>,
     #[serde(default)]
     pub disabled: bool,
@@ -200,6 +310,7 @@ pub struct RequestBody {
 pub struct FormParameter {
     pub key: String,
     pub value: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_description")]
     pub description: Option<String>,
     #[serde(rename = "type")]
     pub param_type: Option<String>,
@@ -244,7 +355,9 @@ pub struct Event {
 /// Script.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Script {
-    #[serde(default)]
+    // Postman exports `exec` as either an array of lines or a single string;
+    // accept both so a string-form exec cannot fail RequestItem parsing.
+    #[serde(default, deserialize_with = "de_exec")]
     pub exec: Vec<String>,
     #[serde(rename = "type")]
     pub script_type: Option<String>,
@@ -265,6 +378,7 @@ pub struct Variable {
     pub value: Option<serde_json::Value>,
     #[serde(rename = "type")]
     pub var_type: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_description")]
     pub description: Option<String>,
 }
 
@@ -305,11 +419,15 @@ pub struct AuthAttribute {
 pub struct ResponseDetail {
     pub name: Option<String>,
     pub status: Option<String>,
+    // Missing `code` (or a numeric `response_time`) must not fail parsing —
+    // exports omit it; before the fix that silently dropped the request.
+    #[serde(default)]
     pub code: u16,
     #[serde(default)]
     pub header: Vec<Header>,
     pub body: Option<String>,
     pub content_type: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_response_time")]
     pub response_time: Option<String>,
     #[serde(default)]
     pub cookie: Vec<ResponseCookie>,

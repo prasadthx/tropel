@@ -912,6 +912,69 @@ mod tests {
     }
 
     #[test]
+    fn test_schema_legal_shapes_parse_as_requests() {
+        // Regression (backlog line 93): object-form `description`,
+        // string-form `script.exec`, a header with no `value`, a numeric
+        // `responseTime`, and a missing response `code` are ALL schema-legal
+        // Postman shapes. Before the fix each one made RequestItem fail to
+        // parse, the untagged CollectionItem silently fell through to
+        // FolderItem (which only requires `name`), and the request was
+        // dropped as an empty folder.
+        let json = r#"{
+            "info": {"name": "Shapes", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "item": [{
+                "name": "Shape Req",
+                "request": {
+                    "method": "GET",
+                    "url": {"raw": "https://api.example.com/shapes"},
+                    "description": {"content": "object-form description", "type": "text/plain"},
+                    "header": [{"key": "X-No-Value"}]
+                },
+                "event": [{
+                    "listen": "test",
+                    "script": {"exec": "pm.test('ok', () => {});", "type": "text/javascript"}
+                }],
+                "response": [{"name": "r1", "status": "OK", "responseTime": 123}]
+            }]
+        }"#;
+
+        let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
+        assert_eq!(scenario.items.len(), 1, "request must not fall through to a folder");
+        assert_eq!(scenario.items[0].name, "Shape Req");
+        let req = scenario.items[0].request.as_ref().expect("request parsed");
+        assert_eq!(req.url, "https://api.example.com/shapes");
+        assert_eq!(req.headers.get("X-No-Value").map(String::as_str), Some(""));
+        // String-form exec must still surface as a test script.
+        let test = scenario.items[0].test.as_ref().expect("test script parsed");
+        assert!(test.contains("pm.test"), "string-form exec joined into script");
+    }
+
+    #[test]
+    fn test_malformed_request_fails_loudly() {
+        // Regression (backlog line 93): a request with a genuinely
+        // malformed sub-field (here: a non-string header value) must ERROR
+        // loudly — not silently become an empty folder that vanishes from
+        // the run. The request-key discriminator guarantees RequestItem is
+        // attempted whenever a `request` key is present.
+        let json = r#"{
+            "info": {"name": "Bad", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "item": [{
+                "name": "Broken Req",
+                "request": {
+                    "method": "GET",
+                    "url": {"raw": "https://api.example.com/broken"},
+                    "header": [{"key": "X", "value": 42}]
+                }
+            }]
+        }"#;
+
+        assert!(
+            parse_collection_str(json).is_err(),
+            "malformed request must fail loudly, not become an empty folder"
+        );
+    }
+
+    #[test]
     fn test_parse_urlencoded_body() {
         let json = r#"{
             "info": {"name": "Form", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
