@@ -6,8 +6,14 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 /// HTTP method.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "UPPERCASE")]
+///
+/// In addition to the standard nine, any valid HTTP token (RFC 7230
+/// `tchar`) is representable as [`Method::Custom`] — so `PURGE`, `LINK`,
+/// `PROPFIND`, etc. load-test the write path they name instead of silently
+/// degrading to `GET` (k6 passes any token through to the HTTP client).
+/// Custom serde keeps the wire format a plain uppercase string (`"GET"`,
+/// `"PURGE"`), matching the old derived `rename_all = "UPPERCASE"` shape.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Method {
     GET,
     HEAD,
@@ -18,6 +24,9 @@ pub enum Method {
     OPTIONS,
     TRACE,
     CONNECT,
+    /// Any valid non-standard HTTP token (e.g. `PURGE`, `LINK`), preserved
+    /// as written after trimming. Never constructed for the standard nine.
+    Custom(String),
 }
 
 impl std::fmt::Display for Method {
@@ -32,7 +41,29 @@ impl std::fmt::Display for Method {
             Method::OPTIONS => write!(f, "OPTIONS"),
             Method::TRACE => write!(f, "TRACE"),
             Method::CONNECT => write!(f, "CONNECT"),
+            Method::Custom(m) => write!(f, "{}", m),
         }
+    }
+}
+
+impl Serialize for Method {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Method {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Method::parse(&s).ok_or_else(|| {
+            serde::de::Error::custom(format!("invalid HTTP method {:?}", s))
+        })
     }
 }
 
@@ -42,7 +73,23 @@ impl Method {
     /// Named `parse` (not `from_str`) to avoid colliding with the standard
     /// `FromStr::from_str` — this variant returns `Option`, not `Result`,
     /// so it is deliberately NOT the trait impl.
+    ///
+    /// - Leading/trailing whitespace is trimmed (`" GET"` → `GET`).
+    /// - Any RFC 7230 `tchar` token is accepted: the standard nine map to
+    ///   their variants, anything else becomes [`Method::Custom`] (so a
+    ///   write-path method like `PURGE` is sent as-is).
+    /// - `None` only for genuinely invalid input: empty, whitespace inside
+    ///   the token, or characters outside the HTTP token set (a typo like
+    ///   `"POTS"` is still a VALID token and round-trips as `Custom`).
     pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+        // RFC 7230 tchar = "!#$%&'*+-.^_`|~" / DIGIT / ALPHA.
+        if !s.chars().all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~" .contains(c)) {
+            return None;
+        }
         match s.to_uppercase().as_str() {
             "GET" => Some(Method::GET),
             "HEAD" => Some(Method::HEAD),
@@ -53,7 +100,7 @@ impl Method {
             "OPTIONS" => Some(Method::OPTIONS),
             "TRACE" => Some(Method::TRACE),
             "CONNECT" => Some(Method::CONNECT),
-            _ => None,
+            _ => Some(Method::Custom(s.to_string())),
         }
     }
 }
@@ -656,6 +703,63 @@ pub enum SampleType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn method_parse_accepts_custom_tokens_and_trims() {
+        // Backlog line 95: unknown methods silently became GET. A valid HTTP
+        // token (PURGE, LINK, …) must round-trip as Method::Custom — the
+        // write path is preserved, not degraded to GET. Leading/trailing
+        // whitespace is trimmed.
+        assert_eq!(Method::parse("PURGE"), Some(Method::Custom("PURGE".into())));
+        assert_eq!(Method::parse("purge"), Some(Method::Custom("purge".into())));
+        assert_eq!(Method::parse("LINK"), Some(Method::Custom("LINK".into())));
+        assert_eq!(Method::parse(" get "), Some(Method::GET));
+        assert_eq!(Method::parse(" POST"), Some(Method::POST));
+    }
+
+    #[test]
+    fn method_parse_rejects_invalid_tokens() {
+        // Empty, whitespace-inside, and non-tchar chars are genuinely invalid
+        // — these must be None (callers fail loudly), never silent GET.
+        // NOTE 1: `!` IS a valid tchar (RFC 7230), so "POTS!" parses as
+        // Custom and must NOT be here.
+        // NOTE 2: trailing/leading whitespace is TRIMMED by design, so a
+        // bare "GET\n" (CRLF artifact) parses as GET — the genuinely invalid
+        // case is whitespace INSIDE the token ("GE\nT").
+        for bad in ["", " ", "  ", "GE T", "GE\nT", "GET,", "{GET}", "POTS(", " GET"] {
+            assert!(
+                Method::parse(bad).is_none(),
+                "method {:?} must not parse",
+                bad
+            );
+        }
+        // Trailing newline is trimmed like any other outer whitespace.
+        assert_eq!(Method::parse("GET\n"), Some(Method::GET));
+        // Sanity: a punctuation-only token is still valid (Custom).
+        assert_eq!(
+            Method::parse("!*+"),
+            Some(Method::Custom("!*+".into()))
+        );
+    }
+
+    #[test]
+    fn method_custom_serde_roundtrip() {
+        // Custom serde keeps the wire format a plain string, so a Custom
+        // method survives a JSON round-trip without becoming an object.
+        let m = Method::Custom("PURGE".into());
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(json, "\"PURGE\"");
+        let back: Method = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, m);
+
+        // Standard variants still serialize as plain uppercase strings.
+        assert_eq!(serde_json::to_string(&Method::GET).unwrap(), "\"GET\"");
+        let get: Method = serde_json::from_str("\"GET\"").unwrap();
+        assert_eq!(get, Method::GET);
+
+        // Deserializing a genuinely invalid token errors loudly.
+        assert!(serde_json::from_str::<Method>("\"GE T\"").is_err());
+    }
 
     #[test]
     fn body_roundtrip_preserves_all_variants() {

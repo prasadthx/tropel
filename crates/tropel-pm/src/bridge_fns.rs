@@ -690,9 +690,25 @@ impl PmBridge {
                             Some(std::time::Duration::from_secs(30)) // default 30s
                         };
 
+                        // A genuinely invalid method token must not silently
+                        // become GET (a write-path "PURGE" must not degrade
+                        // into a read-path GET that reports green). Surfaced
+                        // as a status-0 error response. Valid-but-uncommon
+                        // tokens (PURGE/LINK/…) parse fine via Method::Custom.
+                        let Some(method) = Method::parse(&method) else {
+                            return serde_json::json!({
+                                "code": 0,
+                                "statusText": format!("invalid HTTP method {}", method),
+                                "body": "",
+                                "headers": {},
+                                "responseTime": 0,
+                            })
+                            .to_string();
+                        };
+
                         let req = Request {
                             url: resolved_url,
-                            method: Method::parse(&method).unwrap_or(Method::GET),
+                            method,
                             headers,
                             query_params: HashMap::new(),
                             body: request_body,

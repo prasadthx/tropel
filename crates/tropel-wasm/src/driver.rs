@@ -434,11 +434,22 @@ fn default_true() -> bool {
 }
 
 impl WasmHttpRequest {
-    fn into_request(self) -> Request {
+    /// Convert into a `Request`, failing loudly on a genuinely invalid method
+    /// token (empty, whitespace inside, non-tchar chars). A write-path method
+    /// must not silently degrade into GET — the host call returns -8 so the
+    /// iteration visibly fails. Valid-but-uncommon tokens (PURGE/LINK/…) parse
+    /// fine via `Method::Custom`.
+    //
+    // Note: uses `std::result::Result` (not the tropel_core `Result` alias,
+    // which takes one generic arg and fixes the error type to TropelError) —
+    // the error here is a plain message string.
+    fn into_request(self) -> std::result::Result<Request, String> {
         let req_body = self.body.filter(|b| !b.is_empty()).map(Body::Raw);
-        Request {
+        let method = Method::parse(&self.method)
+            .ok_or_else(|| format!("invalid HTTP method {:?}", self.method))?;
+        Ok(Request {
             url: self.url,
-            method: Method::parse(&self.method).unwrap_or(Method::GET),
+            method,
             headers: self.headers,
             query_params: HashMap::new(),
             body: req_body,
@@ -469,7 +480,7 @@ impl WasmHttpRequest {
                 }
             }),
             response_type: tropel_core::types::ResponseType::Text,
-        }
+        })
     }
 }
 
@@ -513,7 +524,15 @@ fn http_request_host(
         None => return -4,
     };
 
-    let req = request.into_request();
+    // A genuinely invalid method must fail loudly, not silently become GET
+    // (backlog line 95).
+    let req = match request.into_request() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("WASM driver http_request rejected: {}", e);
+            return -8;
+        }
+    };
     // Clone the request into the 'static future for the I/O runtime; the
     // original stays alive for sample-tag construction below.
     let req_for_io = req.clone();
@@ -1274,7 +1293,8 @@ mod tests {
             timeout_ms: Some(1e300),
             follow_redirects: true,
         }
-        .into_request();
+        .into_request()
+        .unwrap();
         assert_eq!(
             req.timeout,
             Some(Duration::from_millis(MAX_HOST_CALL_MS as u64))
@@ -1289,7 +1309,8 @@ mod tests {
             timeout_ms: Some(2500.0),
             follow_redirects: true,
         }
-        .into_request();
+        .into_request()
+        .unwrap();
         assert_eq!(req.timeout, Some(Duration::from_millis(2500)));
 
         // Non-positive → falls back to the client's default request timeout
@@ -1302,7 +1323,44 @@ mod tests {
             timeout_ms: Some(-5.0),
             follow_redirects: true,
         }
-        .into_request();
+        .into_request()
+        .unwrap();
         assert_eq!(req.timeout, None);
+    }
+
+    #[test]
+    fn test_into_request_rejects_invalid_method() {
+        // Backlog line 95: a genuinely invalid method token must fail loudly,
+        // not silently become GET. Empty, whitespace-inside and non-tchar
+        // tokens are rejected; valid-but-uncommon tokens (PURGE/LINK/…) parse
+        // as Method::Custom.
+        for bad in ["", " ", "GE T", "GE\nT", "POTS,", "{GET}"] {
+            let req = WasmHttpRequest {
+                url: "http://example.com".into(),
+                method: bad.into(),
+                headers: HashMap::new(),
+                body: None,
+                timeout_ms: None,
+                follow_redirects: true,
+            };
+            assert!(
+                req.into_request().is_err(),
+                "method {:?} must be rejected, not silently become GET",
+                bad
+            );
+        }
+
+        // Valid-but-uncommon tokens survive as Custom (write path preserved).
+        let req = WasmHttpRequest {
+            url: "http://example.com".into(),
+            method: "PURGE".into(),
+            headers: HashMap::new(),
+            body: None,
+            timeout_ms: None,
+            follow_redirects: true,
+        }
+        .into_request()
+        .unwrap();
+        assert_eq!(req.method, Method::Custom("PURGE".into()));
     }
 }

@@ -488,12 +488,23 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
             // Resolve auth
             let auth = resolve_auth(operation, &global_security, &doc.components);
 
+            // A genuinely invalid method token (empty, whitespace inside,
+            // non-tchar chars) must fail the parse loudly — silently
+            // becoming GET would "test" the read path while the spec
+            // declared a write path.
+            let method = Method::parse(method).ok_or_else(|| {
+                TropelError::Parse(format!(
+                    "OpenAPI operation '{}' has invalid HTTP method '{}'",
+                    item_name, method
+                ))
+            })?;
+
             items.push(ScenarioItem {
                 id: format!("openapi-item-{}", index),
                 name: item_name,
                 request: Some(Request {
                     url: resolved_url,
-                    method: Method::parse(method).unwrap_or(Method::GET),
+                    method,
                     headers,
                     query_params,
                     body,

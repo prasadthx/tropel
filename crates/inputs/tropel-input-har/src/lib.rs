@@ -211,11 +211,13 @@ impl InputAdapter for HarInputAdapter {
             .unwrap_or("har-export")
             .to_string();
 
+        // `Result` here is the tropel-sdk alias (1 generic: the error type),
+        // so collect with the single-generic turbofish.
         let items: Vec<ScenarioItem> = entries
             .into_iter()
             .enumerate()
             .map(|(i, entry)| har_entry_to_item(entry, i))
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(Scenario {
             info: ScenarioInfo {
@@ -288,8 +290,18 @@ fn is_static_resource(entry: &HarEntry) -> bool {
 }
 
 /// Convert a HAR entry to a ScenarioItem.
-fn har_entry_to_item(entry: HarEntry, index: usize) -> ScenarioItem {
-    let method = Method::parse(&entry.request.method).unwrap_or(Method::GET);
+///
+/// Returns `Result` so a genuinely invalid method token (empty, whitespace
+/// inside, non-token chars) fails the whole parse loudly instead of
+/// silently becoming GET and "testing" the read path.
+fn har_entry_to_item(entry: HarEntry, index: usize) -> Result<ScenarioItem> {
+    let method = Method::parse(&entry.request.method).ok_or_else(|| {
+        TropelError::Parse(format!(
+            "HAR entry #{} has invalid HTTP method {:?}",
+            index + 1,
+            entry.request.method
+        ))
+    })?;
     let url = entry.request.url.clone();
 
     let item_name = generate_item_name(&url, index);
@@ -330,7 +342,7 @@ fn har_entry_to_item(entry: HarEntry, index: usize) -> ScenarioItem {
 
     let body = entry.request.post_data.map(build_body);
 
-    ScenarioItem {
+    Ok(ScenarioItem {
         id: format!("har-item-{}", index),
         name: item_name,
         request: Some(Request {
@@ -349,7 +361,7 @@ fn har_entry_to_item(entry: HarEntry, index: usize) -> ScenarioItem {
         test: None,
         assertions: vec![],
         items: vec![],
-    }
+    })
 }
 
 /// Build the request body from HAR `postData`.

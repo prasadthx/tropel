@@ -746,9 +746,29 @@ impl K6DriverInstance {
                         } else {
                             Some(Body::Raw(body))
                         };
+                        // A genuinely invalid method token must not silently
+                        // become GET (a write-path "PURGE" must not degrade
+                        // into a read-path GET that reports green). Surfaced
+                        // as a status-0 error response the shim returns to
+                        // the script (checks fail, http_req_failed counts).
+                        // Valid-but-uncommon tokens (PURGE/LINK/…)
+                        // parse fine via Method::Custom.
+                        // NOTE: inside the let-else else-block, `method` still
+                        // refers to the original String (the parsed binding is
+                        // only visible after the statement).
+                        let Some(parsed_method) = Method::parse(&method) else {
+                            return serde_json::json!({
+                                "code": 0,
+                                "status": 0,
+                                "status_text": format!("invalid HTTP method {}", method),
+                                "body": "",
+                                "headers": {},
+                                "response_time": 0,
+                            }).to_string();
+                        };
                         let req = Request {
                             url,
-                            method: Method::parse(&method).unwrap_or(Method::GET),
+                            method: parsed_method,
                             headers,
                             query_params: HashMap::new(),
                             body: req_body,
@@ -874,9 +894,19 @@ impl K6DriverInstance {
                             .get("response_type")
                             .and_then(|v| v.as_str())
                             .unwrap_or("text");
+                        // Same loud-failure guard as the first bridge: an
+                        // invalid method token must not silently become GET.
+                        // This closure must return a UNIFORM future type, so
+                        // the invalid-method case is carried as an immediate
+                        // Err result inside the async block (never executed)
+                        // instead of a String — the caller maps it to a
+                        // status-0 response + failure samples.
+                        let parsed_method = Method::parse(&method);
                         let req = Request {
                             url,
-                            method: Method::parse(&method).unwrap_or(Method::GET),
+                            method: parsed_method
+                                .clone()
+                                .unwrap_or_else(|| Method::Custom(method.clone())),
                             headers,
                             query_params: HashMap::new(),
                             body: request_body,
@@ -887,7 +917,14 @@ impl K6DriverInstance {
                             response_type: tropel_sdk::ResponseType::from_k6(response_type),
                         };
                         let http_client = http_for_io.clone();
-                        async move {                                let resp = http_client.execute(&req).await;
+                        async move {
+                            let resp = match parsed_method {
+                                Some(_) => http_client.execute(&req).await,
+                                None => Err(TropelError::Other(format!(
+                                    "invalid HTTP method {}",
+                                    method
+                                ))),
+                            };
                             (key, req, resp)
                         }
                     });

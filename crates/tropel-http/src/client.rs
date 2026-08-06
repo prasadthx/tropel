@@ -484,8 +484,11 @@ impl HttpClient {
             crate::subtimings::begin_request(hop_start);
 
             // Build the reqwest request for THIS hop (URL/method/body may
-            // have been rewritten by a redirect).
-            let mut req_builder = match current_method {
+            // have been rewritten by a redirect). Match by reference: the
+            // `Custom` arm binds `m: &String`, so `current_method` is NOT
+            // moved out of — it is still needed by the redirect-rewrite
+            // logic below (303 → GET etc.).
+            let mut req_builder = match &current_method {
                 Method::GET => client.get(&current_url),
                 Method::POST => {
                     let rb = client.post(&current_url);
@@ -517,6 +520,16 @@ impl HttpClient {
                 Method::TRACE => client.request(reqwest::Method::TRACE, &current_url),
                 Method::CONNECT => {
                     return Err(TropelError::Http("CONNECT method not supported".into()));
+                }
+                // Custom token (PURGE, LINK, …): parse into a reqwest Method.
+                // `from_bytes` validates the token charset, so a token that
+                // slipped past Method::parse would surface as a request-build
+                // error here instead of silently becoming GET.
+                Method::Custom(m) => {
+                    let method = reqwest::Method::from_bytes(m.as_bytes()).map_err(|e| {
+                        TropelError::Http(format!("Invalid HTTP method '{}': {}", m, e))
+                    })?;
+                    client.request(method, &current_url)
                 }
             };
 

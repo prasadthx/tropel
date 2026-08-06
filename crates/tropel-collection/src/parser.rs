@@ -32,6 +32,30 @@ fn validate_collection(collection: &Collection) -> Result<()> {
     if collection.info.schema.is_empty() {
         return Err(CollectionError::MissingField("info.schema".into()));
     }
+    validate_methods(&collection.item)?;
+    Ok(())
+}
+
+/// Every request's method must be a valid HTTP token. A genuinely invalid
+/// method (empty, whitespace inside, non-tchar chars) fails the whole
+/// collection parse loudly instead of silently becoming GET — a write-path
+/// request must not degrade into a read-path "test" that reports green.
+/// (Valid-but-uncommon tokens like PURGE/LINK parse fine via
+/// `Method::Custom`.)
+fn validate_methods(items: &[CollectionItem]) -> Result<()> {
+    for item in items {
+        match item {
+            CollectionItem::Request(req) => {
+                if Method::parse(&req.request.method).is_none() {
+                    return Err(CollectionError::InvalidRequest(format!(
+                        "item '{}' has invalid HTTP method {:?}",
+                        req.name, req.request.method
+                    )));
+                }
+            }
+            CollectionItem::Folder(folder) => validate_methods(&folder.item)?,
+        }
+    }
     Ok(())
 }
 
@@ -144,7 +168,15 @@ fn convert_request(
     request_auth: Option<&CollectionAuth>,
     inherited_auth: Option<&CollectionAuth>,
 ) -> Request {
-    let method = Method::parse(&detail.method).unwrap_or(Method::GET);
+    // validate_methods() (called from parse_collection) rejects genuinely
+    // invalid tokens at parse time. Direct callers of collection_to_scenario
+    // bypass that guard, so the fallback here must NOT be a silent GET: the
+    // raw token is preserved as Method::Custom, and reqwest::Method::from_bytes
+    // (the Custom arm in the HTTP client) rejects non-tchar tokens LOUDLY at
+    // request time — the request fails visibly instead of degrading to a
+    // read-path GET that reports green.
+    let method =
+        Method::parse(&detail.method).unwrap_or_else(|| Method::Custom(detail.method.clone()));
 
     let mut url = build_url(detail);
 

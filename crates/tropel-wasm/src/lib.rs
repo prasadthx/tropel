@@ -720,7 +720,7 @@ fn return_true() -> bool {
 // ══════════════════════════════════════════════════════════════════
 
 fn convert_scenario(ws: WasmScenario) -> Result<Scenario> {
-    let items = build_item_tree(&ws.items);
+    let items = build_item_tree(&ws.items)?;
     let variables: HashMap<String, serde_json::Value> = ws
         .variables
         .into_iter()
@@ -739,25 +739,29 @@ fn convert_scenario(ws: WasmScenario) -> Result<Scenario> {
     })
 }
 
-fn build_item_tree(flat: &[WasmItem]) -> Vec<ScenarioItem> {
+/// Threads `Result` because a request's method token may be invalid — the
+/// whole scenario conversion fails loudly instead of silently becoming GET.
+fn build_item_tree(flat: &[WasmItem]) -> Result<Vec<ScenarioItem>> {
     // Collect flat items first
     let items: Vec<ScenarioItem> = flat
         .iter()
-        .map(|wi| ScenarioItem {
-            id: wi.id.clone(),
-            name: wi.name.clone(),
-            request: wi.request.as_ref().map(convert_request),
-            prerequest: wi.prerequest.clone(),
-            test: wi.test.clone(),
-            assertions: wi.assertions.clone(),
-            items: Vec::new(),
+        .map(|wi| -> Result<ScenarioItem> {
+            Ok(ScenarioItem {
+                id: wi.id.clone(),
+                name: wi.name.clone(),
+                request: wi.request.as_ref().map(convert_request).transpose()?,
+                prerequest: wi.prerequest.clone(),
+                test: wi.test.clone(),
+                assertions: wi.assertions.clone(),
+                items: Vec::new(),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     // Build tree from parent_index references
     // For recursive items (self-contained), use the `items` field directly
     if flat.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // If any item has child items directly (recursive format), use those
@@ -765,19 +769,19 @@ fn build_item_tree(flat: &[WasmItem]) -> Vec<ScenarioItem> {
     if has_recursive {
         return flat
             .iter()
-            .map(|wi| {
-                let children = build_item_tree(&wi.items);
-                ScenarioItem {
+            .map(|wi| -> Result<ScenarioItem> {
+                let children = build_item_tree(&wi.items)?;
+                Ok(ScenarioItem {
                     id: wi.id.clone(),
                     name: wi.name.clone(),
-                    request: wi.request.as_ref().map(convert_request),
+                    request: wi.request.as_ref().map(convert_request).transpose()?,
                     prerequest: wi.prerequest.clone(),
                     test: wi.test.clone(),
                     assertions: wi.assertions.clone(),
                     items: children,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>();
     }
 
     // Otherwise, use parent-index flat format
@@ -792,22 +796,19 @@ fn build_item_tree(flat: &[WasmItem]) -> Vec<ScenarioItem> {
             result.push(item);
         }
     }
-    result
+    Ok(result)
 }
 
-fn convert_request(wr: &WasmRequest) -> Request {
-    let method = match wr.method.to_uppercase().as_str() {
-        "GET" => Method::GET,
-        "HEAD" => Method::HEAD,
-        "POST" => Method::POST,
-        "PUT" => Method::PUT,
-        "DELETE" => Method::DELETE,
-        "CONNECT" => Method::CONNECT,
-        "OPTIONS" => Method::OPTIONS,
-        "TRACE" => Method::TRACE,
-        "PATCH" => Method::PATCH,
-        _ => Method::GET,
-    };
+fn convert_request(wr: &WasmRequest) -> Result<Request> {
+    // A genuinely invalid method token must fail loudly, not silently become
+    // GET (backlog line 95). Valid-but-uncommon tokens (PURGE/LINK/…) parse
+    // fine via Method::Custom.
+    let method = Method::parse(&wr.method).ok_or_else(|| {
+        TropelError::Parse(format!(
+            "WASM plugin request has invalid HTTP method {:?}",
+            wr.method
+        ))
+    })?;
 
     let body = wr.body.as_ref().map(|b| match wr.body_type.as_str() {
         "json" => serde_json::from_str(b)
@@ -827,7 +828,7 @@ fn convert_request(wr: &WasmRequest) -> Request {
         _ => Body::Raw(b.clone()),
     });
 
-    Request {
+    Ok(Request {
         url: wr.url.clone(),
         method,
         headers: wr.headers.clone(),
@@ -838,7 +839,7 @@ fn convert_request(wr: &WasmRequest) -> Request {
         follow_redirects: wr.follow_redirects,
         timeout: wr.timeout_ms.map(std::time::Duration::from_millis),
         response_type: tropel_core::types::ResponseType::Text,
-    }
+    })
 }
 
 fn convert_auth(wa: &WasmAuth) -> Option<AuthConfig> {
