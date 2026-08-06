@@ -3486,6 +3486,69 @@ mod tests {
     }
 
     #[test]
+    fn test_pm_send_request_transport_failure_fires_error_callback() {
+        // Backlog line 147: pm.sendRequest reported transport failures
+        // (DNS/conn refused/timeout) as SUCCESS — callback(null, {code: 0}) —
+        // so the universal `if (err)` guard in user scripts never fired and
+        // auth-token-fetch retry logic was dead. The bridge now stamps an
+        // `error` field; the shim must surface it as the first (err) arg.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                // Transport failure — what the real bridge returns on a
+                // connection error (code 0 + error field).
+                globalThis.__tropel_pm_send_request = function () {
+                    return JSON.stringify({
+                        error: 'Request failed: error sending request for url (http://down:9/)',
+                        code: 0, statusText: '', body: '', headers: {}, responseTime: 0
+                    });
+                };
+                globalThis.__cb_args = null;
+                pm.sendRequest('http://down:9/', function (err, resp) {
+                    globalThis.__cb_args = { err: err ? err.message : null, resp: resp };
+                });
+
+                // A healthy response must still arrive via (null, resp).
+                globalThis.__tropel_pm_send_request = function () {
+                    return JSON.stringify({ code: 200, statusText: 'OK', body: '{}', headers: {},
+                                            responseTime: 5 });
+                };
+                globalThis.__ok_args = null;
+                pm.sendRequest('http://ok/', function (err, resp) {
+                    globalThis.__ok_args = { err: err ? err.message : null, resp: resp };
+                });
+            "#,
+            )
+            .expect("script should eval");
+
+            let err_msg: String = ctx
+                .eval("globalThis.__cb_args.err")
+                .expect("read err message");
+            assert!(
+                err_msg.contains("Request failed"),
+                "transport failure must fire callback(err, null): {err_msg}"
+            );
+            let resp_null: bool = ctx
+                .eval("globalThis.__cb_args.resp === null")
+                .expect("read resp nullity");
+            assert!(resp_null, "err path must pass null response");
+
+            let ok_err: bool = ctx
+                .eval("globalThis.__ok_args.err === null")
+                .expect("read ok err");
+            assert!(ok_err, "healthy response must fire callback(null, resp)");
+            let ok_code: i64 = ctx
+                .eval("globalThis.__ok_args.resp.code")
+                .expect("read ok code");
+            assert_eq!(ok_code, 200, "success path code must round-trip");
+        });
+    }
+
+    #[test]
     fn test_pm_response_members_are_value_properties() {
         // Backlog line 143: pm.response.code/status/responseTime/headers/
         // cookies are VALUE properties in Postman, not functions. The old

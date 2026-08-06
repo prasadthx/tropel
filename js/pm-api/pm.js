@@ -920,6 +920,15 @@ pm.sendRequest = function (options, callback) {
         if (typeof callback === 'function') {
             try {
                 var result = JSON.parse(resultJson);
+                // Backlog line 147: transport failures (DNS/conn refused/timeout)
+                // used to arrive as callback(null, {code: 0}) — a "success" to
+                // the universal `if (err)` guard, so auth-token-fetch retry logic
+                // never fired. The bridge now stamps an `error` field; surface it
+                // as the first (err) argument so the canonical guard works.
+                if (result.error) {
+                    callback(new Error(result.error), null);
+                    return;
+                }
                 callback(null, {
                     code: result.code || 0,
                     status: result.statusText || '',

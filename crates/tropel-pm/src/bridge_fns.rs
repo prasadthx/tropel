@@ -171,6 +171,32 @@ fn resolve_vars(
     result
 }
 
+/// Resolve `{{var}}` placeholders across URL, headers, and body for
+/// `pm.sendRequest` (backlog line 147: only the URL was resolved, so a
+/// `Bearer {{token}}` header or `{{"key":"{{val}}"}}` body went out with the
+/// literal placeholder). Extracted as a pure function so the resolution
+/// contract is unit-testable without a live JS context.
+fn resolve_send_request(
+    url: &str,
+    headers_json: &str,
+    body: &str,
+    environment: &HashMap<String, String>,
+    collection_vars: &HashMap<String, serde_json::Value>,
+    globals: &HashMap<String, serde_json::Value>,
+) -> (String, HashMap<String, String>, Option<Body>) {
+    let resolved_url = resolve_vars(url, environment, collection_vars, globals);
+    let headers: HashMap<String, String> = parse_headers(headers_json)
+        .into_iter()
+        .map(|(k, v)| (k.clone(), resolve_vars(&v, environment, collection_vars, globals)))
+        .collect();
+    let request_body = if body.is_empty() {
+        None
+    } else {
+        Some(Body::Raw(resolve_vars(body, environment, collection_vars, globals)))
+    };
+    (resolved_url, headers, request_body)
+}
+
 /// Parse headers from a JSON string that may be either:
 /// - Object form: {"Content-Type": "application/json"}
 /// - Postman array form: [{"key": "Content-Type", "value": "application/json"}]
@@ -1047,20 +1073,20 @@ impl PmBridge {
                           timeout_ms: f64,
                           response_type: String|
                           -> String {
-                        // Resolve {{variables}} in the URL using current PM state
-                        let resolved_url = {
+                        // Resolve {{variables}} across URL, headers, and body
+                        // (backlog line 147: only the URL was resolved — a
+                        // header like "Authorization: Bearer {{token}}" went
+                        // out with the literal placeholder).
+                        let (resolved_url, headers, request_body) = {
                             let st = state_for_send.lock().unwrap();
-                            resolve_vars(&url, &st.environment, &st.collection_vars, &st.globals)
-                        };
-
-                        // Parse headers — supports both object form {"key":"val"} and
-                        // Postman array form [{"key":"Content-Type","value":"application/json"}]
-                        let headers: HashMap<String, String> = parse_headers(&headers_json);
-
-                        let request_body = if body.is_empty() {
-                            None
-                        } else {
-                            Some(Body::Raw(body))
+                            resolve_send_request(
+                                &url,
+                                &headers_json,
+                                &body,
+                                &st.environment,
+                                &st.collection_vars,
+                                &st.globals,
+                            )
                         };
 
                         let timeout = if timeout_ms > 0.0 {
@@ -1076,6 +1102,7 @@ impl PmBridge {
                         // tokens (PURGE/LINK/…) parse fine via Method::Custom.
                         let Some(method) = Method::parse(&method) else {
                             return serde_json::json!({
+                                "error": format!("invalid HTTP method {}", method),
                                 "code": 0,
                                 "statusText": format!("invalid HTTP method {}", method),
                                 "body": "",
@@ -1118,7 +1145,13 @@ impl PmBridge {
                                 })
                                 .to_string()
                             }
+                            // Backlog line 147: transport failures must be
+                            // visible to the universal `if (err)` guard in the
+                            // shim. The `error` field is what the JS side
+                            // checks — code 0 alone is not enough (a 0-status
+                            // reply looks like a "success" to naive callers).
                             Err(e) => serde_json::json!({
+                                "error": format!("Request failed: {}", e),
                                 "code": 0,
                                 "statusText": format!("Request failed: {}", e),
                                 "body": "",
@@ -1206,6 +1239,50 @@ mod tests {
         // No scope has it.
         let got = variables_lookup("missing", Some(&data), &env, &collection, &globals);
         assert_eq!(got, None, "unknown key resolves to None");
+    }
+
+    /// Regression (backlog line 147): `pm.sendRequest` must resolve
+    /// `{{var}}` placeholders in the URL, headers, AND body — the old code
+    /// resolved the URL only, so `Authorization: Bearer {{token}}` or a
+    /// body containing a placeholder went out with the literal braces.
+    #[test]
+    fn test_resolve_send_request_resolves_url_headers_body() {
+        let env = HashMap::from([("token".to_string(), "s3cret".to_string())]);
+        let collection = HashMap::new();
+        let globals = HashMap::new();
+
+        let (url, headers, body) = resolve_send_request(
+            "https://api.example.com/v1?key={{token}}",
+            "{\"Authorization\":\"Bearer {{token}}\",\"X-Static\":\"v\"}",
+            "{\"token\":\"{{token}}\"}",
+            &env,
+            &collection,
+            &globals,
+        );
+
+        assert_eq!(url, "https://api.example.com/v1?key=s3cret", "URL must resolve");
+        assert_eq!(
+            headers.get("Authorization").map(String::as_str),
+            Some("Bearer s3cret"),
+            "header values must resolve"
+        );
+        assert_eq!(
+            headers.get("X-Static").map(String::as_str),
+            Some("v"),
+            "non-placeholder headers must pass through untouched"
+        );
+        assert_eq!(
+            body.map(|b| match b {
+                Body::Raw(s) => s,
+                _ => String::new(),
+            }),
+            Some("{\"token\":\"s3cret\"}".to_string()),
+            "raw body must resolve"
+        );
+
+        // Empty body stays None.
+        let (_, _, body) = resolve_send_request("u", "{}", "", &env, &collection, &globals);
+        assert!(body.is_none(), "empty body must stay None");
     }
 
     /// Regression (backlog line 68): `pm.response.json()` returned
