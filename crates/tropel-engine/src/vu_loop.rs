@@ -26,7 +26,7 @@ use tropel_ext::registry::ExtensionRegistry;
 use tropel_ext::traits::{Driver, DriverHttpClient, DriverInstance, Protocol, VuContext};
 use tropel_http::client::HttpClient;
 use tropel_metrics::collector::MetricsCollector;
-use tropel_metrics::thresholds::check_abort_on_fail;
+use tropel_metrics::thresholds::{check_abort_on_fail, evaluate_thresholds};
 use tropel_pm::bridge::SharedPmState;
 
 /// Outcome of one VU iteration, normalized across scenario runners and
@@ -248,6 +248,9 @@ async fn run_vu_loop(
         if vu_gauge_due {
             let active = sched.active_vus().await;
             let peak = sched.peak_vus();
+            shared
+                .last_active_vus
+                .store(active, std::sync::atomic::Ordering::Relaxed);
             utils_emit_vus_metrics(&shared.metrics, active, peak, &shared.sc_tags).await;
             last_vu_gauge = Instant::now();
         }
@@ -384,6 +387,10 @@ struct VuRunShared {
     /// [`VuIterationOutcome::script_failures`] so a run where scripts keep
     /// throwing exits non-zero instead of reporting success (backlog line 98).
     script_failures: Arc<AtomicU64>,
+    /// Last sampled active VU count (Gauge). The final post-run vus sample
+    /// uses this instead of a hardcoded 0 so short runs still report the
+    /// real last-known concurrency (backlog line 154).
+    last_active_vus: Arc<AtomicU32>,
 }
 
 /// Shared VU-run scaffolding used by both the scenario and driver paths:
@@ -443,14 +450,12 @@ where
         _ => u64::MAX,
     };
 
-    let has_abort_thresholds = thresholds.values().any(|t| t.abort_on_fail);
     let is_per_vu_iterations = matches!(exec_cfg, ExecutionConfig::PerVUIterations { .. });
     let think_time_cfg = extract_think_time(&exec_cfg);
     // k6-style executor name (e.g. "constant-vus") — backs exec.scenario.executor().
     let executor_name = exec_cfg.executor_name().to_string();
 
     let abort_monitor = spawn_abort_coordinator(
-        has_abort_thresholds,
         metrics.clone(),
         executor.control_handle(),
         thresholds.clone(),
@@ -459,6 +464,7 @@ where
 
     let vu_init_failures = Arc::new(AtomicU32::new(0));
     let script_failures = Arc::new(AtomicU64::new(0));
+    let last_active_vus = Arc::new(AtomicU32::new(0));
     let shared = VuRunShared {
         metrics: metrics.clone(),
         sc_tags: sc_tags.clone(),
@@ -470,6 +476,7 @@ where
         executor_name,
         vu_init_failures: vu_init_failures.clone(),
         script_failures: script_failures.clone(),
+        last_active_vus: last_active_vus.clone(),
     };
 
     executor
@@ -498,8 +505,11 @@ where
 
     // Emit a guaranteed final vus/vus_max sample. The periodic sampler only
     // fires every 100 iterations per VU, so a short run would otherwise emit
-    // NO vus/vus_max samples and the summary would read vus_max: 0.
-    utils_emit_vus_metrics(&metrics, 0, executor.peak_vus(), &sc_tags).await;
+    // NO vus/vus_max samples and the summary would read vus_max: 0. The
+    // active count uses the LAST KNOWN sampled value (not 0) so the vus
+    // gauge's `last` reflects real concurrency (backlog line 154).
+    let final_active = last_active_vus.load(std::sync::atomic::Ordering::SeqCst);
+    utils_emit_vus_metrics(&metrics, final_active, executor.peak_vus(), &sc_tags).await;
 
     // Record dropped iterations (carries the scenario tags like every other
     // sample this scenario emits).
@@ -906,13 +916,12 @@ pub(crate) async fn run_driver_vus(
 /// threshold aborts; the caller must `abort()` the returned handle once the
 /// run has finished so the task doesn't keep the metrics aggregator alive.
 fn spawn_abort_coordinator(
-    has_abort_thresholds: bool,
     metrics: Arc<MetricsCollector>,
     sched: Arc<VUScheduler>,
     thresholds: HashMap<String, tropel_core::config::ThresholdConfig>,
     test_start: Instant,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    if !has_abort_thresholds {
+    if thresholds.is_empty() {
         return None;
     }
     Some(tokio::spawn(async move {
@@ -932,6 +941,15 @@ fn spawn_abort_coordinator(
             let elapsed = test_start.elapsed();
             if elapsed > Duration::from_secs(1) {
                 let results = metrics.results().await;
+                // k6 `tainted`: ANY failed threshold (abortOnFail or not)
+                // marks the run so the control API status doc reports
+                // `tainted: true` (backlog line 154).
+                for tr in evaluate_thresholds(&thresholds, &results) {
+                    if !tr.passed {
+                        sched.set_tainted();
+                        break;
+                    }
+                }
                 if check_abort_on_fail(&thresholds, &results, elapsed) {
                     sched.request_stop();
                     break;

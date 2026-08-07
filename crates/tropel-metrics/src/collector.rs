@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{broadcast, mpsc};
 use tropel_core::types::{Sample, SampleType};
@@ -1083,6 +1084,7 @@ impl Aggregator {
             },
             iterations,
             vus_max,
+            run_duration: Duration::ZERO,
             summary_trend_stats: self.summary_trend_stats.clone(),
             effective_thresholds: self.effective_thresholds.clone(),
         }
@@ -1384,6 +1386,10 @@ pub struct MetricsResult {
     pub iterations: u64,
     /// Maximum concurrent VUs observed.
     pub vus_max: u64,
+    /// Wall-clock duration of the run (stamped by the engine after the run
+    /// finishes). Reporters use it for k6-style per-second rates
+    /// (`http_reqs: 136 13.56/s`) and `handleSummary` state.
+    pub run_duration: Duration,
     /// Trend statistics to show in the summary, k6 `summaryTrendStats`
     /// semantics (e.g. `["avg","min","med","max","p(90)","p(95)","p(99)"]`).
     /// Defaults to the k6 set. Reporters must honor this list.
@@ -1415,6 +1421,7 @@ impl Default for MetricsResult {
             http_req_failed: 0.0,
             iterations: 0,
             vus_max: 0,
+            run_duration: Duration::ZERO,
             summary_trend_stats: k6_default_trend_stats(),
             effective_thresholds: std::collections::HashMap::new(),
         }

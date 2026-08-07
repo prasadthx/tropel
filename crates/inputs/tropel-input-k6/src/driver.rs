@@ -151,6 +151,7 @@ impl Driver for K6Driver {
             http_bridge_registered: false,
             script_bridges_registered: false,
             sample_sink: Arc::new(Mutex::new(Vec::new())),
+            group_stack: Arc::new(Mutex::new(Vec::new())),
             exec_state: Arc::new(Mutex::new(K6ExecState::default())),
             abort_requested: Arc::new(Mutex::new(None)),
             ws_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -545,6 +546,11 @@ pub struct K6DriverInstance {
     /// 'static and can't reach the VuContext, so they push into this buffer
     /// and run_iteration() drains it into ctx.samples after each iteration.
     sample_sink: Arc<Mutex<Vec<Sample>>>,
+    /// Per-VU group() stack (backlog line 154). `group(name)` pushes here,
+    /// the matching group_end pops; the http bridges read the top when
+    /// stamping http_req_* samples so metrics recorded inside a group carry
+    /// `group=::name` (k6 parity) instead of the hardcoded `group=http`.
+    group_stack: Arc<Mutex<Vec<String>>>,
     /// Shared exec.* state — the pm.js / k6-shim / exec.js scripts read it
     /// through __tropel_exec_* closures registered lazily; sync_globals()
     /// refreshes it from the VuContext before each iteration.
@@ -660,8 +666,14 @@ fn interned(s: &'static str) -> Arc<str> {
 /// [`interned`]. The scenario tag is stamped here when present, so the
 /// drain's scenario pass is a no-op for http samples — it never
 /// `Arc::make_mut`-clones the map shared by the 5 per-request samples.
-fn http_tags(req: &Request, status: &str, scenario: &Arc<str>, extra: Option<&HashMap<String, String>>) -> TagMap {
-    http_tags_for(&req.url, req.method.as_str(), status, scenario, extra)
+fn http_tags(
+    req: &Request,
+    status: &str,
+    scenario: &Arc<str>,
+    extra: Option<&HashMap<String, String>>,
+    group: Option<&str>,
+) -> TagMap {
+    http_tags_for(&req.url, req.method.as_str(), status, scenario, extra, group)
 }
 
 /// [`http_tags`] with explicit URL/method (redirect hops reuse it).
@@ -670,12 +682,17 @@ fn http_tags(req: &Request, status: &str, scenario: &Arc<str>, extra: Option<&Ha
 /// defaults so a user `name`/`url`/… tag wins (k6 semantics: params.tags
 /// add to AND override the auto tags; the `name` tag is the common case,
 /// grouping `http_req_duration` for a specific request).
+///
+/// `group` is the active group() path (backlog line 154: k6 stamps metrics
+/// recorded inside `group("x")` with `group=::x`, not the hardcoded
+/// `group=http`). None → default `group=http` (back-compat).
 fn http_tags_for(
     url: &str,
     method: &str,
     status: &str,
     scenario: &Arc<str>,
     extra: Option<&HashMap<String, String>>,
+    group: Option<&str>,
 ) -> TagMap {
     let mut tags = TagMap::with_capacity(6);
     let url_arc: Arc<str> = Arc::from(url);
@@ -683,7 +700,10 @@ fn http_tags_for(
     tags.insert(interned("method"), Arc::from(method));
     tags.insert(interned("status"), Arc::from(status));
     tags.insert(interned("name"), url_arc);
-    tags.insert(interned("group"), interned("http"));
+    tags.insert(
+        interned("group"),
+        group.map(Arc::from).unwrap_or_else(|| interned("http")),
+    );
     if !scenario.is_empty() {
         // Refcount bump — the Arc was created once at bridge registration.
         tags.insert(interned("scenario"), scenario.clone());
@@ -711,6 +731,7 @@ fn push_http_samples(
     timings: Option<&Timings>,
     scenario: &Arc<str>,
     extra_tags: Option<&HashMap<String, String>>,
+    group: Option<&str>,
 ) {
     push_http_samples_for(
         sink,
@@ -723,6 +744,7 @@ fn push_http_samples(
         timings,
         scenario,
         extra_tags,
+        group,
     );
 }
 
@@ -736,6 +758,7 @@ fn push_redirect_hops(
     method: &str,
     scenario: &Arc<str>,
     extra_tags: Option<&HashMap<String, String>>,
+    group: Option<&str>,
 ) {
     for hop in &resp.redirects {
         push_http_samples_for(
@@ -749,6 +772,7 @@ fn push_redirect_hops(
             hop.timings.as_ref(),
             scenario,
             extra_tags,
+            group,
         );
     }
 }
@@ -766,6 +790,7 @@ fn push_http_samples_for(
     timings: Option<&Timings>,
     scenario: &Arc<str>,
     extra_tags: Option<&HashMap<String, String>>,
+    group: Option<&str>,
 ) {
     let now = SystemTime::now();
     let tags = Arc::new(http_tags_for(
@@ -774,6 +799,7 @@ fn push_http_samples_for(
         &status_code.to_string(),
         scenario,
         extra_tags,
+        group,
     ));
 
     let is_failed = !(200..400).contains(&status_code);
@@ -923,9 +949,10 @@ fn push_http_failure(
     req: &Request,
     scenario: &Arc<str>,
     extra_tags: Option<&HashMap<String, String>>,
+    group: Option<&str>,
 ) {
     let now = SystemTime::now();
-    let tags = Arc::new(http_tags(req, "0", scenario, extra_tags));
+    let tags = Arc::new(http_tags(req, "0", scenario, extra_tags, group));
 
     let mut v = sink.lock().unwrap();
     v.push(Sample {
@@ -1116,7 +1143,13 @@ impl K6DriverInstance {
         // cannot declare — the registration lives in the generic free fn
         // below. Behavior is identical; only the marshalling changes.
         self.js_ctx.with_ctx(|rq_ctx| {
-            register_http_bridges(rq_ctx, http_client.clone(), sink.clone(), &ctx.scenario_name);
+            register_http_bridges(
+                rq_ctx,
+                http_client.clone(),
+                sink.clone(),
+                &ctx.scenario_name,
+                self.group_stack.clone(),
+            );
         });
 
         self.http_bridge_registered = true;
@@ -1135,6 +1168,7 @@ fn register_http_bridges<'js>(
     http_client: Arc<dyn DriverHttpClient + Send + Sync>,
     sink: Arc<Mutex<Vec<Sample>>>,
     scenario: &str,
+    group_stack: Arc<Mutex<Vec<String>>>,
 ) {
     let globals = rq_ctx.globals();
     let http_client_request = http_client.clone();
@@ -1145,6 +1179,10 @@ fn register_http_bridges<'js>(
     // entirely: no Arc::make_mut, no 4x deep-clone of the map shared by the
     // 5 per-request samples.
     let scenario_req = Arc::from(scenario);
+    // Backlog line 154: current group() path (::a::b) read from the per-VU
+    // group stack at REQUEST time, so http_req_* samples recorded inside a
+    // group carry `group=::path` instead of the hardcoded `group=http`.
+    let group_stack_req = group_stack.clone();
     let _ = globals.set(
         "__tropel_k6_http_request",
         Func::from(
@@ -1313,7 +1351,8 @@ fn register_http_bridges<'js>(
                                 // k6 parity: every redirect hop counts as its
                                 // own request (test.k6.io 302 chain = 2 reqs
                                 // per iteration, not 1).
-                                push_redirect_hops(&sink_req, &resp, req.method.as_str(), &scenario_req, Some(&extra_tags));
+                                let group = group_stack_req.lock().unwrap().last().cloned();
+                                push_redirect_hops(&sink_req, &resp, req.method.as_str(), &scenario_req, Some(&extra_tags), group.as_deref());
                                 push_http_samples(
                                     &sink_req,
                                     &req,
@@ -1324,6 +1363,7 @@ fn register_http_bridges<'js>(
                                     resp.timings.as_ref(),
                                     &scenario_req,
                                     Some(&extra_tags),
+                                    group.as_deref(),
                                 );
                                 build_k6_response_object(
                                     &ctx,
@@ -1340,7 +1380,8 @@ fn register_http_bridges<'js>(
                             }
                             Err(e) => {
                                 tracing::debug!("k6 http request failed: {}", e);
-                                push_http_failure(&sink_req, &req, &scenario_req, Some(&extra_tags));
+                                let group = group_stack_req.lock().unwrap().last().cloned();
+                                push_http_failure(&sink_req, &req, &scenario_req, Some(&extra_tags), group.as_deref());
                                 let err = e.to_string();
                                 build_k6_response_object(
                                     &ctx,
@@ -1362,6 +1403,7 @@ fn register_http_bridges<'js>(
 
     let batch_sink = sink.clone();
     let scenario_batch = Arc::from(scenario);
+    let group_stack_batch = group_stack.clone();
             let _ = globals.set(
                 "__tropel_k6_http_batch",
                 Func::from(move |requests_json: String| -> String {
@@ -1532,7 +1574,8 @@ fn register_http_bridges<'js>(
                                     // k6 parity: every redirect hop counts as
                                     // its own request, same as the single-
                                     // request path.
-                                    push_redirect_hops(&batch_sink, &resp, req.method.as_str(), &scenario_batch, Some(&extra_tags));
+                                    let group = group_stack_batch.lock().unwrap().last().cloned();
+                                    push_redirect_hops(&batch_sink, &resp, req.method.as_str(), &scenario_batch, Some(&extra_tags), group.as_deref());
                                     push_http_samples(
                                         &batch_sink,
                                         &req,
@@ -1543,6 +1586,7 @@ fn register_http_bridges<'js>(
                                         resp.timings.as_ref(),
                                         &scenario_batch,
                                         Some(&extra_tags),
+                                        group.as_deref(),
                                     );
                                     // Backlog line 150: batch responses now
                                     // carry real timings + error/error_code
@@ -1589,7 +1633,8 @@ fn register_http_bridges<'js>(
                                 }
                                 Err(e) => {
                                     tracing::debug!("k6 batch request failed: {}", e);
-                                    push_http_failure(&batch_sink, &req, &scenario_batch, Some(&extra_tags));
+                                    let group = group_stack_batch.lock().unwrap().last().cloned();
+                                    push_http_failure(&batch_sink, &req, &scenario_batch, Some(&extra_tags), group.as_deref());
                                     let err = e.to_string();
                                     serde_json::json!({
                                         "code": 0,
@@ -1653,12 +1698,23 @@ impl K6DriverInstance {
                 }),
             );
 
-            // Custom metric .add() → typed sample (Counter/Gauge/Rate/Trend)
+            // Custom metric .add() → typed sample (Counter/Gauge/Rate/Trend).
+            // Backlog line 154: the 5th arg carries k6's `isTime` flag — when
+            // true the metric name is registered in the tropel-metrics time
+            // registry so json-stream stamps `contains: "time"` and stdout
+            // renders it in ms (k6's `new Trend('x', true)` behavior).
             let sink_metric = sink.clone();
             let _ = globals.set(
                 "__tropel_pm_custom_metric_add",
                 Func::from(
-                    move |name: String, value: f64, tags_json: String, metric_type_str: String| {
+                    move |name: String,
+                          value: f64,
+                          tags_json: String,
+                          metric_type_str: String,
+                          is_time: bool| {
+                        if is_time {
+                            tropel_metrics::time_metrics::register(&name);
+                        }
                         let tags = if tags_json.is_empty() || tags_json == "{}" {
                             TagMap::new()
                         } else {
@@ -1722,14 +1778,31 @@ impl K6DriverInstance {
 
             // group() → group_duration Trend sample (duration in ms). The
             // shim's group() wraps fn() between __tropel_pm_group_start/end.
+            // Backlog line 154: the START bridge pushes the name onto the
+            // per-VU group stack (http bridges read the top when stamping
+            // http_req_* tags), and END pops it — the two must balance or
+            // the stack leaks across iterations. The group_duration sample
+            // keeps its k6-style `group=<name>` tag.
             let sink_group = sink.clone();
+            let group_start = self.group_stack.clone();
             let _ = globals.set(
                 "__tropel_pm_group_start",
-                Func::from(move |_name: String| {}),
+                Func::from(move |name: String| {
+                    group_start.lock().unwrap().push(name);
+                }),
             );
+            let group_end = self.group_stack.clone();
             let _ = globals.set(
                 "__tropel_pm_group_end",
                 Func::from(move |name: String, duration_ms: f64| {
+                    if let Some(top) = group_end.lock().unwrap().pop() {
+                        // Defensive: the JS shim always calls end with the
+                        // matching name; if a script mismatches, don't lose
+                        // the whole stack — just drop the stale top.
+                        if top != name {
+                            tracing::debug!("k6 group_end mismatch: top={} got={}", top, name);
+                        }
+                    }
                     let mut v = sink_group.lock().unwrap();
                     let mut tags = TagMap::with_capacity(1);
                     tags.insert("group", name);
@@ -4529,6 +4602,7 @@ mod tests {
             7,
             Some(&timings),
             &scenario,
+            None,
             None,
         );
         let samples = sink.lock().unwrap();

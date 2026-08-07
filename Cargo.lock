@@ -4282,6 +4282,7 @@ dependencies = [
  "tropel-es",
  "tropel-http",
  "tropel-js",
+ "tropel-metrics",
  "tropel-native",
  "tropel-sdk",
 ]

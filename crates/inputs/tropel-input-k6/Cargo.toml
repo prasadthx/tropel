@@ -10,6 +10,7 @@ description = "Input adapter that reads k6-style JavaScript/TypeScript test scri
 [dependencies]
 tropel-sdk.workspace = true
 tropel-http.workspace = true
+tropel-metrics.workspace = true
 tropel-js.workspace = true
 tropel-native.workspace = true
 tropel-es.workspace = true

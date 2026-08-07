@@ -1134,12 +1134,13 @@ function Counter(name) {
     }
     this._name = name;
     this._type = 'counter';
+    this._isTime = false;
 }
 
 Counter.prototype.add = function (value, tags) {
     if (typeof __tropel_pm_custom_metric_add === 'function') {
         var tagsStr = tags ? JSON.stringify(tags) : '{}';
-        __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type);
+        __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type, this._isTime);
     }
     return this;
 };
@@ -1150,12 +1151,13 @@ function Gauge(name) {
     }
     this._name = name;
     this._type = 'gauge';
+    this._isTime = false;
 }
 
 Gauge.prototype.add = function (value, tags) {
     if (typeof __tropel_pm_custom_metric_add === 'function') {
         var tagsStr = tags ? JSON.stringify(tags) : '{}';
-        __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type);
+        __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type, this._isTime);
     }
     return this;
 };
@@ -1166,28 +1168,30 @@ function Rate(name) {
     }
     this._name = name;
     this._type = 'rate';
+    this._isTime = false;
 }
 
 Rate.prototype.add = function (value, tags) {
     if (typeof __tropel_pm_custom_metric_add === 'function') {
         var tagsStr = tags ? JSON.stringify(tags) : '{}';
-        __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type);
+        __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type, this._isTime);
     }
     return this;
 };
 
-function Trend(name) {
+function Trend(name, isTime) {
     if (!name || typeof name !== 'string') {
         throw new Error('Trend requires a metric name');
     }
     this._name = name;
     this._type = 'trend';
+    this._isTime = isTime === true;
 }
 
 Trend.prototype.add = function (value, tags) {
     if (typeof __tropel_pm_custom_metric_add === 'function') {
         var tagsStr = tags ? JSON.stringify(tags) : '{}';
-        __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type);
+        __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type, this._isTime);
     }
     return this;
 };

@@ -461,7 +461,53 @@ function K6Response(status, body, headers, timings, url) {
     this.status_text = String(status) + ' ' + getStatusText(status);
 }
 
-K6Response.prototype.json = function () {
+// Backlog line 154: k6's res.json() accepts an OPTIONAL selector. k6 uses
+// gjson-style dotted paths ('a.b.0' -> obj.a.b[0], also array wildcards like
+// 'items.#.name' and '#.id'). This is a JSONPath-lite subset covering the
+// common cases: dotted keys, numeric array indices, and the k6 array
+// wildcard '#' (matches every element of an array). Unknown paths return
+// undefined (k6 parity — no throw).
+function resolveJsonSelector(value, selector) {
+    if (!selector) {
+        return value;
+    }
+    var parts = String(selector).split('.');
+    for (var i = 0; i < parts.length; i++) {
+        var part = parts[i];
+        if (part === '') {
+            continue; // tolerate leading/trailing/double dots
+        }
+        if (part === '#') {
+            // Array wildcard: expand to an array of each element's remainder.
+            if (!Array.isArray(value)) {
+                return undefined;
+            }
+            var rest = parts.slice(i + 1).join('.');
+            var out = [];
+            for (var j = 0; j < value.length; j++) {
+                out.push(resolveJsonSelector(value[j], rest));
+            }
+            return out;
+        }
+        if (value === null || value === undefined) {
+            return undefined;
+        }
+        if (Array.isArray(value)) {
+            var idx = Number(part);
+            if (!isFinite(idx) || idx < 0 || idx >= value.length) {
+                return undefined;
+            }
+            value = value[idx];
+        } else if (typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, part)) {
+            value = value[part];
+        } else {
+            return undefined;
+        }
+    }
+    return value;
+}
+
+K6Response.prototype.json = function (selector) {
     if (!this.body || this.body === '') {
         throw new Error('Response body is empty — cannot parse JSON');
     }
@@ -470,7 +516,8 @@ K6Response.prototype.json = function () {
     // (k6 does not cache, and caching would persist user mutations). The
     // heavy copy savings for the response envelope itself come from the
     // native-object bridge (driver.rs), not from re-parsing here.
-    return JSON.parse(this.body);
+    var parsed = JSON.parse(this.body);
+    return resolveJsonSelector(parsed, selector);
 };
 
 // ══════════════════════════════════════════════════════════════════
@@ -960,11 +1007,12 @@ if (typeof Counter !== 'function') {
         }
         this._name = name;
         this._type = 'counter';
+        this._isTime = false;
     };
     Counter.prototype.add = function (value, tags) {
         if (typeof __tropel_pm_custom_metric_add === 'function') {
             var tagsStr = tags ? JSON.stringify(tags) : '{}';
-            __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type);
+            __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type, this._isTime);
         }
         return this;
     };
@@ -976,11 +1024,12 @@ if (typeof Gauge !== 'function') {
         }
         this._name = name;
         this._type = 'gauge';
+        this._isTime = false;
     };
     Gauge.prototype.add = function (value, tags) {
         if (typeof __tropel_pm_custom_metric_add === 'function') {
             var tagsStr = tags ? JSON.stringify(tags) : '{}';
-            __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type);
+            __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type, this._isTime);
         }
         return this;
     };
@@ -992,27 +1041,32 @@ if (typeof Rate !== 'function') {
         }
         this._name = name;
         this._type = 'rate';
+        this._isTime = false;
     };
     Rate.prototype.add = function (value, tags) {
         if (typeof __tropel_pm_custom_metric_add === 'function') {
             var tagsStr = tags ? JSON.stringify(tags) : '{}';
-            __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type);
+            __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type, this._isTime);
         }
         return this;
     };
 }
 if (typeof Trend !== 'function') {
-    var Trend = function (name) {
+    // Backlog line 154: k6's Trend takes (name, isTime). isTime marks the
+    // metric as containing time, so json-stream stamps `contains: "time"`
+    // and summaries render it in ms even for nonstandard names (my_timer).
+    var Trend = function (name, isTime) {
         if (!name || typeof name !== 'string') {
             throw new Error('Trend requires a metric name');
         }
         this._name = name;
         this._type = 'trend';
+        this._isTime = isTime === true;
     };
     Trend.prototype.add = function (value, tags) {
         if (typeof __tropel_pm_custom_metric_add === 'function') {
             var tagsStr = tags ? JSON.stringify(tags) : '{}';
-            __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type);
+            __tropel_pm_custom_metric_add(this._name, Number(value), tagsStr, this._type, this._isTime);
         }
         return this;
     };

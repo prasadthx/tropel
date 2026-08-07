@@ -23,11 +23,17 @@ pub(crate) fn build_summary_data(
     let mut metrics = Map::new();
     for m in &results.metrics {
         let (typ, contains, values) = match m.metric_type {
-            MetricType::Counter => (
-                "counter",
-                "default",
-                json!({ "count": m.count }),
-            ),
+            MetricType::Counter => {
+                // k6 handleSummary Counter values: `count` (accumulated) +
+                // `rate` = count / elapsed seconds (backlog line 154).
+                let secs = results.run_duration.as_secs_f64();
+                let rate = if secs > 0.0 { m.count as f64 / secs } else { 0.0 };
+                (
+                    "counter",
+                    "default",
+                    json!({ "count": m.count, "rate": rate }),
+                )
+            }
             MetricType::Gauge => (
                 "gauge",
                 "default",

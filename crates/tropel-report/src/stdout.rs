@@ -75,6 +75,9 @@ impl StdoutReporter {
         } else {
             result.summary_trend_stats.clone()
         };
+        // k6-style per-second rate (`http_reqs: 136 13.56/s`) — backlog 154.
+        let run_secs = result.run_duration.as_secs_f64();
+        let per_sec = |n: f64| if run_secs > 0.0 { n / run_secs } else { 0.0 };
 
         // ── Dynamic-width centered header box ──
         const BOX_W: usize = 66;
@@ -100,9 +103,10 @@ impl StdoutReporter {
         // HTTP requests — aligned two-column block
         out.push_str("\n  ── HTTP requests ─────────────────────────────────────────\n");
         out.push_str(&format!(
-            "    {:<14}{}\n",
+            "    {:<14}{} ({:.2}/s)\n",
             "Total",
-            result.http_reqs
+            result.http_reqs,
+            per_sec(result.http_reqs as f64)
         ));
         out.push_str(&format!(
             "    {:<14}{} ({:.1}%)\n",
@@ -166,7 +170,11 @@ impl StdoutReporter {
                 out.push_str(&format!("    {}  ", metric.key));
                 match metric.metric_type {
                     tropel_metrics::collector::MetricType::Counter => {
-                        out.push_str(&format!("[Counter]  total: {:.0}\n", metric.sum));
+                        out.push_str(&format!(
+                            "[Counter]  total: {:.0}  rate: {:.2}/s\n",
+                            metric.sum,
+                            per_sec(metric.sum)
+                        ));
                     }
                     tropel_metrics::collector::MetricType::Rate => {
                         out.push_str(&format!(

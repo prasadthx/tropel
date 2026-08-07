@@ -61,6 +61,11 @@ enum InfluxTarget {
         bucket: Option<String>,
         /// v2 auth token (`Authorization: Token <token>`).
         token: Option<String>,
+        /// v1 basic auth from the URL userinfo (`http://user:pass@host:…`;
+        /// k6 sends `Authorization: Basic …` for v1). Sent on BOTH v1 and v2
+        /// writes when present.
+        user: Option<String>,
+        password: Option<String>,
     },
 }
 
@@ -247,6 +252,8 @@ impl InfluxdbOutput {
                 org,
                 bucket,
                 token,
+                user,
+                password,
             } => {
                 let client = reqwest::Client::new();
                 let (url, builder) = if let (Some(org), Some(bucket)) = (org, bucket) {
@@ -266,6 +273,14 @@ impl InfluxdbOutput {
                     let url = format!("{base}/write?db={db}");
                     let builder = client.post(&url);
                     (url, builder)
+                };
+                // Backlog line 154: v1 (and v2) Basic auth from the URL
+                // userinfo — `http://user:pass@host:8086/db` sends
+                // `Authorization: Basic …` (k6 parity). reqwest encodes the
+                // header itself, so no manual base64.
+                let builder = match (user, password) {
+                    (Some(u), p) => builder.basic_auth(u, p.clone()),
+                    (None, _) => builder,
                 };
 
                 let body = lines.join("\n");
@@ -314,12 +329,15 @@ fn parse_http_target(url_str: &str) -> Result<InfluxTarget> {
         let token = pairs.get("token").cloned().or_else(|| {
             std::env::var("INFLUXDB_V2_TOKEN").ok().filter(|t| !t.is_empty())
         });
+        let (user, password) = userinfo_from_url(&url);
         return Ok(InfluxTarget::Http {
             base,
             db: None,
             org: Some(org.clone()),
             bucket: Some(bucket.clone()),
             token,
+            user,
+            password,
         });
     }
 
@@ -328,13 +346,28 @@ fn parse_http_target(url_str: &str) -> Result<InfluxTarget> {
         .get("db")
         .cloned()
         .or_else(|| url.path_segments().and_then(|mut s| s.find(|p| !p.is_empty())).map(str::to_string));
+    let (user, password) = userinfo_from_url(&url);
     Ok(InfluxTarget::Http {
         base,
         db,
         org: None,
         bucket: None,
         token: None,
+        user,
+        password,
     })
+}
+
+/// Extract `(username, password)` from a URL's userinfo, if any. The URL
+/// crate percent-decodes these, so `user%40domain:secret` becomes the raw
+/// pair — exactly what InfluxDB v1 expects for Basic auth.
+fn userinfo_from_url(url: &reqwest::Url) -> (Option<String>, Option<String>) {
+    let user = url.username();
+    if user.is_empty() {
+        (None, None)
+    } else {
+        (Some(user.to_string()), url.password().map(str::to_string))
+    }
 }
 
 #[async_trait]
@@ -411,12 +444,37 @@ mod tests {
                 bucket,
                 token,
                 db,
+                user,
+                password,
             } => {
                 assert_eq!(base, "http://localhost:8086");
                 assert_eq!(org.as_deref(), Some("myorg"));
                 assert_eq!(bucket.as_deref(), Some("mybucket"));
                 assert_eq!(token.as_deref(), Some("sekret"));
                 assert!(db.is_none());
+                assert!(user.is_none() && password.is_none());
+            }
+            other => panic!("expected HTTP target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_v1_basic_auth_from_userinfo() {
+        // Backlog line 154: `http://user:pass@host:8086/db` must carry the
+        // credentials for the v1 `Authorization: Basic` header.
+        let output = InfluxdbOutput::new("http://admin:s3cret@localhost:8086/k6db").unwrap();
+        match &output.target {
+            InfluxTarget::Http {
+                base,
+                db,
+                user,
+                password,
+                ..
+            } => {
+                assert_eq!(base, "http://localhost:8086");
+                assert_eq!(db.as_deref(), Some("k6db"));
+                assert_eq!(user.as_deref(), Some("admin"));
+                assert_eq!(password.as_deref(), Some("s3cret"));
             }
             other => panic!("expected HTTP target, got {other:?}"),
         }

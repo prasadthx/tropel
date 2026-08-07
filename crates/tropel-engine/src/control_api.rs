@@ -3,13 +3,14 @@
 //! Binds `127.0.0.1:<port>` and serves:
 //! - `GET  /v1/status`  → k6 JSON:API shape
 //!   `{"data":{"type":"status","id":"default","attributes":{...}}}`
-//!   (vus / max / paused / running / stopped / tainted)
+//!   (vus / vus-max / paused / running / stopped / tainted)
 //! - `PATCH /v1/status` → k6 envelope `{"data":{"attributes":{...}}}` or a
-//!   flat `{"vus":N,"max":M,"paused":bool}` — adjusts the
+//!   flat `{"vus":N,"max":M,"vus-max":N,"paused":bool}` — adjusts the
 //!   externally-controlled scheduler's VU pool / pause state at runtime.
 //!   `max` is clamped to the configured `max_vus` ceiling, so a client can
-//!   never grow the pool past the run's cap.
-//! - `POST /v1/stop`    → requests a graceful stop.
+//!   never grow the pool past the run's cap. Both `max` (legacy) and
+//!   `vus-max` (k6's JSON:API field name) are accepted, and the status doc
+//!   emits BOTH so old and new clients work.
 //!
 //! Everything else returns 404. This is intentionally dependency-free: a
 //! hand-rolled HTTP/1.1 reader keeps the control surface small and avoids
@@ -149,16 +150,18 @@ fn route(
 }
 
 /// Render the k6 JSON:API status document. `running` is false once a stop
-/// has been requested; `tainted` is always null (no threshold-taint tracking).
+/// has been requested; `tainted` reflects real threshold failures
+/// (backlog line 154 — was hardcoded null).
 fn status_json(sched: &Arc<VUScheduler>) -> String {
     let vus = sched.control_target();
     let max = sched.control_max();
     let paused = sched.is_paused();
     let stopped = sched.is_stop_requested();
     let running = !stopped;
+    let tainted = sched.is_tainted();
     format!(
-        r#"{{"data":{{"type":"status","id":"default","attributes":{{"vus":{},"max":{},"paused":{},"running":{},"stopped":{},"tainted":null}}}}}}"#,
-        vus, max, paused, running, stopped
+        r#"{{"data":{{"type":"status","id":"default","attributes":{{"vus":{},"vus-max":{},"max":{},"paused":{},"running":{},"stopped":{},"tainted":{}}}}}}}"#,
+        vus, max, max, paused, running, stopped, tainted
     )
 }
 
@@ -171,8 +174,11 @@ struct StatusPatch {
     paused: Option<bool>,
 }
 
-/// Parse a PATCH /v1/status body. Accepts both the flat form
-/// `{"vus":5,"max":10}` and the k6 envelope `{"data":{"attributes":{"vus":5,"max":10}}}`.
+/// Parse a PATCH /v1/status body. Accepts the flat form
+/// `{"vus":5,"vus-max":10}`, the k6 envelope
+/// `{"data":{"attributes":{"vus":5,"vus-max":10}}}` — and the legacy
+/// `max` key (backlog line 154: k6's JSON:API field is `vus-max`; Tropel's
+/// old `max` stays accepted). `vus-max` wins over `max` when both are sent.
 /// Returns `None` when the body is unparseable or carries none of the known
 /// fields (so a garbage body can't be silently swallowed).
 fn parse_status_body(body: &[u8]) -> Option<StatusPatch> {
@@ -186,7 +192,11 @@ fn parse_status_body(body: &[u8]) -> Option<StatusPatch> {
         .or(Some(&json))?;
 
     let vus = attrs.get("vus").and_then(|v| v.as_u64()).map(|v| v as u32);
-    let max = attrs.get("max").and_then(|v| v.as_u64()).map(|v| v as u32);
+    let max = attrs
+        .get("vus-max")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .or_else(|| attrs.get("max").and_then(|v| v.as_u64()).map(|v| v as u32));
     let paused = attrs.get("paused").and_then(|v| v.as_bool());
 
     if vus.is_none() && max.is_none() && paused.is_none() {
@@ -272,10 +282,19 @@ mod tests {
         assert_eq!(v["data"]["type"], "status");
         assert_eq!(v["data"]["id"], "default");
         assert_eq!(attrs["vus"], 4);
+        // Backlog line 154: k6's JSON:API field is `vus-max`; Tropel also
+        // keeps emitting `max` for back-compat.
+        assert_eq!(attrs["vus-max"], 10);
         assert_eq!(attrs["max"], 10);
         assert_eq!(attrs["paused"], false);
         assert_eq!(attrs["running"], true);
         assert_eq!(attrs["stopped"], false);
-        assert!(attrs.get("tainted").is_some());
+        assert_eq!(attrs["tainted"], false);
+
+        // Taint is real: once a threshold fails, the status shows it.
+        sched.set_tainted();
+        let body = status_json(&sched);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["data"]["attributes"]["tainted"], true);
     }
 }

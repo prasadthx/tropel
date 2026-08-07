@@ -117,6 +117,10 @@ pub struct VUScheduler {
     control_paused: Arc<AtomicBool>,
     /// Wakes the externally-controlled control loop when the target changes.
     control_notify: Arc<tokio::sync::Notify>,
+    /// Threshold-taint flag (k6 `tainted` in the status doc): set once any
+    /// threshold (with or without abortOnFail) fails. Sticky — once tainted,
+    /// the run stays tainted.
+    control_tainted: Arc<AtomicBool>,
 }
 
 impl VUScheduler {
@@ -142,6 +146,7 @@ impl VUScheduler {
             control_spawned: Arc::new(AtomicU32::new(0)),
             control_paused: Arc::new(AtomicBool::new(false)),
             control_notify: Arc::new(tokio::sync::Notify::new()),
+            control_tainted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -314,6 +319,17 @@ impl VUScheduler {
     /// Notify handle for the externally-controlled control loop.
     pub fn control_notify(&self) -> Arc<tokio::sync::Notify> {
         self.control_notify.clone()
+    }
+
+    /// Mark the run as threshold-tainted (sticky). Exposed to the engine so
+    /// the threshold monitor can set it when a check fails.
+    pub fn set_tainted(&self) {
+        self.control_tainted.store(true, Ordering::Release);
+    }
+
+    /// Whether any threshold has failed so far (k6 status `tainted`).
+    pub fn is_tainted(&self) -> bool {
+        self.control_tainted.load(Ordering::Acquire)
     }
 
     /// Get and reset the dropped iterations counter.
@@ -1333,6 +1349,7 @@ impl VUScheduler {
             control_spawned: self.control_spawned.clone(),
             control_paused: self.control_paused.clone(),
             control_notify: self.control_notify.clone(),
+            control_tainted: self.control_tainted.clone(),
         })
     }
 

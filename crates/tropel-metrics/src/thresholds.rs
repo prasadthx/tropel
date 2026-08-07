@@ -51,45 +51,58 @@ pub fn evaluate_thresholds(
 /// at startup with a clear message — k6 rejects bad threshold syntax at init
 /// rather than silently passing it at the end.
 ///
-/// Rejects: fewer/greater than 3 whitespace tokens, an unknown operator,
-/// a non-numeric RHS, and compound `&&`/`||` expressions (not yet
-/// supported — previously they warned and always PASSED, which is a
-/// fail-open gate; now they are a hard config error).
+/// Rejects: fewer/greater than 3 whitespace tokens per CLAUSE, an unknown
+/// operator, or a non-numeric RHS. Backlog line 154: compound `&&`/`||`
+/// expressions are now ACCEPTED (k6 supports them) — each clause is validated
+/// independently instead of the whole expression being rejected.
 pub fn validate_thresholds(
     thresholds: &HashMap<String, ThresholdConfig>,
 ) -> Result<(), String> {
     for (name, config) in thresholds {
         let expr = config.expression.trim();
-        if expr.contains("&&") || expr.contains("||") {
-            return Err(format!(
-                "threshold '{}': compound expression '{}' is not supported — use a single \
-                 '<metric> <op> <value>' per threshold",
-                name, expr
-            ));
-        }
-        let parts: Vec<&str> = expr.split_whitespace().collect();
-        if parts.len() != 3 {
-            return Err(format!(
-                "threshold '{}': '{}' — expected '<metric> <op> <value>' (3 tokens), got {}",
-                name,
-                expr,
-                parts.len()
-            ));
-        }
-        if !matches!(parts[1], "<" | "<=" | ">" | ">=" | "==" | "!=") {
-            return Err(format!(
-                "threshold '{}': unknown operator '{}' in '{}'",
-                name, parts[1], expr
-            ));
-        }
-        if parts[2].parse::<f64>().is_err() {
-            return Err(format!(
-                "threshold '{}': value '{}' is not a number",
-                name, parts[2]
-            ));
+        // Compound AND/OR: validate every clause the same way a single
+        // threshold is validated.
+        for clause in compound_clauses(expr) {
+            let parts: Vec<&str> = clause.split_whitespace().collect();
+            if parts.len() != 3 {
+                return Err(format!(
+                    "threshold '{}': clause '{}' in '{}' — expected '<metric> <op> <value>' \
+                     (3 tokens), got {}",
+                    name,
+                    clause,
+                    expr,
+                    parts.len()
+                ));
+            }
+            if !matches!(parts[1], "<" | "<=" | ">" | ">=" | "==" | "!=") {
+                return Err(format!(
+                    "threshold '{}': unknown operator '{}' in clause '{}' of '{}'",
+                    name, parts[1], clause, expr
+                ));
+            }
+            if parts[2].parse::<f64>().is_err() {
+                return Err(format!(
+                    "threshold '{}': value '{}' is not a number",
+                    name, parts[2]
+                ));
+            }
         }
     }
     Ok(())
+}
+
+/// Split a (possibly compound) threshold expression into its individual
+/// clauses on `&&` and `||`. A simple expression returns itself.
+fn compound_clauses(expression: &str) -> Vec<&str> {
+    if !expression.contains("&&") && !expression.contains("||") {
+        return vec![expression];
+    }
+    expression
+        .split("||")
+        .flat_map(|group| group.split("&&"))
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty())
+        .collect()
 }
 
 /// Check if any abort-on-fail threshold has been breached (mid-run evaluation).
@@ -234,6 +247,37 @@ fn evaluate_single_threshold_opt(
     expression: &str,
     metrics: &MetricsResult,
 ) -> Option<(bool, f64, f64)> {
+    // Backlog line 154: compound AND/OR expressions (k6 supports them,
+    // e.g. `p(95) < 500 && p(99) < 1000`). `&&` binds tighter than `||`:
+    // split on `||` first, every group must contain only AND-passing
+    // clauses, and any passing group passes the whole threshold. The
+    // reported (actual, threshold) pair comes from the LAST clause that
+    // determined the outcome (the group's final clause).
+    if expression.contains("&&") || expression.contains("||") {
+        let groups: Vec<Vec<&str>> = expression
+            .split("||")
+            .map(|g| g.split("&&").map(|c| c.trim()).filter(|c| !c.is_empty()).collect())
+            .filter(|g: &Vec<&str>| !g.is_empty())
+            .collect();
+        let mut last_pair = (0.0f64, 0.0f64);
+        let mut any_group_passed = false;
+        for group in groups {
+            let mut group_passed = true;
+            for clause in group {
+                let (passed, actual, threshold) =
+                    evaluate_single_threshold_opt(clause, metrics)?;
+                last_pair = (actual, threshold);
+                if !passed {
+                    group_passed = false;
+                }
+            }
+            if group_passed {
+                any_group_passed = true;
+            }
+        }
+        return Some((any_group_passed, last_pair.0, last_pair.1));
+    }
+
     // Fail CLOSED: any parse error or unknown operator must FAIL the
     // threshold (and, via `validate_thresholds` at startup, abort the run).
     // The old code returned `(true, …)` on malformed input, so a typo'd
@@ -618,6 +662,97 @@ mod tests {
         assert!(!result.0, "p95 1200 should NOT be < 1000");
         assert_eq!(result.1, 1200.0);
         assert_eq!(result.2, 1000.0);
+    }
+
+    // ── compound && / || (backlog line 154) ──
+
+    #[test]
+    fn compound_and_requires_all_clauses() {
+        // p95=1200 < 1500 AND p90=900 < 1000 → both pass.
+        let metrics = make_metrics();
+        let result = evaluate_single_threshold(
+            "http_req_duration.p95 < 1500 && http_req_duration.p90 < 1000",
+            &metrics,
+        );
+        assert!(result.0, "&& passes when ALL clauses pass");
+        assert_eq!(result.1, 900.0, "reports the last clause's actual");
+        assert_eq!(result.2, 1000.0, "reports the last clause's threshold");
+
+        // p95=1200 < 1500 (true) AND p90=900 < 500 (false) → fails.
+        let result = evaluate_single_threshold(
+            "http_req_duration.p95 < 1500 && http_req_duration.p90 < 500",
+            &metrics,
+        );
+        assert!(!result.0, "&& requires ALL clauses");
+    }
+
+    #[test]
+    fn compound_or_passes_on_any_clause() {
+        // p95=1200 > 1500 (false) OR p90=900 < 1000 (true) → passes.
+        let metrics = make_metrics();
+        let result = evaluate_single_threshold(
+            "http_req_duration.p95 > 1500 || http_req_duration.p90 < 1000",
+            &metrics,
+        );
+        assert!(result.0, "|| passes if ANY clause passes");
+
+        // Both false → fails.
+        let result = evaluate_single_threshold(
+            "http_req_duration.p95 > 1500 || http_req_duration.p90 > 1000",
+            &metrics,
+        );
+        assert!(!result.0, "|| fails when ALL clauses fail");
+    }
+
+    #[test]
+    fn compound_and_binds_tighter_than_or() {
+        // `a && b || c` — && binds tighter: (a AND b) OR c. With make_metrics
+        // p95=1200, p90=900, p99=1800: a = (p95>1500)=false, b = (p90<1000)=true,
+        // so the && group is false; c = (p99>1500)=true saves the || group.
+        let metrics = make_metrics();
+        let result = evaluate_single_threshold(
+            "http_req_duration.p95 > 1500 && http_req_duration.p90 < 1000 || \
+             http_req_duration.p99 > 1500",
+            &metrics,
+        );
+        assert!(result.0, "c saves the OR group: {result:?}");
+
+        // c=false too → fails.
+        let result = evaluate_single_threshold(
+            "http_req_duration.p95 > 1500 && http_req_duration.p90 < 1000 || \
+             http_req_duration.p99 < 1500",
+            &metrics,
+        );
+        assert!(!result.0, "&& group fails and || group fails: {result:?}");
+    }
+
+    #[test]
+    fn validate_accepts_compound_rejects_bad_clause() {
+        let mut ok = HashMap::new();
+        ok.insert(
+            "compound".to_string(),
+            ThresholdConfig {
+                expression: "p(95) < 500 && p(99) < 1000".into(),
+                abort_on_fail: false,
+                delay_abort_eval: None,
+            },
+        );
+        assert!(validate_thresholds(&ok).is_ok(), "&& thresholds validate");
+
+        let mut bad = HashMap::new();
+        bad.insert(
+            "bad".to_string(),
+            ThresholdConfig {
+                expression: "p(95) < 500 && p(99) < not-a-number".into(),
+                abort_on_fail: false,
+                delay_abort_eval: None,
+            },
+        );
+        let err = validate_thresholds(&bad).unwrap_err();
+        assert!(
+            err.contains("not-a-number"),
+            "bad clause names the offending value: {err}"
+        );
     }
 
     #[test]

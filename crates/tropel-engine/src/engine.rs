@@ -592,7 +592,11 @@ impl Engine {
         } else {
             tropel_metrics::collector::MetricsSnapshot::default()
         };
-        let results = metrics.results().await;
+        let mut results = metrics.results().await;
+        // Stamp the wall-clock run duration so reporters can emit k6-style
+        // per-second rates (`http_reqs: 136 13.56/s`) — k6's Counter summary
+        // carries `rate` = count / elapsed seconds (backlog line 154).
+        results.run_duration = test_start.elapsed();
 
         // Distributed workers (`tropel-agent`) skip ALL end-of-run output —
         // the controller owns the summary, handleSummary, and reporters —
