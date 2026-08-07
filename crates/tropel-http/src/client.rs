@@ -672,12 +672,19 @@ impl HttpClient {
         // retried response replaces the 401 for all downstream processing.
         if response.status().as_u16() == 401 {
             if let Some(signer) = signer {
-                let www = response
+                // A server may send several `WWW-Authenticate` header LINES
+                // (one per scheme: `Basic realm=...` then `Digest realm=...`)
+                // — the old `.get()` read only the first line, so a Digest
+                // challenge on a later line was never seen (backlog line 176).
+                let www: Vec<String> = response
                     .headers()
-                    .get(reqwest::header::WWW_AUTHENTICATE)
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string);
-                if let Some(www) = www {
+                    .get_all(reqwest::header::WWW_AUTHENTICATE)
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .map(str::to_string)
+                    .collect();
+                let www = www.join(", ");
+                if !www.is_empty() {
                     if let Some(mut retry) = retry_request {
                         if let Some(auth_value) = signer.challenge_response(&www, &retry) {
                             retry

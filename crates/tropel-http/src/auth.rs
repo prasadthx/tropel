@@ -19,6 +19,7 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tropel_core::types::{ApiKeyLocation, AuthConfig};
 use tropel_core::Result;
@@ -753,9 +754,28 @@ fn hawk_mac(normalized: &str, key: &str, algorithm: Option<&str>) -> String {
 /// [`AuthSigner::challenge_response`] which parses `WWW-Authenticate`,
 /// computes the digest response (MD5 or SHA-256, with or without qop) and
 /// returns the `Authorization: Digest ...` header value for the retry.
+///
+/// The session (nonce + `nc` counter) is cached per host, so [`AuthSigner::sign`]
+/// can pre-attach the Authorization header on subsequent requests to the same
+/// host — no 401 round-trip per request (backlog line 176).
 pub struct DigestAuth {
     username: String,
     password: String,
+    /// Cached digest sessions keyed by `host[:port]` (backlog line 176).
+    sessions: Mutex<HashMap<String, DigestSession>>,
+}
+
+/// One server challenge we're actively authenticating against: the realm /
+/// nonce / qop / algorithm / opaque from the 401's `WWW-Authenticate`, plus
+/// the per-nonce request counter (`nc`, RFC 7616 §3.4.1 — counts requests
+/// sent with a given nonce, reset when the server rotates the nonce).
+struct DigestSession {
+    realm: String,
+    nonce: String,
+    nc: u64,
+    qop: Option<String>,
+    algorithm: Option<String>,
+    opaque: Option<String>,
 }
 
 impl DigestAuth {
@@ -763,6 +783,7 @@ impl DigestAuth {
         Self {
             username: username.to_string(),
             password: password.to_string(),
+            sessions: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -772,8 +793,31 @@ impl AuthSigner for DigestAuth {
         "digest"
     }
 
-    fn sign(&self, _request: &mut reqwest::Request) -> Result<()> {
-        // No-op: the challenge must come from the server's 401 first.
+    fn sign(&self, request: &mut reqwest::Request) -> Result<()> {
+        // Backlog line 176: if a digest session is already cached for this
+        // host (established by an earlier 401 → challenge_response), attach
+        // the Authorization header NOW with the next `nc` — the request
+        // skips the 401 round-trip entirely. The first request to a new host
+        // has no session and still goes out unauthenticated.
+        let key = digest_session_key(request.url());
+        let header = {
+            let mut sessions = self.sessions.lock().unwrap();
+            match sessions.get_mut(&key) {
+                Some(sess) => {
+                    sess.nc += 1;
+                    Some(build_digest_authorization(
+                        &self.username,
+                        &self.password,
+                        sess,
+                        request,
+                    ))
+                }
+                None => None,
+            }
+        };
+        if let Some(h) = header {
+            set_auth_header(request, &h)?;
+        }
         Ok(())
     }
 
@@ -782,107 +826,41 @@ impl AuthSigner for DigestAuth {
         www_authenticate: &str,
         request: &reqwest::Request,
     ) -> Option<String> {
-        let challenge = parse_challenge(www_authenticate)?;
-        if !challenge
-            .get("scheme")
-            .map(|s| s.eq_ignore_ascii_case("digest"))
-            .unwrap_or(false)
-        {
-            return None;
-        }
+        // RFC 7235 §4.1 allows several challenges in one header value
+        // (`WWW-Authenticate: Basic realm=\"x\", Digest realm=\"y\", nonce=\"z\"`)
+        // and the header may repeat across lines — the old parser only ever
+        // looked at the first scheme, so Digest after Basic was skipped
+        // (backlog line 176).
+        let challenge = find_digest_challenge(www_authenticate)?;
         let realm = challenge.get("realm")?;
         let nonce = challenge.get("nonce")?;
-        // RFC 7616 defaults to MD5 when the server omits `algorithm`; only
-        // emit the field when the challenge actually specified it (some
-        // strict servers reject an explicit `algorithm=MD5`).
-        let server_algorithm = challenge.get("algorithm").map(|s| s.to_ascii_uppercase());
-        let algorithm = server_algorithm.clone().unwrap_or_else(|| "MD5".to_string());
-        // RFC 7616 §3.4.4: the "-sess" variants (MD5-sess / SHA-256-sess)
-        // only change how HA1 is derived (nonce + cnonce are folded in); the
-        // hash function itself is always the base algorithm (MD5 or SHA-256).
-        let base_algorithm = if algorithm.starts_with("SHA-256") {
-            "SHA-256"
-        } else {
-            "MD5"
-        };
-        let is_sess = algorithm.ends_with("-SESS");
-        let qop = challenge.get("qop");
-
-        let method = request.method().as_str();
-        // The digest `uri` is the request-target: path + query (RFC 7616).
-        let url = request.url();
-        let uri = match url.query() {
-            Some(q) => format!("{}?{}", url.path(), q),
-            None => url.path().to_string(),
-        };
-
-        // Base HA1 = H(username:realm:password)
-        let ha1_input = format!("{}:{}:{}", self.username, realm, self.password);
-        let base_ha1 = digest_with(&ha1_input, base_algorithm);
-        // HA2 = H(method:uri)
-        let ha2_input = format!("{method}:{uri}");
-        let ha2 = digest_with(&ha2_input, base_algorithm);
-
-        let mut fields: Vec<(String, String)> = vec![
-            ("username".into(), self.username.clone()),
-            ("realm".into(), realm.clone()),
-            ("nonce".into(), nonce.clone()),
-            ("uri".into(), uri),
-        ];
-
-        // -sess requires a cnonce even when qop is absent (RFC 7616 §3.4.4).
-        let response = if let Some(qop) = qop {
-            if qop.split(',').any(|q| q.trim() == "auth") {
-                let nc = "00000001".to_string();
-                let c = generate_crypto_nonce();
-                let ha1 = sess_fold_ha1(&base_ha1, is_sess, nonce, &c, base_algorithm);
-                let response_input = format!("{ha1}:{nonce}:{nc}:{c}:auth:{ha2}");
-                let response = digest_with(&response_input, base_algorithm);
-                fields.push(("qop".into(), "auth".into()));
-                fields.push(("nc".into(), nc));
-                fields.push(("cnonce".into(), c));
-                response
-            } else {
-                // qop present but no 'auth' — fall back to the no-qop form.
-                if is_sess {
-                    let c = generate_crypto_nonce();
-                    let ha1 = sess_fold_ha1(&base_ha1, true, nonce, &c, base_algorithm);
-                    fields.push(("cnonce".into(), c.clone()));
-                    digest_with(&format!("{ha1}:{nonce}:{ha2}"), base_algorithm)
-                } else {
-                    digest_with(&format!("{base_ha1}:{nonce}:{ha2}"), base_algorithm)
-                }
-            }
-        } else if is_sess {
-            let c = generate_crypto_nonce();
-            let ha1 = sess_fold_ha1(&base_ha1, true, nonce, &c, base_algorithm);
-            fields.push(("cnonce".into(), c.clone()));
-            digest_with(&format!("{ha1}:{nonce}:{ha2}"), base_algorithm)
-        } else {
-            digest_with(&format!("{base_ha1}:{nonce}:{ha2}"), base_algorithm)
-        };
-        fields.push(("response".into(), response));
-        if let Some(alg) = server_algorithm {
-            fields.push(("algorithm".into(), alg));
+        let key = digest_session_key(request.url());
+        let mut sessions = self.sessions.lock().unwrap();
+        let sess = sessions.entry(key).or_insert_with(|| DigestSession {
+            realm: realm.clone(),
+            nonce: nonce.clone(),
+            nc: 0,
+            qop: challenge.get("qop").cloned(),
+            algorithm: challenge.get("algorithm").cloned(),
+            opaque: challenge.get("opaque").cloned(),
+        });
+        // Server rotated the nonce (or first challenge for this host) → reset
+        // the per-nonce counter; otherwise keep counting within this nonce.
+        if sess.nonce != *nonce {
+            sess.nonce = nonce.clone();
+            sess.nc = 0;
+            sess.realm = realm.clone();
+            sess.qop = challenge.get("qop").cloned();
+            sess.algorithm = challenge.get("algorithm").cloned();
+            sess.opaque = challenge.get("opaque").cloned();
         }
-        if let Some(opaque) = challenge.get("opaque") {
-            fields.push(("opaque".into(), opaque.clone()));
-        }
-
-        // RFC 7616 §3.4.1: `qop`, `nc` and `algorithm` are `token` productions
-        // and MUST NOT be quoted (strict servers reject `qop=\"auth\"` — the
-        // old code quoted every field, so `nc`/`algorithm`/`qop` were wrong).
-        // All other directives (username, realm, nonce, uri, response,
-        // cnonce, opaque) are `quoted-string` and MUST be quoted.
-        let header = fields
-            .iter()
-            .map(|(k, v)| match k.as_str() {
-                "qop" | "nc" | "algorithm" => format!("{k}={v}"),
-                _ => format!("{k}=\"{}\"", v.replace('"', "")),
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        Some(format!("Digest {header}"))
+        sess.nc += 1;
+        Some(build_digest_authorization(
+            &self.username,
+            &self.password,
+            sess,
+            request,
+        ))
     }
 }
 
@@ -902,6 +880,121 @@ fn sess_fold_ha1(
     }
 }
 
+/// Cache key for a digest session: `host[:port]` from the request URL.
+fn digest_session_key(url: &reqwest::Url) -> String {
+    let host = url.host_str().unwrap_or("");
+    match url.port() {
+        Some(p) => format!("{host}:{p}"),
+        None => host.to_string(),
+    }
+}
+
+/// Build the full `Authorization: Digest ...` header value for a session and
+/// a request (RFC 7616). Shared by [`AuthSigner::sign`] (pre-attached from a
+/// cached session) and [`AuthSigner::challenge_response`] (fresh challenge).
+fn build_digest_authorization(
+    username: &str,
+    password: &str,
+    sess: &DigestSession,
+    request: &reqwest::Request,
+) -> String {
+    let realm = &sess.realm;
+    let nonce = &sess.nonce;
+    // RFC 7616 defaults to MD5 when the server omits `algorithm`; only
+    // emit the field when the challenge actually specified it (some
+    // strict servers reject an explicit `algorithm=MD5`).
+    let server_algorithm = sess.algorithm.as_ref().map(|s| s.to_ascii_uppercase());
+    let algorithm = server_algorithm.clone().unwrap_or_else(|| "MD5".to_string());
+    // RFC 7616 §3.4.4: the "-sess" variants (MD5-sess / SHA-256-sess)
+    // only change how HA1 is derived (nonce + cnonce are folded in); the
+    // hash function itself is always the base algorithm (MD5 or SHA-256).
+    let base_algorithm = if algorithm.starts_with("SHA-256") {
+        "SHA-256"
+    } else {
+        "MD5"
+    };
+    let is_sess = algorithm.ends_with("-SESS");
+    let qop = sess.qop.as_deref();
+
+    let method = request.method().as_str();
+    // The digest `uri` is the request-target: path + query (RFC 7616).
+    let url = request.url();
+    let uri = match url.query() {
+        Some(q) => format!("{}?{}", url.path(), q),
+        None => url.path().to_string(),
+    };
+
+    // Base HA1 = H(username:realm:password)
+    let ha1_input = format!("{username}:{realm}:{password}");
+    let base_ha1 = digest_with(&ha1_input, base_algorithm);
+    // HA2 = H(method:uri)
+    let ha2_input = format!("{method}:{uri}");
+    let ha2 = digest_with(&ha2_input, base_algorithm);
+
+    let mut fields: Vec<(String, String)> = vec![
+        ("username".into(), username.to_string()),
+        ("realm".into(), realm.clone()),
+        ("nonce".into(), nonce.clone()),
+        ("uri".into(), uri),
+    ];
+
+    // RFC 7616 §3.4.1: `nc` is an 8-digit hex counter of requests sent with
+    // this nonce (00000001, 00000002, …) — NOT hardcoded (backlog line 176).
+    let nc = format!("{:08x}", sess.nc);
+    // -sess requires a cnonce even when qop is absent (RFC 7616 §3.4.4).
+    let response = if let Some(qop) = qop {
+        if qop.split(',').any(|q| q.trim() == "auth") {
+            let c = generate_crypto_nonce();
+            let ha1 = sess_fold_ha1(&base_ha1, is_sess, nonce, &c, base_algorithm);
+            let response_input = format!("{ha1}:{nonce}:{nc}:{c}:auth:{ha2}");
+            let response = digest_with(&response_input, base_algorithm);
+            fields.push(("qop".into(), "auth".into()));
+            fields.push(("nc".into(), nc));
+            fields.push(("cnonce".into(), c));
+            response
+        } else {
+            // qop present but no 'auth' — fall back to the no-qop form.
+            if is_sess {
+                let c = generate_crypto_nonce();
+                let ha1 = sess_fold_ha1(&base_ha1, true, nonce, &c, base_algorithm);
+                fields.push(("cnonce".into(), c.clone()));
+                digest_with(&format!("{ha1}:{nonce}:{ha2}"), base_algorithm)
+            } else {
+                digest_with(&format!("{base_ha1}:{nonce}:{ha2}"), base_algorithm)
+            }
+        }
+    } else if is_sess {
+        let c = generate_crypto_nonce();
+        let ha1 = sess_fold_ha1(&base_ha1, true, nonce, &c, base_algorithm);
+        fields.push(("cnonce".into(), c.clone()));
+        digest_with(&format!("{ha1}:{nonce}:{ha2}"), base_algorithm)
+    } else {
+        digest_with(&format!("{base_ha1}:{nonce}:{ha2}"), base_algorithm)
+    };
+    fields.push(("response".into(), response));
+    if let Some(alg) = server_algorithm {
+        fields.push(("algorithm".into(), alg));
+    }
+    if let Some(opaque) = &sess.opaque {
+        fields.push(("opaque".into(), opaque.clone()));
+    }
+
+    // RFC 7616 §3.4.1: `qop`, `nc` and `algorithm` are `token` productions
+    // and MUST NOT be quoted (strict servers reject `qop=\"auth\"` — the
+    // old code quoted every field, so `nc`/`algorithm`/`qop` were wrong).
+    // All other directives (username, realm, nonce, uri, response,
+    // cnonce, opaque) are `quoted-string` and MUST be quoted.
+    let header = fields
+        .iter()
+        .map(|(k, v)| match k.as_str() {
+            "qop" | "nc" | "algorithm" => format!("{k}={v}"),
+            _ => format!("{k}=\"{}\"", v.replace('"', "")),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Digest {header}")
+}
+
 /// Digest a string with the algorithm chosen by the server's challenge.
 fn digest_with(input: &str, algorithm: &str) -> String {
     match algorithm {
@@ -914,40 +1007,86 @@ fn hex_md5(bytes: &[u8]) -> String {
     hex::encode(md5::Md5::digest(bytes))
 }
 
-/// Parse a `WWW-Authenticate` header value into `{key: value}` (unquoted).
-/// Scheme name (before the first space) is stored under `"scheme"`.
-fn parse_challenge(header: &str) -> Option<HashMap<String, String>> {
-    let mut out = HashMap::new();
-    let trimmed = header.trim();
-    let (scheme, rest) = match trimmed.find(char::is_whitespace) {
-        Some(idx) => (&trimmed[..idx], &trimmed[idx..]),
-        None => (trimmed, ""),
-    };
-    out.insert("scheme".to_string(), scheme.to_string());
+/// Parse a `WWW-Authenticate` header value into a list of `(scheme, params)`
+/// challenges (RFC 7235 §4.1). Handles MULTIPLE schemes in one header value
+/// — `Basic realm=\"x\", Digest realm=\"y\", nonce=\"z\"` is two challenges, and
+/// the old parser only ever looked at the first scheme, so a Digest challenge
+/// listed after a Basic one was silently skipped (backlog line 176).
+fn parse_challenges(header: &str) -> Vec<(String, HashMap<String, String>)> {
+    let mut challenges: Vec<(String, HashMap<String, String>)> = Vec::new();
+    let mut current: Option<(String, HashMap<String, String>)> = None;
 
-    // Split on commas, but NOT commas inside a quoted-string — RFC 2617/7616
-    // challenges frequently quote a list (`qop=\"auth, auth-int\"`). The old
-    // naive `split(',')` split inside the quotes, so a challenge advertising
-    // `auth` second would be mis-parsed as only the first qop value.
+    for part in split_challenge_parts(header) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        // A new challenge starts with a bare scheme token: a token NOT
+        // followed by '=' (e.g. `Digest realm=\"y\"` — "Digest" then space).
+        // A `key=value` part (no whitespace before the '=') belongs to the
+        // current challenge.
+        let first_space = part.find(char::is_whitespace).unwrap_or(usize::MAX);
+        let first_eq = part.find('=').unwrap_or(usize::MAX);
+        // New scheme iff the part's first token is NOT a `key=value`: either
+        // there is no '=' at all (bare/token68 challenge) or the '=' comes
+        // after the first whitespace (scheme then params).
+        if first_eq == usize::MAX || first_eq > first_space {
+            // Flush the previous challenge, start a new scheme.
+            if let Some(c) = current.take() {
+                challenges.push(c);
+            }
+            let (scheme, rest) = match part.find(char::is_whitespace) {
+                Some(i) => (&part[..i], &part[i..]),
+                None => (part, ""),
+            };
+            let mut params = HashMap::new();
+            if let Some((k, v)) = parse_challenge_part(rest) {
+                params.insert(k, v);
+            }
+            current = Some((scheme.to_string(), params));
+        } else if let Some((_, params)) = current.as_mut() {
+            if let Some((k, v)) = parse_challenge_part(part) {
+                params.insert(k, v);
+            }
+        }
+    }
+    if let Some(c) = current {
+        challenges.push(c);
+    }
+    challenges
+}
+
+/// Find the Digest challenge among possibly several schemes in a
+/// `WWW-Authenticate` value (backlog line 176).
+fn find_digest_challenge(header: &str) -> Option<HashMap<String, String>> {
+    parse_challenges(header)
+        .into_iter()
+        .find(|(scheme, _)| scheme.eq_ignore_ascii_case("digest"))
+        .map(|(_, params)| params)
+}
+
+/// Split a `WWW-Authenticate` value on commas, but NOT commas inside a
+/// quoted-string — RFC 2617/7616 challenges frequently quote a list
+/// (`qop=\"auth, auth-int\"`). The old naive `split(',')` split inside the
+/// quotes, so a challenge advertising `auth` second would be mis-parsed as
+/// only the first qop value.
+fn split_challenge_parts(header: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
     let mut part_start = 0usize;
-    let bytes = rest.as_bytes();
+    let bytes = header.as_bytes();
     let mut in_quotes = false;
     for (i, b) in bytes.iter().enumerate() {
         match b {
             b'"' => in_quotes = !in_quotes,
             b',' if !in_quotes => {
-                if let Some((k, v)) = parse_challenge_part(&rest[part_start..i]) {
-                    out.insert(k, v);
-                }
+                parts.push(&header[part_start..i]);
                 part_start = i + 1;
             }
             _ => {}
         }
     }
-    if let Some((k, v)) = parse_challenge_part(&rest[part_start..]) {
-        out.insert(k, v);
-    }
-    Some(out)
+    parts.push(&header[part_start..]);
+    parts
 }
 
 /// Parse one `key=value` segment of a challenge (may be quoted or bare).
@@ -1635,10 +1774,110 @@ mod tests {
 
     #[test]
     fn parse_challenge_handles_quotes_and_bare_values() {
-        let m = parse_challenge(r#"Digest realm="r", qop="auth", algorithm=MD5"#).unwrap();
-        assert_eq!(m.get("scheme").map(|s| s.as_str()), Some("Digest"));
+        let challenges = parse_challenges(r#"Digest realm="r", qop="auth", algorithm=MD5"#);
+        assert_eq!(challenges.len(), 1);
+        let (scheme, m) = &challenges[0];
+        assert_eq!(scheme, "Digest");
         assert_eq!(m.get("realm").map(|s| s.as_str()), Some("r"));
         assert_eq!(m.get("qop").map(|s| s.as_str()), Some("auth"));
         assert_eq!(m.get("algorithm").map(|s| s.as_str()), Some("MD5"));
+    }
+
+    #[test]
+    fn parse_challenges_finds_digest_after_basic_in_one_header() {
+        // Regression (backlog line 176): `WWW-Authenticate: Basic …, Digest …`
+        // in ONE header line — the old parser only looked at the first
+        // scheme, so Digest after Basic was silently skipped.
+        let www = r#"Basic realm="basic-realm", Digest realm="digest-realm", qop="auth", nonce="n1""#;
+        let m = find_digest_challenge(www).expect("digest challenge must be found");
+        assert_eq!(m.get("realm").map(|s| s.as_str()), Some("digest-realm"));
+        assert_eq!(m.get("nonce").map(|s| s.as_str()), Some("n1"));
+        assert_eq!(m.get("qop").map(|s| s.as_str()), Some("auth"));
+        // The Basic challenge's realm must NOT leak into the digest params.
+        assert_ne!(m.get("realm").map(|s| s.as_str()), Some("basic-realm"));
+    }
+
+    #[test]
+    fn parse_challenges_handles_multi_line_joined_header() {
+        // A server may send several WWW-Authenticate header lines (one per
+        // scheme); the client joins them with ", " before parsing. The joined
+        // value must still resolve the Digest challenge correctly.
+        let joined = r#"Basic realm="b", Digest realm="d", nonce="n2", algorithm=SHA-256"#;
+        let challenges = parse_challenges(joined);
+        assert_eq!(challenges.len(), 2, "two schemes must be split: {challenges:?}");
+        assert_eq!(challenges[0].0, "Basic");
+        assert_eq!(challenges[1].0, "Digest");
+        assert_eq!(challenges[1].1.get("realm").map(|s| s.as_str()), Some("d"));
+    }
+
+    #[test]
+    fn digest_challenge_response_works_when_digest_second_scheme() {
+        // End-to-end: challenge_response must build a Digest header even when
+        // the Digest challenge is the SECOND scheme in the header.
+        let www = r#"Basic realm="b", Digest realm="testrealm@host.com", qop="auth", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093""#;
+        let req = build_request("GET", "http://www.example.com/dir/index.html", None);
+        let header = DigestAuth::new("Mufasa", "Circle Of Life")
+            .challenge_response(www, &req)
+            .expect("digest challenge after basic must still respond");
+        assert!(header.starts_with("Digest "));
+        assert!(header.contains("realm=\"testrealm@host.com\""));
+        assert!(header.contains("qop=auth"));
+    }
+
+    #[test]
+    fn digest_nc_increments_and_sign_preattaches() {
+        // Regression (backlog line 176): nc was hardcoded 00000001 with no
+        // nonce caching, so EVERY request paid a 401 round-trip. Now the
+        // session is cached per host: challenge_response uses nc=00000001,
+        // and a later sign() on the same host pre-attaches the digest header
+        // with nc=00000002 — no 401 needed.
+        let www = r#"Digest realm="r", qop="auth", nonce="n1""#;
+        let auth = DigestAuth::new("u", "p");
+        let req1 = build_request("GET", "http://example.com/", None);
+        let h1 = auth.challenge_response(www, &req1).expect("first challenge");
+        assert!(h1.contains("nc=00000001"), "first use must be nc=1: {h1}");
+
+        // A fresh request to the SAME host: sign() must attach the cached
+        // digest with the incremented nc.
+        let mut req2 = build_request("GET", "http://example.com/", None);
+        auth.sign(&mut req2).expect("sign must succeed");
+        let auth_header = req2
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .expect("sign must pre-attach the digest header")
+            .to_string();
+        assert!(auth_header.starts_with("Digest "));
+        assert!(auth_header.contains("nc=00000002"), "second use must be nc=2: {auth_header}");
+
+        // A DIFFERENT host has no session: sign() must not attach anything.
+        let mut req3 = build_request("GET", "http://other.example.com/", None);
+        auth.sign(&mut req3).expect("sign must succeed");
+        assert!(
+            req3.headers().get("authorization").is_none(),
+            "no session for other host — no pre-attached header"
+        );
+    }
+
+    #[test]
+    fn digest_nonce_rotation_resets_nc() {
+        // When the server rotates the nonce, the per-nonce nc counter must
+        // reset to 00000001 (RFC 7616 §3.4.1: nc counts requests for THIS
+        // nonce).
+        let auth = DigestAuth::new("u", "p");
+        let req = build_request("GET", "http://example.com/", None);
+        let h1 = auth
+            .challenge_response(r#"Digest realm="r", qop="auth", nonce="nonce-a""#, &req)
+            .unwrap();
+        assert!(h1.contains("nc=00000001"));
+        let h2 = auth
+            .challenge_response(r#"Digest realm="r", qop="auth", nonce="nonce-a""#, &req)
+            .unwrap();
+        assert!(h2.contains("nc=00000002"), "same nonce continues counting: {h2}");
+        let h3 = auth
+            .challenge_response(r#"Digest realm="r", qop="auth", nonce="nonce-b""#, &req)
+            .unwrap();
+        assert!(h3.contains("nonce=\"nonce-b\""));
+        assert!(h3.contains("nc=00000001"), "rotated nonce resets nc: {h3}");
     }
 }
