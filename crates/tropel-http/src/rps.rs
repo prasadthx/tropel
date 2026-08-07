@@ -30,13 +30,31 @@ pub struct RpsLimiter {
     next_slot_ns: AtomicU64,
 }
 
+/// Longest interval `RpsLimiter` will ever construct: u64::MAX ns ≈ 584
+/// years. A rate slower than one request per 584 years is clamped to this so
+/// `Duration::from_secs_f64` cannot overflow (it panics past u64::MAX
+/// seconds — e.g. `rps: 1e-30` → 1e30 s) and `acquire`'s `as_nanos() as u64`
+/// cannot truncate. The limiter then blocks ~forever, which is exactly the
+/// declared rate.
+const MAX_INTERVAL: Duration = Duration::from_secs(u64::MAX / 1_000_000_000);
+
 impl RpsLimiter {
     /// Create a limiter for the given rate (requests/second). A rate <= 0,
-    /// NaN or infinite yields a zero-interval limiter that never blocks
-    /// (`Duration::from_secs_f64` panics on NaN/inf, so guard before use).
+    /// NaN or infinite yields a zero-interval limiter that never blocks; a
+    /// rate so slow its interval would overflow `Duration` (e.g. `1e-30` rps
+    /// → one request per 1e30 s) is clamped to [`MAX_INTERVAL`] — never a
+    /// panic (`Duration::from_secs_f64` panics on NaN/inf AND overflow, so
+    /// guard before use).
     pub fn new(rate: f64) -> Self {
         let interval = if rate.is_finite() && rate > 0.0 {
-            Duration::from_secs_f64(1.0 / rate)
+            let secs = 1.0 / rate;
+            // `Duration::from_secs_f64` panics on overflow (not just
+            // NaN/inf) — guard before use, per this fn's own doc.
+            if secs > MAX_INTERVAL.as_secs_f64() {
+                MAX_INTERVAL
+            } else {
+                Duration::from_secs_f64(secs)
+            }
         } else {
             Duration::ZERO
         };
@@ -123,6 +141,45 @@ mod tests {
         let limiter = RpsLimiter::new(0.0);
         let start = Instant::now();
         limiter.acquire().await;
+        assert!(start.elapsed() < Duration::from_millis(10));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn extreme_rates_never_panic() {
+        // Regression (backlog line 165): `rps: 1e-30` → 1/rate = 1e30 s,
+        // which `Duration::from_secs_f64` cannot represent — it panics on
+        // overflow. The guard clamps to MAX_INTERVAL (~584 years) so the
+        // limiter BLOCKS instead of panicking, which is the correct meaning
+        // of "at most one request per 1e30 s". (The first acquire is always
+        // immediate — the slot starts at construction — so the block shows on
+        // the SECOND acquire.)
+        for rate in [1e-30f64, 1e-20, 1e-19, 1e-300] {
+            let limiter = RpsLimiter::new(rate);
+            limiter.acquire().await; // first acquire is always immediate
+            // The clamped wait is ~584 years, so 10 ms is plenty.
+            let blocked =
+                tokio::time::timeout(Duration::from_millis(10), limiter.acquire())
+                    .await
+                    .is_err();
+            assert!(
+                blocked,
+                "a {rate} rps limiter must block (clamped interval), not fire"
+            );
+        }
+        // Non-positive / NaN / infinite rates stay zero-interval (never
+        // block) — and must never panic either.
+        for rate in [0.0f64, -1.0, -1e30, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let limiter = RpsLimiter::new(rate);
+            let start = Instant::now();
+            limiter.acquire().await;
+            limiter.acquire().await;
+            assert!(start.elapsed() < Duration::from_millis(10));
+        }
+        // f64::MAX rps → ~0 s interval → immediate, no panic.
+        let max_rate = RpsLimiter::new(f64::MAX);
+        let start = Instant::now();
+        max_rate.acquire().await;
+        max_rate.acquire().await;
         assert!(start.elapsed() < Duration::from_millis(10));
     }
 
