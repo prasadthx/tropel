@@ -33,6 +33,14 @@ pub struct RunnerConfig {
     pub max_duration: Option<Duration>,
 }
 
+/// Postman caps `setNextRequest` loops at 10,000 jumps. This counter is
+/// PER-ITERATION (stricter than Postman's per-run cap — a run may legitimately
+/// span many iterations, but 10k jumps inside one iteration is a runaway
+/// loop). Without it, a script that jumps to an earlier item spins forever
+/// inside ONE iteration — the JS interrupt doesn't apply to this Rust item
+/// loop, so the run never terminates (backlog line 161).
+const MAX_SET_NEXT_REQUEST_JUMPS: usize = 10_000;
+
 
 /// Per-VU iteration runner with full HTTP/JS/PM integration.
 ///
@@ -188,6 +196,9 @@ impl VURunner {
         // Walk through the flattened execution list in order
         let item_count = self.execution_items.len();
         let mut current_index = 0usize;
+        // setNextRequest jumps honored this iteration (Postman caps loops;
+        // a backward/self jump must not spin forever).
+        let mut jumps = 0usize;
 
         while current_index < item_count {
             // Check for setNextRequest override
@@ -195,6 +206,22 @@ impl VURunner {
                 let mut state = self.pm_state.lock().unwrap();
                 if let Some(next) = state.next_request.take() {
                     if next < item_count {
+                        jumps += 1;
+                        if jumps > MAX_SET_NEXT_REQUEST_JUMPS {
+                            tracing::warn!(
+                                "VU {}: setNextRequest loop exceeded {} jumps — aborting iteration",
+                                iteration_index,
+                                MAX_SET_NEXT_REQUEST_JUMPS
+                            );
+                            // Record a failed check so the runaway jump is
+                            // visible in the summary and drives a non-zero
+                            // exit, like any other script failure.
+                            record_script_failure(
+                                &mut result,
+                                "setNextRequest (loop limit exceeded)",
+                            );
+                            break;
+                        }
                         current_index = next;
                     } else {
                         break;
@@ -996,6 +1023,105 @@ mod tests {
             resolver.resolve("{{authToken}}", &scope2),
             "fresh-token",
             "script-set env must override a stale seeded value"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_next_request_self_loop_terminates_with_failure() {
+        // Backlog line 161: a prerequest script that jumps to an EARLIER
+        // item (here: itself) used to spin forever inside ONE iteration — no
+        // jump counter, and the JS interrupt doesn't apply to the Rust item
+        // loop, so the run never terminated. The jump guard must abort the
+        // iteration with a failed check instead of hanging.
+        let scenario = Arc::new(Scenario {
+            info: tropel_core::scenario::ScenarioInfo {
+                name: "loop".into(),
+                description: None,
+                schema: None,
+            },
+            // Item 0's prerequest jumps back to itself every iteration. A
+            // SECOND item is required for the spin: with a single item the
+            // loop would exit after one pass (the jump is set during item
+            // processing and never re-consumed), but with item 1 still ahead,
+            // the jump-back re-runs item 0's script, which re-arms the jump
+            // forever. Both items are script-only — no network traffic.
+            items: vec![
+                ScenarioItem {
+                    id: "self".into(),
+                    name: "self".into(),
+                    request: None,
+                    prerequest: Some("postman.setNextRequest('self');".into()),
+                    test: None,
+                    assertions: vec![],
+                    items: vec![],
+                },
+                ScenarioItem {
+                    id: "after".into(),
+                    name: "after".into(),
+                    request: None,
+                    prerequest: Some("// inert".into()),
+                    test: None,
+                    assertions: vec![],
+                    items: vec![],
+                },
+            ],
+            variables: HashMap::new(),
+            auth: None,
+        });
+        let execution_items = Arc::new(flatten_execution_items(&scenario.items));
+        let names: Arc<Vec<String>> = Arc::new(
+            execution_items.iter().map(|i| i.name.clone()).collect(),
+        );
+        let client = HttpClient::new(&tropel_core::config::HttpConfig::default())
+            .expect("http client should construct");
+        let mut runner = VURunner::new(
+            scenario,
+            execution_items,
+            names,
+            client,
+            0,
+            "loop".into(),
+        );
+
+        // Wire a real JS context with the pm shim + bridge so the prerequest
+        // script can actually call setNextRequest.
+        let mut js_ctx = Box::new(
+            JsContext::new(None, None)
+                .await
+                .expect("js context should construct"),
+        );
+        js_ctx
+            .eval(include_str!("../../../js/pm-api/pm.js"))
+            .await
+            .expect("pm shim should eval");
+        let bridge_client = Arc::new(
+            HttpClient::new(&tropel_core::config::HttpConfig::default())
+                .expect("bridge http client should construct"),
+        );
+        tropel_pm::bridge_fns::PmBridge::new(runner.pm_state().clone(), bridge_client)
+            .install(&mut js_ctx)
+            .expect("pm bridge should install");
+        runner = runner.with_js_context(js_ctx);
+
+        let env = HashMap::new();
+        // 30s outer guard: if the jump counter regresses, the loop spins and
+        // this times out instead of hanging the whole test suite.
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            runner.run_iteration(0, None, &env),
+        )
+        .await
+        .expect("setNextRequest self-loop must terminate (jump guard)");
+        assert!(
+            result.script_failures >= 1,
+            "runaway jump must be recorded as a script failure"
+        );
+        assert!(
+            result
+                .samples
+                .iter()
+                .any(|s| s.metric == "checks" && s.value == 0.0),
+            "a failed checks sample must be emitted for the loop limit"
         );
     }
 }
