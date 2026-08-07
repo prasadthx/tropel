@@ -15,11 +15,14 @@
 //!
 //! 2. **Ramping wall-clock**: a `RampingVus` run with staged targets must
 //!    actually *span* wall-clock time (stages are not collapsed), actually
-//!    reach the stage target (observed `vus_max` reflects the ramp), and make
-//!    real requests. A scheduler that skipped stages or finished instantly
-//!    fails the elapsed-time and `vus_max` assertions.
+//!    reach the stage target (the server observes the peak number of
+//!    simultaneously-open connections), and make real requests. A scheduler
+//!    that skipped stages or finished instantly fails the elapsed-time and
+//!    peak-concurrency assertions.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -31,16 +34,30 @@ use tropel_engine::Engine;
 use tropel_ext::registry::ExtensionRegistry;
 use tropel_metrics::thresholds::evaluate_thresholds;
 
-/// Minimal HTTP/1.1 server that answers `200 {"ok":true}`.
-async fn start_echo_server() -> std::net::SocketAddr {
+/// Minimal HTTP/1.1 server that answers `200 {"ok":true}` while tracking
+/// the PEAK number of simultaneously-open connections via an `AtomicUsize`
+/// guard, and returns it alongside the address. The response is delayed
+/// ~20 ms so concurrent VUs genuinely overlap — a fast local echo would
+/// serialize connections and under-count the real concurrency. This is the
+/// behavioral fix for the ramping test: `vus_max` is a pure function of
+/// the config (`peak_vus()` = `stages.fold`), so only an on-the-wire peak
+/// count proves the pool actually grew.
+async fn start_peak_server() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let peak_out = peak.clone();
     tokio::spawn(async move {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else {
                 break;
             };
+            let active = active.clone();
+            let peak = peak.clone();
             tokio::spawn(async move {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
                 let mut head = Vec::new();
                 let mut buf = [0u8; 4096];
                 loop {
@@ -53,6 +70,8 @@ async fn start_echo_server() -> std::net::SocketAddr {
                         break;
                     }
                 }
+                // Hold the connection open so concurrent VUs overlap.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 let body = r#"{"ok":true}"#;
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -60,6 +79,55 @@ async fn start_echo_server() -> std::net::SocketAddr {
                     body
                 );
                 let _ = sock.write_all(resp.as_bytes()).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+    });
+    (addr, peak_out)
+}
+
+/// Minimal HTTP/1.1 server that answers `200 {"ok":true}`.
+///
+/// Serves keep-alive (loops per connection): the client's HTTP/1.1
+/// connection pool reuses sockets, and a server that dropped the socket
+/// after one response raced the client's reuse — occasionally failing a
+/// pooled request and flaking `checks_failed == 0` assertions (the k6
+/// test observed 1 failed check of 4283).
+async fn start_echo_server() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                // Per-connection keep-alive loop: read a request head, answer,
+                // repeat until the client closes. A fresh buffer per request
+                // avoids stale head bytes from the previous pipelined read.
+                loop {
+                    let mut head = Vec::new();
+                    loop {
+                        let n = match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        head.extend_from_slice(&buf[..n]);
+                        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let body = r#"{"ok":true}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    if sock.write_all(resp.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
             });
         }
     });
@@ -179,10 +247,10 @@ async fn k6_script_records_requests_checks_and_real_latency() -> Result<()> {
 /// Ramping must be a *real* wall-clock behavior: stages are not collapsed,
 /// the pool actually grows toward the stage target, and requests fire.
 /// A scheduler that skipped stages (or finished instantly) fails the
-/// elapsed-time and vus_max assertions.
+/// elapsed-time and peak-concurrency assertions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ramping_stages_span_wall_clock_and_reach_target() -> Result<()> {
-    let srv = start_echo_server().await;
+    let (srv, peak) = start_peak_server().await;
     let coll = write_k6_script(&format!("http://{srv}"), "ramp");
 
     // 1s ramp to 3 VUs, 1s hold at 3, 1s ramp down to 1 → ~3s of stages.
@@ -229,11 +297,17 @@ async fn ramping_stages_span_wall_clock_and_reach_target() -> Result<()> {
         "ramping run elapsed {elapsed:?}, expected >= 2.25s (stages not collapsed)"
     );
 
-    // 2. The ramp reached its target: vus_max reflects the stage target (3).
+    // 2. The ramp REALLY reached 3 concurrent VUs: the server observed the
+    //    peak number of simultaneously-open connections. `vus_max` is a
+    //    pure function of the config (`peak_vus()` = stages.fold of the
+    //    targets the test itself wrote), so it proves nothing — a scheduler
+    //    that spawned 1 VU and slept(3s) passes all the old assertions.
+    //    Three overlapping connections prove the pool actually grew.
+    let peak_obs = peak.load(Ordering::SeqCst);
     assert!(
-        m.vus_max >= 2,
-        "vus_max >= 2, got {} (pool actually grew toward target)",
-        m.vus_max
+        peak_obs >= 3,
+        "peak concurrent connections >= 3, got {} (pool actually grew)",
+        peak_obs
     );
 
     // 3. Requests actually fired during the ramp.

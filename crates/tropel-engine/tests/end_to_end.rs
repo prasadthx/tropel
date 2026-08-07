@@ -13,6 +13,7 @@
 //! server, and the assertions below fail loudly.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -28,16 +29,28 @@ use tropel_metrics::thresholds::evaluate_thresholds;
 /// each request, then answers `200 {"ok":true}`. Header values are pushed
 /// into the shared `seen` list so the test can assert the resolved
 /// `{{header}}` variable actually reached the wire.
-async fn start_echo_server(seen: Arc<Mutex<Vec<String>>>) -> std::net::SocketAddr {
+///
+/// Also tracks the PEAK number of simultaneously-open connections via an
+/// `AtomicUsize` guard (returned alongside the address) so the test can
+/// assert REAL concurrency — `http_reqs >= vus` only proves requests fired,
+/// not that `vus` were actually concurrent.
+async fn start_echo_server(seen: Arc<Mutex<Vec<String>>>) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let peak_out = peak.clone();
     tokio::spawn(async move {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else {
                 break;
             };
             let seen = seen.clone();
+            let active = active.clone();
+            let peak = peak.clone();
             tokio::spawn(async move {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
                 // Read until the request-head terminator (headers end at
                 // CRLF CRLF). Loop so a split packet never loses the header.
                 let mut head = Vec::new();
@@ -56,9 +69,17 @@ async fn start_echo_server(seen: Arc<Mutex<Vec<String>>>) -> std::net::SocketAdd
                 for line in text.lines() {
                     let lower = line.to_ascii_lowercase();
                     if let Some(v) = lower.strip_prefix("x-e2e:") {
-                        seen.lock().unwrap().push(v.trim().to_string());
+                        // Poison-tolerant: a panicked test thread must not let
+                        // this connection task die before the active-count
+                        // decrement (which would inflate peak forever).
+                        seen.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(v.trim().to_string());
                     }
                 }
+                // Hold the connection open so concurrent VUs overlap — the
+                // same determinism trick as behavior_parity's peak server.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 let body = r#"{"ok":true}"#;
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -66,10 +87,11 @@ async fn start_echo_server(seen: Arc<Mutex<Vec<String>>>) -> std::net::SocketAdd
                     body
                 );
                 let _ = sock.write_all(resp.as_bytes()).await;
+                active.fetch_sub(1, Ordering::SeqCst);
             });
         }
     });
-    addr
+    (addr, peak_out)
 }
 
 /// Server that records the `Authorization` header value it sees on each
@@ -174,7 +196,7 @@ fn write_collection(base: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn end_to_end_two_vu_with_header_check_and_threshold() -> Result<()> {
     let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let srv = start_echo_server(seen.clone()).await;
+    let (srv, peak) = start_echo_server(seen.clone()).await;
     let coll = write_collection(&format!("http://{srv}"));
 
     // Threshold on http_req_duration (samples are MICROSECONDS): a generous
@@ -267,7 +289,16 @@ async fn end_to_end_two_vu_with_header_check_and_threshold() -> Result<()> {
     );
 
     // Sanity: both VUs actually made requests.
-    assert!(m.http_reqs >= 2, "http_reqs >= 2, got {}", m.http_reqs);
+    // Real concurrency: the server observed >= 2 simultaneously-open
+    // connections. `http_reqs >= 2` only proves requests fired — a
+    // sequential runner would pass it; two overlapping connections prove
+    // the 2 configured VUs actually ran in parallel.
+    let peak_obs = peak.load(Ordering::SeqCst);
+    assert!(
+        peak_obs >= 2,
+        "peak concurrent connections >= 2, got {} (vus actually parallel)",
+        peak_obs
+    );
 
     let _ = std::fs::remove_file(&coll);
     Ok(())
