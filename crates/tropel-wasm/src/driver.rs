@@ -254,6 +254,8 @@ impl Driver for WasmDriver {
             call_fuel: DEFAULT_CALL_FUEL,
             malloc_fn,
             free_fn,
+            module,
+            linker,
         }))
     }
 }
@@ -301,6 +303,59 @@ pub struct WasmDriverInstance {
     call_fuel: u64,
     malloc_fn: Option<TypedFunc<i32, i32>>,
     free_fn: Option<TypedFunc<i32, ()>>,
+    /// The compiled module + linker are retained so a guest trap can be
+    /// recovered by re-instantiating into a fresh store (see [`Self::reset`]).
+    module: Module,
+    linker: Linker<WasmDriverState>,
+}
+
+impl WasmDriverInstance {
+    /// Discard the current store + instance and re-instantiate the module
+    /// into a pristine store. Called after a guest trap: fuel exhaustion is
+    /// the EXPECTED trap for a slow iteration, so this is the common path —
+    /// the linear memory is left half-mutated (allocator free-list, RefCell
+    /// flags, in-progress guards) and must NOT be reused by the next
+    /// iteration. Re-instantiating gives a fresh linear memory, fresh
+    /// globals, and a default [`WasmDriverState`] (cleared samples/budgets).
+    fn reset(&mut self) -> Result<()> {
+        // Build the replacement store + instance fully before touching self:
+        // if re-instantiation fails, the (trapped) old store is left in place
+        // so `self` stays internally consistent.
+        let mut store = Store::new(wasm_engine(), WasmDriverState::default());
+        store
+            .set_fuel(self.call_fuel)
+            .map_err(|e| TropelError::Other(format!("WASM fuel setup failed: {}", e)))?;
+        let instance = self
+            .linker
+            .instantiate(&mut store, &self.module)
+            .map_err(|e| {
+                TropelError::Other(format!("WASM driver re-instantiation failed: {}", e))
+            })?;
+
+        // Fetch every handle against the LOCAL store, then commit — reset()
+        // is all-or-nothing: on any failure `self` keeps its old store.
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| {
+                TropelError::Other(
+                    "WASM driver module must export a linear 'memory' (cdylib pattern)".into(),
+                )
+            })?;
+        let run_iteration = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "adapter_run_iteration")
+            .map_err(wasm_err)?;
+        let malloc_fn = instance.get_typed_func::<i32, i32>(&mut store, "malloc").ok();
+        // C's free is (i32) -> () — looking it up as (i32) -> i32 returns
+        // None for every real cdylib (same reasoning as in init()).
+        let free_fn = instance.get_typed_func::<i32, ()>(&mut store, "free").ok();
+
+        self.store = store;
+        self.memory = memory;
+        self.run_iteration = run_iteration;
+        self.malloc_fn = malloc_fn;
+        self.free_fn = free_fn;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -363,43 +418,75 @@ impl DriverInstance for WasmDriverInstance {
         // Capture the call result WITHOUT early-returning on error: samples
         // recorded by host functions must be drained even when the iteration
         // fails (mirrors the declarative runner, which records samples on
-        // request failures too). Free the input buffer only when it was
-        // allocated through the module's own malloc — never hand FALLBACK_BASE
-        // (a host-owned bump region) to the module's free.
+        // request failures too). The input buffer is freed ONLY when the
+        // guest returned cleanly — never hand a buffer back to the heap of a
+        // trapped module (that heap is discarded wholesale on reset below).
         let call_result = self
             .run_iteration
             .call(&mut self.store, (ptr as i32, input_bytes.len() as i32));
 
+        let ret = match call_result {
+            Ok(r) => r,
+            Err(e) => {
+                // Guest trap — fuel exhaustion is the EXPECTED trap for a
+                // slow iteration, so this is the common path. The linear
+                // memory is left half-mutated (allocator free-list, RefCell
+                // flags, in-progress guards) and must NOT be reused: calling
+                // free on that heap would corrupt the allocator further, and
+                // the next iteration would run on poisoned memory. Drain the
+                // samples the host recorded (the reset drops the old store),
+                // then re-instantiate into a pristine store.
+                {
+                    let state = self.store.data_mut();
+                    ctx.samples.append(&mut state.samples);
+                }
+                let err = wasm_err(e);
+                if let Err(reset_err) = self.reset() {
+                    tracing::warn!(
+                        "WASM driver: iteration trapped and re-instantiation failed: {}",
+                        reset_err
+                    );
+                }
+                return Err(err);
+            }
+        };
+
+        // Only reachable when the guest returned cleanly: its heap is in a
+        // consistent state, so freeing the malloc'd input buffer is safe.
         if used_malloc {
             if let Some(free) = &self.free_fn {
                 let _ = free.call(&mut self.store, ptr as i32);
             }
         }
 
-        // Drain samples collected by host functions, unconditionally.
-        let state = self.store.data_mut();
-        let over_budget = state.sleep_over_budget;
-        let spam = state.metric_spam_exceeded;
-        ctx.samples.append(&mut state.samples);
+        // Drain samples collected by host functions — including any recorded
+        // by `free` above — unconditionally.
+        {
+            let state = self.store.data_mut();
+            let over_budget = state.sleep_over_budget;
+            let spam = state.metric_spam_exceeded;
+            ctx.samples.append(&mut state.samples);
 
-        // A host sleep that refused to block (budget exhausted) fails the
-        // iteration, mirroring a trap: the module's declared pacing cannot
-        // hang the run.
-        if over_budget {
-            return Err(TropelError::Other(
-                "WASM driver iteration exceeded its per-iteration sleep budget".into(),
-            ));
-        }
-        // Sample spam is bounded the same way: past the cap, further samples
-        // are refused and the iteration fails, so a hostile module cannot
-        // flood the metrics pipeline with multi-GB of samples.
-        if spam {
-            return Err(TropelError::Other(
-                "WASM driver iteration exceeded its per-iteration sample cap".into(),
-            ));
+            // A host sleep that refused to block (budget exhausted) fails the
+            // iteration, mirroring a trap: the module's declared pacing
+            // cannot hang the run. (The guest returned normally here — the
+            // heap is consistent — so no reset is needed.)
+            if over_budget {
+                return Err(TropelError::Other(
+                    "WASM driver iteration exceeded its per-iteration sleep budget".into(),
+                ));
+            }
+            // Sample spam is bounded the same way: past the cap, further
+            // samples are refused and the iteration fails, so a hostile
+            // module cannot flood the metrics pipeline with multi-GB of
+            // samples.
+            if spam {
+                return Err(TropelError::Other(
+                    "WASM driver iteration exceeded its per-iteration sample cap".into(),
+                ));
+            }
         }
 
-        let ret = call_result.map_err(wasm_err)?;
         if ret != 0 {
             return Err(TropelError::Other(format!(
                 "WASM driver iteration returned error code {}",
@@ -1074,6 +1161,159 @@ mod tests {
             names.contains(&"free_called"),
             "free must be invoked after run_iteration (marker 'free_called' missing): {:?}",
             names
+        );
+    }
+
+    // Module that reads the `iteration` field from the host-provided input
+    // JSON (by scanning for the byte sequence "iteration"): iteration 0 is a
+    // "slow" iteration — it grows the linear memory, scribbles the heap via
+    // malloc, then spins until fuel exhaustion (the EXPECTED trap) — while
+    // iteration 1+ is healthy and reports memory.size so the test can tell
+    // whether the instance was reset (fresh store ⇒ 64 pages) or reused
+    // (grown store ⇒ 65 pages). free() emits a marker so the test can also
+    // assert the host never frees into a trapped heap.
+    const TRAP_RESET_WAT: &str = r#"
+(module
+  (import "env" "metric_add" (func $metric_add (param i32 i32 f64 i32 i32 i32)))
+  (memory (export "memory") 64 256)
+  (global $heap (mut i32) (i32.const 1024))
+  (data (i32.const 8192) "mem_pages\00")
+  (data (i32.const 8210) "pages_after_grow\00")
+  (data (i32.const 8300) "{}\00")
+  (data (i32.const 8500) "free_called\00")
+  (data (i32.const 8600) "digit\00")
+  (func $malloc (export "malloc") (param $size i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (global.get $heap))
+    (global.set $heap (i32.add (global.get $heap) (local.get $size)))
+    (local.get $ptr))
+  (func (export "free") (param $ptr i32)
+    ;; free is C's (i32)->() signature; emits a marker so the host call is
+    ;; observable (must NEVER fire for a trapped iteration).
+    (call $metric_add (i32.const 8500) (i32.const 11) (f64.const 1.0) (i32.const 8300) (i32.const 2) (i32.const 1)))
+  ;; Read the iteration digit from the input JSON at a FIXED offset. The host
+  ;; serializes {"data_row":null,"env":{},"iteration":N,"scenario_name":...,"vu_id":1}
+  ;; (serde_json Map keys sort), so with a null data_row / empty env /
+  ;; single-digit N the digit is always at p+38 — the test's own byte probes
+  ;; pin that layout, so a host format change fails loudly here, not silently.
+  ;; NOTE: deliberately unrolled with NO loop / br_if / br — this engine
+  ;; miscompiles br_if-conditional loops at runtime (a counting loop returns
+  ;; after ONE iteration; probes proved if-with-return is fine), which is what
+  ;; made the scanning version of this function fail.
+  (func $iter_digit (param $p i32) (result i32)
+    (if (i32.and (i32.and (i32.and (i32.and
+          (i32.eq (i32.load (i32.add (local.get $p) (i32.const 27))) (i32.const 0x72657469))
+          (i32.eq (i32.load (i32.add (local.get $p) (i32.const 31))) (i32.const 0x6F697461)))
+          (i32.eq (i32.load8_u (i32.add (local.get $p) (i32.const 35))) (i32.const 110)))
+          (i32.eq (i32.load8_u (i32.add (local.get $p) (i32.const 36))) (i32.const 34)))
+          (i32.eq (i32.load8_u (i32.add (local.get $p) (i32.const 37))) (i32.const 58)))
+      (then (return (i32.load8_u (i32.add (local.get $p) (i32.const 38)))))
+      (else (return (i32.const 0))))
+    ;; Trailing value required: this engine fails to compile a function whose
+    ;; body is a statement-if with no value after it (function[3] error).
+    (i32.const 0))
+  (func (export "adapter_run_iteration") (param $in i32) (param $in_len i32) (result i32)
+    (if (i32.eq (call $iter_digit (local.get $in)) (i32.const 48))
+      (then
+        ;; Iteration 0 = slow iteration: grow memory and scribble the heap,
+        ;; then trap hard via `unreachable` — a GUARANTEED runtime trap (the
+        ;; spin-loop fuel variant depends on `br`, also unreliable in this
+        ;; engine). The linear memory is left half-mutated: a store that is
+        ;; NOT reset would report 65 pages on the next iteration.
+        (drop (memory.grow (i32.const 1)))
+        (drop (call $malloc (i32.const 70000)))
+        (call $metric_add (i32.const 8210) (i32.const 16)
+          (f64.convert_i32_u (memory.size))
+          (i32.const 8300) (i32.const 2) (i32.const 1))
+        (unreachable))
+      (else
+        ;; Healthy iteration: on a FRESH store (post-reset) memory.size is
+        ;; back to its initial 64 pages; on a reused store it stayed at 65.
+        (call $metric_add (i32.const 8600) (i32.const 5)
+          (f64.convert_i32_u (call $iter_digit (local.get $in)))
+          (i32.const 8300) (i32.const 2) (i32.const 1))
+        (call $metric_add
+          (i32.const 8192) (i32.const 9)
+          (f64.convert_i32_u (memory.size))
+          (i32.const 8300) (i32.const 2) (i32.const 1))
+        (return (i32.const 0))))
+    (i32.const 0))
+)
+"#;
+
+    #[tokio::test]
+    async fn test_trap_resets_store_for_next_iteration() {
+        // P1 regression: a guest trap (the test module deliberately traps
+        // via `unreachable` after mutating its heap) left the Store in place
+        // and the next
+        // iteration reused the half-mutated linear memory, with free() called
+        // on that poisoned heap. The instance must now re-instantiate into a
+        // fresh store: the trapped iteration surfaces the trap and emits NO
+        // free marker, and the next iteration runs on pristine memory.
+        let driver = WasmDriver;
+        let mut inst = driver
+            .init(TRAP_RESET_WAT.as_bytes(), None, None)
+            .await
+            .expect("driver init must succeed");
+
+        let mut ctx = VuContext::new(1, 0, "default".into());
+        ctx.http_client = Some(Arc::new(StubClient));
+
+        // Iteration 0: the module grows memory, scribbles the heap, emits a
+        // pages_after_grow=65 sample, then traps via `unreachable`.
+        let err = match inst.run_iteration(&mut ctx).await {
+            Err(e) => e,
+            Ok(()) => panic!("iteration 0 must trap (input layout at fixed offsets p+27..p+38 may have drifted)"),
+        };
+        assert!(
+            format!("{}", err).contains("WASM driver error"),
+            "trap must surface through wasm_err, got: {}",
+            err
+        );
+
+        // The grow must have really happened (the trap path drains samples
+        // before resetting) — otherwise the 64-pages assertion on iteration 1
+        // would pass vacuously even on a reused store.
+        let grown = ctx
+            .samples
+            .iter()
+            .find(|s| s.metric == "pages_after_grow")
+            .expect("pages_after_grow sample from the trapped iteration");
+        assert_eq!(grown.value, 65.0, "iteration 0 must have grown the memory");
+
+        // The host must NOT free the input buffer into a trapped heap — the
+        // marker emitted from `free` must be absent.
+        let names: Vec<&str> = ctx.samples.iter().map(|s| s.metric.as_ref()).collect();
+        assert!(
+            !names.contains(&"free_called"),
+            "free must never run on a trapped heap: {:?}",
+            names
+        );
+        ctx.samples.clear();
+
+        // Iteration 1 (healthy): the instance must have been reset — the
+        // store is fresh, so the linear memory is back at its initial 64
+        // pages, the module reads iteration digit '1' (49), and reports
+        // mem_pages = 64 (a reused store would report 65).
+        ctx.iteration = 1;
+        inst
+            .run_iteration(&mut ctx)
+            .await
+            .expect("iteration 1 must succeed on the reset store");
+        let digit = ctx
+            .samples
+            .iter()
+            .find(|s| s.metric == "digit")
+            .expect("digit sample");
+        assert_eq!(digit.value, 49.0, "iteration 1 digit must be '1'");
+        let mem = ctx
+            .samples
+            .iter()
+            .find(|s| s.metric == "mem_pages")
+            .expect("mem_pages sample");
+        assert_eq!(
+            mem.value, 64.0,
+            "store must be reset after a trap (memory back to initial size)"
         );
     }
 
