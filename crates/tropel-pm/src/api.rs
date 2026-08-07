@@ -245,7 +245,7 @@ impl PmApi {
             metric: "group_duration".into(),
             value: duration_micros as f64,
             tags: Arc::new(TagMap::from_pairs(tags)),
-            timestamp: std::time::SystemTime::now(),
+            timestamp: tropel_core::clock::monotonic_wall_now(),
             sample_type: tropel_core::types::SampleType::Trend,
         });
     }
@@ -267,7 +267,7 @@ impl PmApi {
             metric: std::borrow::Cow::Owned(metric.to_string()),
             value,
             tags: Arc::new(TagMap::from_pairs(tags)),
-            timestamp: std::time::SystemTime::now(),
+            timestamp: tropel_core::clock::monotonic_wall_now(),
             sample_type: tropel_core::types::SampleType::Point,
         });
     }

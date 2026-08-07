@@ -7,7 +7,7 @@ use std::ffi::{c_void, CString};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 static NEXT_CTX_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -227,12 +227,15 @@ pub struct JsContext {
 // `&mut self`, so a `JsContext` can only ever be used exclusively.
 unsafe impl Send for JsContext {}
 
-/// Get the current time as nanoseconds since UNIX epoch.
+/// Get the current time in nanoseconds from the shared monotonic clock.
+///
+/// The interrupt deadline uses a MONOTONIC base (backlog P3: "interrupt
+/// deadline uses SystemTime — an NTP step kills a running script"): a wall-
+/// clock jump must never trip or extend the deadline mid-eval. Shared with
+/// the k6 driver's ws re-arm via `tropel_core::clock` so both sides agree on
+/// the epoch.
 fn now_nanos() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
+    tropel_core::clock::monotonic_now_nanos()
 }
 
 impl JsContext {
@@ -272,7 +275,9 @@ impl JsContext {
             rt.set_host_promise_rejection_tracker(Some(Box::new(
                 move |ctx, promise, reason, is_handled| {
                     let key = promise_identity(&promise);
-                    let mut map = pending.lock().unwrap();
+                    // Poison-tolerant: a panicked thread must not permanently
+                    // silence unhandled-rejection reporting (backlog P3).
+                    let mut map = pending.lock().unwrap_or_else(|e| e.into_inner());
                     if is_handled {
                         map.remove(&key);
                     } else {
@@ -406,7 +411,10 @@ impl JsContext {
     /// removed by the `is_handled=true` tracker callback before this runs, so
     /// only genuinely-unhandled rejections surface here.
     fn check_unhandled_rejections(&self) -> Result<()> {
-        let mut map = self.unhandled_rejections.lock().unwrap();
+        let mut map = self
+            .unhandled_rejections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if map.is_empty() {
             return Ok(());
         }
@@ -781,9 +789,11 @@ impl JsContext {
         const WRAPPER_OFFSET: u32 = 2;
         let source_url_str = source_url.as_deref().unwrap_or("script.js");
 
-        // Check cache (lock dropped before ctx.with)
+        // Check cache (lock dropped before ctx.with). Poison-tolerant: a
+        // single panicked thread must not disable script caching for the
+        // whole run (backlog P3).
         let cached = {
-            let cache = self.script_cache.lock().unwrap();
+            let cache = self.script_cache.lock().unwrap_or_else(|e| e.into_inner());
             cache.get(&hash).cloned()
         };
 
@@ -860,7 +870,7 @@ impl JsContext {
 
         // Store in cache for future calls
         {
-            let mut cache = self.script_cache.lock().unwrap();
+            let mut cache = self.script_cache.lock().unwrap_or_else(|e| e.into_inner());
             cache.entry(hash).or_insert_with(|| script.clone());
         }
 

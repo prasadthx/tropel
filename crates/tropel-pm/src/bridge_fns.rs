@@ -200,15 +200,38 @@ fn resolve_send_request(
 /// Parse headers from a JSON string that may be either:
 /// - Object form: {"Content-Type": "application/json"}
 /// - Postman array form: [{"key": "Content-Type", "value": "application/json"}]
+///
+/// Object-form values may be non-strings (e.g. `{"Content-Length": 123}` or
+/// `{"X-Bool": true}`). The old code parsed the object as
+/// `HashMap<String, String>` and fell through to the (failing) array form
+/// whenever ANY value was non-string — silently dropping EVERY header
+/// (backlog P3). Non-string scalars are now stringified; null/complex values
+/// are skipped.
 fn parse_headers(json: &str) -> HashMap<String, String> {
     if json.is_empty() || json == "{}" || json == "[]" {
         return HashMap::new();
     }
 
-    // Try object form first
+    // Try object form first — tolerant of non-string values.
     if json.trim_start().starts_with('{') {
-        if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(json) {
-            return map;
+        if let Ok(map) = serde_json::from_str::<HashMap<String, serde_json::Value>>(json) {
+            let mut headers = HashMap::new();
+            for (k, v) in map {
+                match v {
+                    serde_json::Value::String(s) => {
+                        headers.insert(k, s);
+                    }
+                    serde_json::Value::Number(n) => {
+                        headers.insert(k, n.to_string());
+                    }
+                    serde_json::Value::Bool(b) => {
+                        headers.insert(k, b.to_string());
+                    }
+                    // Null and complex values cannot be header strings.
+                    _ => {}
+                }
+            }
+            return headers;
         }
     }
 
@@ -883,7 +906,7 @@ impl PmBridge {
                         metric: "group_duration".into(),
                         value: duration_micros as f64,
                         tags: Arc::new(tags),
-                        timestamp: std::time::SystemTime::now(),
+                        timestamp: tropel_core::clock::monotonic_wall_now(),
                         sample_type: tropel_core::types::SampleType::Trend,
                     });
                 }),
@@ -909,7 +932,7 @@ impl PmBridge {
                         metric: name.into(),
                         value,
                         tags: Arc::new(tropel_core::types::TagMap::new()),
-                        timestamp: std::time::SystemTime::now(),
+                        timestamp: tropel_core::clock::monotonic_wall_now(),
                         sample_type,
                     });
                 }),
@@ -957,7 +980,7 @@ impl PmBridge {
                             metric: name.into(),
                             value,
                             tags: Arc::new(tags),
-                            timestamp: std::time::SystemTime::now(),
+                            timestamp: tropel_core::clock::monotonic_wall_now(),
                             sample_type,
                         });
                     },
@@ -1320,5 +1343,29 @@ mod tests {
         assert!(response_json_string(b"not json").is_none());
         // Empty body → None.
         assert!(response_json_string(b"").is_none());
+    }
+
+    /// Regression (backlog P3): `parse_headers` returned an EMPTY map on any
+    /// object form containing a non-string value (e.g. {"Content-Length":
+    /// 123}) — the `HashMap<String, String>` parse failed, the array fallback
+    /// failed, and EVERY header was silently dropped. Non-string scalars must
+    /// be stringified and the rest preserved.
+    #[test]
+    fn parse_headers_non_string_object_values_are_stringified() {
+        let headers = parse_headers(r#"{"Content-Type":"application/json","Content-Length":123,"X-Bool":true}"#);
+        assert_eq!(headers.get("Content-Type").map(String::as_str), Some("application/json"));
+        assert_eq!(headers.get("Content-Length").map(String::as_str), Some("123"));
+        assert_eq!(headers.get("X-Bool").map(String::as_str), Some("true"));
+        assert_eq!(headers.len(), 3, "no header may be dropped");
+
+        // Null/complex values are skipped, not fatal.
+        let headers = parse_headers(r#"{"A":"keep","B":null,"C":[1,2]}"#);
+        assert_eq!(headers.get("A").map(String::as_str), Some("keep"));
+        assert!(!headers.contains_key("B"));
+        assert!(!headers.contains_key("C"));
+
+        // Array form still works unchanged.
+        let headers = parse_headers(r#"[{"key":"X","value":"y"}]"#);
+        assert_eq!(headers.get("X").map(String::as_str), Some("y"));
     }
 }

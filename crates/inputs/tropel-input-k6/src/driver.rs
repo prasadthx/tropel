@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
@@ -792,7 +792,7 @@ fn push_http_samples_for(
     extra_tags: Option<&HashMap<String, String>>,
     group: Option<&str>,
 ) {
-    let now = SystemTime::now();
+    let now = tropel_core::clock::monotonic_wall_now();
     let tags = Arc::new(http_tags_for(
         url,
         method,
@@ -951,7 +951,7 @@ fn push_http_failure(
     extra_tags: Option<&HashMap<String, String>>,
     group: Option<&str>,
 ) {
-    let now = SystemTime::now();
+    let now = tropel_core::clock::monotonic_wall_now();
     let tags = Arc::new(http_tags(req, "0", scenario, extra_tags, group));
 
     let mut v = sink.lock().unwrap();
@@ -1678,7 +1678,7 @@ impl K6DriverInstance {
                 // 3rd arg: optional k6 check() tags JSON (backlog line 149).
                 Func::from(move |name: String, passed: bool, tags_json: Option<String>| {
                     let mut v = sink_test.lock().unwrap();
-                    let now = SystemTime::now();
+                    let now = tropel_core::clock::monotonic_wall_now();
                     let mut tags = TagMap::with_capacity(2);
                     tags.insert("check", name);
                     if let Some(j) = tags_json {
@@ -1733,7 +1733,7 @@ impl K6DriverInstance {
                             metric: name.into(),
                             value,
                             tags: Arc::new(tags),
-                            timestamp: SystemTime::now(),
+                            timestamp: tropel_core::clock::monotonic_wall_now(),
                             sample_type,
                         });
                     },
@@ -1810,7 +1810,7 @@ impl K6DriverInstance {
                         metric: "group_duration".into(),
                         value: duration_ms * 1000.0, // μs, consistent with other Trends
                         tags: Arc::new(tags),
-                        timestamp: SystemTime::now(),
+                        timestamp: tropel_core::clock::monotonic_wall_now(),
                         sample_type: SampleType::Trend,
                     });
                 }),
@@ -2051,10 +2051,9 @@ impl K6DriverInstance {
                     move |id: u64, timeout_ms: f64| -> String {
                         // Reset the per-eval interrupt deadline so a long ws
                         // session isn't killed by the eval timeout mid-pump.
-                        let now_ns = SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_nanos() as u64;
+                        // Same MONOTONIC base as JsContext's interrupt handler
+                        // (backlog P3: an NTP step must not kill a script).
+                        let now_ns = tropel_core::clock::monotonic_now_nanos();
                         deadline_step.store(
                             now_ns.saturating_add(max_exec.as_nanos() as u64),
                             Ordering::Relaxed,
@@ -2192,7 +2191,7 @@ impl K6DriverInstance {
                             return serde_json::json!({"ok": false}).to_string();
                         };
                         let duration = session.start.elapsed();
-                        let now = SystemTime::now();
+                        let now = tropel_core::clock::monotonic_wall_now();
                         let mut tags = TagMap::with_capacity(5);
                         tags.insert("url", session.url.clone());
                         tags.insert("method", String::from("GET"));
@@ -3108,9 +3107,29 @@ fn parse_headers_tolerant(json: &str) -> HashMap<String, String> {
     if json.is_empty() || json == "{}" || json == "[]" {
         return HashMap::new();
     }
+    // Object form must tolerate non-string values (e.g. {"Content-Length":
+    // 123}) — the old `HashMap<String, String>` parse fell through to the
+    // array form and returned an EMPTY map whenever any value was
+    // non-string, silently dropping every header (backlog P3). Scalars are
+    // stringified; null/complex values are skipped.
     if json.trim_start().starts_with('{') {
-        if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(json) {
-            return map;
+        if let Ok(map) = serde_json::from_str::<HashMap<String, serde_json::Value>>(json) {
+            let mut headers = HashMap::new();
+            for (k, v) in map {
+                match v {
+                    serde_json::Value::String(s) => {
+                        headers.insert(k, s);
+                    }
+                    serde_json::Value::Number(n) => {
+                        headers.insert(k, n.to_string());
+                    }
+                    serde_json::Value::Bool(b) => {
+                        headers.insert(k, b.to_string());
+                    }
+                    _ => {}
+                }
+            }
+            return headers;
         }
     }
     if json.trim_start().starts_with('[') {

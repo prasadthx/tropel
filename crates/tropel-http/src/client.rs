@@ -366,7 +366,9 @@ impl HttpClient {
                     TropelError::Config("per-request certificate requires a key path".into())
                 })?;
                 let cache_key = (cert_path.to_string(), key_path.to_string(), follow);
-                let mut cache = self.cert_clients.lock().unwrap();
+                // Poison-tolerant: a single panicked thread must not disable
+                // the cert-client cache for the whole run (backlog P3).
+                let mut cache = self.cert_clients.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(client) = cache.get(&cache_key) {
                     return Ok(client.clone());
                 }

@@ -36,8 +36,15 @@ pub fn generate_uuid() -> String {
 }
 
 /// Generate a random integer in [min, max).
+///
+/// An empty or inverted range (`min >= max`) returns `min` instead of
+/// panicking — this unwinds out of a QuickJS callback when called from a
+/// script, so it must never panic (backlog P3).
 pub fn random_int(min: i64, max: i64) -> i64 {
     use rand::RngExt;
+    if min >= max {
+        return min;
+    }
     let mut rng = rand::rng();
     rng.random_range(min..max)
 }
@@ -47,4 +54,22 @@ pub fn random_float() -> f64 {
     use rand::RngExt;
     let mut rng = rand::rng();
     rng.random::<f64>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn random_int_empty_range_does_not_panic() {
+        // Backlog P3: `random_range(min..max)` panics on an empty/inverted
+        // range (unwinding out of a QuickJS callback). Must return `min`.
+        assert_eq!(random_int(5, 5), 5);
+        assert_eq!(random_int(7, 3), 7);
+        // Valid ranges still produce in-range values.
+        for _ in 0..100 {
+            let v = random_int(0, 10);
+            assert!((0..10).contains(&v));
+        }
+    }
 }

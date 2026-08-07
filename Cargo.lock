@@ -4279,6 +4279,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "tropel-core",
  "tropel-es",
  "tropel-http",
  "tropel-js",

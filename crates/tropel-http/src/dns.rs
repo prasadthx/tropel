@@ -472,7 +472,9 @@ fn select_addrs(
             if addrs.len() <= 1 {
                 return addrs.to_vec();
             }
-            let mut map = rotation.lock().unwrap();
+            // Poison-tolerant: a panicked thread must not permanently break
+            // round-robin/random selection for the run (backlog P3).
+            let mut map = rotation.lock().unwrap_or_else(|e| e.into_inner());
             let n = map.entry(host.to_string()).or_insert(0);
             let k = match select {
                 DnsSelect::RoundRobin => *n % addrs.len(),

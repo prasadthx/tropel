@@ -515,6 +515,11 @@ const LOREM_WORDS: &[&str] = &[
 ];
 
 fn random_choice<'a, R: RngExt>(rng: &mut R, items: &'a [&'a str]) -> &'a str {
+    // Empty input must not panic (backlog P3): an empty slice would make
+    // `random_range(0..0)` panic. Return an empty string instead.
+    if items.is_empty() {
+        return "";
+    }
     items[rng.random_range(0..items.len())]
 }
 
@@ -656,6 +661,10 @@ fn capitalize_first_letter(text: String) -> String {
 
 fn random_string(rng: &mut impl RngExt, length: usize, charset: &str) -> String {
     let chars: Vec<char> = charset.chars().collect();
+    // Empty charset must not panic (backlog P3): `random_range(0..0)` panics.
+    if chars.is_empty() {
+        return String::new();
+    }
     (0..length)
         .map(|_| chars[rng.random_range(0..chars.len())])
         .collect()
@@ -857,5 +866,27 @@ mod tests {
         assert!(future.starts_with("future="));
         assert!(date.starts_with("date="));
         assert!(time.starts_with("time="));
+    }
+
+    #[test]
+    fn random_choice_empty_input_does_not_panic() {
+        // Backlog P3: an empty items slice made `random_range(0..0)` panic
+        // (unwinding through the variable resolver). Must return "" instead.
+        let mut rng = rand::rng();
+        let empty: [&str; 0] = [];
+        assert_eq!(random_choice(&mut rng, &empty), "");
+        // Non-empty input still works.
+        assert_eq!(random_choice(&mut rng, &["a"]), "a");
+    }
+
+    #[test]
+    fn random_string_empty_charset_does_not_panic() {
+        // Backlog P3: an empty charset made `random_range(0..0)` panic.
+        let mut rng = rand::rng();
+        assert_eq!(random_string(&mut rng, 10, ""), "");
+        assert_eq!(random_string(&mut rng, 0, "abc"), "");
+        let s = random_string(&mut rng, 5, "ab");
+        assert_eq!(s.len(), 5);
+        assert!(s.chars().all(|c| c == 'a' || c == 'b'));
     }
 }

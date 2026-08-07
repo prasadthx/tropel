@@ -12,6 +12,7 @@ tropel-sdk.workspace = true
 tropel-http.workspace = true
 tropel-metrics.workspace = true
 tropel-js.workspace = true
+tropel-core.workspace = true
 tropel-native.workspace = true
 tropel-es.workspace = true
 async-trait.workspace = true

@@ -2,6 +2,30 @@ use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+/// Build an auto-resizing histogram without ever panicking (backlog P3).
+///
+/// sigfig 3 is always within hdrhistogram's valid `0..=5` range, so the
+/// error branch is unreachable in practice; it is handled defensively so a
+/// future hdr-histogram constraint change can never unwind out of the
+/// aggregator task (which has no panic guard).
+fn auto_resizing_histogram() -> Histogram<u64> {
+    match Histogram::new(3) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!("Failed to create auto-resizing histogram: {e}");
+            // sigfig 1 is also always valid; last-resort fallback.
+            match Histogram::new(1) {
+                Ok(h) => h,
+                Err(e2) => {
+                    tracing::error!("histogram fallback also failed: {e2}");
+                    // Unreachable: sigfig 1 is in the valid range.
+                    panic!("hdr-histogram rejected valid sigfig 1: {e2}")
+                }
+            }
+        }
+    }
+}
+
 /// A latency histogram backed by HdrHistogram.
 #[derive(Debug, Clone)]
 pub struct LatencyHistogram {
@@ -15,18 +39,43 @@ impl LatencyHistogram {
     /// above the initial ceiling grow the histogram instead of being silently
     /// dropped. The old fixed 60 s ceiling clipped very slow requests, which
     /// skewed p99/max and under-counted latency.
+    ///
+    /// Construction is infallible (sigfig 3 is always in the valid 0..=5
+    /// range); the fallback exists only to keep the aggregator task panic-free
+    /// by construction (backlog P3).
     pub fn new() -> Self {
-        let inner = Histogram::new(3).expect("Failed to create auto-resizing histogram");
-        Self { inner }
+        Self {
+            inner: auto_resizing_histogram(),
+        }
     }
 
     /// Create a new histogram with custom bounds (fixed ceiling — values above
     /// `high` are silently clamped/dropped, matching k6's bounded histogram
     /// behavior). Prefer [`Self::new`] (auto-resize) unless a bounded ceiling
     /// is explicitly required.
+    ///
+    /// Garbage bounds must not panic inside the aggregator task AND must not
+    /// silently become a degenerate tiny ceiling that drops every sample:
+    /// hdrhistogram requires `low >= 1` and `high >= 2 * low`, so invalid
+    /// inputs fall back to auto-resize with a logged error instead of
+    /// panicking or truncating to a useless 2 µs histogram (backlog P3).
     pub fn with_bounds(low: u64, high: u64) -> Self {
-        let inner = Histogram::new_with_bounds(low, high, 3).expect("Failed to create histogram");
-        Self { inner }
+        if low < 1 || high < low.saturating_mul(2) {
+            tracing::error!(
+                "Invalid histogram bounds {low}..{high} (need low >= 1, high >= 2*low); \
+                 falling back to auto-resize"
+            );
+            return Self::new();
+        }
+        match Histogram::new_with_bounds(low, high, 3) {
+            Ok(inner) => Self { inner },
+            Err(e) => {
+                tracing::error!(
+                    "Failed to create histogram with bounds {low}..{high}: {e}; falling back to auto-resize"
+                );
+                Self::new()
+            }
+        }
     }
 
     /// Create a new histogram with a custom high bound in microseconds
@@ -120,8 +169,7 @@ impl LatencyHistogram {
         // Fallback: rebuild a fresh auto-resizing histogram from the recorded
         // bins of both sides. Lossless — HdrHistogram bin iteration yields the
         // exact value and count at every populated bucket.
-        let mut merged = Histogram::<u64>::new(3)
-            .expect("Failed to create auto-resizing histogram");
+        let mut merged = auto_resizing_histogram();
         for v in self.inner.iter_recorded() {
             merged
                 .record_n(v.value_iterated_to(), v.count_at_value())
@@ -233,6 +281,27 @@ mod tests {
     fn v2_corrupt_bytes_return_none() {
         assert!(LatencyHistogram::from_bytes(b"garbage").is_none());
         assert!(LatencyHistogram::from_bytes(&[]).is_none());
+    }
+
+    #[test]
+    fn garbage_bounds_fall_back_to_auto_resize() {
+        // Backlog P3: hdr-histogram requires high >= 2*low (low >= 1); a
+        // garbage ceiling must fall back gracefully, never panic inside the
+        // aggregator task. The fallback histogram must still record.
+        //
+        // NOTE: `max()` is the upper edge of the auto-resized bucket holding
+        // the sample, not the exact recorded value (5 s lands in a bucket
+        // whose top is 5,001,215 µs with sigfig 3) — assert the sample was
+        // recorded, not the exact bucket edge.
+        let mut h = LatencyHistogram::with_bounds(0, 0);
+        h.record_micros(5_000_000); // 5 s — above any fixed tiny ceiling
+        assert_eq!(h.count(), 1, "the sample must not be dropped");
+        assert!(h.max() >= 5_000_000, "max={} must cover the recorded value", h.max());
+
+        let mut h2 = LatencyHistogram::with_bounds(1, 1); // high < 2*low
+        h2.record_micros(1_000);
+        assert_eq!(h2.count(), 1);
+        assert!(h2.max() >= 1_000, "max={} must cover the recorded value", h2.max());
     }
 
     #[test]

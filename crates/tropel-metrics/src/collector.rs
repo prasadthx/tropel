@@ -319,6 +319,16 @@ enum MetricsEvent {
 /// skip missed samples). This ensures VUs are never blocked by slow outputs.
 pub struct MetricsCollector {
     tx: mpsc::Sender<MetricsEvent>,
+    /// Receiver held until a tokio runtime is available, then given to the
+    /// spawned aggregator task. `tokio::spawn` panics OUTSIDE a runtime
+    /// (backlog P3: "`MetricsCollector::new()` panics outside a runtime"), so
+    /// construction is now panic-free: the aggregator starts lazily on the
+    /// first async call once a runtime exists.
+    pending_rx: std::sync::Mutex<Option<mpsc::Receiver<MetricsEvent>>>,
+    /// Fast-path flag: once the aggregator task is spawned, `ensure_aggregator`
+    /// returns without touching the mutex — `record()`/`record_batch()` are
+    /// the VU hot path and must not pay a lock per call.
+    aggregator_spawned: std::sync::atomic::AtomicBool,
     /// Optional broadcast sender for streaming outputs.
     /// Cloned samples are sent via `broadcast::Sender::send()` (non-blocking,
     /// evicts oldest if buffer is full).
@@ -327,24 +337,61 @@ pub struct MetricsCollector {
 
 impl MetricsCollector {
     /// Create a new collector and spawn the background aggregator task.
+    ///
+    /// Never panics outside a tokio runtime: if no runtime is present at
+    /// construction (unit tests, early CLI init), the aggregator starts
+    /// lazily on the first async method call (which requires a runtime).
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel(MAX_PENDING_SAMPLES);
-
-        // Spawn the aggregator task on the current tokio runtime.
-        // It processes samples sequentially, lock-free on the consumer side.
-        tokio::spawn(async move {
-            Aggregator::run(rx).await;
-        });
-
-        Self {
+        let collector = Self {
             tx,
+            pending_rx: std::sync::Mutex::new(Some(rx)),
+            aggregator_spawned: std::sync::atomic::AtomicBool::new(false),
             sample_sink: std::sync::Mutex::new(None),
+        };
+        collector.ensure_aggregator();
+        collector
+    }
+
+    /// Spawn the aggregator task if a receiver is pending and a runtime is
+    /// available. Panic-free by construction: `Handle::try_current()` returns
+    /// `Err` outside a runtime instead of panicking like `tokio::spawn`.
+    ///
+    /// The spawned flag gives a lock-free fast path after the first success:
+    /// the hot-path `record()`/`record_batch()` calls must not take the
+    /// mutex on every batch.
+    fn ensure_aggregator(&self) {
+        use std::sync::atomic::Ordering;
+        if self.aggregator_spawned.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut guard = match self.pending_rx.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(), // poisoned: recover the receiver
+        };
+        let Some(rx) = guard.take() else {
+            self.aggregator_spawned.store(true, Ordering::Relaxed);
+            return; // already spawned (or no receiver left)
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                self.aggregator_spawned.store(true, Ordering::Relaxed);
+                handle.spawn(async move {
+                    Aggregator::run(rx).await;
+                });
+            }
+            Err(_) => {
+                // No runtime yet — keep the receiver and retry on the next
+                // async call (which must run inside a runtime).
+                *guard = Some(rx);
+            }
         }
     }
 
     /// Set the latency histogram ceiling (microseconds) before samples are
     /// recorded. `None` selects auto-resize (no ceiling). Best-effort.
     pub async fn set_histogram_max(&self, max_micros: Option<u64>) {
+        self.ensure_aggregator();
         let _ = self.tx.send(MetricsEvent::SetHistogramMax(max_micros)).await;
     }
 
@@ -359,6 +406,7 @@ impl MetricsCollector {
             tropel_core::config::ThresholdConfig,
         >,
     ) {
+        self.ensure_aggregator();
         let _ = self
             .tx
             .send(MetricsEvent::SetSummaryConfig {
@@ -410,6 +458,7 @@ impl MetricsCollector {
     /// If the aggregator has shut down (channel closed), the send silently
     /// drops the samples — acceptable during test teardown.
     pub async fn record_batch(&self, samples: &[Sample]) {
+        self.ensure_aggregator();
         // Forward to streaming output sinks (best-effort, non-blocking)
         self.forward_to_sink(samples);
 
@@ -422,6 +471,7 @@ impl MetricsCollector {
     /// Record a single sample — bounded backpressure path.
     /// Also forwards to the streaming output sink if configured.
     pub async fn record(&self, sample: &Sample) {
+        self.ensure_aggregator();
         // Forward to streaming output sinks (best-effort, non-blocking)
         self.forward_to_sink(std::slice::from_ref(sample));
 
@@ -437,6 +487,7 @@ impl MetricsCollector {
 
     /// Get aggregated results — sends a request and waits for the response.
     pub async fn results(&self) -> MetricsResult {
+        self.ensure_aggregator();
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         if self
             .tx
@@ -454,6 +505,7 @@ impl MetricsCollector {
     /// ship its metrics to a `tropel-controller`, which merges histograms
     /// losslessly via [`merge_snapshots`].
     pub async fn snapshot(&self) -> MetricsSnapshot {
+        self.ensure_aggregator();
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         if self
             .tx
@@ -468,6 +520,7 @@ impl MetricsCollector {
 
     /// Get total count for a metric — sends a request and waits.
     pub async fn total_count(&self, metric: &str) -> f64 {
+        self.ensure_aggregator();
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         if self
             .tx
@@ -1554,6 +1607,23 @@ pub fn percentile_value(m: &MetricSummary, pct: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_outside_tokio_runtime_does_not_panic() {
+        // Backlog P3: `tokio::spawn` panics outside a runtime, so
+        // `MetricsCollector::new()` previously panicked in unit tests / early
+        // CLI init. The aggregator must start lazily instead — and the
+        // collector must be constructible without a runtime.
+        let c = MetricsCollector::new();
+        // No runtime here (plain #[test]): the receiver must still be
+        // pending (spawn deferred), and construction must not have panicked.
+        {
+            let guard = c.pending_rx.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(guard.is_some(), "aggregator must not have spawned without a runtime");
+        }
+        assert!(!c.aggregator_spawned.load(std::sync::atomic::Ordering::Relaxed));
+        drop(c); // clean drop with a pending receiver
+    }
 
     #[test]
     fn test_metric_key_equality() {
