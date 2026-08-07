@@ -1580,23 +1580,38 @@ mod tests {
     /// for `current_vus - target` surplus slots, EXACTLY that many claims
     /// succeed — no VU that reads the same `active > target` snapshot can
     /// over-exit below the target.
-    #[tokio::test]
+    ///
+    /// The claims are made from REAL concurrently-running tasks (`tokio::spawn`
+    /// + a barrier on a multi-thread runtime), so a `fetch_update` CAS bug that
+    /// only manifests under simultaneous contention — invisible to the old
+    /// single-threaded `for` loop — would fail here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn try_claim_ramp_down_bounds_exits_to_surplus() {
-        let sched = VUScheduler::new(&ExecutionConfig::ConstantVus {
+        let sched = Arc::new(VUScheduler::new(&ExecutionConfig::ConstantVus {
             vus: 1,
             duration: "1s".to_string(),
             graceful_stop: None,
             think_time: Default::default(),
-        });
+        }));
         let current_vus: u32 = 10;
         let target: u32 = 5;
         sched.set_ramp_down_target(target, current_vus);
 
-        // Simulate all 10 VUs observing active=10 (the old overshoot race:
-        // every VU sees active > target). Exactly 5 may claim.
-        let mut claimed = 0usize;
+        // All 10 VUs observe active=10 (the old overshoot race: every VU sees
+        // active > target) and claim at the SAME instant. Exactly 5 succeed.
+        let barrier = Arc::new(tokio::sync::Barrier::new(current_vus as usize));
+        let mut handles = Vec::with_capacity(current_vus as usize);
         for _ in 0..current_vus {
-            if sched.try_claim_ramp_down(10).await {
+            let sched = sched.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                sched.try_claim_ramp_down(10).await
+            }));
+        }
+        let mut claimed = 0usize;
+        for handle in handles {
+            if handle.await.expect("ramp-down claim task panicked") {
                 claimed += 1;
             }
         }
@@ -1627,20 +1642,36 @@ mod tests {
     /// Locked: shared-iteration pre-claim CAS never overshoots the budget,
     /// no matter how many VUs contend simultaneously (the old run-then-check
     /// allowed up to vus−1 extras).
-    #[tokio::test]
+    ///
+    /// 1000 VUs claim from REAL concurrently-running tasks (`tokio::spawn` +
+    /// a barrier on a multi-thread runtime) — not the old single-threaded
+    /// `for` loop that could never exercise the CAS under contention.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn try_claim_shared_iteration_bounds_to_budget() {
-        let sched = VUScheduler::new(&ExecutionConfig::SharedIterations {
+        let sched = Arc::new(VUScheduler::new(&ExecutionConfig::SharedIterations {
             iterations: 5,
             max_duration: None,
             vus: 10,
             graceful_stop: None,
             think_time: Default::default(),
-        });
+        }));
 
-        // 1000 "VUs" all claim concurrently-ish: exactly 5 succeed.
+        const CONTENDERS: usize = 1000;
+        // All 1000 tasks trip the barrier before any claims — maximal
+        // simultaneous `fetch_update` CAS pressure on the budget counter.
+        let barrier = Arc::new(tokio::sync::Barrier::new(CONTENDERS));
+        let mut handles = Vec::with_capacity(CONTENDERS);
+        for _ in 0..CONTENDERS {
+            let sched = sched.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                sched.try_claim_shared_iteration(5)
+            }));
+        }
         let mut claimed = 0u64;
-        for _ in 0..1000 {
-            if sched.try_claim_shared_iteration(5) {
+        for handle in handles {
+            if handle.await.expect("shared-iteration claim task panicked") {
                 claimed += 1;
             }
         }
