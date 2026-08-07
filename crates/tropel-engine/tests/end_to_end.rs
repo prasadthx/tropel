@@ -167,9 +167,9 @@ async fn start_auth_capture_server(seen: Arc<Mutex<Vec<String>>>) -> std::net::S
 /// HTTP status and that the prerequest-set variable is still visible — the
 /// exact seam where a broken prerequest→test bridge or a broken response
 /// slot would surface.
-fn write_collection(base: &str) -> String {
+fn write_collection(base: &str, tag: &str) -> String {
     let dir = std::env::temp_dir();
-    let path = dir.join(format!("tropel-e2e-{}.json", std::process::id()));
+    let path = dir.join(format!("tropel-e2e-{}-{}.json", std::process::id(), tag));
     let url = format!("{base}/");
     let collection = serde_json::json!({
         "info": {
@@ -213,7 +213,7 @@ fn write_collection(base: &str) -> String {
 async fn end_to_end_two_vu_with_header_check_and_threshold() -> Result<()> {
     let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let (srv, peak) = start_echo_server(seen.clone()).await;
-    let coll = write_collection(&format!("http://{srv}"));
+    let coll = write_collection(&format!("http://{srv}"), "two-vu");
 
     // Threshold on http_req_duration (samples are MICROSECONDS): a generous
     // 5 s ceiling that still reflects REAL latency — a hardcoded pass or an
@@ -331,7 +331,7 @@ async fn prerequest_pm_request_header_reaches_the_wire() -> Result<()> {
     let srv = start_auth_capture_server(seen.clone()).await;
 
     let dir = std::env::temp_dir();
-    let path = dir.join(format!("tropel-e2e-prereq-hdr-{}.json", std::process::id()));
+    let path = dir.join(format!("tropel-e2e-prereq-hdr-{}-prereq.json", std::process::id()));
     let url = format!("http://{srv}/");
     let collection = serde_json::json!({
         "info": {

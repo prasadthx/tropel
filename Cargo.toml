@@ -38,7 +38,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal", "test-util"] }
 
 # JS engine
 rquickjs = { version = "0.12.2", features = ["full-async"] }

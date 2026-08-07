@@ -361,9 +361,9 @@ mod tests {
         addr
     }
 
-    fn write_collection(base: &str) -> String {
+    fn write_collection(base: &str, tag: &str) -> String {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("tropel-cloud-run-e2e-{}.json", std::process::id()));
+        let path = dir.join(format!("tropel-cloud-run-e2e-{}-{}.json", std::process::id(), tag));
         let json = format!(
             r#"{{"info":{{"_postman_id":"e2e","name":"cloud","schema":"https://schema.getpostman.com/json/collection/v2.1.0/collection.json"}},"item":[{{"name":"r1","request":{{"method":"GET","url":"{base}/","header":[]}},"response":[]}}]}}"#
         );
@@ -377,7 +377,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cloud_local_runs_and_merges() -> Result<()> {
         let srv = start_http_server().await;
-        let coll = write_collection(&format!("http://{srv}"));
+        let coll = write_collection(&format!("http://{srv}"), "cloud-local");
 
         let config = JobConfig {
             input: coll.clone(),
@@ -501,7 +501,7 @@ mod tests {
         // ride in the ConfigMap AND the embedded job.json's `input` field
         // must point at the mount path, or every agent pod fails to parse.
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("tropel-k8s-input-{}.json", std::process::id()));
+        let path = dir.join(format!("tropel-k8s-input-{}-manifests.json", std::process::id()));
         std::fs::write(&path, r#"{"item":[{"request":{}}]}"#).unwrap();
 
         let config = JobConfig {

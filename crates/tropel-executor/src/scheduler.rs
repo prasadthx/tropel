@@ -1907,7 +1907,11 @@ mod tests {
     /// Locked: 20/s with 10 pre-allocated VUs at 300ms latency must NEVER
     /// drop iterations — 10 VUs can sustain ~33/s, so the pool easily keeps
     /// up. Guards against regressions in the token bucket / growth path.
-    #[tokio::test]
+    ///
+    /// `start_paused` runs the wall-clock token bucket on VIRTUAL time, so
+    /// the run is fully deterministic — the old real-time `sleep`-driven
+    /// version could flake under CI load (backlog line 209).
+    #[tokio::test(start_paused = true)]
     async fn arrival_rate_never_drops_with_10_vus_at_300ms() {
         let sched = VUScheduler::new(&ExecutionConfig::ConstantArrivalRate {
             rate: 20.0,
@@ -1943,7 +1947,11 @@ mod tests {
     /// and iterations drop. The old growth code (gated on token-add, by at
     /// most `to_add`) stopped growing entirely once the bucket was full;
     /// queued-token-pressure growth must keep up.
-    #[tokio::test]
+    ///
+    /// `start_paused` runs the wall-clock token bucket on VIRTUAL time, so
+    /// the run is fully deterministic — the old real-time `sleep`-driven
+    /// version could flake under CI load (backlog line 209).
+    #[tokio::test(start_paused = true)]
     async fn arrival_rate_grows_pool_to_keep_up_with_latency() {
         let sched = VUScheduler::new(&ExecutionConfig::ConstantArrivalRate {
             rate: 100.0,

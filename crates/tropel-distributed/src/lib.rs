@@ -252,8 +252,10 @@ mod tests {
         // P1 regression: report_and_thresholds only built stdout/json/csv
         // reporters and NEVER called emit_handle_summary, so summary_export
         // was silently dropped on distributed runs. It must write the file.
-        let dir =
-            std::env::temp_dir().join(format!("tropel-summary-export-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "tropel-summary-export-test-{}-report",
+            std::process::id()
+        ));
         let path = dir.with_extension("json");
         let _ = std::fs::remove_file(&path);
 

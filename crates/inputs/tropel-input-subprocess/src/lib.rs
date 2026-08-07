@@ -459,7 +459,12 @@ mod tests {
     /// echo/timeout behaviour with plain tools (`cat`, `sleep`) that would
     /// otherwise reject the unknown flag and exit 1.
     fn script_adapter(name: &str, body: &str) -> SubprocessAdapter {
-        let dir = std::env::temp_dir().join(format!("tropel-sub-tests-{}", std::process::id()));
+        // Per-test tag in the dir name (not just pid) so parallel tests in
+        // the same process don't clobber each other's scripts (backlog 209).
+        let dir = std::env::temp_dir().join(format!(
+            "tropel-sub-tests-{}-{name}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let path = dir.join(name);
         std::fs::write(&path, body).expect("write script");

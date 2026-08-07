@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn flush_appends_k6_ndjson() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("tropel-json-stream-{}.ndjson", std::process::id()));
+        let path = dir.join(format!("tropel-json-stream-{}-flush.ndjson", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         let output = JsonStreamOutput::new(path.to_string_lossy().to_string());
