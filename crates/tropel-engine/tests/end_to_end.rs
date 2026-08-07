@@ -51,42 +51,58 @@ async fn start_echo_server(seen: Arc<Mutex<Vec<String>>>) -> (std::net::SocketAd
             tokio::spawn(async move {
                 let now = active.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
-                // Read until the request-head terminator (headers end at
-                // CRLF CRLF). Loop so a split packet never loses the header.
-                let mut head = Vec::new();
                 let mut buf = [0u8; 4096];
-                loop {
-                    let n = match sock.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => n,
-                    };
-                    head.extend_from_slice(&buf[..n]);
-                    if head.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
+                // Keep-alive loop (like behavior_parity's echo server): the
+                // client pools HTTP/1.1 connections, and a server that drops
+                // the socket after one response races the client's reuse —
+                // occasionally failing a pooled request and flaking
+                // `checks_failed == 0` assertions. Run the per-connection
+                // body in a block so the active-count decrement is guaranteed
+                // on every exit path (clean close, read error, write error).
+                let conn_result: std::io::Result<()> = async {
+                    loop {
+                        // Read until the request-head terminator (headers end
+                        // at CRLF CRLF). A fresh head per request so a split
+                        // packet never loses the header across requests.
+                        let mut head = Vec::new();
+                        loop {
+                            let n = sock.read(&mut buf).await?;
+                            if n == 0 {
+                                return Ok(());
+                            }
+                            head.extend_from_slice(&buf[..n]);
+                            if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        let text = String::from_utf8_lossy(&head).to_string();
+                        for line in text.lines() {
+                            let lower = line.to_ascii_lowercase();
+                            if let Some(v) = lower.strip_prefix("x-e2e:") {
+                                // Poison-tolerant: a panicked test thread must
+                                // not let this connection task die before the
+                                // active-count decrement (which would inflate
+                                // peak forever).
+                                seen.lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .push(v.trim().to_string());
+                            }
+                        }
+                        // Hold the connection open so concurrent VUs overlap —
+                        // the same determinism trick as behavior_parity's
+                        // peak server.
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        let body = r#"{"ok":true}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        sock.write_all(resp.as_bytes()).await?;
                     }
                 }
-                let text = String::from_utf8_lossy(&head).to_string();
-                for line in text.lines() {
-                    let lower = line.to_ascii_lowercase();
-                    if let Some(v) = lower.strip_prefix("x-e2e:") {
-                        // Poison-tolerant: a panicked test thread must not let
-                        // this connection task die before the active-count
-                        // decrement (which would inflate peak forever).
-                        seen.lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push(v.trim().to_string());
-                    }
-                }
-                // Hold the connection open so concurrent VUs overlap — the
-                // same determinism trick as behavior_parity's peak server.
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                let body = r#"{"ok":true}"#;
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = sock.write_all(resp.as_bytes()).await;
+                .await;
+                let _ = conn_result;
                 active.fetch_sub(1, Ordering::SeqCst);
             });
         }

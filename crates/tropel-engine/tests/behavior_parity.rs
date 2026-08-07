@@ -134,6 +134,72 @@ async fn start_echo_server() -> std::net::SocketAddr {
     addr
 }
 
+/// Server that answers `500 Internal Server Error` — for the error-path
+/// tests that assert non-2xx drives `http_req_failed == 1.0`.
+async fn start_500_server() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                loop {
+                    let mut head = Vec::new();
+                    loop {
+                        let n = match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        head.extend_from_slice(&buf[..n]);
+                        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let body = r#"{"error":"boom"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    if sock.write_all(resp.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// Server that ACCEPTS connections but never responds — for the timeout
+/// test. The client's `request_timeout` must bound the hung request.
+async fn start_hung_server() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                // Swallow the request, never answer — hold the connection
+                // open until the client times out and closes it.
+                let mut buf = [0u8; 4096];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
 /// Write a minimal k6 script to a temp file. Uses `http.get` + `check` —
 /// the exact seam where a broken k6 shim, a broken HTTP bridge, or a broken
 /// `checks` recording would surface as zero samples.
@@ -150,6 +216,28 @@ import {{ check }} from 'k6';
 
 export default function () {{
   const res = http.get('{base}/');
+  check(res, {{ 'status is 200': (r) => r.status === 200 }});
+}}
+"#
+    );
+    std::fs::write(&path, script).unwrap();
+    path.to_string_lossy().to_string()
+}
+
+/// Variant with an explicit per-request `params.timeout` — k6's native way
+/// to bound a single request. The k6 driver wires `params.timeout` through
+/// to the client's per-request ceiling (the postman-path global
+/// `HttpConfig.request_timeout` does NOT reach the k6 driver), so a hung
+/// server is bounded by this.
+fn write_k6_timeout_script(base: &str, tag: &str, timeout: &str) -> String {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("tropel-k6-e2e-{}-{}.js", std::process::id(), tag));
+    let script = format!(
+        r#"import http from 'k6/http';
+import {{ check }} from 'k6';
+
+export default function () {{
+  const res = http.get('{base}/', {{ timeout: '{timeout}' }});
   check(res, {{ 'status is 200': (r) => r.status === 200 }});
 }}
 "#
@@ -316,6 +404,142 @@ async fn ramping_stages_span_wall_clock_and_reach_target() -> Result<()> {
         "http_reqs > 0 during ramp, got {}",
         m.http_reqs
     );
+
+    let _ = std::fs::remove_file(&coll);
+    Ok(())
+}
+
+/// Backlog P1 · the failure-path trio. Every other test server returns 200;
+/// nothing exercised `http_req_failed` — the metric that decides whether a
+/// load test found errors — against a real non-2xx response. A 500 with the
+/// default expected statuses (`200-399`) must drive `http_req_failed == 1.0`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_2xx_drives_http_req_failed() -> Result<()> {
+    let srv = start_500_server().await;
+    let coll = write_k6_script(&format!("http://{srv}"), "err500");
+    let config = JobConfig {
+        input: coll.clone(),
+        input_type: Some("k6".to_string()),
+        execution: ExecutionConfig::ConstantVus {
+            vus: 2,
+            duration: "2s".to_string(),
+            graceful_stop: Some("3s".to_string()),
+            think_time: ThinkTimeConfig::default(),
+        },
+        output: OutputConfig {
+            reporters: vec![],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let engine = Engine::new(ExtensionRegistry::new());
+    let result = engine.run(&config).await?;
+    let m = &result.metrics;
+
+    assert!(m.http_reqs > 0, "requests fired against the 500 server");
+    assert_eq!(
+        m.http_req_failed, 1.0,
+        "every request got a non-expected 500 -> http_req_failed == 1.0, got {}",
+        m.http_req_failed
+    );
+
+    let _ = std::fs::remove_file(&coll);
+    Ok(())
+}
+
+/// Backlog P1 · a server that ACCEPTS the connection but never responds
+/// must be bounded by the client's `request_timeout`, the failed request
+/// recorded as `http_req_failed`, and the RUN must still terminate (a hung
+/// VU must not hang the drain loop).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hung_server_is_bounded_by_request_timeout() -> Result<()> {
+    let srv = start_hung_server().await;
+    // k6's native per-request timeout: the k6 driver wires `params.timeout`
+    // through to the client ceiling (the postman-path global
+    // `HttpConfig.request_timeout` never reaches the k6 driver).
+    let coll = write_k6_timeout_script(&format!("http://{srv}"), "hung", "500ms");
+    let config = JobConfig {
+        input: coll.clone(),
+        input_type: Some("k6".to_string()),
+        execution: ExecutionConfig::ConstantVus {
+            vus: 2,
+            duration: "2s".to_string(),
+            graceful_stop: Some("3s".to_string()),
+            think_time: ThinkTimeConfig::default(),
+        },
+        output: OutputConfig {
+            reporters: vec![],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let engine = Engine::new(ExtensionRegistry::new());
+    let start = Instant::now();
+    let result = engine.run(&config).await?;
+    let elapsed = start.elapsed();
+    let m = &result.metrics;
+
+    // The run terminated (a 2s job plus graceful stop, well under 30s even
+    // with a 500ms per-request ceiling — proves the hung server couldn't
+    // stall the drain loop).
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "run terminated despite hung server, took {elapsed:?}"
+    );
+    assert!(m.http_reqs > 0, "requests fired against the hung server");
+    assert_eq!(
+        m.http_req_failed, 1.0,
+        "every request timed out -> http_req_failed == 1.0, got {}",
+        m.http_req_failed
+    );
+
+    let _ = std::fs::remove_file(&coll);
+    Ok(())
+}
+
+/// Backlog P1 · a connection-refused endpoint (bound then dropped) must be
+/// recorded as a failed request, not silently dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connection_refused_is_recorded_as_failure() -> Result<()> {
+    // Bind a listener to claim a port, grab the address, then drop the
+    // listener so connecting to the address is refused.
+    let refused_addr = {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        drop(listener);
+        addr
+    };
+    let coll = write_k6_script(&format!("http://{refused_addr}"), "refused");
+    let config = JobConfig {
+        input: coll.clone(),
+        input_type: Some("k6".to_string()),
+        execution: ExecutionConfig::ConstantVus {
+            vus: 2,
+            duration: "2s".to_string(),
+            graceful_stop: Some("3s".to_string()),
+            think_time: ThinkTimeConfig::default(),
+        },
+        output: OutputConfig {
+            reporters: vec![],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let engine = Engine::new(ExtensionRegistry::new());
+    let result = engine.run(&config).await?;
+    let m = &result.metrics;
+
+    assert_eq!(
+        m.http_req_failed, 1.0,
+        "connection refused -> http_req_failed == 1.0, got {}",
+        m.http_req_failed
+    );
+    // The k6 driver records transport failures as http_reqs + http_req_failed
+    // (no k6 `errors` counter — that metric is postman-runner-only).
+    assert!(m.http_reqs > 0, "requests fired against the refused port");
 
     let _ = std::fs::remove_file(&coll);
     Ok(())
