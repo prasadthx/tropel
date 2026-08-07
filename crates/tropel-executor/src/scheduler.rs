@@ -123,6 +123,57 @@ pub struct VUScheduler {
     control_tainted: Arc<AtomicBool>,
 }
 
+/// RAII guard for the arrival-rate idle count. Marks the VU idle on
+/// creation and busy on drop, so the count can't leak if the VU task is
+/// aborted or panics while waiting for an arrival token.
+pub struct IdleVusGuard<'a> {
+    sched: &'a VUScheduler,
+}
+
+impl<'a> IdleVusGuard<'a> {
+    pub fn new(sched: &'a VUScheduler) -> Self {
+        sched.mark_idle();
+        Self { sched }
+    }
+}
+
+impl Drop for IdleVusGuard<'_> {
+    fn drop(&mut self) {
+        self.sched.mark_busy();
+    }
+}
+
+/// RAII guard for the externally-controlled spawn count. Decrements
+/// [`VUScheduler::vu_exited`] when the VU task exits for ANY reason
+/// (stop / force-stop / panic / abort / iteration budget), so a VU that dies
+/// outside a ramp-down claim can't leave `target > spawned` permanently
+/// false. A successful ramp-down claim already decrements inside
+/// `try_claim_ramp_down`, so callers must [`Self::mark_claimed`] there to
+/// avoid a double decrement.
+pub struct ControlSpawnGuard<'a> {
+    sched: &'a VUScheduler,
+    claimed: bool,
+}
+
+impl<'a> ControlSpawnGuard<'a> {
+    pub fn new(sched: &'a VUScheduler) -> Self {
+        Self { sched, claimed: false }
+    }
+
+    /// Mark that the ramp-down claim path already decremented the count.
+    pub fn mark_claimed(&mut self) {
+        self.claimed = true;
+    }
+}
+
+impl Drop for ControlSpawnGuard<'_> {
+    fn drop(&mut self) {
+        if !self.claimed {
+            self.sched.vu_exited();
+        }
+    }
+}
+
 impl VUScheduler {
     /// Create a new VU scheduler from config.
     pub fn new(config: &ExecutionConfig) -> Self {
@@ -266,14 +317,54 @@ impl VUScheduler {
             || matches!(self.config.as_ref(), ExecutionConfig::RampingArrivalRate { .. })
     }
 
-    /// Mark a VU as idle (waiting for an arrival token).
+    /// Mark a VU as idle (waiting for an arrival token). Prefer the RAII
+    /// [`IdleVusGuard`] so an aborted/panicking VU can't leak the count.
     pub fn mark_idle(&self) {
         self.idle_vus.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Mark a VU as busy (acquired a token, about to execute).
+    ///
+    /// Saturating: a raw `fetch_sub` on an already-zero count would wrap to
+    /// `u32::MAX`, and `grow_arrival_pool` treats any non-zero idle count as
+    /// "pool has spare VUs" — permanently disabling growth for the run
+    /// (backlog line 170).
     pub fn mark_busy(&self) {
-        self.idle_vus.fetch_sub(1, Ordering::Relaxed);
+        self.idle_vus
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            })
+            .ok();
+    }
+
+    /// A VU task exited for ANY reason — decrement the logical
+    /// externally-controlled pool count so the control loop sees the loss
+    /// and re-spawns to target. Saturating: modes where the counter stays 0
+    /// are unaffected. Previously only a ramp-down claim decremented, so a
+    /// VU dying via stop/force-stop/panic/abort left `target > spawned`
+    /// permanently false — a silent undershoot with no re-spawn (backlog
+    /// line 170).
+    pub fn vu_exited(&self) {
+        self.control_spawned
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                Some(v.saturating_sub(1))
+            })
+            .ok();
+    }
+
+    /// Create the RAII guard that marks this VU idle and restores the count
+    /// when the VU task ends (covers the `mark_idle`..`mark_busy` window even
+    /// under abort/panic).
+    pub fn idle_guard(&self) -> IdleVusGuard<'_> {
+        IdleVusGuard::new(self)
+    }
+
+    /// Create the RAII guard that decrements [`Self::vu_exited`] when the VU
+    /// task exits for any reason. Call [`ControlSpawnGuard::mark_claimed`]
+    /// after a successful ramp-down claim (which already decrements) to
+    /// avoid a double decrement.
+    pub fn control_spawn_guard(&self) -> ControlSpawnGuard<'_> {
+        ControlSpawnGuard::new(self)
     }
 
     /// Current count of idle VUs (waiting for tokens).
@@ -614,11 +705,20 @@ impl VUScheduler {
 
             if target > current_vus {
                 // ── Linear ramp-up: spawn one VU every (duration / delta) ──
-                // No clear_ramp_down() here: if the previous ramp-down timed
-                // out with grace-expired stragglers still mid-iteration, they
-                // must still be able to claim a surplus slot and exit during
-                // this ramp-up. Stale state from a fully-drained ramp-down is
-                // harmless (remaining == 0 blocks claims; see clear below).
+                // Clear any leftover ramp-down state FIRST. A ramp-down that
+                // ended without draining (gracefulRampDown: "0s" makes
+                // wait_for_drain_while return false unconditionally, so EVERY
+                // ramp-down leaves remaining ≈ delta re-armed after the final
+                // set_ramp_down_target(target, current_vus)) would otherwise
+                // make each freshly spawned VU read active_vus > the stale
+                // OLD target, claim a surplus slot and self-exit at its loop
+                // top — silently eating up to delta VUs of this ramp-up.
+                // During a GROW stage every existing VU (including
+                // grace-expired stragglers from the previous ramp-down) is
+                // within the new, higher target, so nothing should exit here
+                // — matching the externally-controlled grow path, which
+                // clears ramp-down first for exactly this hazard.
+                self.clear_ramp_down();
                 let delta = target - current_vus;
                 let step_delay = stage_duration / delta;
                 for _ in 0..delta {
@@ -1234,6 +1334,12 @@ impl VUScheduler {
         // prevents busy-waiting; the 100ms tick bounds latency if a wake is
         // missed (notify_waiters is edge-triggered).
         loop {
+            // Reap finished VU handles so a long grow/shrink run can't
+            // accumulate completed JoinHandles unboundedly (each handle is
+            // only polled once at final join anyway). Dropping a finished
+            // handle is a no-op on the task itself.
+            handles.retain(|h| !h.is_finished());
+
             if self.is_stop_requested() || self.is_force_stop_requested() {
                 break;
             }
@@ -1619,6 +1725,102 @@ mod tests {
         assert_eq!(sched2.control_spawned.load(Ordering::Acquire), 0);
     }
 
+    /// Locked (backlog line 170): a VU exiting for ANY reason (not just a
+    /// ramp-down claim) must decrement the logical externally-controlled
+    /// pool, or `target > spawned` stays permanently false and the control
+    /// loop never re-spawns. `vu_exited` saturates so modes where the
+    /// counter stays 0 are unaffected.
+    #[tokio::test]
+    async fn vu_exited_decrements_saturating_and_guard_marks_claimed() {
+        let sched = VUScheduler::new(&ExecutionConfig::ExternallyControlled {
+            vus: 1,
+            max_vus: 10,
+            duration: None,
+            graceful_stop: None,
+            think_time: Default::default(),
+        });
+        sched.control_spawned.store(5, Ordering::Release);
+
+        // An unclaimed guard (VU died outside a ramp-down claim) decrements.
+        {
+            let guard = sched.control_spawn_guard();
+            assert!(!guard.claimed);
+        }
+        assert_eq!(sched.control_spawned.load(Ordering::Acquire), 4);
+
+        // A claimed guard (ramp-down claim already decremented) must NOT
+        // double-decrement.
+        {
+            let mut guard = sched.control_spawn_guard();
+            guard.mark_claimed();
+        }
+        assert_eq!(sched.control_spawned.load(Ordering::Acquire), 4);
+
+        // Saturating: never underflows to u32::MAX.
+        for _ in 0..6 {
+            sched.vu_exited();
+        }
+        assert_eq!(sched.control_spawned.load(Ordering::Acquire), 0);
+    }
+
+    /// Locked (backlog line 170): the idle count must be restored when the
+    /// VU task ends for any reason (abort/panic while waiting for a token),
+    /// and `mark_busy` must saturate — a raw `fetch_sub` underflow to
+    /// `u32::MAX` would make `grow_arrival_pool` see a huge idle count and
+    /// disable pool growth for the whole run.
+    #[tokio::test]
+    async fn idle_guard_restores_count_and_mark_busy_saturates() {
+        let sched = VUScheduler::new(&ExecutionConfig::ConstantArrivalRate {
+            rate: 1.0,
+            time_unit: "1s".to_string(),
+            duration: "1s".to_string(),
+            pre_alloc_vus: 1,
+            max_vus: 10,
+            graceful_stop: Some("1s".to_string()),
+            think_time: Default::default(),
+        });
+        assert_eq!(sched.idle_vu_count(), 0);
+
+        // Guard marks idle on creation and busy on drop.
+        {
+            let _guard = sched.idle_guard();
+            assert_eq!(sched.idle_vu_count(), 1);
+        }
+        assert_eq!(sched.idle_vu_count(), 0, "idle count must be restored on drop");
+
+        // mark_busy at 0 must saturate, not wrap to u32::MAX.
+        sched.mark_busy();
+        assert_eq!(sched.idle_vu_count(), 0, "mark_busy must saturate at zero");
+        sched.mark_busy();
+        assert_eq!(sched.idle_vu_count(), 0);
+    }
+
+    /// Locked (backlog line 170): the externally-controlled control loop
+    /// must reap finished VU handles each tick — otherwise a long grow/shrink
+    /// run accumulates completed JoinHandles unboundedly.
+    #[tokio::test]
+    async fn reap_finished_handles_keeps_only_live() {
+        let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        // Two short-lived VU tasks that finish quickly.
+        for _ in 0..2 {
+            handles.push(tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }));
+        }
+        // One long-lived VU task that outlives the reap.
+        handles.push(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }));
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let before = handles.len();
+        handles.retain(|h| !h.is_finished());
+        assert_eq!(handles.len(), 1, "finished handles must be reaped ({before} → {})", handles.len());
+
+        // The remaining live handle still completes normally.
+        handles.remove(0).await.unwrap();
+    }
+
     /// Fake VU body for the arrival-rate pool tests: marks itself idle, waits
     /// for an arrival token (or stop), then simulates `latency` of work per
     /// iteration — mirroring the real run_vu_loop arrival branch.
@@ -1630,22 +1832,26 @@ mod tests {
                 if sched.is_stop_requested() || sched.is_force_stop_requested() {
                     break;
                 }
-                sched.mark_idle();
                 let mut got_token = false;
-                loop {
-                    if sched.is_stop_requested() || sched.is_force_stop_requested() {
-                        break;
-                    }
-                    if sched.try_acquire_arrival_token() {
-                        got_token = true;
-                        break;
-                    }
-                    tokio::select! {
-                        _ = arrival_notify.notified() => {}
-                        _ = stop.notified() => {}
+                {
+                    // RAII idle — same guard the real loop uses, scoped to the
+                    // token wait ONLY (it must drop before the simulated work,
+                    // or the pool would see every VU as idle and never grow).
+                    let _idle_guard = sched.idle_guard();
+                    loop {
+                        if sched.is_stop_requested() || sched.is_force_stop_requested() {
+                            break;
+                        }
+                        if sched.try_acquire_arrival_token() {
+                            got_token = true;
+                            break;
+                        }
+                        tokio::select! {
+                            _ = arrival_notify.notified() => {}
+                            _ = stop.notified() => {}
+                        }
                     }
                 }
-                sched.mark_busy();
                 if !got_token {
                     break;
                 }

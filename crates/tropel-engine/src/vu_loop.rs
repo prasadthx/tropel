@@ -205,6 +205,14 @@ async fn run_vu_loop(
     vu_id: u32,
     source: &mut dyn VuIterationSource,
 ) {
+    // RAII: whenever this VU task exits for ANY reason (stop / force-stop /
+    // ramp-down / budget exhausted / panic / abort), keep the externally-
+    // controlled spawn count in sync so the control loop re-spawns to
+    // target. A successful ramp-down claim already decrements inside
+    // `try_claim_ramp_down`, so that path marks the guard claimed. Harmless
+    // in non-externally-controlled modes (counter stays 0, saturating).
+    let mut exit_guard = sched.control_spawn_guard();
+
     let mut iteration_index = 0u64;
     let mut vu_sample_counter: u64 = 0;
     // Time-based VU gauge cadence: vus/vus_max are ALSO sampled every ~2s
@@ -219,6 +227,9 @@ async fn run_vu_loop(
         {
             let active = sched.active_vus().await;
             if sched.try_claim_ramp_down(active).await {
+                // The claim already decremented control_spawned — don't let
+                // the exit guard double-decrement.
+                exit_guard.mark_claimed();
                 break;
             }
         }
@@ -261,7 +272,10 @@ async fn run_vu_loop(
         // woken by the stop signal so an idle VU observes the level-triggered
         // stop flag and exits promptly.
         if sched.is_arrival_rate() {
-            sched.mark_idle();
+            // RAII idle: restored to busy on drop, so an aborted/panicking
+            // VU can't leak the idle count (a leaked count looks like "pool
+            // has spare VUs" and permanently disables arrival-pool growth).
+            let _idle_guard = sched.idle_guard();
             let arrival_notify = sched.arrival_notify();
             let stop = sched.stop_signal();
             let mut got_token = false;
@@ -278,7 +292,6 @@ async fn run_vu_loop(
                     _ = stop.notified() => {}
                 }
             }
-            sched.mark_busy();
             if !got_token {
                 break;
             }
@@ -840,6 +853,11 @@ pub(crate) async fn run_driver_vus(
                     None => {
                         tracing::error!("VU {}: Driver '{}' not found in registry", vu_id, driver_id);
                         shared.vu_init_failures.fetch_add(1, Ordering::SeqCst);
+                        // This VU bails BEFORE `run_vu_loop` creates its
+                        // ControlSpawnGuard — decrement here so the
+                        // externally-controlled pool count can't go stale and
+                        // stall re-spawn (backlog line 170).
+                        sched.vu_exited();
                         return;
                     }
                 };
@@ -858,6 +876,9 @@ pub(crate) async fn run_driver_vus(
                             e
                         );
                         shared.vu_init_failures.fetch_add(1, Ordering::SeqCst);
+                        // Same accounting as the not-found bail above — the
+                        // ControlSpawnGuard hasn't been created yet.
+                        sched.vu_exited();
                         return;
                     }
                 };
