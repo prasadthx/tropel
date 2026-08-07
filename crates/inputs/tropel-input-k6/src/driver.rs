@@ -4858,6 +4858,387 @@ mod tests {
         js_ctx
     }
 
+    // ── lodash / CryptoJS shim fidelity (backlog line 155) ──
+
+    /// JsContext with native modules + the full base shim bundle (lodash,
+    /// CryptoJS, chai, exec) installed — the same bootstrap production VUs
+    /// get, so shim behavior is verified under real native crypto.
+    async fn ctx_with_base_shims() -> JsContext {
+        let mut js_ctx = JsContext::new(None, Some(Duration::from_secs(10)))
+            .await
+            .expect("context creation should succeed");
+        bootstrap_js_libs(&mut js_ctx)
+            .await
+            .expect("shim bootstrap should succeed");
+        js_ctx
+    }
+
+    #[tokio::test]
+    async fn test_lodash_get_bracket_and_primitive_paths() {
+        // Backlog line 155: `_.get(o,'a[0].b')` returned undefined and
+        // `_.get({name:'bob'},'name.length')` THREW ('length' in 'bob').
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                JSON.stringify([
+                    _.get({ a: [{ b: 42 }] }, 'a[0].b'),
+                    _.get({ name: 'bob' }, 'name.length'),
+                    _.get({ a: { b: null } }, 'a.b.c', 'fallback'),
+                ])
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, "[42,3,\"fallback\"]", "bracket paths + primitive .length + default");
+    }
+
+    #[tokio::test]
+    async fn test_lodash_every_object_matcher() {
+        // Backlog line 155: `_.every([{active:false}],{active:true})`
+        // returned TRUE (truthiness branch ignored the object predicate).
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                JSON.stringify([
+                    _.every([{active:false}], {active:true}),
+                    _.every([{active:true},{active:true}], {active:true}),
+                ])
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, "[false,true]", "object matcher must be honored");
+    }
+
+    #[tokio::test]
+    async fn test_lodash_set_blocks_proto_pollution() {
+        // Backlog line 155: `_.set({}, '__proto__.polluted', 1)` polluted
+        // the per-VU context for the whole run.
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                _.set({}, '__proto__.polluted', 1);
+                ({}).polluted === undefined && Object.prototype.polluted === undefined
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, "true", "prototype pollution must be blocked");
+    }
+
+    #[tokio::test]
+    async fn test_lodash_clone_deep_preserves_dates_and_cycles() {
+        // Backlog line 155: cloneDeep was JSON round-trip — Dates became
+        // strings and cycles threw.
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                var d = new Date(12345);
+                var cyc = { a: 1 }; cyc.self = cyc;
+                var c = _.cloneDeep({ d: d, u: undefined });
+                var cc = _.cloneDeep(cyc);
+                JSON.stringify([
+                    c.d instanceof Date,
+                    c.d.getTime(),
+                    'u' in c,
+                    cc.self === cc,
+                ])
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, "[true,12345,true,true]", "Dates preserved + cycles handled");
+    }
+
+    #[tokio::test]
+    async fn test_lodash_debounce_coalesces_and_throttle_default_fires() {
+        // Backlog line 155: debounce fired once PER CALL in a timer-less
+        // runtime (3 calls -> 3 invocations); throttle with no wait NEVER
+        // fired (`now - lastCall >= undefined` was always false).
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                var n = 0;
+                var d = _.debounce(function(){ n++; }, 100);
+                d(); d(); d();
+                var debounced = n;
+                n = 0;
+                var t = _.throttle(function(){ n++; });
+                t(); t(); t();
+                JSON.stringify([debounced, n])
+                "#,
+            )
+            .await
+            .unwrap();
+        // The eval pumps the microtask queue, so the coalesced debounce fires
+        // exactly once by the time we read `debounced`... actually the read
+        // happens synchronously in the same eval BEFORE the microtask. Assert
+        // debounced is 0 here and verify the coalesced single-fire below via
+        // an awaited tick.
+        assert_eq!(out, "[0,3]", "debounce must not fire per call; throttle(no wait) fires");
+    }
+
+    #[tokio::test]
+    async fn test_lodash_debounce_single_trailing_invocation() {
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval_async(
+                r#"
+                var n = 0;
+                var d = _.debounce(function(){ n++; }, 100);
+                d(); d(); d();
+                // eval_async uses plain ctx.eval (no top-level await). Return
+                // a promise instead: finish_promise drives the job queue in
+                // FIFO order, so the debounce's coalesced flush (queued by
+                // the 3 d() calls, BEFORE this .then) runs first, then this
+                // callback reads n.
+                Promise.resolve().then(function(){ return n; })
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, "1", "3 sync calls must coalesce to ONE trailing invocation");
+    }
+
+    #[tokio::test]
+    async fn test_lodash_object_collections_and_take_drop_chunk() {
+        // Backlog line 155: map/filter/find returned EMPTY for object
+        // collections; n===0 off-by-one in take/drop/chunk.
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                JSON.stringify([
+                    _.map({a:1,b:2}, function(v){ return v * 2; }),
+                    _.filter({a:1,b:0,c:3}, function(v){ return v > 0; }),
+                    _.find({a:1,b:2}, function(v){ return v === 2; }),
+                    _.take([1,2,3], 0),
+                    _.drop([1,2,3], 0),
+                    _.chunk([1,2,3], 0),
+                ])
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            "[[2,4],[1,3],2,[],[1,2,3],[]]",
+            "object collections + n===0 semantics"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lodash_merge_and_reduce_exist() {
+        // Backlog line 155: `_.merge`/`_.reduce` did not exist.
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                JSON.stringify([
+                    _.merge({a:{b:1}}, {a:{c:2}}),
+                    _.reduce([1,2,3,4], function(a,b){ return a + b; }, 0),
+                ])
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, "[{\"a\":{\"b\":1,\"c\":2}},10]", "merge deep-merges; reduce sums");
+    }
+
+    #[tokio::test]
+    async fn test_cryptojs_hashes_are_real() {
+        // Backlog line 155: the fallback FABRICATED a plausible digest
+        // (SHA1 and SHA512 of 'hello' both returned 05e918d2...).
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                JSON.stringify([
+                    CryptoJS.SHA1('hello').toString(),
+                    CryptoJS.SHA256('hello').toString(),
+                    CryptoJS.SHA256('').toString(),
+                    CryptoJS.SHA512('hello').toString(),
+                ])
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            "[\"aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d\",\"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\",\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\"9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca72323c3d99ba5c11d7c7acc6e14b8c5da0c4663475c2e5c3adef46f73bcdec043\"]",
+            "real digests must match known vectors"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cryptojs_sha3_is_keccak_512() {
+        // Backlog line 155: SHA3 was SHA3-256; CryptoJS.SHA3 defaults to
+        // KECCAK-512. SHA3('hello') must match the Keccak-512 vector.
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                JSON.stringify([
+                    CryptoJS.SHA3('hello').toString(),
+                    CryptoJS.SHA3('hello', 256).toString(),
+                ])
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            "[\"52fa80662e64c128f8389c9ea6c73d4c02368004bf4463491900d11aaadca39d47de1b01361f207c512cfa79f0f92c3395c67ff7928e3f5ce3e3c852b392f976\",\"1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8\"]",
+            "SHA3 default must be Keccak-512 (hello = 52fa…6f976, 256-bit = 1c8a…eac8)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cryptojs_base64_parse_padding_and_wordarray_create() {
+        // Backlog line 155: Base64.parse corrupted EVERY padded input ('='
+        // was in the alphabet at index 64); WordArray.create ignored args.
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                JSON.stringify([
+                    CryptoJS.enc.Utf8.stringify(CryptoJS.enc.Base64.parse('aGVsbG8=')),
+                    CryptoJS.enc.Utf8.stringify(CryptoJS.enc.Base64.parse('aGk=')),
+                    CryptoJS.lib.WordArray.create([0x12345678], 4).toString(),
+                ])
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            "[\"hello\",\"hi\",\"12345678\"]",
+            "padded base64 round-trips; WordArray.create honors args"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cryptojs_utf8_emoji_is_4byte() {
+        // Backlog line 155: Utf8.parse emitted CESU-8 (two 3-byte sequences)
+        // for emoji instead of one 4-byte UTF-8 code point.
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                CryptoJS.enc.Utf8.parse('\u{1F600}').toString(CryptoJS.enc.Hex)
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, "f09f9880", "emoji must encode as a single 4-byte UTF-8 sequence");
+    }
+
+    #[tokio::test]
+    async fn test_cryptojs_aes_default_cbc_and_mode_pad_namespaces() {
+        // Backlog line 155: AES defaulted to GCM (CryptoJS defaults to
+        // CBC/PKCS7), and CryptoJS.mode/CryptoJS.pad did not exist so the
+        // universal incantation TypeErrored.
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                var key = CryptoJS.lib.WordArray.random(32);
+                var iv = CryptoJS.lib.WordArray.random(16);
+                var ct = CryptoJS.AES.encrypt('hello world', key, {
+                    mode: CryptoJS.mode.CBC,
+                    padding: CryptoJS.pad.Pkcs7,
+                    iv: iv
+                });
+                var pt = CryptoJS.enc.Utf8.stringify(
+                    CryptoJS.AES.decrypt(ct, key, {
+                        mode: CryptoJS.mode.CBC,
+                        padding: CryptoJS.pad.Pkcs7
+                    })
+                );
+                // Also verify the default (no options) is a working CBC round-trip.
+                var ct2 = CryptoJS.AES.encrypt('abc', key);
+                var pt2 = CryptoJS.enc.Utf8.stringify(CryptoJS.AES.decrypt(ct2, key));
+                JSON.stringify([pt, pt2])
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            "[\"hello world\",\"abc\"]",
+            "CBC/PKCS7 with mode+pad namespaces must round-trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cryptojs_aes_128_192_keys_accepted() {
+        // Backlog line 155: AES-128/192 were rejected (hardcoded 32-byte).
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                var k16 = CryptoJS.enc.Hex.parse('000102030405060708090a0b0c0d0e0f');
+                var k24 = CryptoJS.enc.Hex.parse('000102030405060708090a0b0c0d0e0f1011121314151617');
+                var c16 = CryptoJS.AES.encrypt('sixteen', k16);
+                var c24 = CryptoJS.AES.encrypt('twentyfour', k24);
+                JSON.stringify([
+                    CryptoJS.enc.Utf8.stringify(CryptoJS.AES.decrypt(c16, k16)),
+                    CryptoJS.enc.Utf8.stringify(CryptoJS.AES.decrypt(c24, k24)),
+                ])
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, "[\"sixteen\",\"twentyfour\"]", "AES-128/192 must round-trip");
+    }
+
+    #[tokio::test]
+    async fn test_cryptojs_aes_decrypt_uses_passed_key() {
+        // Backlog line 155: `ciphertext.key || key` IGNORED the passed key,
+        // so a wrong-password decrypt "succeeded" against the embedded key.
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                var key = CryptoJS.enc.Hex.parse('000102030405060708090a0b0c0d0e0f');
+                var wrong = CryptoJS.enc.Hex.parse('000102030405060708090a0b0c0d0e10');
+                var ct = CryptoJS.AES.encrypt('secret', key);
+                var threw = false;
+                try {
+                    var out = CryptoJS.enc.Utf8.stringify(CryptoJS.AES.decrypt(ct, wrong));
+                    if (out !== 'secret') threw = true;
+                } catch (e) { threw = true; }
+                threw
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, "true", "wrong key must fail (not silently use embedded key)");
+    }
+
+    #[tokio::test]
+    async fn test_cryptojs_aes_passphrase_roundtrip() {
+        // Passphrase path: EVP_BytesToKey + Salted__ header round-trip.
+        let mut ctx = ctx_with_base_shims().await;
+        let out = ctx
+            .eval(
+                r#"
+                var ct = CryptoJS.AES.encrypt('phrase msg', 'correct horse');
+                var s = ct.toString();
+                var back = CryptoJS.enc.Utf8.stringify(CryptoJS.AES.decrypt(s, 'correct horse'));
+                JSON.stringify([s.slice(0, 8) === 'U2FsdGVk', back])
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, "[true,\"phrase msg\"]", "passphrase encrypt/decrypt round-trips");
+    }
+
     fn temp_script_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "tropel-k6-open-{}-{}",

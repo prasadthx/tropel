@@ -7,7 +7,10 @@ var _ = _ || {};
 (function () {
     // ── Array ──
     _.chunk = function (array, size) {
-        size = Math.max(size, 1);
+        // n===0 off-by-one (backlog line 155): size 0 -> [] (not 1-element
+        // chunks), and undefined -> lodash default 1.
+        size = size === undefined ? 1 : size;
+        if (size <= 0) return [];
         var result = [];
         for (var i = 0; i < array.length; i += size) {
             result.push(array.slice(i, i + size));
@@ -31,13 +34,13 @@ var _ = _ || {};
     };
 
     _.drop = function (array, n) {
-        n = n || 1;
+        n = n === undefined ? 1 : n;
         return array.slice(n);
     };
 
     _.dropRight = function (array, n) {
-        n = n || 1;
-        return array.slice(0, array.length - n);
+        n = n === undefined ? 1 : n;
+        return array.slice(0, Math.max(0, array.length - n));
     };
 
     _.fill = function (array, value, start, end) {
@@ -174,8 +177,8 @@ var _ = _ || {};
     };
 
     _.tail = function (array) { return array.slice(1); };
-    _.take = function (array, n) { n = n || 1; return array.slice(0, n); };
-    _.takeRight = function (array, n) { n = n || 1; return array.slice(Math.max(0, array.length - n)); };
+    _.take = function (array, n) { n = n === undefined ? 1 : n; return array.slice(0, n); };
+    _.takeRight = function (array, n) { n = n === undefined ? 1 : n; return array.slice(Math.max(0, array.length - n)); };
     _.union = function () {
         var args = Array.prototype.slice.call(arguments);
         var result = [];
@@ -224,52 +227,66 @@ var _ = _ || {};
     _.forEach = _.each;
 
     _.every = function (collection, predicate) {
-        if (typeof predicate === 'function') {
-            for (var i = 0; i < collection.length; i++) {
-                if (!predicate(collection[i], i, collection)) return false;
-            }
-        } else {
-            for (var i = 0; i < collection.length; i++) {
-                if (!collection[i]) return false;
+        // Iterate objects by key too, and honor object/matcher predicates
+        // (backlog line 155): `_.every([{active:false}],{active:true})` must
+        // be false — the old truthiness branch returned true.
+        var keys = Array.isArray(collection) ? null : Object.keys(collection || {});
+        var len = keys ? keys.length : (collection ? collection.length : 0);
+        for (var i = 0; i < len; i++) {
+            var item = keys ? collection[keys[i]] : collection[i];
+            if (typeof predicate === 'function') {
+                if (!predicate(item, keys ? keys[i] : i, collection)) return false;
+            } else if (predicate !== null && typeof predicate === 'object') {
+                var match = true;
+                for (var k in predicate) {
+                    if (item[k] !== predicate[k]) { match = false; break; }
+                }
+                if (!match) return false;
+            } else {
+                if (!item) return false;
             }
         }
         return true;
     };
 
     _.filter = function (collection, predicate) {
+        // Object collections iterate by key (backlog line 155) — the old
+        // `collection.length` loop returned empty for objects.
+        var keys = Array.isArray(collection) ? null : Object.keys(collection || {});
+        var len = keys ? keys.length : (collection ? collection.length : 0);
         var result = [];
-        if (typeof predicate === 'function') {
-            for (var i = 0; i < collection.length; i++) {
-                if (predicate(collection[i], i, collection)) result.push(collection[i]);
-            }
-        } else if (typeof predicate === 'object') {
-            for (var i = 0; i < collection.length; i++) {
+        for (var i = 0; i < len; i++) {
+            var item = keys ? collection[keys[i]] : collection[i];
+            if (typeof predicate === 'function') {
+                if (predicate(item, keys ? keys[i] : i, collection)) result.push(item);
+            } else if (predicate !== null && typeof predicate === 'object') {
                 var match = true;
                 for (var k in predicate) {
-                    if (collection[i][k] !== predicate[k]) { match = false; break; }
+                    if (item[k] !== predicate[k]) { match = false; break; }
                 }
-                if (match) result.push(collection[i]);
-            }
-        } else {
-            for (var i = 0; i < collection.length; i++) {
-                if (collection[i]) result.push(collection[i]);
+                if (match) result.push(item);
+            } else {
+                if (item) result.push(item);
             }
         }
         return result;
     };
 
     _.find = function (collection, predicate) {
-        if (typeof predicate === 'function') {
-            for (var i = 0; i < collection.length; i++) {
-                if (predicate(collection[i], i, collection)) return collection[i];
-            }
-        } else if (typeof predicate === 'object') {
-            for (var i = 0; i < collection.length; i++) {
+        var keys = Array.isArray(collection) ? null : Object.keys(collection || {});
+        var len = keys ? keys.length : (collection ? collection.length : 0);
+        for (var i = 0; i < len; i++) {
+            var item = keys ? collection[keys[i]] : collection[i];
+            if (typeof predicate === 'function') {
+                if (predicate(item, keys ? keys[i] : i, collection)) return item;
+            } else if (predicate !== null && typeof predicate === 'object') {
                 var match = true;
                 for (var k in predicate) {
-                    if (collection[i][k] !== predicate[k]) { match = false; break; }
+                    if (item[k] !== predicate[k]) { match = false; break; }
                 }
-                if (match) return collection[i];
+                if (match) return item;
+            } else if (predicate === undefined) {
+                if (item) return item;
             }
         }
         return undefined;
@@ -287,14 +304,24 @@ var _ = _ || {};
     };
 
     _.map = function (collection, iteratee) {
+        // Object collections iterate by key (backlog line 155).
+        var keys = Array.isArray(collection) ? null : Object.keys(collection || {});
+        var len = keys ? keys.length : (collection ? collection.length : 0);
         var result = [];
-        if (typeof iteratee === 'function') {
-            for (var i = 0; i < collection.length; i++) {
-                result.push(iteratee(collection[i], i, collection));
-            }
-        } else if (typeof iteratee === 'string') {
-            for (var i = 0; i < collection.length; i++) {
-                result.push(collection[i][iteratee]);
+        for (var i = 0; i < len; i++) {
+            var item = keys ? collection[keys[i]] : collection[i];
+            if (typeof iteratee === 'function') {
+                result.push(iteratee(item, keys ? keys[i] : i, collection));
+            } else if (typeof iteratee === 'string') {
+                result.push(item[iteratee]);
+            } else if (iteratee !== null && typeof iteratee === 'object') {
+                var match = true;
+                for (var k in iteratee) {
+                    if (item[k] !== iteratee[k]) { match = false; break; }
+                }
+                result.push(!!match);
+            } else {
+                result.push(item);
             }
         }
         return result;
@@ -365,17 +392,39 @@ var _ = _ || {};
 
     _.debounce = function (func, wait) {
         var timeout;
+        var pending = null; // { ctx, args } — latest call wins
+        var scheduled = false;
         return function () {
             var context = this;
-            var args = arguments;
-            cancelTimeout(timeout);
-            timeout = scheduleTimeout(function () {
-                func.apply(context, args);
-            }, wait);
+            var args = Array.prototype.slice.call(arguments);
+            if (typeof clearTimeout === 'function') cancelTimeout(timeout);
+            if (typeof setTimeout === 'function' && wait !== undefined) {
+                timeout = setTimeout(function () { func.apply(context, args); }, wait);
+                return;
+            }
+            // Timer-less runtime (backlog line 155): 3 sync calls must NOT
+            // invoke 3 times. Coalesce into ONE trailing microtask flush
+            // using the LATEST call's context/args.
+            pending = { ctx: context, args: args };
+            if (!scheduled) {
+                scheduled = true;
+                Promise.resolve().then(function () {
+                    scheduled = false;
+                    if (pending) {
+                        var p = pending;
+                        pending = null;
+                        func.apply(p.ctx, p.args);
+                    }
+                });
+            }
         };
     };
 
     _.throttle = function (func, wait) {
+        // wait===undefined defaults to 0 (lodash) — the old `>= undefined`
+        // comparison was always false, so a bare throttle NEVER fired
+        // (backlog line 155).
+        wait = wait || 0;
         var lastCall = 0;
         return function () {
             var now = Date.now();
@@ -396,7 +445,29 @@ var _ = _ || {};
     };
 
     _.cloneDeep = function (value) {
-        return JSON.parse(JSON.stringify(value));
+        // Real recursive deep clone — JSON round-trip threw on undefined /
+        // cycles and converted Dates to strings (backlog line 155). Cycles
+        // resolve to the in-progress clone; Dates/RegExps are preserved.
+        var seen = [];
+        function deep(v) {
+            if (v === null || typeof v !== 'object') return v;
+            if (v instanceof Date) return new Date(v.getTime());
+            if (v instanceof RegExp) return new RegExp(v.source, v.flags);
+            for (var s = 0; s < seen.length; s++) {
+                if (seen[s].src === v) return seen[s].dst;
+            }
+            var out = Array.isArray(v) ? [] : {};
+            seen.push({ src: v, dst: out });
+            if (Array.isArray(v)) {
+                for (var i = 0; i < v.length; i++) out[i] = deep(v[i]);
+            } else {
+                for (var k in v) {
+                    if (Object.prototype.hasOwnProperty.call(v, k)) out[k] = deep(v[k]);
+                }
+            }
+            return out;
+        }
+        return deep(value);
     };
 
     function isEqualDeep(a, b) {
@@ -478,6 +549,23 @@ var _ = _ || {};
     _.sum = function (array) {
         return array.reduce(function (a, b) { return a + b; }, 0);
     };
+
+    // Collection reduce with optional accumulator; works on objects too
+    // (backlog line 155: `_.reduce` did not exist).
+    _.reduce = function (collection, iteratee, accumulator) {
+        var keys = Array.isArray(collection) ? null : Object.keys(collection || {});
+        var len = keys ? keys.length : (collection ? collection.length : 0);
+        var hasAcc = arguments.length >= 3;
+        var acc = hasAcc ? accumulator : undefined;
+        var first = true;
+        for (var i = 0; i < len; i++) {
+            var item = keys ? collection[keys[i]] : collection[i];
+            var idx = keys ? keys[i] : i;
+            if (!hasAcc && first) { acc = item; first = false; continue; }
+            acc = iteratee(acc, item, idx, collection);
+        }
+        return acc;
+    };
     _.mean = function (array) {
         return _.sum(array) / array.length;
     };
@@ -504,7 +592,7 @@ var _ = _ || {};
         sources.forEach(function (src) {
             if (src) {
                 for (var k in src) {
-                    if (src.hasOwnProperty(k)) object[k] = src[k];
+                    if (src.hasOwnProperty(k) && !unsafeKey(k)) object[k] = src[k];
                 }
             }
         });
@@ -516,7 +604,7 @@ var _ = _ || {};
         sources.forEach(function (src) {
             if (src) {
                 for (var k in src) {
-                    if (object[k] === undefined) object[k] = src[k];
+                    if (object[k] === undefined && !unsafeKey(k)) object[k] = src[k];
                 }
             }
         });
@@ -525,36 +613,101 @@ var _ = _ || {};
 
     _.extend = _.assign;
 
+    // Deep merge (backlog line 155: `_.merge` did not exist). Arrays and
+    // plain objects merge recursively; prototype-pollution keys are skipped.
+    _.merge = function (object) {
+        var sources = Array.prototype.slice.call(arguments, 1);
+        function mergeInto(target, src) {
+            if (src === null || typeof src !== 'object') return src;
+            if (Array.isArray(src)) {
+                var arr = Array.isArray(target) ? target.slice() : [];
+                for (var i = 0; i < src.length; i++) {
+                    arr[i] = (typeof src[i] === 'object' && src[i] !== null && i < arr.length)
+                        ? mergeInto(arr[i], src[i])
+                        : src[i];
+                }
+                return arr;
+            }
+            if (src instanceof Date) return new Date(src.getTime());
+            var out = (target !== null && typeof target === 'object' && !Array.isArray(target))
+                ? target
+                : {};
+            for (var k in src) {
+                if (src.hasOwnProperty(k) && !unsafeKey(k)) {
+                    if (src[k] !== null && typeof src[k] === 'object' && !(src[k] instanceof Date)) {
+                        out[k] = mergeInto(out[k], src[k]);
+                    } else {
+                        out[k] = src[k];
+                    }
+                }
+            }
+            return out;
+        }
+        sources.forEach(function (src) {
+            if (src !== null && typeof src === 'object') {
+                for (var k in src) {
+                    if (src.hasOwnProperty(k) && !unsafeKey(k)) {
+                        object[k] = mergeInto(object[k], src[k]);
+                    }
+                }
+            }
+        });
+        return object;
+    };
+
+    // Parse lodash-style paths incl. bracket notation: 'a[0].b' -> ['a','0','b']
+    // (backlog line 155: _.get on such paths returned undefined).
+    function toPath(path) {
+        if (Array.isArray(path)) return path;
+        var parts = [];
+        var re = /\.?([^.\[\]]+)|\[(\d+)\]/g;
+        var m;
+        while ((m = re.exec(String(path))) !== null) {
+            if (m[1] !== undefined) parts.push(m[1]);
+            else parts.push(parseInt(m[2], 10));
+        }
+        return parts;
+    }
+
+    function unsafeKey(k) {
+        return k === '__proto__' || k === 'constructor' || k === 'prototype';
+    }
+
     _.has = function (object, path) {
-        if (typeof path === 'string') path = path.split('.');
+        var parts = toPath(path);
         var current = object;
-        for (var i = 0; i < path.length; i++) {
+        for (var i = 0; i < parts.length; i++) {
             if (current === null || current === undefined) return false;
-            if (!(path[i] in current)) return false;
-            current = current[path[i]];
+            // `in` on primitives ('length' in 'bob') THROWS — box it.
+            if (!(parts[i] in Object(current))) return false;
+            current = current[parts[i]];
         }
         return true;
     };
 
     _.get = function (object, path, defaultValue) {
-        if (typeof path === 'string') path = path.split('.');
+        var parts = toPath(path);
         var current = object;
-        for (var i = 0; i < path.length; i++) {
+        for (var i = 0; i < parts.length; i++) {
             if (current === null || current === undefined) return defaultValue;
-            if (!(path[i] in current)) return defaultValue;
-            current = current[path[i]];
+            if (!(parts[i] in Object(current))) return defaultValue;
+            current = current[parts[i]];
         }
         return current !== undefined ? current : defaultValue;
     };
 
     _.set = function (object, path, value) {
-        if (typeof path === 'string') path = path.split('.');
+        // Block prototype-pollution keys (backlog line 155): setting
+        // '__proto__.polluted' must not mutate Object.prototype.
+        var parts = toPath(path);
         var current = object;
-        for (var i = 0; i < path.length - 1; i++) {
-            if (!(path[i] in current)) current[path[i]] = {};
-            current = current[path[i]];
+        for (var i = 0; i < parts.length - 1; i++) {
+            if (unsafeKey(parts[i])) return object;
+            if (!(parts[i] in Object(current))) current[parts[i]] = {};
+            current = current[parts[i]];
         }
-        current[path[path.length - 1]] = value;
+        var last = parts[parts.length - 1];
+        if (!unsafeKey(last)) current[last] = value;
         return object;
     };
 

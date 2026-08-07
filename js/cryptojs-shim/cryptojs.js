@@ -21,8 +21,19 @@ var CryptoJS = CryptoJS || {};
         return this;
     };
 
-    WordArray.create = function () {
-        return new WordArray();
+    WordArray.create = function (words, sigBytes) {
+        // Backlog line 155: the old signature IGNORED its arguments.
+        return new WordArray(words, sigBytes);
+    };
+
+    // CryptoJS.lib.WordArray.random(nBytes) — CSPRNG-backed, so scripts that
+    // generate keys/IVs with it behave identically to real CryptoJS. Fails
+    // loudly if the CSPRNG is unavailable (never falls back to weak bytes).
+    WordArray.random = function (nBytes) {
+        if (typeof __tropel_native_random_bytes === 'function') {
+            return wordArrayFromBytes(__tropel_native_random_bytes(nBytes));
+        }
+        throw new Error('CSPRNG unavailable: cannot generate random bytes');
     };
 
     function wordArrayFromBytes(bytes) {
@@ -102,18 +113,28 @@ var CryptoJS = CryptoJS || {};
             if (typeof __tropel_native_base64_decode === 'function') {
                 return wordArrayFromBytes(__tropel_native_base64_decode(base64Str));
             }
-            var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+            // Fallback (no native): the old alphabet contained '=' at index
+            // 64, so every PADDED input decoded garbage bytes (backlog 155).
+            var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+            var s = String(base64Str);
+            var pad = 0;
+            while (s.charAt(s.length - 1 - pad) === '=') pad++;
+            var cleaned = s.replace(/[^A-Za-z0-9+/]/g, '');
+            var expected = Math.floor((cleaned.length * 3) / 4) - pad;
             var bytes = [];
-            base64Str = base64Str.replace(/[^A-Za-z0-9+/=]/g, '');
-            for (var i = 0; i < base64Str.length; i += 4) {
-                var c1 = chars.indexOf(base64Str[i] || '=');
-                var c2 = chars.indexOf(base64Str[i + 1] || '=');
-                var c3 = chars.indexOf(base64Str[i + 2] || '=');
-                var c4 = chars.indexOf(base64Str[i + 3] || '=');
-                if (c1 >= 0) bytes.push((c1 << 2) | (c2 >> 4));
-                if (c3 >= 0) bytes.push(((c2 & 15) << 4) | (c3 >> 2));
-                if (c4 >= 0) bytes.push(((c3 & 3) << 6) | c4);
+            var buffer = 0;
+            var bits = 0;
+            for (var i = 0; i < cleaned.length; i++) {
+                var v = chars.indexOf(cleaned.charAt(i));
+                if (v < 0) continue;
+                buffer = (buffer << 6) | v;
+                bits += 6;
+                if (bits >= 8) {
+                    bits -= 8;
+                    bytes.push((buffer >> bits) & 0xFF);
+                }
             }
+            if (bytes.length > expected) bytes.length = expected;
             return wordArrayFromBytes(bytes);
         }
     };
@@ -127,9 +148,24 @@ var CryptoJS = CryptoJS || {};
             }).join(''));
         },
         parse: function (str) {
+            // Backlog line 155: surrogate pairs (emoji) were encoded as
+            // CESU-8 (two 3-byte sequences) instead of one 4-byte UTF-8
+            // code point.
             var bytes = [];
             for (var i = 0; i < str.length; i++) {
                 var c = str.charCodeAt(i);
+                if (c >= 0xD800 && c <= 0xDBFF && i + 1 < str.length) {
+                    var lo = str.charCodeAt(i + 1);
+                    if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                        var cp = 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00);
+                        bytes.push(0xF0 | (cp >> 18));
+                        bytes.push(0x80 | ((cp >> 12) & 0x3F));
+                        bytes.push(0x80 | ((cp >> 6) & 0x3F));
+                        bytes.push(0x80 | (cp & 0x3F));
+                        i++;
+                        continue;
+                    }
+                }
                 if (c < 0x80) {
                     bytes.push(c);
                 } else if (c < 0x800) {
@@ -163,6 +199,9 @@ var CryptoJS = CryptoJS || {};
     // ── Hasher ──
     function Hasher(algorithm) {
         this._algorithm = algorithm;
+        // Backlog line 155: `SHA256('')` threw because finalize() touched
+        // uninitialized `_data` (the old code only created it in update()).
+        this.reset();
     }
 
     Hasher.prototype.reset = function () {
@@ -179,7 +218,9 @@ var CryptoJS = CryptoJS || {};
     };
 
     Hasher.prototype.finalize = function (messageUpdate) {
-        if (messageUpdate) this.update(messageUpdate);
+        // `''` is a valid message — the old truthiness check skipped it and
+        // finalize() then crashed on undefined _data (backlog line 155).
+        if (messageUpdate !== undefined && messageUpdate !== null) this.update(messageUpdate);
         var allBytes = [];
         for (var i = 0; i < this._data.length; i++) {
             allBytes = allBytes.concat(bytesFromWordArray(this._data[i]));
@@ -223,10 +264,24 @@ var CryptoJS = CryptoJS || {};
                 }
                 break;
             case 'SHA3':
-                if (typeof __tropel_native_sha3_256 === 'function') {
-                    result = wordArrayFromBytes(__tropel_native_sha3_256(allBytes));
+                // CryptoJS.SHA3 is KECCAK-512 by default (original padding
+                // 0x01), NOT NIST SHA3-256 — they differ on every input
+                // (backlog line 155). `_outputLength` defaults to 512 bits.
+                // Fail loudly on unsupported lengths (native keccak supports
+                // 224/256/384/512) instead of fabricating a wrong digest.
+                if (typeof __tropel_native_keccak === 'function') {
+                    var bits = this._outputLength || 512;
+                    var keccakOut = __tropel_native_keccak(allBytes, bits);
+                    if (keccakOut !== null && keccakOut !== undefined) {
+                        result = wordArrayFromBytes(keccakOut);
+                    } else {
+                        throw new Error(
+                            'SHA3 output length must be 224, 256, 384, or 512 bits (got ' +
+                                bits + ')'
+                        );
+                    }
                 } else {
-                    result = this._fallbackHash(allBytes, 'SHA3');
+                    throw new Error('SHA3 unavailable: native keccak not installed');
                 }
                 break;
             case 'RIPEMD160':
@@ -244,15 +299,13 @@ var CryptoJS = CryptoJS || {};
         return result;
     };
 
-    Hasher.prototype._fallbackHash = function (bytes, algorithm) {
-        // Simple fallback for environments without native crypto
-        var hash = 0;
-        for (var i = 0; i < bytes.length; i++) {
-            hash = ((hash << 5) - hash) + bytes[i];
-            hash = hash & hash; // Convert to 32bit integer
-        }
-        var words = [hash, hash >>> 16, hash, hash >>> 16];
-        return new WordArray(words, 16);
+    Hasher.prototype._fallbackHash = function (_bytes, algorithm) {
+        // Backlog line 155: the old fallback FABRICATED a plausible-looking
+        // digest (every algorithm returned the same made-up words), silently
+        // corrupting hashes when native crypto was absent. Native crypto is
+        // always installed by Tropel, so a missing function is a real error:
+        // fail loudly instead of returning a fake hash.
+        throw new Error('Native ' + algorithm + ' is not available in this runtime');
     };
 
     function createHasher(algorithm) {
@@ -299,6 +352,8 @@ var CryptoJS = CryptoJS || {};
 
     CryptoJS.SHA3 = function (message, outputLength) {
         var hasher = createHasher('SHA3');
+        // CryptoJS default is 512 bits; 224/256/384 also supported.
+        hasher._outputLength = outputLength || 512;
         return hasher.finalize(message);
     };
 
@@ -374,6 +429,33 @@ var CryptoJS = CryptoJS || {};
         }
     };
 
+    // ── Mode / padding namespaces (backlog line 155) ──
+    // The universal CryptoJS incantation `{ mode: CryptoJS.mode.CBC,
+    // padding: CryptoJS.pad.Pkcs7 }` previously TypeErrored because these
+    // namespaces did not exist. They are marker objects — the shim resolves
+    // them by `.name` and otherwise defaults to CryptoJS's CBC/PKCS7.
+    CryptoJS.mode = {
+        CBC: { name: 'CBC' },
+        ECB: { name: 'ECB' },
+        CFB: { name: 'CFB' },
+        OFB: { name: 'OFB' },
+        CTR: { name: 'CTR' },
+    };
+    CryptoJS.pad = {
+        Pkcs7: { name: 'Pkcs7' },
+        AnsiX923: { name: 'AnsiX923' },
+        Iso10126: { name: 'Iso10126' },
+        Iso97971: { name: 'Iso97971' },
+        ZeroPadding: { name: 'ZeroPadding' },
+        NoPadding: { name: 'NoPadding' },
+    };
+
+    function resolveMode(mode) {
+        if (typeof mode === 'string') return mode;
+        if (mode && mode.name) return mode.name;
+        return undefined;
+    }
+
     // ── AES (real encryption via native Rust) ──
     /// Derive a key+IV from a passphrase using OpenSSL-compatible EVP_BytesToKey.
     /// For AES-256-GCM: key=32 bytes, iv=12 bytes.
@@ -408,9 +490,10 @@ var CryptoJS = CryptoJS || {};
             var plainBytes = bytesFromWordArray(msgBytes);
 
             options = options || {};
-            var mode = options.mode || 'GCM';
+            // CryptoJS default is CBC/PKCS7, not GCM (backlog line 155).
+            var mode = resolveMode(options.mode) || 'CBC';
             var ivLen = mode === 'CBC' ? 16 : 12;
-            var keyLen = 32; // AES-256
+            var keyLen = 32; // AES-256 passphrase derivation (CryptoJS default)
 
             var keyBytes;
             var keyWordArr;
@@ -425,13 +508,12 @@ var CryptoJS = CryptoJS || {};
                 if (typeof __tropel_native_random_bytes === 'function') {
                     saltBytes = __tropel_native_random_bytes(8);
                 } else {
-                    // Fallback: use Date.now (not cryptographically secure)
-                    saltBytes = [];
-                    var ts = Date.now();
-                    for (var i = 0; i < 8; i++) {
-                        saltBytes.push(ts & 0xFF);
-                        ts = ts >>> 8;
-                    }
+                    // Backlog line 155: a Date.now()-derived salt under a
+                    // fixed passphrase enables key-reuse attacks — fail
+                    // loudly instead of emitting trivially broken ciphertext.
+                    throw new Error(
+                        'CSPRNG unavailable: cannot generate a random salt for passphrase encryption'
+                    );
                 }
                 saltWordArr = wordArrayFromBytes(saltBytes);
 
@@ -456,10 +538,9 @@ var CryptoJS = CryptoJS || {};
                     ivBytes = __tropel_native_random_bytes(ivLen);
                     ivWordArr = wordArrayFromBytes(ivBytes);
                 } else {
-                    // Last-resort fallback (NOT cryptographically secure)
-                    ivBytes = [];
-                    for (var i = 0; i < ivLen; i++) ivBytes.push(0);
-                    ivWordArr = wordArrayFromBytes(ivBytes);
+                    // Backlog line 155: a zero IV under a fixed key is
+                    // catastrophic nonce reuse — fail loudly instead.
+                    throw new Error('CSPRNG unavailable: cannot generate a random IV');
                 }
             }
 
@@ -517,13 +598,16 @@ var CryptoJS = CryptoJS || {};
         decrypt: function (ciphertext, key, options) {
             var ct = ciphertext.ciphertext || ciphertext;
             options = options || {};
-            var mode = options.mode || 'GCM';
+            var mode = resolveMode(options.mode) || 'CBC';
             var ivLen = mode === 'CBC' ? 16 : 12;
             var keyLen = 32;
 
-            // Extract IV, key, and salt from cipherParams object if available
+            // Extract IV, key, and salt from cipherParams object if available.
+            // The EXPLICIT key argument wins over the embedded one — the old
+            // `ciphertext.key || key` ignored the passed key, so a
+            // wrong-password test "passed" vacuously (backlog line 155).
             var ctIv = ciphertext.iv || null;
-            var ctKey = ciphertext.key || key;
+            var ctKey = (key !== undefined && key !== null) ? key : (ciphertext.key || null);
             var ctSalt = ciphertext.salt || null;
 
             // Parse ciphertext: base64 string or WordArray to bytes

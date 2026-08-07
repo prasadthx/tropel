@@ -69,6 +69,7 @@ mod tests {
             "__tropel_native_sha384",
             "__tropel_native_sha512",
             "__tropel_native_sha3_256",
+            "__tropel_native_keccak",
             "__tropel_native_ripemd160",
             "__tropel_native_hmac_md5",
             "__tropel_native_hmac_sha1",
