@@ -407,13 +407,19 @@ pub struct Response {
 
 impl Response {
     /// Decode the body as UTF-8 text (lazy — decodes once, then memoized).
+    ///
+    /// Postman parity (backlog line 171): an EMPTY body yields `Some("")`
+    /// (Postman's `pm.response.text()` returns `''`, not `undefined`), and a
+    /// non-UTF-8 body is decoded LOSSILY instead of becoming `null` — so
+    /// `res.body.includes(...)` on a binary/odd-encoding response doesn't
+    /// throw `undefined` method errors.
     pub fn body_text(&self) -> Option<String> {
         self.text_cache
             .get_or_init(|| {
                 if self.body.is_empty() {
-                    None
+                    Some(String::new())
                 } else {
-                    String::from_utf8(self.body.clone()).ok()
+                    Some(String::from_utf8_lossy(&self.body).into_owned())
                 }
             })
             .clone()
@@ -787,6 +793,43 @@ mod tests {
 
         // Deserializing a genuinely invalid token errors loudly.
         assert!(serde_json::from_str::<Method>("\"GE T\"").is_err());
+    }
+
+    #[test]
+    fn body_text_lossy_and_empty_string() {
+        // Regression (backlog line 171): non-UTF-8 bodies must decode LOSSILY
+        // (never `null` — `res.body.includes(...)` would throw), and empty
+        // bodies must yield `Some("")` (Postman's `pm.response.text()`
+        // returns `''`, not `undefined`).
+        //
+        // NOTE: each Response gets FRESH caches (never `..base.clone()` — the
+        // initialized OnceCell would memoize the first result onto the next).
+        fn resp_with(body: Vec<u8>) -> Response {
+            Response {
+                url: String::new(),
+                status_code: 200,
+                status_text: "OK".into(),
+                headers: Default::default(),
+                body,
+                text_cache: Default::default(),
+                json_cache: Default::default(),
+                response_time: Default::default(),
+                timings: None,
+                cookies: Vec::new(),
+                size: 0,
+                redirects: Vec::new(),
+            }
+        }
+        assert_eq!(resp_with(Vec::new()).body_text(), Some(String::new()));
+
+        // 0xC3 is an invalid UTF-8 lead byte — must become U+FFFD, not None.
+        let text = resp_with(vec![0xC3, 0x28, 0x41])
+            .body_text()
+            .expect("lossy decode must never be None");
+        assert_eq!(text, "\u{FFFD}(A");
+
+        // Valid UTF-8 passes through unchanged.
+        assert_eq!(resp_with(b"ok".to_vec()).body_text(), Some("ok".to_string()));
     }
 
     #[test]

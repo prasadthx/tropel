@@ -1064,13 +1064,19 @@ impl From<&HttpResponse> for tropel_core::types::Response {
 
 impl HttpResponse {
     /// Decode the body as UTF-8 text (lazy — decodes once, then memoized).
+    ///
+    /// Postman parity (backlog line 171): an EMPTY body yields `Some("")`
+    /// (Postman's `pm.response.text()` returns `''`, not `undefined`), and a
+    /// non-UTF-8 body is decoded LOSSILY instead of becoming `null` — so
+    /// `res.body.includes(...)` on a binary/odd-encoding response doesn't
+    /// throw `undefined` method errors.
     pub fn body_text(&self) -> Option<String> {
         self.text_cache
             .get_or_init(|| {
                 if self.body.is_empty() {
-                    None
+                    Some(String::new())
                 } else {
-                    String::from_utf8(self.body.clone()).ok()
+                    Some(String::from_utf8_lossy(&self.body).into_owned())
                 }
             })
             .clone()
@@ -1310,6 +1316,38 @@ mod tests {
         assert_eq!(canonical_header_name("Content-Type"), "Content-Type");
         assert_eq!(canonical_header_name("location"), "Location");
         assert_eq!(canonical_header_name("set-cookie"), "Set-Cookie");
+    }
+
+    #[test]
+    fn http_response_body_text_lossy_and_empty() {
+        // Regression (backlog line 171) — same contract as the core
+        // `Response::body_text()`: empty → Some("") (Postman `''`), and
+        // non-UTF-8 decodes LOSSILY so `res.body.includes(...)` never sees
+        // null/undefined. Fresh caches per response (OnceCell memoization
+        // must not leak across the struct-update clones).
+        fn resp_with(body: Vec<u8>) -> HttpResponse {
+            HttpResponse {
+                url: String::new(),
+                status_code: 200,
+                status_text: "OK".into(),
+                headers: Default::default(),
+                body,
+                text_cache: Default::default(),
+                json_cache: Default::default(),
+                response_time: Duration::ZERO,
+                timings: None,
+                cookies: Vec::new(),
+                size: 0,
+                request_body_size: 0,
+                redirects: Vec::new(),
+            }
+        }
+        assert_eq!(resp_with(Vec::new()).body_text(), Some(String::new()));
+        assert_eq!(
+            resp_with(vec![0xC3, 0x28, 0x41]).body_text(),
+            Some("\u{FFFD}(A".to_string())
+        );
+        assert_eq!(resp_with(b"ok".to_vec()).body_text(), Some("ok".to_string()));
     }
 
     #[test]
