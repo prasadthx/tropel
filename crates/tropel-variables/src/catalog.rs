@@ -16,6 +16,31 @@ macro_rules! cached_re {
     }};
 }
 
+/// Cap for `:length` / `:count` arguments on dynamic variables (backlog line
+/// 162). Postman's own values are single-digit-to-low-hundreds; a collection
+/// author typo like `{{$randomString:9999999999}}` previously parsed into an
+/// UNBOUNDED `usize` and `(0..length)` attempted a ~10 GB allocation →
+/// `handle_alloc_error` → process abort, not a recoverable error. Clamping to
+/// this cap keeps resolution bounded (and the substitution complete) instead
+/// of killing the run.
+const MAX_DYNAMIC_LENGTH: usize = 10_000;
+
+/// Parse a `:length` / `:count` capture, clamping to [`MAX_DYNAMIC_LENGTH`].
+/// Unparseable or missing captures fall back to `default` (the variable's
+/// built-in size), matching Postman.
+fn capped_len(raw: Option<&str>, default: usize) -> usize {
+    match raw {
+        // The capture regex only feeds digits, so a parse failure here means
+        // the value OVERFLOWED usize — the worst attack case. Clamp it to the
+        // cap rather than silently falling back to a small default.
+        Some(s) => s
+            .parse::<usize>()
+            .map(|n| n.min(MAX_DYNAMIC_LENGTH))
+            .unwrap_or(MAX_DYNAMIC_LENGTH),
+        None => default,
+    }
+}
+
 /// Dynamic variable catalog.
 /// Generates values for built-in Postman dynamic variables like {{$guid}}, {{$timestamp}}, etc.
 pub struct DynamicCatalog {
@@ -90,10 +115,7 @@ impl DynamicCatalog {
         if result.contains("{{$randomString") {
             let re = cached_re!(RE_RANDOM_STRING, r"\{\{\$randomString(?::(\d+))?\}\}");
             result = self.replace_with_func(&result, &re, |caps| {
-                let len = caps
-                    .get(1)
-                    .and_then(|m| m.as_str().parse().ok())
-                    .unwrap_or(10);
+                let len = capped_len(caps.get(1).map(|m| m.as_str()), 10);
                 random_string(
                     &mut rng,
                     len,
@@ -106,10 +128,7 @@ impl DynamicCatalog {
         if result.contains("{{$randomAlphabetic") {
             let re = cached_re!(RE_RANDOM_ALPHABETIC, r"\{\{\$randomAlphabetic(?::(\d+))?\}\}");
             result = self.replace_with_func(&result, &re, |caps| {
-                let len = caps
-                    .get(1)
-                    .and_then(|m| m.as_str().parse().ok())
-                    .unwrap_or(10);
+                let len = capped_len(caps.get(1).map(|m| m.as_str()), 10);
                 random_string(
                     &mut rng,
                     len,
@@ -122,10 +141,7 @@ impl DynamicCatalog {
         if result.contains("{{$randomAlphanumeric") {
             let re = cached_re!(RE_RANDOM_ALPHANUMERIC, r"\{\{\$randomAlphanumeric(?::(\d+))?\}\}");
             result = self.replace_with_func(&result, &re, |caps| {
-                let len = caps
-                    .get(1)
-                    .and_then(|m| m.as_str().parse().ok())
-                    .unwrap_or(10);
+                let len = capped_len(caps.get(1).map(|m| m.as_str()), 10);
                 random_string(
                     &mut rng,
                     len,
@@ -144,10 +160,7 @@ impl DynamicCatalog {
         if result.contains("{{$randomHex") {
             let re = cached_re!(RE_RANDOM_HEX, r"\{\{\$randomHex(?::(\d+))?\}\}");
             result = self.replace_with_func(&result, &re, |caps| {
-                let len = caps
-                    .get(1)
-                    .and_then(|m| m.as_str().parse().ok())
-                    .unwrap_or(8);
+                let len = capped_len(caps.get(1).map(|m| m.as_str()), 8);
                 random_string(&mut rng, len, "0123456789abcdef")
             });
         }
@@ -184,10 +197,7 @@ impl DynamicCatalog {
         if result.contains("{{$randomWords") {
             let re = cached_re!(RE_RANDOM_WORDS, r"\{\{\$randomWords(?::(\d+))?\}\}");
             result = self.replace_with_func(&result, &re, |caps| {
-                let count = caps
-                    .get(1)
-                    .and_then(|m| m.as_str().parse().ok())
-                    .unwrap_or(5);
+                let count = capped_len(caps.get(1).map(|m| m.as_str()), 5);
                 random_words(&mut rng, count)
             });
         }
@@ -286,10 +296,7 @@ impl DynamicCatalog {
         if result.contains("{{$randomPassword") {
             let re = cached_re!(RE_RANDOM_PASSWORD, r"\{\{\$randomPassword(?::(\d+))?\}\}");
             result = self.replace_with_func(&result, &re, |caps| {
-                let len = caps
-                    .get(1)
-                    .and_then(|m| m.as_str().parse().ok())
-                    .unwrap_or(12);
+                let len = capped_len(caps.get(1).map(|m| m.as_str()), 12);
                 random_string(
                     &mut rng,
                     len,
@@ -753,6 +760,60 @@ mod tests {
         let result = catalog.resolve("hex={{$randomHex:16}}");
         assert!(result.starts_with("hex="));
         assert_eq!(result.len(), "hex=".len() + 16);
+    }
+
+    #[test]
+    fn test_huge_length_clamped_not_abort() {
+        // Backlog line 162: `{{$randomString:9999999999}}` parsed into an
+        // UNBOUNDED usize and `(0..length)` attempted a ~10 GB allocation →
+        // handle_alloc_error → process abort. Every :length/:count must be
+        // clamped to MAX_DYNAMIC_LENGTH so resolution completes instead of
+        // killing the process.
+        let catalog = DynamicCatalog::new();
+
+        let s = catalog.resolve("x={{$randomString:9999999999}}");
+        assert_eq!(s.len(), "x=".len() + MAX_DYNAMIC_LENGTH);
+        assert!(!s.contains("{{$"));
+
+        let hex = catalog.resolve("h={{$randomHex:9999999999}}");
+        assert_eq!(hex.len(), "h=".len() + MAX_DYNAMIC_LENGTH);
+
+        let pwd = catalog.resolve("p={{$randomPassword:9999999999}}");
+        assert_eq!(pwd.len(), "p=".len() + MAX_DYNAMIC_LENGTH);
+
+        let alpha = catalog.resolve("a={{$randomAlphabetic:9999999999}}");
+        assert_eq!(alpha.len(), "a=".len() + MAX_DYNAMIC_LENGTH);
+
+        let alnum = catalog.resolve("n={{$randomAlphanumeric:9999999999}}");
+        assert_eq!(alnum.len(), "n=".len() + MAX_DYNAMIC_LENGTH);
+
+        let words = catalog.resolve("w={{$randomWords:9999999999}}");
+        // 10k words (each >= 5 chars + spaces) — bounded, no abort; the
+        // count itself is what is clamped.
+        assert!(words.starts_with("w="));
+        assert!(!words.contains("{{$"));
+        assert!(words.len() < MAX_DYNAMIC_LENGTH * 16);
+    }
+
+    #[test]
+    fn test_moderate_length_still_honored() {
+        // The cap must NOT change legitimate sizes below the limit.
+        let catalog = DynamicCatalog::new();
+        let s = catalog.resolve("x={{$randomString:64}}");
+        assert_eq!(s.len(), "x=".len() + 64);
+        // "w=" + 7 words joined by spaces → 7 space-separated tokens.
+        let words = catalog.resolve("w={{$randomWords:7}}");
+        assert_eq!(words.split(' ').count(), 7);
+    }
+
+    #[test]
+    fn test_capped_len_helper() {
+        assert_eq!(capped_len(Some("5"), 10), 5);
+        // Overflowing usize parse (the regex only feeds digits, so a parse
+        // failure IS an overflow) clamps to the cap — the attack case.
+        assert_eq!(capped_len(Some("999999999999999999999999"), 10), MAX_DYNAMIC_LENGTH);
+        assert_eq!(capped_len(Some("abc"), 8), MAX_DYNAMIC_LENGTH, "any parse failure clamps to the cap");
+        assert_eq!(capped_len(None, 12), 12);
     }
 
     #[test]
