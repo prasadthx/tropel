@@ -5,12 +5,13 @@
 //! against a real local HTTP server, with a `{{header}}` variable, a
 //! prerequest script that sets a variable, a `pm.test`, and a threshold.
 //!
-//! The run goes past 10s deliberately — this is the window that used to
-//! break (N2: the script interrupt timer keyed off context-creation time
-//! killed every eval ~10s in; N1: a shared response slot let one VU read
-//! another's response). If either regresses, the checks recorded by the
-//! test script dry up or the `{{header}}` value never makes it to the
-//! server, and the assertions below fail loudly.
+//! Two historical regressions are covered elsewhere by dedicated unit
+//! tests: N2 (the script interrupt timer keyed off context-creation time,
+//! which killed every eval ~10s in) is pinned by
+//! `tropel_js::context::reset_interrupt_keeps_evals_alive_past_original_deadline`;
+//! N1 (a shared response slot letting one VU read another's response) is
+//! covered by the per-VU response assertions. Keeping this e2e short (3s)
+//! keeps `cargo test` fast.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -236,9 +237,10 @@ async fn end_to_end_two_vu_with_header_check_and_threshold() -> Result<()> {
         input_type: Some("postman".to_string()),
         execution: ExecutionConfig::ConstantVus {
             vus: 2,
-            // Past 10s on purpose — the old interrupt-timer bug fired at ~10s.
-            duration: "12s".to_string(),
-            graceful_stop: Some("10s".to_string()),
+            // Short run to keep cargo test fast — the ~10s interrupt-timer
+            // regression has dedicated unit coverage in tropel-js.
+            duration: "3s".to_string(),
+            graceful_stop: Some("5s".to_string()),
             think_time: ThinkTimeConfig::default(),
         },
         env,

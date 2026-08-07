@@ -1445,4 +1445,77 @@ mod tests {
             n
         );
     }
+
+    // ── JS limits (backlog line 214) ──
+
+    #[tokio::test]
+    async fn infinite_loop_interrupted_within_two_seconds() {
+        // A 500 ms interrupt must kill `while(true){}` quickly (< 2 s). If the
+        // interrupt handler were never armed (or keyed off the wrong clock),
+        // this test would hang until the 5 s context default and fail the
+        // time bound.
+        let mut ctx = JsContext::new(None, Some(Duration::from_millis(500)))
+            .await
+            .expect("context creation");
+        let start = std::time::Instant::now();
+        let err = ctx.eval("while (true) {}").await.err();
+        let elapsed = start.elapsed();
+        assert!(err.is_some(), "infinite loop must be interrupted");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "interrupt must fire in < 2s, took {elapsed:?}"
+        );
+        // The context must still be usable after the interrupt.
+        let ok = ctx.eval("1 + 1").await.unwrap();
+        assert_eq!(ok, "2");
+    }
+
+    #[tokio::test]
+    async fn script_past_memory_cap_errors_and_process_survives() {
+        // A script that blows past the 4 MiB cap must fail with an error
+        // (not abort the process — QuickJS memory limits raise an exception
+        // rather than hard-aborting). The follow-up eval proves the runtime
+        // is still healthy afterwards.
+        let mut ctx = JsContext::new(Some(4 * 1024 * 1024), Some(Duration::from_secs(5)))
+            .await
+            .expect("context creation");
+        // Allocate ~48 MiB of strings in a loop — well past the 4 MiB cap.
+        let err = ctx
+            .eval("let s = ''; for (let i = 0; i < 100000; i++) { s += 'x'.repeat(500); }")
+            .await
+            .err();
+        assert!(
+            err.is_some(),
+            "script exceeding the memory cap must error, got Ok"
+        );
+        // Process survived — the runtime still evaluates.
+        let ok = ctx.eval("'alive'").await.unwrap();
+        assert_eq!(ok, "alive");
+    }
+
+    #[tokio::test]
+    async fn reset_interrupt_keeps_evals_alive_past_original_deadline() {
+        // N2 regression (backlog line 214): the interrupt timer used to be
+        // keyed off CONTEXT-CREATION time, so every eval ~10s into a run was
+        // killed even though the script itself was fast. reset_interrupt()
+        // re-arms the deadline per eval — an eval starting AFTER the original
+        // deadline must still complete. This is the coverage the 12s e2e run
+        // used to provide; the e2e can now be shortened.
+        let mut ctx = JsContext::new(None, Some(Duration::from_millis(300)))
+            .await
+            .expect("context creation");
+        // First eval succeeds and arms a fresh deadline.
+        assert_eq!(ctx.eval("1").await.unwrap(), "1");
+        // Wait past the ORIGINAL context-creation deadline (300 ms).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // A fast eval must still complete — a stale creation-time deadline
+        // would trip the interrupt handler immediately and error.
+        let start = std::time::Instant::now();
+        let ok = ctx.eval("2 + 2").await.unwrap();
+        assert_eq!(ok, "4");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "eval past the original deadline must complete quickly"
+        );
+    }
 }
