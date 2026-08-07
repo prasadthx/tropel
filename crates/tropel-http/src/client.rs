@@ -504,7 +504,12 @@ impl HttpClient {
             // at a blacklisted literal must not slip past the resolver.
             check_literal_blacklist(&self.blacklist, &current_url)?;
             let hop_start = std::time::Instant::now();
-            crate::subtimings::begin_request(hop_start);
+            // Per-request slot: concurrent requests (http.batch) interleave on
+            // one thread and futures migrate threads on the shared io_rt, so
+            // phases can no longer live in a single thread-local. Each hop
+            // gets its own slot; the TimedRequest wrapper below makes the
+            // DNS/connector hooks attribute to THIS request during every poll.
+            let slot = crate::subtimings::begin_request(hop_start);
 
             // Build the reqwest request for THIS hop (URL/method/body may
             // have been rewritten by a redirect). Match by reference: the
@@ -653,10 +658,12 @@ impl HttpClient {
         // this point: blocked + DNS + TCP connect + TLS handshake + sending +
         // server processing.
         let waiting_start = std::time::Instant::now();
-        let mut response = client
-            .execute(built_request)
-            .await
-            .map_err(|e| TropelError::Http(format!("Request failed: {}", e)))?;
+        let mut response = crate::subtimings::TimedRequest::new(
+            client.execute(built_request),
+            slot.clone(),
+        )
+        .await
+        .map_err(|e| TropelError::Http(format!("Request failed: {}", e)))?;
         let mut waiting_duration = waiting_start.elapsed();
 
         // HTTP Digest (RFC 7616) is challenge-response: the first request goes
@@ -684,10 +691,14 @@ impl HttpClient {
                                     })?,
                                 );
                             let retry_start = std::time::Instant::now();
-                            response = client
-                                .execute(retry)
-                                .await
-                                .map_err(|e| TropelError::Http(format!("Request failed: {}", e)))?;
+                            response = crate::subtimings::TimedRequest::new(
+                                client.execute(retry),
+                                slot.clone(),
+                            )
+                            .await
+                            .map_err(|e| {
+                                TropelError::Http(format!("Request failed: {}", e))
+                            })?;
                             waiting_duration = retry_start.elapsed();
                             tracing::debug!(
                                 "Digest auth: retried after 401 challenge (status now {})",
@@ -758,7 +769,7 @@ impl HttpClient {
                     hop_body.extend_from_slice(&chunk);
                 }
                 let hop_total = hop_start.elapsed();
-                let hop_phases = crate::subtimings::take_slot();
+                let hop_phases = crate::subtimings::take_slot(&slot);
                 let mut hop_timings =
                     Timings::from_measured(waiting_duration, Duration::ZERO, hop_total);
                 if let (Some(request_start), Some(connect_start), Some(connect_elapsed)) = (
@@ -897,7 +908,7 @@ impl HttpClient {
         // Note: `dns` is optional on purpose — for IP-literal hosts (e.g.
         // "127.0.0.1") reqwest's HttpConnector skips DNS resolution entirely,
         // so only the connect phases exist.
-        let phases = crate::subtimings::take_slot();
+        let phases = crate::subtimings::take_slot(&slot);
         let mut timings = Timings::from_measured(waiting_duration, receiving_duration, total_duration);
         if let (Some(request_start), Some(connect_start), Some(connect_elapsed)) = (
             phases.request_start,

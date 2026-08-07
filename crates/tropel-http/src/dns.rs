@@ -5,11 +5,12 @@
 //! Implemented as a custom [`reqwest::dns::Resolve`] that wraps the real
 //! lookup (tokio `lookup_host`, the same getaddrinfo path reqwest's default
 //! GaiResolver uses) and applies the configured options. Real lookup time is
-//! still recorded into the thread-local sub-timing slot, so the `dns` phase
-//! measurement is preserved (cache hits and static-host entries report zero).
+//! still recorded into the active request's sub-timing slot, so the `dns`
+//! phase measurement is preserved (cache hits and static-host entries report
+//! zero).
 
 use crate::client::parse_duration;
-use crate::subtimings::record_dns;
+use crate::subtimings::{current_slot, record_dns};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -256,12 +257,21 @@ impl Resolve for DnsResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let host = name.as_str().to_string();
         let inner = Arc::clone(&self.inner);
+        // Capture the requesting request's slot at entry: `resolve()` runs
+        // inside a poll of the request future (TimedRequest has installed the
+        // current slot), and the async block below may be completed outside
+        // that poll, so the explicit capture — not a second `current_slot()`
+        // read — keeps the elapsed write attributed to the right request even
+        // when requests interleave (http.batch) or migrate threads (io_rt).
+        let slot = current_slot();
         Box::pin(async move {
             // 1. Static hosts map (exact or wildcard) — no DNS involved. The
             //    blacklist still applies: an explicit host override must not
             //    smuggle connections to a blocked network.
             if let Some(addrs) = hosts_lookup(&inner.hosts, &host) {
-                record_dns(Duration::ZERO);
+                if let Some(slot) = &slot {
+                    record_dns(slot, Duration::ZERO);
+                }
                 let mut addrs: Vec<SocketAddr> = addrs;
                 if !inner.blacklist.is_empty() {
                     let before = addrs.len();
@@ -282,7 +292,9 @@ impl Resolve for DnsResolver {
             //    and cache hits instead of every VU hammering the same first
             //    IP for the whole TTL window.
             if let Some(entry) = cache_get(&inner, &host) {
-                record_dns(Duration::ZERO);
+                if let Some(slot) = &slot {
+                    record_dns(slot, Duration::ZERO);
+                }
                 let rotated = select_addrs(&host, &entry, inner.select, &inner.rotation);
                 return Ok(box_addrs(rotated));
             }
@@ -290,7 +302,9 @@ impl Resolve for DnsResolver {
             // 3. Real lookup (port 0: hyper-util applies the request's port).
             let start = Instant::now();
             let result = tokio::net::lookup_host((host.clone(), 0)).await;
-            record_dns(start.elapsed());
+            if let Some(slot) = &slot {
+                record_dns(slot, start.elapsed());
+            }
             let mut addrs: Vec<SocketAddr> = match result {
                 Ok(it) => it.collect(),
                 Err(e) => return Err(BoxError::from(e)),

@@ -10,15 +10,28 @@
 //!    a generic tower layer that wraps the connector service and times each
 //!    connection attempt (DNS + TCP + TLS for a fresh connection).
 //!
-//! Results are recorded into a thread-local slot and consumed by
-//! [`HttpClient::execute`](crate::client::HttpClient::execute) after each
-//! request. This is safe because Tropel's thread-per-core executor gives each
-//! VU its own OS thread and its own `HttpClient`; all request work (including
-//! DNS and connection establishment) happens on that one thread. If a client
-//! is ever shared across threads, the slot degrades gracefully (phases report
-//! zero rather than crashing).
+//! # Phase attribution (per-request slots)
 //!
-//! # Phase attribution
+//! Requests are NOT one-per-thread: `http.batch` interleaves many requests on
+//! one thread via `join_all`, and `execute()` runs on the shared multi-thread
+//! `io_rt`, so a single request future can even migrate threads between polls.
+//! A single thread-local slot would be clobbered by concurrent requests — the
+//! old design cross-attributed phases between batch entries (one entry
+//! reported everyone's `blocked`/`dns`/`connecting`, the rest got zeros).
+//!
+//! Instead every request gets its OWN slot (`Arc<Mutex<PhaseSlot>>`, created
+//! by [`begin_request`]). Attribution happens through a thread-local *current
+//! slot* that the [`TimedRequest`] wrapper installs at the start of **each
+//! poll** of the request future and restores when the poll returns. The
+//! DNS/connector hooks fire *inside* a poll of that request future (reqwest
+//! drives them as part of it), so they observe exactly their request's slot —
+//! even with N requests interleaved on one thread. As belt-and-braces the
+//! hooks additionally capture the slot at `resolve()` / `call()` entry and
+//! thread it through their async completions, so a completion that is polled
+//! outside the originating poll (e.g. by hyper on another thread) still
+//! writes to the correct slot.
+//!
+//! # Phase semantics
 //!
 //! - **blocked**: request start → connector `call()` begins (connection-pool
 //!   wait / queueing). Zero when a pooled keep-alive connection is reused.
@@ -34,6 +47,7 @@
 use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -50,25 +64,42 @@ pub(crate) struct PhaseSlot {
     pub connect_elapsed: Option<Duration>,
 }
 
+// The slot of the request whose future is currently being polled on this
+// thread. Installed by [`TimedRequest`] at the start of every poll and
+// restored when the poll returns; the DNS resolver and connector layer read
+// it to discover which request they belong to. `None` outside a request poll
+// — hooks then no-op (or, for async completions, use the slot captured at
+// entry instead).
+//
+// (A plain comment, not `///`: rustdoc does not generate docs for the
+// `thread_local!` macro invocation, so a doc comment here triggers
+// `unused_doc_comments`.)
 thread_local! {
-    static SLOT: RefCell<PhaseSlot> = RefCell::new(PhaseSlot::default());
+    static CURRENT_SLOT: RefCell<Option<Arc<Mutex<PhaseSlot>>>> = const { RefCell::new(None) };
 }
 
-/// Begin timing a new request: resets the slot and stamps the request start.
-pub(crate) fn begin_request(now: Instant) {
-    SLOT.with(|slot| {
-        *slot.borrow_mut() = PhaseSlot {
-            request_start: Some(now),
-            ..PhaseSlot::default()
-        };
-    });
+/// Create a fresh per-request slot and stamp the request start.
+///
+/// Returns the slot handle. The caller must wrap the request future in
+/// [`TimedRequest`] (which installs the slot as the poll-scoped current slot)
+/// and later call [`take_slot`] on the same handle.
+pub(crate) fn begin_request(now: Instant) -> Arc<Mutex<PhaseSlot>> {
+    Arc::new(Mutex::new(PhaseSlot {
+        request_start: Some(now),
+        ..PhaseSlot::default()
+    }))
 }
 
-/// Record real DNS resolution time (called from the resolver hook).
-pub(crate) fn record_dns(elapsed: Duration) {
-    SLOT.with(|slot| {
-        slot.borrow_mut().dns_elapsed = Some(elapsed);
-    });
+/// The slot of the request whose future is currently being polled on this
+/// thread, if any. Hooks call this at `call()` / `resolve()` entry — i.e.
+/// during a poll of the request future — to discover their request's slot.
+pub(crate) fn current_slot() -> Option<Arc<Mutex<PhaseSlot>>> {
+    CURRENT_SLOT.with(|s| s.borrow().clone())
+}
+
+/// Record real DNS resolution time into the given request's slot.
+pub(crate) fn record_dns(slot: &Arc<Mutex<PhaseSlot>>, elapsed: Duration) {
+    slot.lock().unwrap().dns_elapsed = Some(elapsed);
 }
 
 /// Record when a connector `call()` began. First attempt wins (redirects
@@ -78,33 +109,66 @@ pub(crate) fn record_dns(elapsed: Duration) {
 /// one measured — pairing first-start with first-elapsed keeps the two
 /// consistent. This is intentional and matches the "first connection"
 /// semantics k6 reports for the redirecting request.
-pub(crate) fn record_connect_start(now: Instant) {
-    SLOT.with(|slot| {
-        let mut s = slot.borrow_mut();
-        if s.connect_start.is_none() {
-            s.connect_start = Some(now);
-        }
-    });
+pub(crate) fn record_connect_start(slot: &Arc<Mutex<PhaseSlot>>, now: Instant) {
+    let mut s = slot.lock().unwrap();
+    if s.connect_start.is_none() {
+        s.connect_start = Some(now);
+    }
 }
 
 /// Record the duration of a connector call. First completion wins.
-pub(crate) fn record_connect_elapsed(elapsed: Duration) {
-    SLOT.with(|slot| {
-        let mut s = slot.borrow_mut();
-        if s.connect_elapsed.is_none() {
-            s.connect_elapsed = Some(elapsed);
-        }
-    });
+pub(crate) fn record_connect_elapsed(slot: &Arc<Mutex<PhaseSlot>>, elapsed: Duration) {
+    let mut s = slot.lock().unwrap();
+    if s.connect_elapsed.is_none() {
+        s.connect_elapsed = Some(elapsed);
+    }
 }
 
-/// Read the recorded phases and reset the slot for the next request.
-pub(crate) fn take_slot() -> PhaseSlot {
-    SLOT.with(|slot| {
-        let mut s = slot.borrow_mut();
-        let taken = *s;
-        *s = PhaseSlot::default();
-        taken
-    })
+/// Read the recorded phases of the given request and reset its slot.
+pub(crate) fn take_slot(slot: &Arc<Mutex<PhaseSlot>>) -> PhaseSlot {
+    let mut s = slot.lock().unwrap();
+    let taken = *s;
+    *s = PhaseSlot::default();
+    taken
+}
+
+/// Wraps a request future so its connection-phase hooks attribute to the
+/// right per-request slot.
+///
+/// Every poll installs the request's slot as the thread-local *current slot*
+/// and restores the previous value when the poll returns. The DNS resolver
+/// and connector layer callbacks fire *inside* one of these polls, so — even
+/// with N requests interleaved on one thread (`http.batch`) or a future
+/// migrating threads on the multi-thread `io_rt` — each request's phases land
+/// in its own slot and never leak into another request's.
+pub(crate) struct TimedRequest<F> {
+    inner: F,
+    slot: Arc<Mutex<PhaseSlot>>,
+}
+
+impl<F> TimedRequest<F> {
+    pub(crate) fn new(inner: F, slot: Arc<Mutex<PhaseSlot>>) -> Self {
+        Self { inner, slot }
+    }
+}
+
+impl<F: Future> Future for TimedRequest<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Install this request's slot as the current one for the duration of
+        // this poll, then restore whatever was current before (normally None
+        // — polls never nest, but restoring is cheap and defensive).
+        let prev = CURRENT_SLOT.with(|s| s.borrow_mut().replace(self.slot.clone()));
+        // SAFETY: `inner` is a field of the pinned struct and is never moved
+        // out of it — we only project the Pin down to the field (the standard
+        // pin-projection pattern; `Pin::map_unchecked_mut` is stable since
+        // 1.75).
+        let inner = unsafe { self.map_unchecked_mut(|s| &mut s.inner) };
+        let out = inner.poll(cx);
+        CURRENT_SLOT.with(|s| *s.borrow_mut() = prev);
+        out
+    }
 }
 
 /// Tower layer that times each connector call.
@@ -146,11 +210,21 @@ where
 
     fn call(&mut self, req: Req) -> Self::Future {
         let start = Instant::now();
-        record_connect_start(start);
+        // Capture the slot at entry: `call()` runs during a poll of the
+        // request future (TimedRequest has installed the current slot), and
+        // the completion below may be polled outside that poll, so the
+        // explicit capture — not a second `current_slot()` read — is what
+        // keeps the elapsed write attributed correctly.
+        let slot = current_slot();
+        if let Some(slot) = &slot {
+            record_connect_start(slot, start);
+        }
         let inner = self.inner.call(req);
         Box::pin(async move {
             let out = inner.await;
-            record_connect_elapsed(start.elapsed());
+            if let Some(slot) = &slot {
+                record_connect_elapsed(slot, start.elapsed());
+            }
             out
         })
     }
@@ -163,19 +237,20 @@ mod tests {
     #[test]
     fn slot_records_and_resets() {
         let now = Instant::now();
-        begin_request(now);
-        record_dns(Duration::from_millis(5));
-        record_connect_start(now + Duration::from_millis(2));
-        record_connect_elapsed(Duration::from_millis(20));
+        let slot = begin_request(now);
+        record_dns(&slot, Duration::from_millis(5));
+        record_connect_start(&slot, now + Duration::from_millis(2));
+        record_connect_elapsed(&slot, Duration::from_millis(20));
 
-        let s = take_slot();
+        let s = take_slot(&slot);
         assert_eq!(s.request_start, Some(now));
         assert_eq!(s.dns_elapsed, Some(Duration::from_millis(5)));
         assert_eq!(s.connect_start, Some(now + Duration::from_millis(2)));
         assert_eq!(s.connect_elapsed, Some(Duration::from_millis(20)));
 
-        // Second read sees a clean slot.
-        let s2 = take_slot();
+        // Second read sees a clean slot (and other requests' slots are
+        // unaffected — each request owns its own handle).
+        let s2 = take_slot(&slot);
         assert!(s2.connect_start.is_none());
         assert!(s2.connect_elapsed.is_none());
     }
@@ -183,13 +258,13 @@ mod tests {
     #[test]
     fn first_connect_wins() {
         let now = Instant::now();
-        begin_request(now);
-        record_connect_start(now + Duration::from_millis(1));
-        record_connect_start(now + Duration::from_millis(50));
-        record_connect_elapsed(Duration::from_millis(10));
-        record_connect_elapsed(Duration::from_millis(99));
+        let slot = begin_request(now);
+        record_connect_start(&slot, now + Duration::from_millis(1));
+        record_connect_start(&slot, now + Duration::from_millis(50));
+        record_connect_elapsed(&slot, Duration::from_millis(10));
+        record_connect_elapsed(&slot, Duration::from_millis(99));
 
-        let s = take_slot();
+        let s = take_slot(&slot);
         assert_eq!(s.connect_start, Some(now + Duration::from_millis(1)));
         assert_eq!(s.connect_elapsed, Some(Duration::from_millis(10)));
     }
@@ -197,11 +272,57 @@ mod tests {
     #[test]
     fn pooled_connection_records_no_connect_phases() {
         let now = Instant::now();
-        begin_request(now);
+        let slot = begin_request(now);
         // No connector call — pooled keep-alive reuse.
-        let s = take_slot();
+        let s = take_slot(&slot);
         assert!(s.connect_start.is_none());
         assert!(s.dns_elapsed.is_none());
+    }
+
+    #[test]
+    fn slots_are_isolated_per_request() {
+        // Backlog line 166: two concurrent requests must never share phases.
+        // Each `begin_request` returns an independent slot, so recording into
+        // one can never be read by the other.
+        let now = Instant::now();
+        let a = begin_request(now);
+        let b = begin_request(now + Duration::from_millis(10));
+        record_connect_start(&a, now + Duration::from_millis(1));
+        record_connect_elapsed(&a, Duration::from_millis(5));
+        // B records nothing — its slot must stay empty regardless of A.
+        let sb = take_slot(&b);
+        assert!(sb.connect_start.is_none());
+        assert!(sb.connect_elapsed.is_none());
+        // And A still sees its own phases.
+        let sa = take_slot(&a);
+        assert_eq!(sa.connect_start, Some(now + Duration::from_millis(1)));
+        assert_eq!(sa.connect_elapsed, Some(Duration::from_millis(5)));
+    }
+
+    #[tokio::test]
+    async fn timed_request_installs_current_slot_during_poll() {
+        // The wrapper must make `current_slot()` return THIS request's slot
+        // while the inner future is being polled, and clear it afterwards.
+        let slot = begin_request(Instant::now());
+        let seen: Arc<Mutex<Option<Arc<Mutex<PhaseSlot>>>>> = Arc::new(Mutex::new(None));
+        let seen_clone = seen.clone();
+        TimedRequest::new(
+            async move {
+                *seen_clone.lock().unwrap() = current_slot();
+            },
+            slot.clone(),
+        )
+        .await;
+
+        let got = seen.lock().unwrap().clone();
+        assert!(
+            Arc::ptr_eq(got.as_ref().unwrap(), &slot),
+            "inner future must see its own request's slot"
+        );
+        assert!(
+            current_slot().is_none(),
+            "current slot must be cleared after the request completes"
+        );
     }
 
     /// End-to-end: a fresh connection records real connect phases; a pooled
@@ -212,7 +333,7 @@ mod tests {
     /// Uses the **current-thread** runtime flavor to mirror the engine's
     /// thread-per-core model: every VU runs on its own OS thread with a
     /// current-thread tokio runtime, so all DNS/connect work happens on the
-    /// VU thread and the thread-local recorder is exact. A multi-thread
+    /// VU thread and the per-request recorder is exact. A multi-thread
     /// runtime would let reqwest poll the connector on a different worker
     /// thread, and the slot written there would be invisible to `take_slot()`.
     #[tokio::test(flavor = "current_thread")]
@@ -291,5 +412,75 @@ mod tests {
         // EOF and the task can be awaited without hanging.
         drop(client);
         server.await.unwrap();
+    }
+
+    /// Backlog line 166 regression: `http.batch` runs N requests through
+    /// `join_all`, so several requests are in flight on ONE thread at once.
+    /// The old single thread-local slot cross-attributed phases (the first
+    /// `take_slot` drained everything, the rest reported zeros). Every
+    /// concurrent request must report its OWN connect phases.
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_requests_each_report_own_connect_phases() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Server accepts 4 connections and answers each after a short delay
+        // so the client futures overlap on the one test thread — the exact
+        // batch interleaving the bug was about.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                )
+                .await
+                .ok();
+            }
+        });
+
+        // `no_connection_reuse` forces a FRESH connection per request — every
+        // one of the 4 concurrent requests must perform a real TCP connect,
+        // so each must record non-zero connect phases.
+        let cfg = tropel_core::config::HttpConfig {
+            no_connection_reuse: true,
+            ..Default::default()
+        };
+        let client = super::super::client::HttpClient::new(&cfg).unwrap();
+        let req = tropel_core::types::Request {
+            url: format!("http://{}/", addr),
+            method: tropel_core::types::Method::GET,
+            ..Default::default()
+        };
+
+        let f1 = client.execute(&req, None);
+        let f2 = client.execute(&req, None);
+        let f3 = client.execute(&req, None);
+        let f4 = client.execute(&req, None);
+        let (r1, r2, r3, r4) = tokio::join!(f1, f2, f3, f4);
+
+        drop(client);
+        server.await.unwrap();
+
+        let responses = [r1, r2, r3, r4];
+        for (i, resp) in responses.iter().enumerate() {
+            let resp = resp.as_ref().expect("request succeeded");
+            let t = resp.timings.as_ref().expect("timings present");
+            assert!(
+                t.blocked + t.dns + t.connecting > Duration::ZERO,
+                "request {i}: a fresh connection must record its own connect \
+                 phases (cross-attribution regression), got {:?}",
+                t
+            );
+            let sum = t.blocked + t.dns + t.connecting + t.waiting + t.receiving;
+            assert!(
+                sum <= t.total,
+                "request {i}: phase sum must not exceed total: {sum:?} vs {:?}",
+                t.total
+            );
+        }
     }
 }
