@@ -325,3 +325,140 @@ impl Reporter for StdoutReporter {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::time::Duration;
+    use tropel_core::config::ThresholdConfig;
+    use tropel_metrics::collector::{MetricSummary, MetricType};
+
+    fn trend(key: &str, mean: f64, p50: u64, p90: u64, p95: u64, p99: u64) -> MetricSummary {
+        MetricSummary {
+            key: key.to_string(),
+            tags: vec![],
+            metric_type: MetricType::Trend,
+            count: 10,
+            sum: mean * 10.0,
+            mean,
+            min: (mean * 0.5) as u64,
+            max: (mean * 1.5) as u64,
+            p50,
+            p90,
+            p95,
+            p99,
+            last: 0.0,
+            rate: 0.0,
+            histogram: None,
+        }
+    }
+
+    fn result_with() -> MetricsResult {
+        MetricsResult {
+            iterations: 68,
+            http_reqs: 136,
+            vus_max: 2,
+            data_received: 266_000.0,
+            data_sent: 13_000.0,
+            http_req_failed: 0.0,
+            dropped_iterations: 0,
+            checks_total: 2,
+            checks_passed: 2,
+            checks_failed: 0,
+            run_duration: Duration::from_secs(10),
+            http_req_duration: Some(trend("http_req_duration", 134_890.0, 150_040, 268_230, 272_420, 337_910)),
+            iteration_duration: Some(trend("iteration_duration", 294_580.0, 262_280, 278_660, 321_420, 1_150_000)),
+            summary_trend_stats: vec![],
+            effective_thresholds: HashMap::new(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn render_shows_execution_and_http_blocks() {
+        let out = StdoutReporter.render(&result_with());
+        assert!(out.contains("Tropel Load Test Summary"), "header box");
+        assert!(out.contains("Iterations"), "execution block");
+        assert!(out.contains("Max VUs"));
+        assert!(out.contains("Dropped"));
+        assert!(out.contains("HTTP requests"));
+        // k6-style per-second rate: 136 reqs / 10s = 13.60/s.
+        assert!(out.contains("13.60/s"), "per-second rate: {out}");
+        assert!(out.contains("Total"), "request totals");
+    }
+
+    #[test]
+    fn render_trend_uses_ms_for_time_metrics_only() {
+        let mut out = String::new();
+        let m = trend("http_req_duration", 134_890.0, 150_040, 268_230, 272_420, 337_910);
+        let stats = vec![
+            "avg".to_string(),
+            "min".to_string(),
+            "med".to_string(),
+            "max".to_string(),
+            "p(90)".to_string(),
+        ];
+        StdoutReporter::render_trend(&mut out, "", &m, &stats);
+        // μs → ms: avg=134.89ms, med=150ms, p(90)=268ms.
+        assert!(out.contains("avg=134.89ms"), "{out}");
+        assert!(out.contains("med=150ms"), "{out}");
+        assert!(out.contains("p(90)=268ms"), "{out}");
+        assert!(out.contains("min=67ms"), "{out}");
+    }
+
+    #[test]
+    fn render_trend_keeps_raw_values_for_non_time_metrics() {
+        // A custom byte-count trend is NOT a time metric — values render raw
+        // with no ms suffix (regression: old code stamped ms on everything).
+        let mut out = String::new();
+        let m = trend("http_response_body_size", 2_500_000.0, 2_400_000, 3_000_000, 3_200_000, 3_500_000);
+        let stats = vec!["avg".to_string(), "med".to_string()];
+        StdoutReporter::render_trend(&mut out, "", &m, &stats);
+        assert!(out.contains("avg=2500000.00"), "{out}");
+        assert!(out.contains("med=2400000"), "{out}");
+        assert!(!out.contains("ms"), "no ms suffix on non-time trend: {out}");
+    }
+
+    #[test]
+    fn render_thresholds_pass_fail_and_status_footer() {
+        // PASS case.
+        let r = result_with();
+        let out = StdoutReporter.render(&r);
+        assert!(
+            out.contains("✓ PASS — test completed successfully"),
+            "{out}"
+        );
+
+        // FAIL case: threshold breached.
+        let mut failed = result_with();
+        let mut thresholds = HashMap::new();
+        thresholds.insert(
+            "http_req_duration".to_string(),
+            ThresholdConfig {
+                expression: "http_req_duration avg < 100".to_string(),
+                abort_on_fail: false,
+                delay_abort_eval: None,
+            },
+        );
+        failed.effective_thresholds = thresholds;
+        let out = StdoutReporter.render(&failed);
+        assert!(out.contains("── Thresholds ──"), "{out}");
+        assert!(out.contains("✗"), "failed threshold mark");
+        assert!(out.contains("FAIL"), "{out}");
+    }
+
+    #[test]
+    fn render_per_url_breakdown_when_multiple_urls() {
+        let mut r = result_with();
+        let mut a = trend("http_req_duration{url=/a}", 100_000.0, 100_000, 150_000, 160_000, 200_000);
+        let mut b = trend("http_req_duration{url=/b}", 200_000.0, 200_000, 250_000, 260_000, 300_000);
+        a.tags = vec![("url".to_string(), "/a".to_string())];
+        b.tags = vec![("url".to_string(), "/b".to_string())];
+        r.per_url = vec![a, b];
+        let out = StdoutReporter.render(&r);
+        assert!(out.contains("Per-URL (http_req_duration)"), "{out}");
+        assert!(out.contains("/a"), "{out}");
+        assert!(out.contains("/b"), "{out}");
+    }
+}

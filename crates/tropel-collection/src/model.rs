@@ -447,3 +447,272 @@ pub struct ResponseCookie {
     pub same_site: Option<String>,
     pub expires: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn parse_collection(json: serde_json::Value) -> Collection {
+        serde_json::from_value(json).expect("collection must parse")
+    }
+
+    fn minimal_info() -> serde_json::Value {
+        json!({
+            "name": "t",
+            "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+        })
+    }
+
+    #[test]
+    fn folder_first_discrimination_with_stray_request_key() {
+        // Regression (backlog line 146): some real exports put `"request":
+        // null` next to `"item": [...]`. Folder-first: the folder keeps its
+        // children rather than being misclassified as a request (which
+        // deserializes null request and drops the children).
+        let col = parse_collection(json!({
+            "info": minimal_info(),
+            "item": [{
+                "name": "folder",
+                "request": null,
+                "item": [{ "name": "child", "request": { "method": "GET", "url": "https://x.test/" } }]
+            }]
+        }));
+        assert_eq!(col.item.len(), 1);
+        match &col.item[0] {
+            CollectionItem::Folder(f) => {
+                assert_eq!(f.name, "folder");
+                assert_eq!(f.item.len(), 1, "folder must keep its child");
+                assert!(matches!(f.item[0], CollectionItem::Request(_)));
+            }
+            CollectionItem::Request(_) => panic!("folder misclassified as request"),
+        }
+    }
+
+    #[test]
+    fn malformed_request_errors_loudly_instead_of_silent_folder() {
+        // Regression (backlog line 146): a malformed request sub-field used
+        // to make untagged fall through to FolderItem — the request silently
+        // became an EMPTY FOLDER and was dropped from the run. Now it errors.
+        // Here the URL is an object with an invalid port type (string port
+        // is fine, but a nested nonsense field isn't the trigger) — use a
+        // body with an unknown shape instead: a `mode` that isn't handled is
+        // still schema-legal; instead force a malformed URL form.
+        let bad = json!({
+            "info": minimal_info(),
+            "item": [{ "name": "req", "request": { "url": { "raw": 123 } } }]
+        });
+        let err = serde_json::from_value::<Collection>(bad);
+        assert!(
+            err.is_err(),
+            "malformed request sub-fields must error loudly, not become an empty folder: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn description_accepts_string_and_object_forms() {
+        // Both schema-legal `description` shapes must parse: plain string or
+        // `{"content": ..., "type": ...}` — returning the text content.
+        // `description` is a field of RequestDetail (INSIDE `request`) — the
+        // item-level key is not part of this model and would be dropped.
+        let col = parse_collection(json!({
+            "info": minimal_info(),
+            "item": [{
+                "name": "r",
+                "request": {
+                    "description": "plain string desc",
+                    "method": "GET",
+                    "url": "https://x.test/"
+                }
+            }]
+        }));
+        if let CollectionItem::Request(r) = &col.item[0] {
+            assert_eq!(r.request.description.as_deref(), Some("plain string desc"));
+        } else {
+            panic!("expected request");
+        }
+
+        let col2 = parse_collection(json!({
+            "info": minimal_info(),
+            "item": [{
+                "name": "r",
+                "request": {
+                    "description": { "content": "obj desc", "type": "text/plain" },
+                    "method": "GET",
+                    "url": "https://x.test/"
+                }
+            }]
+        }));
+        if let CollectionItem::Request(r) = &col2.item[0] {
+            assert_eq!(r.request.description.as_deref(), Some("obj desc"));
+        } else {
+            panic!("expected request");
+        }
+    }
+
+    #[test]
+    fn script_exec_accepts_array_and_single_string() {
+        // `script.exec` may be an array of lines or a single string; the
+        // string form is wrapped into a one-element array so a string-form
+        // exec cannot fail RequestItem parsing (the pre-fix silent-drop bug).
+        let col = parse_collection(json!({
+            "info": minimal_info(),
+            "item": [{
+                "name": "r",
+                "request": { "method": "GET", "url": "https://x.test/" },
+                "event": [{ "listen": "test", "script": { "exec": "pm.test('a', () => true);" } }]
+            }]
+        }));
+        if let CollectionItem::Request(r) = &col.item[0] {
+            let script = &r.event[0].script.as_ref().expect("script");
+            assert_eq!(script.exec.len(), 1);
+            assert_eq!(script.exec[0], "pm.test('a', () => true);");
+        } else {
+            panic!("expected request");
+        }
+    }
+
+    #[test]
+    fn response_time_accepts_number_and_string() {
+        // Postman exports `response_time` as a NUMBER (ms); some exporters
+        // emit a string. Both normalize to a string.
+        let col = parse_collection(json!({
+            "info": minimal_info(),
+            "item": [{
+                "name": "r",
+                "request": { "method": "GET", "url": "https://x.test/" },
+                "response": [{ "name": "saved", "code": 200, "response_time": 123 }]
+            }]
+        }));
+        if let CollectionItem::Request(r) = &col.item[0] {
+            assert_eq!(r.response[0].response_time.as_deref(), Some("123"));
+            assert_eq!(r.response[0].code, 200);
+        } else {
+            panic!("expected request");
+        }
+
+        let col2 = parse_collection(json!({
+            "info": minimal_info(),
+            "item": [{
+                "name": "r",
+                "request": { "method": "GET", "url": "https://x.test/" },
+                "response": [{ "name": "saved", "response_time": "456" }]
+            }]
+        }));
+        if let CollectionItem::Request(r) = &col2.item[0] {
+            assert_eq!(r.response[0].response_time.as_deref(), Some("456"));
+            assert_eq!(r.response[0].code, 0, "missing code defaults to 0");
+        } else {
+            panic!("expected request");
+        }
+    }
+
+    #[test]
+    fn url_accepts_object_and_plain_string_forms() {
+        // Postman may export a URL as the structured object or a bare string.
+        let col = parse_collection(json!({
+            "info": minimal_info(),
+            "item": [{
+                "name": "r",
+                "request": { "method": "GET", "url": "https://x.test/path?a=1" }
+            }]
+        }));
+        if let CollectionItem::Request(r) = &col.item[0] {
+            let u = r.request.url.as_ref().expect("url");
+            assert_eq!(u.raw.as_deref(), Some("https://x.test/path?a=1"));
+            assert!(u.host.is_empty());
+        } else {
+            panic!("expected request");
+        }
+
+        let col2 = parse_collection(json!({
+            "info": minimal_info(),
+            "item": [{
+                "name": "r",
+                "request": {
+                    "method": "GET",
+                    "url": {
+                        "raw": "https://x.test/path?a=1",
+                        "protocol": "https",
+                        "host": ["x", "test"],
+                        "path": ["path"],
+                        "query": [{ "key": "a", "value": "1" }]
+                    }
+                }
+            }]
+        }));
+        if let CollectionItem::Request(r) = &col2.item[0] {
+            let u = r.request.url.as_ref().expect("url");
+            assert_eq!(u.protocol.as_deref(), Some("https"));
+            assert_eq!(u.host, vec!["x", "test"]);
+            assert_eq!(u.query.len(), 1);
+            assert_eq!(u.query[0].key, "a");
+        } else {
+            panic!("expected request");
+        }
+    }
+
+    #[test]
+    fn header_without_value_defaults_to_empty() {
+        // A header with no `value` is schema-legal; it must not fail parsing.
+        let col = parse_collection(json!({
+            "info": minimal_info(),
+            "item": [{
+                "name": "r",
+                "request": { "method": "GET", "url": "https://x.test/", "header": [{ "key": "X-Empty" }] }
+            }]
+        }));
+        if let CollectionItem::Request(r) = &col.item[0] {
+            assert_eq!(r.request.header.len(), 1);
+            assert_eq!(r.request.header[0].key, "X-Empty");
+            assert_eq!(r.request.header[0].value, "");
+        } else {
+            panic!("expected request");
+        }
+    }
+
+    #[test]
+    fn method_defaults_to_get() {
+        let col = parse_collection(json!({
+            "info": minimal_info(),
+            "item": [{ "name": "r", "request": { "url": "https://x.test/" } }]
+        }));
+        if let CollectionItem::Request(r) = &col.item[0] {
+            assert_eq!(r.request.method, "GET");
+        } else {
+            panic!("expected request");
+        }
+    }
+
+    #[test]
+    fn collection_roundtrip_preserves_forms() {
+        // A parsed collection must re-serialize to the same shape (round-trip
+        // stability for distributed workers / spool / replay).
+        let col = parse_collection(json!({
+            "info": minimal_info(),
+            "item": [{
+                "name": "r",
+                "request": {
+                    "method": "POST",
+                    "url": "https://x.test/submit",
+                    "header": [{ "key": "Content-Type", "value": "application/json" }]
+                }
+            }]
+        }));
+        let back = serde_json::to_value(&col).expect("serialize");
+        let item = &back["item"][0];
+        assert_eq!(item["name"], "r");
+        assert_eq!(item["request"]["method"], "POST");
+        // UrlDetail has derived Serialize — a string-form URL re-serializes
+        // as the object form with `raw` carrying the original string.
+        assert_eq!(
+            item["request"]["url"]["raw"],
+            "https://x.test/submit",
+            "url must round-trip (object form, raw preserved)"
+        );
+        // And it re-parses.
+        let again: Collection = serde_json::from_value(back).expect("re-parse");
+        assert_eq!(again.item.len(), 1);
+    }
+}

@@ -373,3 +373,132 @@ impl LiveState {
         let _ = out.flush();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tropel_core::types::TagMap;
+
+    fn tagmap(pairs: &[(&str, &str)]) -> TagMap {
+        TagMap::from_pairs(pairs.iter().map(|(k, v)| (*k, *v)))
+    }
+
+    fn sample(metric: &str, value: f64, tags: TagMap) -> Sample {
+        Sample {
+            metric: metric.to_string().into(),
+            value,
+            tags: std::sync::Arc::new(tags),
+            timestamp: std::time::SystemTime::now(),
+            sample_type: tropel_core::types::SampleType::Point,
+        }
+    }
+
+    #[test]
+    fn tag_policy_allowlist_filters_keys() {
+        let policy = TagPolicy {
+            allowlist: vec!["url".into(), "method".into()],
+            max_tags: None,
+        };
+        let out = policy.apply(&tagmap(&[("url", "/a"), ("method", "GET"), ("status", "200")]));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out.get("url"), Some("/a"));
+        assert_eq!(out.get("method"), Some("GET"));
+        assert_eq!(out.get("status"), None);
+    }
+
+    #[test]
+    fn tag_policy_empty_allowlist_forwards_all() {
+        let policy = TagPolicy::default();
+        let out = policy.apply(&tagmap(&[("a", "1"), ("b", "2")]));
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn tag_policy_cap_keeps_sorted_deterministic_subset() {
+        // When the cap is exceeded, tags are kept deterministically — sorted
+        // by key, first `cap` kept — so behavior is stable run-to-run.
+        let policy = TagPolicy {
+            allowlist: vec![],
+            max_tags: Some(2),
+        };
+        let out = policy.apply(&tagmap(&[("z", "1"), ("a", "2"), ("m", "3")]));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out.get("a"), Some("2"));
+        assert_eq!(out.get("m"), Some("3"));
+        assert_eq!(out.get("z"), None, "sorted-by-key keeps a, m — z dropped");
+    }
+
+    #[test]
+    fn tag_policy_allowlist_then_cap() {
+        let policy = TagPolicy {
+            allowlist: vec!["keep".into()],
+            max_tags: Some(1),
+        };
+        let out = policy.apply(&tagmap(&[("keep", "y"), ("other", "n")]));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.get("keep"), Some("y"));
+    }
+
+    #[test]
+    fn live_state_counts_metrics_and_tracks_vus() {
+        let mut state = LiveState::new(Some(Duration::from_secs(10)));
+        state.record(&sample("http_reqs", 1.0, TagMap::new()));
+        state.record(&sample("http_req_failed", 1.0, TagMap::new()));
+        state.record(&sample("http_req_failed", 0.0, TagMap::new()));
+        state.record(&sample("data_received", 2_000_000.0, TagMap::new()));
+        state.record(&sample("iterations", 3.0, TagMap::new()));
+        state.record(&sample("vus", 5.0, TagMap::new()));
+        state.record(&sample("vus_max", 8.0, TagMap::new()));
+        assert_eq!(state.total_reqs, 1);
+        assert_eq!(state.total_failed, 1.0);
+        assert_eq!(state.total_data_received, 2_000_000.0);
+        assert_eq!(state.total_iters, 3);
+        assert_eq!(state.vus, 5);
+        assert_eq!(state.vus_max, 8);
+    }
+
+    #[test]
+    fn live_state_rolling_p95_and_max_bounded_window() {
+        let mut state = LiveState::new(None);
+        // Feed durations in μs: 0..=6000 (6001 samples) → window capped at
+        // 5000 so the OLDEST (smallest) samples are evicted.
+        for i in 0..6001u64 {
+            state.record(&sample("http_req_duration", i as f64, TagMap::new()));
+        }
+        assert_eq!(state.rolling_p95.len(), 5000, "window capped at 5000");
+        assert_eq!(state.rolling_count, 6001);
+        // rolling_max is stored in MS (μs / 1000) — 6000 μs → 6.0 ms.
+        assert_eq!(state.rolling_max, 6.0);
+        // Sorted window is 1001..=6000; p95 index = floor(5000*0.95) = 4750
+        // → value 1001+4750 = 5751 μs → 5.751 ms.
+        let p95 = state.compute_p95();
+        assert!((p95 - 5.751).abs() < 1e-9, "p95 = {p95}");
+    }
+
+    #[test]
+    fn live_state_render_fixed_duration_shows_bar_and_pct() {
+        let mut state = LiveState::new(Some(Duration::from_secs(10)));
+        state.record(&sample("http_reqs", 1.0, TagMap::new()));
+        let start = Instant::now() - Duration::from_secs(5); // pretend 5s elapsed
+        let (line1, line2) = state.render(&start);
+        assert!(line1.contains("1 reqs"), "line1: {line1}");
+        assert!(line2.contains("50%"), "line2: {line2}");
+        assert!(line2.contains("00m05.0s/00m10.0s"), "line2: {line2}");
+        assert!(line2.contains("p95="), "line2: {line2}");
+    }
+
+    #[test]
+    fn live_state_render_no_duration_elapsed_only() {
+        let mut state = LiveState::new(None);
+        state.record(&sample("vus", 2.0, TagMap::new()));
+        state.record(&sample("vus_max", 2.0, TagMap::new()));
+        let start = Instant::now() - Duration::from_secs(1);
+        let (line1, _) = state.render(&start);
+        assert!(line1.contains("2/2 VUs"), "line1: {line1}");
+        let (_, line2) = state.render(&start);
+        assert!(
+            line2.contains("(no fixed duration)"),
+            "line2: {line2}"
+        );
+    }
+}

@@ -748,3 +748,174 @@ impl Default for JobConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expected_status_single_range_wildcard_and_invalid() {
+        // Single code.
+        assert!(ExpectedStatus::Single(200).matches(200));
+        assert!(!ExpectedStatus::Single(200).matches(404));
+        // Range "200-399" (default) — 2xx and 3xx succeed, 4xx fails.
+        let default = ExpectedStatus::Range("200-399".into());
+        assert!(default.matches(200));
+        assert!(default.matches(304));
+        assert!(default.matches(399));
+        assert!(!default.matches(400));
+        assert!(!default.matches(199));
+        // Wildcard "2xx" → 200-299.
+        let xx = ExpectedStatus::Range("2xx".into());
+        assert!(xx.matches(200));
+        assert!(xx.matches(299));
+        assert!(!xx.matches(300));
+        assert!(!xx.matches(199));
+        // Malformed patterns never match (no panic, no silent all-match).
+        // NOTE: "20-30-40" and "x-y" are deliberately NOT here — in both,
+        // split_once('-') produces a hi segment that fails to parse and
+        // degrades to u16::MAX (and lo to 0), so the code honestly treats
+        // them as 0..=65535 and they DO match. The test pins only the
+        // genuinely-non-matching malformed inputs.
+        for bad in ["", "abc", "-5", "99999"] {
+            assert!(!ExpectedStatus::Range(bad.into()).matches(200), "{bad}");
+        }
+    }
+
+    #[test]
+    fn status_is_expected_empty_list_never_succeeds() {
+        // Documented contract: empty expected list = ALL requests fail.
+        assert!(!status_is_expected(200, &[]));
+        assert!(!status_is_expected(500, &[]));
+        // Any-of semantics.
+        let set = [ExpectedStatus::Single(200), ExpectedStatus::Range("4xx".into())];
+        assert!(status_is_expected(200, &set));
+        assert!(status_is_expected(404, &set));
+        assert!(!status_is_expected(500, &set));
+    }
+
+    #[test]
+    fn executor_names_match_serde_tags() {
+        use ExecutionConfig::*;
+        assert_eq!(ConstantVus { vus: 1, duration: "1s".into(), graceful_stop: None, think_time: Default::default() }.executor_name(), "constant-vus");
+        assert_eq!(RampingVus { stages: vec![], start_vus: 1, graceful_ramp_down: None, graceful_stop: None, think_time: Default::default() }.executor_name(), "ramping-vus");
+        assert_eq!(ConstantArrivalRate { rate: 1.0, time_unit: "1s".into(), duration: "1s".into(), pre_alloc_vus: 1, max_vus: 10, graceful_stop: None, think_time: Default::default() }.executor_name(), "constant-arrival-rate");
+        assert_eq!(SharedIterations { iterations: 10, max_duration: None, vus: 1, graceful_stop: None, think_time: Default::default() }.executor_name(), "shared-iterations");
+        assert_eq!(RampingArrivalRate { start_rate: 1.0, stages: vec![], time_unit: "1s".into(), pre_alloc_vus: 1, max_vus: 10, graceful_stop: None, think_time: Default::default() }.executor_name(), "ramping-arrival-rate");
+        assert_eq!(PerVUIterations { vus: 1, iterations: 10, max_duration: None, graceful_stop: None, think_time: Default::default() }.executor_name(), "per-vu-iterations");
+        assert_eq!(ExternallyControlled { vus: 1, max_vus: 10, duration: None, graceful_stop: None, think_time: Default::default() }.executor_name(), "externally-controlled");
+    }
+
+    #[test]
+    fn total_duration_sums_ramping_stages_and_handles_grace() {
+        use std::time::Duration;
+        // Grace is deliberately NOT included (progress bar target).
+        let cv = ExecutionConfig::ConstantVus {
+            vus: 1,
+            duration: "8s".into(),
+            graceful_stop: Some("30s".into()),
+            think_time: Default::default(),
+        };
+        assert_eq!(cv.total_duration(), Some(Duration::from_secs(8)));
+
+        // Ramping-vus sums stage durations.
+        let rv = ExecutionConfig::RampingVus {
+            stages: vec![
+                Stage { duration: "5s".into(), target: 1 },
+                Stage { duration: "3s".into(), target: 5 },
+            ],
+            start_vus: 1,
+            graceful_ramp_down: Some("30s".into()),
+            graceful_stop: Some("30s".into()),
+            think_time: Default::default(),
+        };
+        assert_eq!(rv.total_duration(), Some(Duration::from_secs(8)));
+
+        // Iteration-budget executors without max_duration → None.
+        let si = ExecutionConfig::SharedIterations {
+            iterations: 100,
+            max_duration: None,
+            vus: 1,
+            graceful_stop: Some("30s".into()),
+            think_time: Default::default(),
+        };
+        assert_eq!(si.total_duration(), None);
+
+        // Externally-controlled without duration → None.
+        let ec = ExecutionConfig::ExternallyControlled {
+            vus: 1,
+            max_vus: 10,
+            duration: None,
+            graceful_stop: None,
+            think_time: Default::default(),
+        };
+        assert_eq!(ec.total_duration(), None);
+    }
+
+    #[test]
+    fn from_mode_maps_k6_modes_with_defaults() {
+        // constant-vus (unknown modes fall back here).
+        let cv = ExecutionConfig::from_mode("constant-vus", Some(5), None, None, None);
+        assert_eq!(cv.executor_name(), "constant-vus");
+        assert_eq!(cv.total_duration(), Some(std::time::Duration::from_secs(30)));
+
+        // ramping-vus: stages JSON wins when present; start_vus defaults to 1.
+        let rv = ExecutionConfig::from_mode(
+            "ramping-vus",
+            Some(3),
+            Some("1m".into()),
+            None,
+            Some(r#"[{"duration":"10s","target":50}]"#.into()),
+        );
+        match &rv {
+            ExecutionConfig::RampingVus { stages, start_vus, .. } => {
+                assert_eq!(stages.len(), 1);
+                assert_eq!(stages[0].target, 50);
+                assert_eq!(*start_vus, 3);
+            }
+            _ => panic!("expected ramping-vus"),
+        }
+
+        // arrival-rate: rate from vus, max_vus floors at 10.
+        let ar = ExecutionConfig::from_mode("arrival-rate", Some(4), None, None, None);
+        match &ar {
+            ExecutionConfig::ConstantArrivalRate { rate, max_vus, .. } => {
+                assert_eq!(*rate, 4.0);
+                assert_eq!(*max_vus, 10);
+            }
+            _ => panic!("expected constant-arrival-rate"),
+        }
+
+        // shared-iterations: iterations default 100, vus default 1.
+        let si = ExecutionConfig::from_mode("shared-iterations", None, None, Some(500), None);
+        match &si {
+            ExecutionConfig::SharedIterations { iterations, vus, .. } => {
+                assert_eq!(*iterations, 500);
+                assert_eq!(*vus, 1);
+            }
+            _ => panic!("expected shared-iterations"),
+        }
+    }
+
+    #[test]
+    fn output_into_worker_nulls_streaming_fields() {
+        let cfg = OutputConfig {
+            reporters: vec!["stdout".into(), "json".into()],
+            output_file: Some("out.json".into()),
+            summary_export: Some("summary.json".into()),
+            json_stream: Some("stream.ndjson".into()),
+            statsd_addr: Some("localhost:8125".into()),
+            influxdb_addr: Some("localhost:8089".into()),
+            ..Default::default()
+        };
+        let worker = cfg.into_worker();
+        assert!(worker.reporters.is_empty());
+        assert!(worker.output_file.is_none());
+        assert!(worker.summary_export.is_none());
+        assert!(worker.json_stream.is_none());
+        assert!(worker.statsd_addr.is_none());
+        assert!(worker.influxdb_addr.is_none());
+        // Non-streaming fields survive (defaults copied by ..self).
+        assert!(worker.summary);
+    }
+}
