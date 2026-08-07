@@ -5,7 +5,7 @@ use crate::vu_loop::{parse_duration_str, run_driver_vus, run_scenario_vus};
 use crate::worker::VUWorkerPool;
 
 /// One entry of the per-scenario config list threaded into `run_scenario_vus`.
-struct ScenarioConfigTuple {
+struct ScenarioConfigEntry {
     name: String,
     execution: ExecutionConfig,
     env: HashMap<String, String>,
@@ -25,7 +25,10 @@ use tropel_ext::registry::ExtensionRegistry;
 use tropel_ext::traits::Protocol;
 use tropel_metrics::collector::MetricsCollector;
 use tropel_metrics::thresholds::validate_thresholds;
-use tropel_report::{create_reporter, InfluxdbOutput, JsonStreamOutput, OtlpOutput, PrometheusRemoteWriteOutput, Reporter, StatsdOutput, StreamingStdoutOutput, TagPolicy};
+use tropel_report::{
+    create_reporter, InfluxdbOutput, JsonStreamOutput, OtlpOutput, PrometheusRemoteWriteOutput,
+    Reporter, StatsdOutput, StreamingStdoutOutput, TagPolicy,
+};
 
 /// Capacity of the streaming-output broadcast ring. Sized for ~2.5s of
 /// samples at ~100k samples/s so consumer stalls don't drop live data
@@ -51,7 +54,9 @@ impl Engine {
 
         // Latency histogram ceiling (None = auto-resize, no clipping). Applied
         // before any samples are recorded so every MetricSet uses it.
-        metrics.set_histogram_max(config.http.histogram_max_micros).await;
+        metrics
+            .set_histogram_max(config.http.histogram_max_micros)
+            .await;
 
         let num_workers = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -81,8 +86,7 @@ impl Engine {
         // skipped the whole block and every script safety control evaporated).
         // Only the script's own load profile (execution/scenarios) is gated
         // on execution_explicit so explicit CLI/config profiles win.
-        let script_load_profile_allowed =
-            !config.execution_explicit && config.scenarios.is_empty();
+        let script_load_profile_allowed = !config.execution_explicit && config.scenarios.is_empty();
         let mut declared_scenarios: Option<HashMap<String, ScenarioConfig>> = None;
         let mut declared_execution: Option<ExecutionConfig> = None;
         let mut declared_trend_stats: Option<Vec<String>> = None;
@@ -215,8 +219,9 @@ impl Engine {
 
         // Global RPS limiter (k6 `options.rps`): created ONCE per run and
         // shared by every VU across every scenario, so the cap is global.
-        let rps_limiter: Option<Arc<tropel_http::RpsLimiter>> =
-            http_config.rps.map(|r| Arc::new(tropel_http::RpsLimiter::new(r)));
+        let rps_limiter: Option<Arc<tropel_http::RpsLimiter>> = http_config
+            .rps
+            .map(|r| Arc::new(tropel_http::RpsLimiter::new(r)));
         if rps_limiter.is_some() {
             tracing::info!(
                 "Global RPS cap: {} req/s (shared across all VUs)",
@@ -251,8 +256,7 @@ impl Engine {
             if let Some(scs) = &declared_scenarios {
                 scs.values()
                     .map(|sc| {
-                        let start =
-                            parse_duration_str(&sc.start_time).unwrap_or(Duration::ZERO);
+                        let start = parse_duration_str(&sc.start_time).unwrap_or(Duration::ZERO);
                         consider(&sc.execution, start)
                     })
                     .flatten()
@@ -262,14 +266,16 @@ impl Engine {
                     .scenarios
                     .values()
                     .map(|sc| {
-                        let start =
-                            parse_duration_str(&sc.start_time).unwrap_or(Duration::ZERO);
+                        let start = parse_duration_str(&sc.start_time).unwrap_or(Duration::ZERO);
                         consider(&sc.execution, start)
                     })
                     .flatten()
                     .max()
             } else {
-                consider(declared_execution.as_ref().unwrap_or(&config.execution), Duration::ZERO)
+                consider(
+                    declared_execution.as_ref().unwrap_or(&config.execution),
+                    Duration::ZERO,
+                )
             }
         };
 
@@ -292,11 +298,7 @@ impl Engine {
         // built-in path so samples are not pushed twice. Only skip when the
         // extension output is actually registered: a custom binary built
         // without tropel-x-prometheus must not silently lose its stream.
-        let prometheus_via_extension = config
-            .output
-            .reporters
-            .iter()
-            .any(|r| r == "prometheus")
+        let prometheus_via_extension = config.output.reporters.iter().any(|r| r == "prometheus")
             && self
                 .extension_registry
                 .list_outputs()
@@ -351,15 +353,15 @@ impl Engine {
         }
         if output_handles.is_empty() {
             metrics.set_sample_sink(None);
-        }        // Build scenario configs. Script-declared scenarios/execution (from a
-        // k6 `export const options`) take precedence over the default profile
-        // but not over explicit user config (execution_explicit check above).
-        let scenario_configs: Vec<ScenarioConfigTuple> = if let Some(scs) = declared_scenarios {
+        } // Build scenario configs. Script-declared scenarios/execution (from a
+          // k6 `export const options`) take precedence over the default profile
+          // but not over explicit user config (execution_explicit check above).
+        let scenario_configs: Vec<ScenarioConfigEntry> = if let Some(scs) = declared_scenarios {
             scs.iter()
                 .map(|(name, sc)| {
                     let start_delay = parse_duration_str(&sc.start_time).unwrap_or(Duration::ZERO);
                     let input_path = sc.input.clone().unwrap_or_else(|| config.input.clone());
-                    ScenarioConfigTuple {
+                    ScenarioConfigEntry {
                         name: name.clone(),
                         execution: sc.execution.clone(),
                         env: sc.env.clone(),
@@ -377,7 +379,7 @@ impl Engine {
                 .map(|(name, sc)| {
                     let start_delay = parse_duration_str(&sc.start_time).unwrap_or(Duration::ZERO);
                     let input_path = sc.input.clone().unwrap_or_else(|| config.input.clone());
-                    ScenarioConfigTuple {
+                    ScenarioConfigEntry {
                         name: name.clone(),
                         execution: sc.execution.clone(),
                         env: sc.env.clone(),
@@ -390,17 +392,15 @@ impl Engine {
                 .collect()
         } else {
             let exec = declared_execution.unwrap_or_else(|| config.execution.clone());
-            vec![
-                ScenarioConfigTuple {
-                    name: "default".to_string(),
-                    execution: exec,
-                    env: HashMap::new(),
-                    tags: HashMap::new(),
-                    start_delay: Duration::ZERO,
-                    input_path: config.input.clone(),
-                    exec: None,
-                }
-            ]
+            vec![ScenarioConfigEntry {
+                name: "default".to_string(),
+                execution: exec,
+                env: HashMap::new(),
+                tags: HashMap::new(),
+                start_delay: Duration::ZERO,
+                input_path: config.input.clone(),
+                exec: None,
+            }]
         };
 
         // Apply the execution segment (k6 executionSegment /
@@ -426,7 +426,7 @@ impl Engine {
             },
             None => None,
         };
-        let scenario_configs: Vec<ScenarioConfigTuple> = scenario_configs
+        let scenario_configs: Vec<ScenarioConfigEntry> = scenario_configs
             .into_iter()
             .map(|mut sc| {
                 if let Some(seg) = &segment {
@@ -576,8 +576,8 @@ impl Engine {
 
         // Apply summary presentation config (trend stats + effective
         // thresholds) to the collector so reporters see them.
-        let summary_trend_stats = declared_trend_stats
-            .unwrap_or_else(tropel_metrics::collector::k6_default_trend_stats);
+        let summary_trend_stats =
+            declared_trend_stats.unwrap_or_else(tropel_metrics::collector::k6_default_trend_stats);
         metrics
             .set_summary_config(summary_trend_stats, thresholds.clone())
             .await;
@@ -648,10 +648,7 @@ impl Engine {
                 // Extension outputs are driven from the sample stream during
                 // the run (see Engine::run) — they are not end-of-run
                 // reporters, so there is nothing to create here.
-                tracing::debug!(
-                    "Extension output '{}' driven as a streaming output",
-                    name
-                );
+                tracing::debug!("Extension output '{}' driven as a streaming output", name);
             } else {
                 tracing::warn!("Unknown reporter: {}", name);
             }
@@ -670,9 +667,7 @@ impl Default for Engine {
     }
 }
 
-
 // handleSummary(data) — script-emitted custom summaries
-
 
 /// Invoke the script's `handleSummary(data)` (k6) after the run and
 /// write the returned files (`stdout` key prints to stdout). When the
@@ -690,58 +685,58 @@ pub async fn emit_handle_summary(
     thresholds: &HashMap<String, tropel_core::config::ThresholdConfig>,
     test_start: Instant,
 ) {
-        let summary_value = build_summary_data(results, thresholds, test_start);
-        let summary_json = serde_json::to_string(&summary_value).unwrap_or_default();
+    let summary_value = build_summary_data(results, thresholds, test_start);
+    let summary_json = serde_json::to_string(&summary_value).unwrap_or_default();
 
-        // Resolve a driver for the input (k6 scripts declare handleSummary).
-        // If no driver resolves (e.g. a Postman/HAR declarative collection),
-        // there is no script to call — fall through to --summary-export.
-        let input_path = std::path::Path::new(&config.input);
-        let bytes = std::fs::read(&config.input).ok();
-        let driver = bytes.as_ref().and_then(|b| {
-            if let Some(fmt) = &config.input_type {
-                registry.resolve_driver_by_id(fmt)
-            } else {
-                registry.resolve_driver(b)
-            }
-        });
+    // Resolve a driver for the input (k6 scripts declare handleSummary).
+    // If no driver resolves (e.g. a Postman/HAR declarative collection),
+    // there is no script to call — fall through to --summary-export.
+    let input_path = std::path::Path::new(&config.input);
+    let bytes = std::fs::read(&config.input).ok();
+    let driver = bytes.as_ref().and_then(|b| {
+        if let Some(fmt) = &config.input_type {
+            registry.resolve_driver_by_id(fmt)
+        } else {
+            registry.resolve_driver(b)
+        }
+    });
 
-        let mut handled = false;
-        if let (Some(driver), Some(bytes)) = (driver, bytes.as_deref()) {
-            if let Some(files) = driver
-                .handle_summary(bytes, Some(input_path), &summary_json, &config.env)
-                .await
-            {
-                // k6 semantics: a script-defined handleSummary REPLACES the
-                // default summary entirely — even a stdout-only map suppresses
-                // the --summary-export fallback.
-                handled = true;
-                for (name, content) in files {
-                    if name == "stdout" {
-                        println!("{content}");
-                    } else if let Err(e) = std::fs::write(&name, content) {
-                        tracing::warn!("handleSummary failed to write '{name}': {e}");
-                    } else {
-                        tracing::info!("handleSummary wrote '{name}'");
-                    }
+    let mut handled = false;
+    if let (Some(driver), Some(bytes)) = (driver, bytes.as_deref()) {
+        if let Some(files) = driver
+            .handle_summary(bytes, Some(input_path), &summary_json, &config.env)
+            .await
+        {
+            // k6 semantics: a script-defined handleSummary REPLACES the
+            // default summary entirely — even a stdout-only map suppresses
+            // the --summary-export fallback.
+            handled = true;
+            for (name, content) in files {
+                if name == "stdout" {
+                    println!("{content}");
+                } else if let Err(e) = std::fs::write(&name, content) {
+                    tracing::warn!("handleSummary failed to write '{name}': {e}");
+                } else {
+                    tracing::info!("handleSummary wrote '{name}'");
                 }
             }
         }
+    }
 
-        // Fallback: --summary-export writes the default JSON summary when no
-        // script handleSummary produced any output.
-        if !handled {
-            if let Some(path) = &config.output.summary_export {
-                let pretty = serde_json::to_string_pretty(&summary_value).unwrap_or_default();
-                if let Err(e) = std::fs::write(path, pretty) {
-                    tracing::warn!("Failed to write summary export to '{:?}': {}", path, e);
-                } else {
-                    tracing::info!("Summary exported to '{:?}'", path);            }
+    // Fallback: --summary-export writes the default JSON summary when no
+    // script handleSummary produced any output.
+    if !handled {
+        if let Some(path) = &config.output.summary_export {
+            let pretty = serde_json::to_string_pretty(&summary_value).unwrap_or_default();
+            if let Err(e) = std::fs::write(path, pretty) {
+                tracing::warn!("Failed to write summary export to '{:?}': {}", path, e);
+            } else {
+                tracing::info!("Summary exported to '{:?}'", path);
+            }
         }
     }
 }
 // Result type
-
 
 #[derive(Debug)]
 pub struct EngineResult {
@@ -766,5 +761,3 @@ pub struct EngineResult {
     /// check, exit 0).
     pub script_failures: u64,
 }
-
-

@@ -379,8 +379,7 @@ impl HttpClient {
                 } else {
                     reqwest::redirect::Policy::none()
                 };
-                let client =
-                    Self::build_client(&self.config, &self.tls, Some(identity), redirect)?;
+                let client = Self::build_client(&self.config, &self.tls, Some(identity), redirect)?;
                 cache.insert(cache_key, client.clone());
                 Ok(client)
             }
@@ -452,7 +451,10 @@ impl HttpClient {
 
         // Build the reqwest request
         let multipart_content_type = if matches!(request.body, Some(Body::FormData(_))) {
-            Some(format!("multipart/form-data; boundary={}", MULTIPART_BOUNDARY))
+            Some(format!(
+                "multipart/form-data; boundary={}",
+                MULTIPART_BOUNDARY
+            ))
         } else {
             None
         };
@@ -469,9 +471,8 @@ impl HttpClient {
         // `--no-redirects` (HttpConfig.no_redirects) disables following
         // entirely: the 3xx response is returned as-is with no hops captured
         // — an option k6 itself lacks (it always follows up to maxRedirects).
-        let manual_follow = request.follow_redirects
-            && !self.config.no_redirects
-            && self.config.max_redirects > 0;
+        let manual_follow =
+            request.follow_redirects && !self.config.no_redirects && self.config.max_redirects > 0;
         let client = if manual_follow {
             // Manual following needs a Policy::none() client so reqwest never
             // auto-follows behind our back (the no-redirect twin).
@@ -616,9 +617,9 @@ impl HttpClient {
             // original URL). The signer-added headers are captured and
             // re-applied on same-origin hops (see above); cross-origin hops
             // strip them, matching reqwest's redirect policy.
-            let mut built_request = req_builder.build().map_err(|e| {
-                TropelError::Http(format!("Failed to build request: {}", e))
-            })?;
+            let mut built_request = req_builder
+                .build()
+                .map_err(|e| TropelError::Http(format!("Failed to build request: {}", e)))?;
             if hop_index == 0 {
                 if let Some(signer) = signer {
                     signer
@@ -637,9 +638,10 @@ impl HttpClient {
                             continue;
                         }
                         let value_str = value.to_str().unwrap_or("");
-                        let identical_in_original = request.headers.iter().any(|(k, v)| {
-                            k.eq_ignore_ascii_case(&key) && v == value_str
-                        });
+                        let identical_in_original = request
+                            .headers
+                            .iter()
+                            .any(|(k, v)| k.eq_ignore_ascii_case(&key) && v == value_str);
                         if !identical_in_original {
                             signed_headers.push((key, value_str.to_string()));
                         }
@@ -652,46 +654,42 @@ impl HttpClient {
             // unused.
             let retry_request = built_request.try_clone();
 
-        // ═══════════════════════════════════════════════════════
-        // Phase 1: Send request → receive response head (TTFB)
-        // ═══════════════════════════════════════════════════════
-        // The response head (status line + headers) is received when this
-        // resolves. The measured "waiting" time includes everything up to
-        // this point: blocked + DNS + TCP connect + TLS handshake + sending +
-        // server processing.
-        let waiting_start = std::time::Instant::now();
-        let mut response = crate::subtimings::TimedRequest::new(
-            client.execute(built_request),
-            slot.clone(),
-        )
-        .await
-        .map_err(|e| TropelError::Http(format!("Request failed: {}", e)))?;
-        let mut waiting_duration = waiting_start.elapsed();
+            // ═══════════════════════════════════════════════════════
+            // Phase 1: Send request → receive response head (TTFB)
+            // ═══════════════════════════════════════════════════════
+            // The response head (status line + headers) is received when this
+            // resolves. The measured "waiting" time includes everything up to
+            // this point: blocked + DNS + TCP connect + TLS handshake + sending +
+            // server processing.
+            let waiting_start = std::time::Instant::now();
+            let mut response =
+                crate::subtimings::TimedRequest::new(client.execute(built_request), slot.clone())
+                    .await
+                    .map_err(|e| TropelError::Http(format!("Request failed: {}", e)))?;
+            let mut waiting_duration = waiting_start.elapsed();
 
-        // HTTP Digest (RFC 7616) is challenge-response: the first request goes
-        // out unauthenticated, and on a 401 with a `WWW-Authenticate: Digest`
-        // header we compute the Authorization value and retry once. The
-        // retried response replaces the 401 for all downstream processing.
-        if response.status().as_u16() == 401 {
-            if let Some(signer) = signer {
-                // A server may send several `WWW-Authenticate` header LINES
-                // (one per scheme: `Basic realm=...` then `Digest realm=...`)
-                // — the old `.get()` read only the first line, so a Digest
-                // challenge on a later line was never seen (backlog line 176).
-                let www: Vec<String> = response
-                    .headers()
-                    .get_all(reqwest::header::WWW_AUTHENTICATE)
-                    .iter()
-                    .filter_map(|v| v.to_str().ok())
-                    .map(str::to_string)
-                    .collect();
-                let www = www.join(", ");
-                if !www.is_empty() {
-                    if let Some(mut retry) = retry_request {
-                        if let Some(auth_value) = signer.challenge_response(&www, &retry) {
-                            retry
-                                .headers_mut()
-                                .insert(
+            // HTTP Digest (RFC 7616) is challenge-response: the first request goes
+            // out unauthenticated, and on a 401 with a `WWW-Authenticate: Digest`
+            // header we compute the Authorization value and retry once. The
+            // retried response replaces the 401 for all downstream processing.
+            if response.status().as_u16() == 401 {
+                if let Some(signer) = signer {
+                    // A server may send several `WWW-Authenticate` header LINES
+                    // (one per scheme: `Basic realm=...` then `Digest realm=...`)
+                    // — the old `.get()` read only the first line, so a Digest
+                    // challenge on a later line was never seen (backlog line 176).
+                    let www: Vec<String> = response
+                        .headers()
+                        .get_all(reqwest::header::WWW_AUTHENTICATE)
+                        .iter()
+                        .filter_map(|v| v.to_str().ok())
+                        .map(str::to_string)
+                        .collect();
+                    let www = www.join(", ");
+                    if !www.is_empty() {
+                        if let Some(mut retry) = retry_request {
+                            if let Some(auth_value) = signer.challenge_response(&www, &retry) {
+                                retry.headers_mut().insert(
                                     reqwest::header::AUTHORIZATION,
                                     auth_value.parse().map_err(|_| {
                                         TropelError::Http(
@@ -699,291 +697,292 @@ impl HttpClient {
                                         )
                                     })?,
                                 );
-                            let retry_start = std::time::Instant::now();
-                            response = crate::subtimings::TimedRequest::new(
-                                client.execute(retry),
-                                slot.clone(),
-                            )
-                            .await
-                            .map_err(|e| {
-                                TropelError::Http(format!("Request failed: {}", e))
-                            })?;
-                            waiting_duration = retry_start.elapsed();
-                            tracing::debug!(
-                                "Digest auth: retried after 401 challenge (status now {})",
-                                response.status().as_u16()
-                            );
+                                let retry_start = std::time::Instant::now();
+                                response = crate::subtimings::TimedRequest::new(
+                                    client.execute(retry),
+                                    slot.clone(),
+                                )
+                                .await
+                                .map_err(|e| TropelError::Http(format!("Request failed: {}", e)))?;
+                                waiting_duration = retry_start.elapsed();
+                                tracing::debug!(
+                                    "Digest auth: retried after 401 challenge (status now {})",
+                                    response.status().as_u16()
+                                );
+                            }
                         }
                     }
                 }
             }
-        }
 
-        let status_code = response.status().as_u16();
-        let status_text = response
-            .status()
-            .canonical_reason()
-            .unwrap_or("Unknown")
-            .to_string();
+            let status_code = response.status().as_u16();
+            let status_text = response
+                .status()
+                .canonical_reason()
+                .unwrap_or("Unknown")
+                .to_string();
 
-        // Collect response headers — canonicalized to Go's MIME form
-        // (Content-Type, X-Request-Id) because reqwest's HeaderName is
-        // always lowercase; k6/Postman scripts index headers by their
-        // canonical spelling and every doc example would otherwise see
-        // undefined.
-        let headers: HashMap<String, String> = response
-            .headers()
-            .iter()
-            .map(|(k, v)| {
-                (
-                    canonical_header_name(k.as_str()),
-                    v.to_str().unwrap_or("").to_string(),
-                )
-            })
-            .collect();
+            // Collect response headers — canonicalized to Go's MIME form
+            // (Content-Type, X-Request-Id) because reqwest's HeaderName is
+            // always lowercase; k6/Postman scripts index headers by their
+            // canonical spelling and every doc example would otherwise see
+            // undefined.
+            let headers: HashMap<String, String> = response
+                .headers()
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        canonical_header_name(k.as_str()),
+                        v.to_str().unwrap_or("").to_string(),
+                    )
+                })
+                .collect();
 
-        // Parse Set-Cookie headers into structured cookies so scripts can
-        // read `res.cookies` (pm.response.cookies / k6 res.cookies). The
-        // header may appear multiple times (one per cookie); a HashMap would
-        // collapse them, so we walk `get_all` on the raw header map.
-        let cookies: Vec<Cookie> = response
-            .headers()
-            .get_all(reqwest::header::SET_COOKIE)
-            .iter()
-            .filter_map(|v| parse_set_cookie(v.to_str().ok()?))
-            .collect();
+            // Parse Set-Cookie headers into structured cookies so scripts can
+            // read `res.cookies` (pm.response.cookies / k6 res.cookies). The
+            // header may appear multiple times (one per cookie); a HashMap would
+            // collapse them, so we walk `get_all` on the raw header map.
+            let cookies: Vec<Cookie> = response
+                .headers()
+                .get_all(reqwest::header::SET_COOKIE)
+                .iter()
+                .filter_map(|v| parse_set_cookie(v.to_str().ok()?))
+                .collect();
 
-        // ── Redirect hop? ──
-        // k6 parity: every redirect hop is its own request. When the response
-        // is a 3xx with a Location header (and hops remain), capture it as a
-        // hop response, resolve the next URL, rewrite method/body per RFC
-        // 7231, and loop to send the next hop.
-        let location = response
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        let is_redirect = matches!(status_code, 301 | 302 | 303 | 307 | 308);
-        if manual_follow && redirects.len() < max_hops && is_redirect {
-            if let Some(location) = location {
-                // Capture the hop as its own response (own duration). The
-                // body is the usually-tiny redirect body — drain it so the
-                // connection returns to the pool.
-                let mut hop_body: Vec<u8> = Vec::new();
-                while let Some(chunk) = response
-                    .chunk()
+            // ── Redirect hop? ──
+            // k6 parity: every redirect hop is its own request. When the response
+            // is a 3xx with a Location header (and hops remain), capture it as a
+            // hop response, resolve the next URL, rewrite method/body per RFC
+            // 7231, and loop to send the next hop.
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let is_redirect = matches!(status_code, 301 | 302 | 303 | 307 | 308);
+            if manual_follow && redirects.len() < max_hops && is_redirect {
+                if let Some(location) = location {
+                    // Capture the hop as its own response (own duration). The
+                    // body is the usually-tiny redirect body — drain it so the
+                    // connection returns to the pool.
+                    let mut hop_body: Vec<u8> = Vec::new();
+                    while let Some(chunk) = response.chunk().await.map_err(|e| {
+                        TropelError::Http(format!("Failed to read redirect body: {}", e))
+                    })? {
+                        hop_body.extend_from_slice(&chunk);
+                    }
+                    let hop_total = hop_start.elapsed();
+                    let hop_phases = crate::subtimings::take_slot(&slot);
+                    let mut hop_timings =
+                        Timings::from_measured(waiting_duration, Duration::ZERO, hop_total);
+                    if let (Some(request_start), Some(connect_start), Some(connect_elapsed)) = (
+                        hop_phases.request_start,
+                        hop_phases.connect_start,
+                        hop_phases.connect_elapsed,
+                    ) {
+                        hop_timings.blocked =
+                            connect_start.saturating_duration_since(request_start);
+                        hop_timings.dns = hop_phases.dns_elapsed.unwrap_or_default();
+                        hop_timings.connecting = connect_elapsed.saturating_sub(hop_timings.dns);
+                    }
+                    let hop_connect =
+                        hop_timings.blocked + hop_timings.dns + hop_timings.connecting;
+                    hop_timings.waiting = hop_timings.waiting.saturating_sub(hop_connect);
+
+                    // `size` counts the drained hop body bytes so data_received
+                    // per hop matches the wire (k6 counts per-request
+                    // data_received).
+                    let hop_size = hop_body.len() as u64;
+                    redirects.push(HttpResponse {
+                        url: current_url.clone(),
+                        status_code,
+                        status_text,
+                        headers,
+                        body: hop_body,
+                        text_cache: std::cell::OnceCell::new(),
+                        json_cache: std::cell::OnceCell::new(),
+                        response_time: hop_total,
+                        timings: Some(hop_timings),
+                        cookies,
+                        size: hop_size,
+                        request_body_size: 0,
+                        redirects: Vec::new(),
+                    });
+
+                    // Resolve the Location header against the current URL.
+                    let base = reqwest::Url::parse(&current_url).map_err(|e| {
+                        TropelError::Http(format!("Invalid request URL '{}': {}", current_url, e))
+                    })?;
+                    let next = base.join(&location).map_err(|e| {
+                        TropelError::Http(format!(
+                            "Invalid redirect Location '{}': {}",
+                            location, e
+                        ))
+                    })?;
+
+                    // Cross-origin redirect → drop credentials for the next hop.
+                    let cur = reqwest::Url::parse(&current_url).ok();
+                    let same_origin = match &cur {
+                        Some(c) => {
+                            c.scheme() == next.scheme()
+                                && c.host_str() == next.host_str()
+                                && c.port_or_known_default() == next.port_or_known_default()
+                        }
+                        None => false,
+                    };
+                    if !same_origin {
+                        strip_sensitive = true;
+                    }
+
+                    // RFC 7231 method rewrite (matches reqwest/k6):
+                    //   303 → GET (drop body), except HEAD stays HEAD
+                    //   301/302 → GET only for POST (drop body)
+                    //   307/308 → keep method and body
+                    match status_code {
+                        303 if current_method != Method::HEAD => {
+                            current_method = Method::GET;
+                            current_body = None;
+                        }
+                        301 | 302 if current_method == Method::POST => {
+                            current_method = Method::GET;
+                            current_body = None;
+                        }
+                        _ => {}
+                    }
+
+                    tracing::debug!("Redirect {}: {} -> {}", status_code, current_url, next);
+                    current_url = next.to_string();
+                    hop_index += 1;
+                    continue;
+                }
+            }
+
+            // ═══════════════════════════════════════════════════════
+            // Phase 2: Receive response body
+            // ═══════════════════════════════════════════════════════
+            // The body is drained-but-not-stored when the GLOBAL
+            // discard_response_bodies flag is set OR the per-request k6
+            // `responseType: "none"` is requested — scripts see an empty body,
+            // but the bytes are still read so the pooled connection survives.
+            let receiving_start = std::time::Instant::now();
+            let discard = self.discard_bodies
+                || request.response_type == tropel_core::types::ResponseType::None;
+            // When the body is discarded (global `discardResponseBodies` or the
+            // per-request k6 `responseType: "none"`), we must STILL read the body
+            // off the wire so reqwest can return the connection to the pool.
+            // Dropping the `Response` unread closes the socket — every request
+            // then opens a fresh TCP connection, the exact opposite of the
+            // pooling these flags are meant to preserve. We drain the body and
+            // throw the bytes away; the drained byte count still feeds
+            // `size`/`data_received` so accounting matches the wire.
+            //
+            // Behavior notes (intended): with discard, `http_req_receiving` and
+            // `data_received` now reflect the real drain time / wire bytes instead
+            // of ~0 — k6 still downloads the body and only skips storing it. And
+            // a server that streams forever now fails at the request timeout
+            // (chunk error) instead of silently succeeding with an empty body,
+            // which is more correct.
+            let (body_vec, size) = if discard {
+                let mut drained: u64 = 0;
+                while let Some(chunk) = response.chunk().await.map_err(|e| {
+                    TropelError::Http(format!("Failed to drain response body: {}", e))
+                })? {
+                    drained += chunk.len() as u64;
+                }
+                (Vec::new(), drained)
+            } else {
+                let body = response
+                    .bytes()
                     .await
-                    .map_err(|e| TropelError::Http(format!("Failed to read redirect body: {}", e)))?
-                {
-                    hop_body.extend_from_slice(&chunk);
-                }
-                let hop_total = hop_start.elapsed();
-                let hop_phases = crate::subtimings::take_slot(&slot);
-                let mut hop_timings =
-                    Timings::from_measured(waiting_duration, Duration::ZERO, hop_total);
-                if let (Some(request_start), Some(connect_start), Some(connect_elapsed)) = (
-                    hop_phases.request_start,
-                    hop_phases.connect_start,
-                    hop_phases.connect_elapsed,
-                ) {
-                    hop_timings.blocked = connect_start.saturating_duration_since(request_start);
-                    hop_timings.dns = hop_phases.dns_elapsed.unwrap_or_default();
-                    hop_timings.connecting = connect_elapsed.saturating_sub(hop_timings.dns);
-                }
-                let hop_connect = hop_timings.blocked + hop_timings.dns + hop_timings.connecting;
-                hop_timings.waiting = hop_timings.waiting.saturating_sub(hop_connect);
+                    .map_err(|e| TropelError::Http(format!("Failed to read response body: {}", e)))?
+                    .to_vec();
+                (body.clone(), body.len() as u64)
+            };
+            let receiving_duration = receiving_start.elapsed();
 
-                // `size` counts the drained hop body bytes so data_received
-                // per hop matches the wire (k6 counts per-request
-                // data_received).
-                let hop_size = hop_body.len() as u64;
-                redirects.push(HttpResponse {
-                    url: current_url.clone(),
+            // The FINAL hop's own duration (k6 reports the last hop's time in its
+            // final http_req_duration sample; the whole-chain wall time lives in
+            // iteration_duration, so don't double-count the redirect hops here).
+            let total_duration = hop_start.elapsed();
+
+            // Build sub-timings from the real phases recorded by the
+            // `dns_resolver` and `connector_layer` hooks (thread-local slot).
+            // When the request reused a pooled keep-alive connection no connector
+            // call happened, so the connect phases are ZERO — matching k6, which
+            // also reports ~0 blocked/connecting for pooled connections.
+            //
+            // Note: `dns` is optional on purpose — for IP-literal hosts (e.g.
+            // "127.0.0.1") reqwest's HttpConnector skips DNS resolution entirely,
+            // so only the connect phases exist.
+            let phases = crate::subtimings::take_slot(&slot);
+            let mut timings =
+                Timings::from_measured(waiting_duration, receiving_duration, total_duration);
+            if let (Some(request_start), Some(connect_start), Some(connect_elapsed)) = (
+                phases.request_start,
+                phases.connect_start,
+                phases.connect_elapsed,
+            ) {
+                timings.blocked = connect_start.saturating_duration_since(request_start);
+                timings.dns = phases.dns_elapsed.unwrap_or_default();
+                // connect_elapsed spans DNS + TCP (+ TLS for https); subtract the
+                // separately-measured DNS to leave the transport phases.
+                timings.connecting = connect_elapsed.saturating_sub(timings.dns);
+            }
+
+            // k6 phase semantics: `http_req_waiting` (TTFB) is measured from the
+            // moment the request is fully sent, EXCLUDING the connection phases.
+            // Our `waiting_duration` is stamped just before `client.execute()`,
+            // so for a fresh connection it *includes* blocked + DNS + connecting.
+            // Subtract them so the breakdown sums to `total`:
+            //   total = blocked + dns + connecting + waiting + receiving
+            // (tls_handshaking/sending stay zero — reqwest seals those inside the
+            // connector/request future; see the module docs.) For pooled reuse the
+            // connect phases are zero, so `waiting` is unchanged.
+            let connect_phases = timings.blocked + timings.dns + timings.connecting;
+            timings.waiting = timings.waiting.saturating_sub(connect_phases);
+
+            if self.http_debug {
+                tracing::info!(
+                    "HTTP <<< {:?} {} -> {} ({} bytes in {:.2?})",
+                    request.method,
+                    current_url,
                     status_code,
-                    status_text,
-                    headers,
-                    body: hop_body,
-                    text_cache: std::cell::OnceCell::new(),
-                    json_cache: std::cell::OnceCell::new(),
-                    response_time: hop_total,
-                    timings: Some(hop_timings),
-                    cookies,
-                    size: hop_size,
-                    request_body_size: 0,
-                    redirects: Vec::new(),
-                });
-
-                // Resolve the Location header against the current URL.
-                let base = reqwest::Url::parse(&current_url).map_err(|e| {
-                    TropelError::Http(format!("Invalid request URL '{}': {}", current_url, e))
-                })?;
-                let next = base.join(&location).map_err(|e| {
-                    TropelError::Http(format!("Invalid redirect Location '{}': {}", location, e))
-                })?;
-
-                // Cross-origin redirect → drop credentials for the next hop.
-                let cur = reqwest::Url::parse(&current_url).ok();
-                let same_origin = match &cur {
-                    Some(c) => {
-                        c.scheme() == next.scheme()
-                            && c.host_str() == next.host_str()
-                            && c.port_or_known_default() == next.port_or_known_default()
-                    }
-                    None => false,
-                };
-                if !same_origin {
-                    strip_sensitive = true;
-                }
-
-                // RFC 7231 method rewrite (matches reqwest/k6):
-                //   303 → GET (drop body), except HEAD stays HEAD
-                //   301/302 → GET only for POST (drop body)
-                //   307/308 → keep method and body
-                match status_code {
-                    303 if current_method != Method::HEAD => {
-                        current_method = Method::GET;
-                        current_body = None;
-                    }
-                    301 | 302 if current_method == Method::POST => {
-                        current_method = Method::GET;
-                        current_body = None;
-                    }
-                    _ => {}
-                }
-
-                tracing::debug!("Redirect {}: {} -> {}", status_code, current_url, next);
-                current_url = next.to_string();
-                hop_index += 1;
-                continue;
+                    size,
+                    total_duration
+                );
             }
-        }
 
-        // ═══════════════════════════════════════════════════════
-        // Phase 2: Receive response body
-        // ═══════════════════════════════════════════════════════
-        // The body is drained-but-not-stored when the GLOBAL
-        // discard_response_bodies flag is set OR the per-request k6
-        // `responseType: "none"` is requested — scripts see an empty body,
-        // but the bytes are still read so the pooled connection survives.
-        let receiving_start = std::time::Instant::now();
-        let discard = self.discard_bodies
-            || request.response_type == tropel_core::types::ResponseType::None;
-        // When the body is discarded (global `discardResponseBodies` or the
-        // per-request k6 `responseType: "none"`), we must STILL read the body
-        // off the wire so reqwest can return the connection to the pool.
-        // Dropping the `Response` unread closes the socket — every request
-        // then opens a fresh TCP connection, the exact opposite of the
-        // pooling these flags are meant to preserve. We drain the body and
-        // throw the bytes away; the drained byte count still feeds
-        // `size`/`data_received` so accounting matches the wire.
-        //
-        // Behavior notes (intended): with discard, `http_req_receiving` and
-        // `data_received` now reflect the real drain time / wire bytes instead
-        // of ~0 — k6 still downloads the body and only skips storing it. And
-        // a server that streams forever now fails at the request timeout
-        // (chunk error) instead of silently succeeding with an empty body,
-        // which is more correct.
-        let (body_vec, size) = if discard {
-            let mut drained: u64 = 0;
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|e| TropelError::Http(format!("Failed to drain response body: {}", e)))?
-            {
-                drained += chunk.len() as u64;
-            }
-            (Vec::new(), drained)
-        } else {
-            let body = response
-                .bytes()
-                .await
-                .map_err(|e| TropelError::Http(format!("Failed to read response body: {}", e)))?
-                .to_vec();
-            (body.clone(), body.len() as u64)
-        };
-        let receiving_duration = receiving_start.elapsed();
-
-        // The FINAL hop's own duration (k6 reports the last hop's time in its
-        // final http_req_duration sample; the whole-chain wall time lives in
-        // iteration_duration, so don't double-count the redirect hops here).
-        let total_duration = hop_start.elapsed();
-
-        // Build sub-timings from the real phases recorded by the
-        // `dns_resolver` and `connector_layer` hooks (thread-local slot).
-        // When the request reused a pooled keep-alive connection no connector
-        // call happened, so the connect phases are ZERO — matching k6, which
-        // also reports ~0 blocked/connecting for pooled connections.
-        //
-        // Note: `dns` is optional on purpose — for IP-literal hosts (e.g.
-        // "127.0.0.1") reqwest's HttpConnector skips DNS resolution entirely,
-        // so only the connect phases exist.
-        let phases = crate::subtimings::take_slot(&slot);
-        let mut timings = Timings::from_measured(waiting_duration, receiving_duration, total_duration);
-        if let (Some(request_start), Some(connect_start), Some(connect_elapsed)) = (
-            phases.request_start,
-            phases.connect_start,
-            phases.connect_elapsed,
-        ) {
-            timings.blocked = connect_start.saturating_duration_since(request_start);
-            timings.dns = phases.dns_elapsed.unwrap_or_default();
-            // connect_elapsed spans DNS + TCP (+ TLS for https); subtract the
-            // separately-measured DNS to leave the transport phases.
-            timings.connecting = connect_elapsed.saturating_sub(timings.dns);
-        }
-
-        // k6 phase semantics: `http_req_waiting` (TTFB) is measured from the
-        // moment the request is fully sent, EXCLUDING the connection phases.
-        // Our `waiting_duration` is stamped just before `client.execute()`,
-        // so for a fresh connection it *includes* blocked + DNS + connecting.
-        // Subtract them so the breakdown sums to `total`:
-        //   total = blocked + dns + connecting + waiting + receiving
-        // (tls_handshaking/sending stay zero — reqwest seals those inside the
-        // connector/request future; see the module docs.) For pooled reuse the
-        // connect phases are zero, so `waiting` is unchanged.
-        let connect_phases = timings.blocked + timings.dns + timings.connecting;
-        timings.waiting = timings.waiting.saturating_sub(connect_phases);
-
-        if self.http_debug {
-            tracing::info!(
-                "HTTP <<< {:?} {} -> {} ({} bytes in {:.2?})",
-                request.method,
-                current_url,
+            let response = HttpResponse {
+                url: current_url,
                 status_code,
+                status_text,
+                headers,
+                body: body_vec,
+                text_cache: std::cell::OnceCell::new(),
+                json_cache: std::cell::OnceCell::new(),
+                response_time: total_duration,
+                timings: Some(timings),
+                cookies,
                 size,
-                total_duration
-            );
-        }
+                request_body_size,
+                // Every intermediate redirect hop, in order — callers emit one
+                // http_req_* sample set per hop (k6 parity: a 302 chain counts
+                // as hops + 1 requests, not just the final).
+                redirects,
+            };
 
-        let response = HttpResponse {
-            url: current_url,
-            status_code,
-            status_text,
-            headers,
-            body: body_vec,
-            text_cache: std::cell::OnceCell::new(),
-            json_cache: std::cell::OnceCell::new(),
-            response_time: total_duration,
-            timings: Some(timings),
-            cookies,
-            size,
-            request_body_size,
-            // Every intermediate redirect hop, in order — callers emit one
-            // http_req_* sample set per hop (k6 parity: a 302 chain counts
-            // as hops + 1 requests, not just the final).
-            redirects,
-        };
-
-        return Ok(response);
+            return Ok(response);
         } // end redirect-follow loop
-    }/// Get an auth signer based on the auth config.
-///
-/// Delegates to the single consolidated signer builder
-/// ([`crate::auth::build_auth_signer`]) shared with the executor runner,
-/// so every auth type (Bearer, Basic, ApiKey, OAuth2, SigV4, OAuth1,
-/// Hawk, Digest) is supported in exactly one place.
-pub fn get_signer(&self, auth: &AuthConfig) -> Option<Box<dyn AuthSigner>> {
-    crate::auth::build_auth_signer(auth)
-}
+    }
+    /// Get an auth signer based on the auth config.
+    ///
+    /// Delegates to the single consolidated signer builder
+    /// ([`crate::auth::build_auth_signer`]) shared with the executor runner,
+    /// so every auth type (Bearer, Basic, ApiKey, OAuth2, SigV4, OAuth1,
+    /// Hawk, Digest) is supported in exactly one place.
+    pub fn get_signer(&self, auth: &AuthConfig) -> Option<Box<dyn AuthSigner>> {
+        crate::auth::build_auth_signer(auth)
+    }
 }
 
 /// k6 `blacklistIPs` enforcement for IP-literal hosts.
@@ -1145,9 +1144,7 @@ fn parse_set_cookie(header: &str) -> Option<Cookie> {
                 "domain" => cookie.domain = Some(val.trim().trim_matches('"').to_string()),
                 "path" => cookie.path = Some(val.trim().trim_matches('"').to_string()),
                 "expires" => cookie.expires = Some(val.trim().trim_matches('"').to_string()),
-                "samesite" => {
-                    cookie.same_site = Some(val.trim().trim_matches('"').to_string())
-                }
+                "samesite" => cookie.same_site = Some(val.trim().trim_matches('"').to_string()),
                 _ => {}
             },
             None => match attr.to_ascii_lowercase().as_str() {
@@ -1189,7 +1186,9 @@ fn body_to_bytes(body: &Body) -> Vec<u8> {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone().to_string()))
                 .collect();
-            serde_urlencoded::to_string(params).unwrap_or_default().into_bytes()
+            serde_urlencoded::to_string(params)
+                .unwrap_or_default()
+                .into_bytes()
         }
         Body::Binary(data) => data.clone(),
         Body::GraphQL { query, variables } => {
@@ -1356,7 +1355,10 @@ mod tests {
             resp_with(vec![0xC3, 0x28, 0x41]).body_text(),
             Some("\u{FFFD}(A".to_string())
         );
-        assert_eq!(resp_with(b"ok".to_vec()).body_text(), Some("ok".to_string()));
+        assert_eq!(
+            resp_with(b"ok".to_vec()).body_text(),
+            Some("ok".to_string())
+        );
     }
 
     #[test]
@@ -1377,8 +1379,7 @@ mod tests {
 
     #[test]
     fn parse_set_cookie_case_insensitive_attrs_and_quoted_values() {
-        let c = parse_set_cookie("id=7; PATH=\"/app\"; HTTPONLY; sAmEsItE=Strict")
-            .unwrap();
+        let c = parse_set_cookie("id=7; PATH=\"/app\"; HTTPONLY; sAmEsItE=Strict").unwrap();
         assert_eq!(c.name, "id");
         assert_eq!(c.value, "7");
         assert_eq!(c.path.as_deref(), Some("/app"));
@@ -1570,7 +1571,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
                     let _ = sock.read(&mut buf).await;
@@ -1583,7 +1586,8 @@ mod tests {
                     let resp = if path == "/start" {
                         "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
                     } else {
-                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string()
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                            .to_string()
                     };
                     let _ = sock.write_all(resp.as_bytes()).await;
                 });
@@ -1627,9 +1631,10 @@ mod tests {
         }
 
         fn sign(&self, request: &mut reqwest::Request) -> Result<()> {
-            request
-                .headers_mut()
-                .insert(reqwest::header::AUTHORIZATION, "Bearer s3cret".parse().unwrap());
+            request.headers_mut().insert(
+                reqwest::header::AUTHORIZATION,
+                "Bearer s3cret".parse().unwrap(),
+            );
             Ok(())
         }
     }
@@ -1647,7 +1652,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
                     let _ = sock.read(&mut buf).await;
@@ -1670,7 +1677,8 @@ mod tests {
                             body
                         )
                     } else {
-                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
                     };
                     let _ = sock.write_all(resp.as_bytes()).await;
                 });
@@ -1712,7 +1720,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
                     let _ = sock.read(&mut buf).await;
@@ -1725,7 +1735,8 @@ mod tests {
                     let resp = if path == "/start?page=2" {
                         "HTTP/1.1 302 Found\r\nLocation: /final?token=z\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
                     } else if path == "/final?token=z" {
-                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string()
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                            .to_string()
                     } else {
                         // Any OTHER path/query means the original query leaked
                         // onto the redirect hop — report it in the body so
@@ -1755,7 +1766,8 @@ mod tests {
         };
         let resp = client.execute(&req, None).await.unwrap();
         assert_eq!(
-            resp.status_code, 200,
+            resp.status_code,
+            200,
             "final hop should be served; got body: {}",
             String::from_utf8_lossy(&resp.body)
         );
@@ -1782,7 +1794,8 @@ mod tests {
         };
         let resp2 = client.execute(&req2, None).await.unwrap();
         assert_eq!(
-            resp2.status_code, 200,
+            resp2.status_code,
+            200,
             "hop 0 with populated query_params should be served; got: {}",
             String::from_utf8_lossy(&resp2.body)
         );
@@ -1810,7 +1823,9 @@ mod tests {
 
         let server_b = tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener_b.accept().await else { break };
+                let Ok((mut sock, _)) = listener_b.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
                     let _ = sock.read(&mut buf).await;
@@ -1831,7 +1846,9 @@ mod tests {
 
         let server_a = tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener_a.accept().await else { break };
+                let Ok((mut sock, _)) = listener_a.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
                     let _ = sock.read(&mut buf).await;
@@ -1886,7 +1903,9 @@ mod tests {
         // can reuse the same socket.
         let server = tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
                 connections_srv.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
@@ -1938,4 +1957,3 @@ mod tests {
         );
     }
 }
-

@@ -258,7 +258,10 @@ impl Drop for VUWorkerPool {
         for worker in workers.iter_mut() {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let exited = match &worker.exited {
-                Some(rx) => matches!(rx.recv_timeout(remaining), Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected)),
+                Some(rx) => matches!(
+                    rx.recv_timeout(remaining),
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected)
+                ),
                 None => false,
             };
             if exited {
@@ -299,17 +302,15 @@ mod tests {
 
         let (t0, t1) = tokio::join!(
             async {
-                let h = pool.spawn_vu(
-                    0,
-                    async { std::thread::current().name().map(|s| s.to_string()) },
-                );
+                let h = pool.spawn_vu(0, async {
+                    std::thread::current().name().map(|s| s.to_string())
+                });
                 h.await.unwrap()
             },
             async {
-                let h = pool.spawn_vu(
-                    1,
-                    async { std::thread::current().name().map(|s| s.to_string()) },
-                );
+                let h = pool.spawn_vu(1, async {
+                    std::thread::current().name().map(|s| s.to_string())
+                });
                 h.await.unwrap()
             },
         );
@@ -327,13 +328,10 @@ mod tests {
 
         // The slow VU blocks its OS thread for 200ms (exactly what a script
         // `sleep(0.2)` does via the native bridge).
-        let slow = pool.spawn_vu(
-            0,
-            async {
-                std::thread::sleep(Duration::from_millis(200));
-                "slow"
-            },
-        );
+        let slow = pool.spawn_vu(0, async {
+            std::thread::sleep(Duration::from_millis(200));
+            "slow"
+        });
 
         // The fast VU must finish well within the slow VU's sleep window —
         // if VUs shared a current-thread runtime, the fast VU would be stuck
@@ -378,12 +376,9 @@ mod tests {
         // does via the native bridge). While wedged, the worker cannot poll
         // the shutdown notify, so an unbounded join would hang ~2s here —
         // and with a truly stuck eval, forever.
-        let _h = pool.spawn_vu(
-            0,
-            async {
-                std::thread::sleep(Duration::from_secs(2));
-            },
-        );
+        let _h = pool.spawn_vu(0, async {
+            std::thread::sleep(Duration::from_secs(2));
+        });
 
         let start = Instant::now();
         drop(pool);
@@ -393,7 +388,6 @@ mod tests {
             elapsed < Duration::from_millis(800),
             "drop blocked for {elapsed:?} on a wedged worker instead of detaching"
         );
-
     }
 
     /// A healthy pool (no wedged VUs) must still tear down cleanly and

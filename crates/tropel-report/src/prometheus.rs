@@ -662,7 +662,10 @@ mod tests {
                 found_counter = true;
             }
         }
-        assert!(found_counter, "http_reqs counter series missing from output");
+        assert!(
+            found_counter,
+            "http_reqs counter series missing from output"
+        );
     }
 
     #[test]
@@ -681,7 +684,10 @@ mod tests {
             last: 1.0,
         };
         let out1 = expand_series(&key, &w1, 1000, &mut cumulative);
-        assert_eq!(out1[0].1[0].0, 500.0, "first window: cumulative == window sum");
+        assert_eq!(
+            out1[0].1[0].0, 500.0,
+            "first window: cumulative == window sum"
+        );
 
         let w2 = SeriesAgg {
             sample_type: SampleType::Counter,
@@ -722,7 +728,10 @@ mod tests {
             .map(|(_, s)| s[0].0)
             .unwrap();
         assert_eq!(count2, 5.0, "trend _count cumulative across windows (3+2)");
-        assert_eq!(sum2, 550.0, "trend _sum cumulative across windows (300+250)");
+        assert_eq!(
+            sum2, 550.0,
+            "trend _sum cumulative across windows (300+250)"
+        );
         let _ = tout1; // first window's values are single-window by construction
     }
 
@@ -775,8 +784,7 @@ mod tests {
                 .map(|(_, v)| v.as_str())
                 .unwrap();
             assert!(
-                name_val == "http_req_duration_count"
-                    || name_val == "http_req_duration_sum",
+                name_val == "http_req_duration_count" || name_val == "http_req_duration_sum",
                 "unexpected __name__ value {name_val}"
             );
             // One sample per sub-series at flush time.
@@ -798,7 +806,11 @@ mod tests {
         // Two sub-series (count + sum), each with exactly ONE sample.
         assert_eq!(series.len(), 2);
         for samples in series.values() {
-            assert_eq!(samples.len(), 1, "one aggregated sample per series per window");
+            assert_eq!(
+                samples.len(),
+                1,
+                "one aggregated sample per series per window"
+            );
         }
     }
 
@@ -842,7 +854,9 @@ mod tests {
 
         let encoded = encode_write_request(&series);
         let compressed = snap::raw::Encoder::new().compress_vec(&encoded).unwrap();
-        let decompressed = snap::raw::Decoder::new().decompress_vec(&compressed).unwrap();
+        let decompressed = snap::raw::Decoder::new()
+            .decompress_vec(&compressed)
+            .unwrap();
         assert_eq!(encoded, decompressed);
     }
 
@@ -895,7 +909,9 @@ mod tests {
                 .find_map(|l| {
                     let l = l.trim();
                     let lower = l.to_lowercase();
-                    lower.strip_prefix("content-length:").and_then(|v| v.trim().parse().ok())
+                    lower
+                        .strip_prefix("content-length:")
+                        .and_then(|v| v.trim().parse().ok())
                 })
                 .unwrap_or(0);
             while buf.len() < head_end + content_length {

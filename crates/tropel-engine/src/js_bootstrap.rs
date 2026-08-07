@@ -62,8 +62,11 @@ pub(crate) async fn create_vu_js_context(
     pm_state: &SharedPmState,
     http_client: &Arc<HttpClient>,
 ) -> Option<tropel_js::JsContext> {
-    let mut ctx = match tropel_js::JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
-        .await
+    let mut ctx = match tropel_js::JsContext::new(
+        Some(10 * 1024 * 1024),
+        Some(Duration::from_secs(10)),
+    )
+    .await
     {
         Ok(ctx) => ctx,
         Err(e) => {

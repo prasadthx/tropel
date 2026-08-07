@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 publish = false
-description = "Criterion benchmark suite for Tropel: context bootstrap, per-iteration overhead, native-vs-JS, VUs/sec, memory-per-VU"
+description = "Criterion benchmark suite for Tropel: context bootstrap, per-iteration overhead, native-vs-JS, pool dispatch, memory-per-VU"
 
 [dependencies]
 tropel-js.workspace = true

@@ -109,12 +109,7 @@ async fn handle_conn(stream: TcpStream, sched: &Arc<VUScheduler>) -> Result<()> 
 }
 
 /// Route a control request and return (status line, JSON body).
-fn route(
-    method: &str,
-    path: &str,
-    body: &[u8],
-    sched: &Arc<VUScheduler>,
-) -> (String, String) {
+fn route(method: &str, path: &str, body: &[u8], sched: &Arc<VUScheduler>) -> (String, String) {
     match (method, path) {
         ("GET", "/v1/status") => ("200 OK".to_string(), status_json(sched)),
         ("PATCH", "/v1/status") => match parse_status_body(body) {
@@ -135,7 +130,8 @@ fn route(
             }
             None => (
                 "400 Bad Request".to_string(),
-                "{\"error\":\"expected {\\\"vus\\\":N,\\\"max\\\":M,\\\"paused\\\":bool}\"}".to_string(),
+                "{\"error\":\"expected {\\\"vus\\\":N,\\\"max\\\":M,\\\"paused\\\":bool}\"}"
+                    .to_string(),
             ),
         },
         ("POST", "/v1/stop") => {
@@ -266,13 +262,15 @@ mod tests {
 
     #[test]
     fn status_json_is_k6_shape() {
-        let sched = VUScheduler::new(&tropel_core::config::ExecutionConfig::ExternallyControlled {
-            vus: 2,
-            max_vus: 10,
-            duration: None,
-            graceful_stop: None,
-            think_time: Default::default(),
-        });
+        let sched = VUScheduler::new(
+            &tropel_core::config::ExecutionConfig::ExternallyControlled {
+                vus: 2,
+                max_vus: 10,
+                duration: None,
+                graceful_stop: None,
+                think_time: Default::default(),
+            },
+        );
         let sched = Arc::new(sched);
         sched.set_control_target(4, 10);
         let body = status_json(&sched);

@@ -43,8 +43,7 @@ fn main() -> Result<()> {
 }
 
 async fn run(args: Args) -> Result<()> {
-    let raw = std::fs::read_to_string(&args.config)
-        .map_err(TropelError::Io)?;
+    let raw = std::fs::read_to_string(&args.config).map_err(TropelError::Io)?;
     let config: JobConfig = serde_json::from_str(&raw)
         .map_err(|e| TropelError::Parse(format!("invalid job config: {e}")))?;
 
@@ -65,7 +64,11 @@ async fn run(args: Args) -> Result<()> {
     let listener = TcpListener::bind(&args.listen)
         .await
         .map_err(TropelError::Io)?;
-    tracing::info!("Controller listening on {}. Waiting for {} agent(s)...", args.listen, args.agents);
+    tracing::info!(
+        "Controller listening on {}. Waiting for {} agent(s)...",
+        args.listen,
+        args.agents
+    );
 
     let test_start = std::time::Instant::now();
     let result = tropel_distributed::run_controller(listener, &config, args.agents, &token).await?;

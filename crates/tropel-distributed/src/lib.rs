@@ -44,7 +44,7 @@ pub mod yaml;
 pub use agent::run_agent;
 pub use cloud::{generate_k8s_manifests, run_cloud};
 pub use controller::run_controller;
-pub use protocol::{AssignMsg, HelloMsg, SnapshotMsg, generate_token};
+pub use protocol::{generate_token, AssignMsg, HelloMsg, SnapshotMsg};
 
 /// Build the tokio runtime for the distributed binaries.
 ///
@@ -60,11 +60,8 @@ pub use protocol::{AssignMsg, HelloMsg, SnapshotMsg, generate_token};
 /// threads run on their own thread-per-core pool, so this outer runtime
 /// only ever multiplexes async orchestration.
 pub fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    let workers = distributed_workers_from_override(
-        std::env::var("TROPEL_TOKIO_WORKERS")
-            .ok()
-            .as_deref(),
-    );
+    let workers =
+        distributed_workers_from_override(std::env::var("TROPEL_TOKIO_WORKERS").ok().as_deref());
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .enable_all()
@@ -243,7 +240,9 @@ mod tests {
     #[test]
     fn workers_default_scales_to_cores_with_floor() {
         let n = distributed_workers_from_override(None);
-        let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(4);
+        let cores = std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(4);
         assert!(n >= 2 && n <= 256, "default out of range: {n}");
         assert!(n <= cores.max(2).min(256));
     }
@@ -253,10 +252,8 @@ mod tests {
         // P1 regression: report_and_thresholds only built stdout/json/csv
         // reporters and NEVER called emit_handle_summary, so summary_export
         // was silently dropped on distributed runs. It must write the file.
-        let dir = std::env::temp_dir().join(format!(
-            "tropel-summary-export-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("tropel-summary-export-test-{}", std::process::id()));
         let path = dir.with_extension("json");
         let _ = std::fs::remove_file(&path);
 
@@ -270,7 +267,11 @@ mod tests {
         let result = MetricsResult::default();
         let start = Instant::now() - Duration::from_secs(3);
         let outcome = report_and_thresholds(&config, &result, start).await;
-        assert!(outcome.is_ok(), "report_and_thresholds failed: {:?}", outcome.err());
+        assert!(
+            outcome.is_ok(),
+            "report_and_thresholds failed: {:?}",
+            outcome.err()
+        );
 
         let written = std::fs::read_to_string(&path).expect("summary_export must be written");
         let value: serde_json::Value =

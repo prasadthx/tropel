@@ -147,7 +147,9 @@ where
     // spin — otherwise the flag would latch true forever and the "re-arm on
     // fast completion" promise in the doc comment would be unreachable.
     let park_start = Instant::now();
-    let result = rx.recv().map_err(|_| TropelError::Http(IO_TASK_DROPPED.into()))?;
+    let result = rx
+        .recv()
+        .map_err(|_| TropelError::Http(IO_TASK_DROPPED.into()))?;
     if park_start.elapsed() < SPIN_WINDOW {
         SKIP_SPIN.with(|s| s.set(false));
     }
@@ -161,7 +163,9 @@ mod tests {
     #[test]
     fn workers_from_override_defaults_to_cores() {
         // No override → host core count (no env mutation, deterministic).
-        let expected = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let expected = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         assert_eq!(workers_from_override(None), expected);
         // Unparseable override → same default.
         assert_eq!(workers_from_override(Some("bogus")), expected);

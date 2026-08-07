@@ -187,12 +187,22 @@ fn resolve_send_request(
     let resolved_url = resolve_vars(url, environment, collection_vars, globals);
     let headers: HashMap<String, String> = parse_headers(headers_json)
         .into_iter()
-        .map(|(k, v)| (k.clone(), resolve_vars(&v, environment, collection_vars, globals)))
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                resolve_vars(&v, environment, collection_vars, globals),
+            )
+        })
         .collect();
     let request_body = if body.is_empty() {
         None
     } else {
-        Some(Body::Raw(resolve_vars(body, environment, collection_vars, globals)))
+        Some(Body::Raw(resolve_vars(
+            body,
+            environment,
+            collection_vars,
+            globals,
+        )))
     };
     (resolved_url, headers, request_body)
 }
@@ -497,7 +507,10 @@ impl PmBridge {
                 "__tropel_pm_request_url",
                 Func::from(move || -> String {
                     let st = state_clone.lock().unwrap();
-                    st.request.as_ref().map(|r| r.url.clone()).unwrap_or_default()
+                    st.request
+                        .as_ref()
+                        .map(|r| r.url.clone())
+                        .unwrap_or_default()
                 }),
             );
 
@@ -770,7 +783,9 @@ impl PmBridge {
                 "__tropel_pm_response_json",
                 Func::from(move || -> Option<String> {
                     let st = state_clone.lock().unwrap();
-                    st.response.as_ref().and_then(|r| response_json_string(&r.body))
+                    st.response
+                        .as_ref()
+                        .and_then(|r| response_json_string(&r.body))
                 }),
             );
 
@@ -793,14 +808,16 @@ impl PmBridge {
             let _ = globals.set(
                 "__tropel_pm_test",
                 // 3rd arg: optional k6 check() tags JSON (backlog line 149).
-                Func::from(move |name: String, passed: bool, tags_json: Option<String>| {
-                    let extra = tags_json
-                        .as_deref()
-                        .and_then(|j| serde_json::from_str::<HashMap<String, String>>(j).ok())
-                        .unwrap_or_default();
-                    let mut st = state_clone.lock().unwrap();
-                    st.record_test_tagged(&name, passed, extra);
-                }),
+                Func::from(
+                    move |name: String, passed: bool, tags_json: Option<String>| {
+                        let extra = tags_json
+                            .as_deref()
+                            .and_then(|j| serde_json::from_str::<HashMap<String, String>>(j).ok())
+                            .unwrap_or_default();
+                        let mut st = state_clone.lock().unwrap();
+                        st.record_test_tagged(&name, passed, extra);
+                    },
+                ),
             );
 
             // ── Flow Control ──
@@ -1011,9 +1028,7 @@ impl PmBridge {
             let state_clone = state.clone();
             let _ = globals.set(
                 "__tropel_exec_scenario_executor",
-                Func::from(move || -> String {
-                    state_clone.lock().unwrap().executor_name.clone()
-                }),
+                Func::from(move || -> String { state_clone.lock().unwrap().executor_name.clone() }),
             );
 
             // exec.vu.iterationInScenario — current iteration index
@@ -1150,7 +1165,9 @@ impl PmBridge {
                             certificate: None,
                             follow_redirects: true,
                             timeout,
-                            response_type: tropel_core::types::ResponseType::from_k6(&response_type),
+                            response_type: tropel_core::types::ResponseType::from_k6(
+                                &response_type,
+                            ),
                         };
 
                         // Execute on the dedicated I/O runtime via the shared
@@ -1216,14 +1233,20 @@ mod tests {
         assert_eq!(parsed.as_str().unwrap(), "123");
 
         // Boolean-looking and null-looking env values stay strings too.
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&string_to_json_encoded("true")).unwrap(),
-                   serde_json::Value::String("true".into()));
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&string_to_json_encoded("null")).unwrap(),
-                   serde_json::Value::String("null".into()));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&string_to_json_encoded("true")).unwrap(),
+            serde_json::Value::String("true".into())
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&string_to_json_encoded("null")).unwrap(),
+            serde_json::Value::String("null".into())
+        );
 
         // Plain string (the common case) round-trips unchanged.
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&string_to_json_encoded("hello")).unwrap(),
-                   serde_json::Value::String("hello".into()));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&string_to_json_encoded("hello")).unwrap(),
+            serde_json::Value::String("hello".into())
+        );
 
         // Collection/global vars are serde_json::Value — objects round-trip
         // as objects, numbers as numbers, strings as strings.
@@ -1233,7 +1256,8 @@ mod tests {
         assert_eq!(parsed, obj);
 
         let num = serde_json::json!(123);
-        let parsed: serde_json::Value = serde_json::from_str(&variable_value_to_string(&num)).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&variable_value_to_string(&num)).unwrap();
         assert!(parsed.is_number());
     }
 
@@ -1245,24 +1269,41 @@ mod tests {
     fn test_variables_lookup_postman_precedence() {
         let data = HashMap::from([("k".to_string(), Value::String("from-data".into()))]);
         let env = HashMap::from([("k".to_string(), "from-env".to_string())]);
-        let collection = HashMap::from([("k".to_string(), Value::String("from-collection".into()))]);
+        let collection =
+            HashMap::from([("k".to_string(), Value::String("from-collection".into()))]);
         let globals = HashMap::from([("k".to_string(), Value::String("from-globals".into()))]);
 
         // Full shadow chain: data wins.
         let got = variables_lookup("k", Some(&data), &env, &collection, &globals);
-        assert_eq!(got.as_deref(), Some("\"from-data\""), "iteration data must beat env/collection/globals");
+        assert_eq!(
+            got.as_deref(),
+            Some("\"from-data\""),
+            "iteration data must beat env/collection/globals"
+        );
 
         // No data: env wins.
         let got = variables_lookup("k", None, &env, &collection, &globals);
-        assert_eq!(got.as_deref(), Some("\"from-env\""), "environment must beat collection/globals");
+        assert_eq!(
+            got.as_deref(),
+            Some("\"from-env\""),
+            "environment must beat collection/globals"
+        );
 
         // No data, no env: collection wins.
         let got = variables_lookup("k", None, &HashMap::new(), &collection, &globals);
-        assert_eq!(got.as_deref(), Some("\"from-collection\""), "collection must beat globals");
+        assert_eq!(
+            got.as_deref(),
+            Some("\"from-collection\""),
+            "collection must beat globals"
+        );
 
         // Only globals.
         let got = variables_lookup("k", None, &HashMap::new(), &HashMap::new(), &globals);
-        assert_eq!(got.as_deref(), Some("\"from-globals\""), "globals last resort");
+        assert_eq!(
+            got.as_deref(),
+            Some("\"from-globals\""),
+            "globals last resort"
+        );
 
         // No scope has it.
         let got = variables_lookup("missing", Some(&data), &env, &collection, &globals);
@@ -1288,7 +1329,10 @@ mod tests {
             &globals,
         );
 
-        assert_eq!(url, "https://api.example.com/v1?key=s3cret", "URL must resolve");
+        assert_eq!(
+            url, "https://api.example.com/v1?key=s3cret",
+            "URL must resolve"
+        );
         assert_eq!(
             headers.get("Authorization").map(String::as_str),
             Some("Bearer s3cret"),
@@ -1352,9 +1396,17 @@ mod tests {
     /// be stringified and the rest preserved.
     #[test]
     fn parse_headers_non_string_object_values_are_stringified() {
-        let headers = parse_headers(r#"{"Content-Type":"application/json","Content-Length":123,"X-Bool":true}"#);
-        assert_eq!(headers.get("Content-Type").map(String::as_str), Some("application/json"));
-        assert_eq!(headers.get("Content-Length").map(String::as_str), Some("123"));
+        let headers = parse_headers(
+            r#"{"Content-Type":"application/json","Content-Length":123,"X-Bool":true}"#,
+        );
+        assert_eq!(
+            headers.get("Content-Type").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(
+            headers.get("Content-Length").map(String::as_str),
+            Some("123")
+        );
         assert_eq!(headers.get("X-Bool").map(String::as_str), Some("true"));
         assert_eq!(headers.len(), 3, "no header may be dropped");
 

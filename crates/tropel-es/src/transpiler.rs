@@ -76,7 +76,9 @@ fn transpile_typescript(source: &str, filename: &str) -> anyhow::Result<String> 
     // "script.js" filename for content-detected TS).
     let source_type = match SourceType::from_path(filename) {
         Ok(st) if st.is_typescript() => st.with_module(true),
-        _ => SourceType::default().with_typescript(true).with_module(true),
+        _ => SourceType::default()
+            .with_typescript(true)
+            .with_module(true),
     };
 
     let parser_return = Parser::new(&allocator, source, source_type).parse();
@@ -90,7 +92,11 @@ fn transpile_typescript(source: &str, filename: &str) -> anyhow::Result<String> 
     // The old gate aborted on ANY diagnostic (even a warning), which killed
     // scripts oxc handles fine — warn and continue instead, aborting only on
     // genuine Error-severity diagnostics.
-    if let Some(err) = parser_return.errors.iter().find(|d| d.severity == Severity::Error) {
+    if let Some(err) = parser_return
+        .errors
+        .iter()
+        .find(|d| d.severity == Severity::Error)
+    {
         return Err(anyhow::anyhow!(
             "TypeScript parse error: {}",
             format_diagnostics(&[err.clone()])
@@ -105,15 +111,17 @@ fn transpile_typescript(source: &str, filename: &str) -> anyhow::Result<String> 
     // Build semantic scoping from the parsed program — the transformer's
     // traversal requires a populated `Scoping` (an empty default panics
     // inside oxc's walker).
-    let semantic = SemanticBuilder::new()
-        .build(&program)
-        .semantic;
+    let semantic = SemanticBuilder::new().build(&program).semantic;
     let scoping = semantic.into_scoping();
 
     let options = decorator_options();
     let transformer = Transformer::new(&allocator, std::path::Path::new(filename), &options);
     let transform_return = transformer.build_with_scoping(scoping, &mut program);
-    if let Some(err) = transform_return.errors.iter().find(|d| d.severity == Severity::Error) {
+    if let Some(err) = transform_return
+        .errors
+        .iter()
+        .find(|d| d.severity == Severity::Error)
+    {
         return Err(anyhow::anyhow!(
             "TypeScript transform error: {}",
             format_diagnostics(&[err.clone()])
@@ -289,7 +297,9 @@ pub fn strip_k6_virtual_imports(source: &str) -> String {
     let allocator = Allocator::default();
     // Parse in module + TypeScript mode so imports/exports AND `.ts` sources
     // (the preprocessor runs before TS transpilation) both parse.
-    let source_type = SourceType::default().with_typescript(true).with_module(true);
+    let source_type = SourceType::default()
+        .with_typescript(true)
+        .with_module(true);
     let parser_return = Parser::new(&allocator, source, source_type).parse();
     if parser_return.panicked {
         return source.to_string();
@@ -373,7 +383,10 @@ mod tests {
         "#;
         let js = strip_types(ts);
         // oxc codegen may expand the object literal across lines
-        assert!(js.contains("const user = {") || js.contains("const user = { id: 1"), "got: {js}");
+        assert!(
+            js.contains("const user = {") || js.contains("const user = { id: 1"),
+            "got: {js}"
+        );
         assert!(js.contains("id: 1"), "got: {js}");
         assert!(js.contains("name: \"Alice\""), "got: {js}");
         assert!(js.contains("let count = 42"), "got: {js}");
@@ -475,7 +488,10 @@ mod tests {
         let js = strip_types(ts);
         // oxc lowers enums to runtime JS (reverse mappings included)
         assert!(js.contains("Color"), "got: {js}");
-        assert!(js.contains("c = Color.Red") || js.contains("Color.Red"), "got: {js}");
+        assert!(
+            js.contains("c = Color.Red") || js.contains("Color.Red"),
+            "got: {js}"
+        );
         // `enum` keyword must be gone
         assert!(!js.contains("enum Color"), "got: {js}");
     }
@@ -520,7 +536,10 @@ mod tests {
         let js = strip_types(ts);
         assert!(!js.contains("export default"), "got: {js}");
         // oxc puts the function body on its own line
-        assert!(js.contains("function() {") || js.contains("function () {"), "got: {js}");
+        assert!(
+            js.contains("function() {") || js.contains("function () {"),
+            "got: {js}"
+        );
         assert!(js.contains("return 42;"), "got: {js}");
     }
 
@@ -529,7 +548,10 @@ mod tests {
         let ts = r#"export function foo() { return 1; }"#;
         let js = strip_types(ts);
         assert!(!js.contains("export"), "got: {js}");
-        assert!(js.contains("function foo() {") || js.contains("function foo () {"), "got: {js}");
+        assert!(
+            js.contains("function foo() {") || js.contains("function foo () {"),
+            "got: {js}"
+        );
         assert!(js.contains("return 1;"), "got: {js}");
     }
 
@@ -647,7 +669,10 @@ mod tests {
             !js.contains("export default class {") && !js.contains("export default class{"),
             "got: {js}"
         );
-        assert!(js.contains("class {") || js.contains("class {\n"), "got: {js}");
+        assert!(
+            js.contains("class {") || js.contains("class {\n"),
+            "got: {js}"
+        );
         assert!(js.contains("method()"), "got: {js}");
     }
 
@@ -679,7 +704,10 @@ mod tests {
             const url = "https://example.com/api/v1/items?id=1:number";
         "#;
         let js = strip_types(ts);
-        assert!(js.contains("\"type User = { id: number }; const x: number = 1;\""), "got: {js}");
+        assert!(
+            js.contains("\"type User = { id: number }; const x: number = 1;\""),
+            "got: {js}"
+        );
         assert!(js.contains("https://example.com"), "got: {js}");
     }
 
@@ -741,8 +769,14 @@ mod tests {
             export default function() { return new Greeter("world").greet(); }
         "#;
         let js = strip_types(ts);
-        assert!(!js.contains("@logMethod") && !js.contains("@logParam"), "raw decorators: {js}");
-        assert!(js.contains("babelHelpers.decorateParam"), "param decorator not lowered: {js}");
+        assert!(
+            !js.contains("@logMethod") && !js.contains("@logParam"),
+            "raw decorators: {js}"
+        );
+        assert!(
+            js.contains("babelHelpers.decorateParam"),
+            "param decorator not lowered: {js}"
+        );
         assert!(js.contains("var babelHelpers"), "shim not prepended: {js}");
     }
 
@@ -753,7 +787,10 @@ mod tests {
             export default function() { return 42; }
         "#;
         let js = strip_types(ts);
-        assert!(!js.contains("babelHelpers"), "unexpected shim in plain output: {js}");
+        assert!(
+            !js.contains("babelHelpers"),
+            "unexpected shim in plain output: {js}"
+        );
     }
 
     /// Test helper: strip types + exports (script mode).

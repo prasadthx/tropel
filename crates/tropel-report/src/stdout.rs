@@ -188,7 +188,7 @@ impl StdoutReporter {
                             metric.last, metric.min, metric.max, metric.mean
                         ));
                     }
-                    tropel_metrics::collector::                    MetricType::Trend => {
+                    tropel_metrics::collector::MetricType::Trend => {
                         out.push_str("[Trend]\n");
                         Self::render_trend(&mut out, "", metric, &stats);
                     }
@@ -204,7 +204,11 @@ impl StdoutReporter {
         if result.per_url.len() > 1 {
             out.push_str("\n  Per-URL (http_req_duration):\n");
             for m in &result.per_url {
-                let url = m.tags.iter().find(|(k, _)| k == "url").map(|(_, v)| v.as_str());
+                let url = m
+                    .tags
+                    .iter()
+                    .find(|(k, _)| k == "url")
+                    .map(|(_, v)| v.as_str());
                 let url = url.unwrap_or(&m.key);
                 out.push_str(&format!("    {}  (reqs: {})\n", url, m.count));
                 Self::render_trend(&mut out, "  ", m, &stats);
@@ -289,10 +293,7 @@ impl StdoutReporter {
             ("✓ PASS — test completed successfully", "\x1b[32m") // green
         };
         if Self::stdout_is_tty() {
-            out.push_str(&format!(
-                "\n  {}{}\x1b[0m\n",
-                color, status
-            ));
+            out.push_str(&format!("\n  {}{}\x1b[0m\n", color, status));
         } else {
             out.push_str(&format!("\n  {}\n", status));
         }

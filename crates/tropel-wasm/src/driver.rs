@@ -66,7 +66,7 @@
 //! Response (host → module): `{"code":200,"status":200,"status_text":"OK",
 //! "headers":{…},"body":"…","response_time":12.3,"size":123}`
 
-use crate::{wasm_engine, DEFAULT_CALL_FUEL, FALLBACK_BASE, load_module_aot};
+use crate::{load_module_aot, wasm_engine, DEFAULT_CALL_FUEL, FALLBACK_BASE};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
@@ -170,13 +170,15 @@ impl Driver for WasmDriver {
                 }
             }
         } else {
-            Module::new(wasm_engine(), bytes).map_err(|e| {
-                TropelError::Other(format!("WASM driver module is invalid: {}", e))
-            })?
+            Module::new(wasm_engine(), bytes)
+                .map_err(|e| TropelError::Other(format!("WASM driver module is invalid: {}", e)))?
         };
 
         // Must be an imperative driver module.
-        if !module.exports().any(|e| e.name() == "adapter_run_iteration") {
+        if !module
+            .exports()
+            .any(|e| e.name() == "adapter_run_iteration")
+        {
             return Err(TropelError::Other(
                 "WASM module does not export 'adapter_run_iteration' — not an imperative \
                  driver module (declarative adapters use adapter_parse)"
@@ -194,53 +196,59 @@ impl Driver for WasmDriver {
             .func_wrap("env", "http_request", http_request_host)
             .map_err(wasm_err)?;
         linker
-            .func_wrap("env", "sleep", |mut caller: Caller<'_, WasmDriverState>, ms: f64| {
-                // NaN / negative / absurd values are coerced first:
-                // NaN.max(0.0) → 0.0, so a hostile `sleep(1e300)` is handled
-                // below instead of saturating to u64::MAX ms (≈ 584 M years).
-                let ms = ms.max(0.0);
-                // Check the RAW value against the remaining budget BEFORE any
-                // clamping: `sleep(60001)` must trip the budget even though
-                // the per-call clamp would reduce it to exactly 60 000 ms.
-                // Over budget → do NOT block (the P0 hang vector). Record the
-                // violation; run_iteration fails the iteration after the call.
-                let sleep_for = ms.min(MAX_HOST_CALL_MS);
-                {
-                    let state = caller.data_mut();
-                    if ms > state.sleep_budget_ms {
-                        state.sleep_over_budget = true;
-                        return;
+            .func_wrap(
+                "env",
+                "sleep",
+                |mut caller: Caller<'_, WasmDriverState>, ms: f64| {
+                    // NaN / negative / absurd values are coerced first:
+                    // NaN.max(0.0) → 0.0, so a hostile `sleep(1e300)` is handled
+                    // below instead of saturating to u64::MAX ms (≈ 584 M years).
+                    let ms = ms.max(0.0);
+                    // Check the RAW value against the remaining budget BEFORE any
+                    // clamping: `sleep(60001)` must trip the budget even though
+                    // the per-call clamp would reduce it to exactly 60 000 ms.
+                    // Over budget → do NOT block (the P0 hang vector). Record the
+                    // violation; run_iteration fails the iteration after the call.
+                    let sleep_for = ms.min(MAX_HOST_CALL_MS);
+                    {
+                        let state = caller.data_mut();
+                        if ms > state.sleep_budget_ms {
+                            state.sleep_over_budget = true;
+                            return;
+                        }
+                        state.sleep_budget_ms -= sleep_for;
                     }
-                    state.sleep_budget_ms -= sleep_for;
-                }
-                if sleep_for > 0.0 {
-                    std::thread::sleep(Duration::from_millis(sleep_for as u64));
-                }
-            })
+                    if sleep_for > 0.0 {
+                        std::thread::sleep(Duration::from_millis(sleep_for as u64));
+                    }
+                },
+            )
             .map_err(wasm_err)?;
         linker
             .func_wrap("env", "metric_add", metric_add_host)
             .map_err(wasm_err)?;
         // Any other imports (WASI etc.) become traps — WASI-less capabilities.
-        linker.define_unknown_imports_as_traps(&module).map_err(wasm_err)?;
+        linker
+            .define_unknown_imports_as_traps(&module)
+            .map_err(wasm_err)?;
 
         let instance = linker
             .instantiate(&mut store, &module)
             .map_err(|e| TropelError::Other(format!("WASM driver instantiation failed: {}", e)))?;
 
-        let memory = instance
-            .get_memory(&mut store, "memory")
-            .ok_or_else(|| {
-                TropelError::Other(
-                    "WASM driver module must export a linear 'memory' (cdylib pattern)".into(),
-                )
-            })?;
+        let memory = instance.get_memory(&mut store, "memory").ok_or_else(|| {
+            TropelError::Other(
+                "WASM driver module must export a linear 'memory' (cdylib pattern)".into(),
+            )
+        })?;
 
         let run_iteration = instance
             .get_typed_func::<(i32, i32), i32>(&mut store, "adapter_run_iteration")
             .map_err(wasm_err)?;
 
-        let malloc_fn = instance.get_typed_func::<i32, i32>(&mut store, "malloc").ok();
+        let malloc_fn = instance
+            .get_typed_func::<i32, i32>(&mut store, "malloc")
+            .ok();
         // C's free is (i32) -> () — looking it up as (i32) -> i32 returns
         // None for every real cdylib, silently disabling the free path and
         // leaking the guest heap every iteration (malloc failure ~1/3 into a
@@ -334,17 +342,17 @@ impl WasmDriverInstance {
 
         // Fetch every handle against the LOCAL store, then commit — reset()
         // is all-or-nothing: on any failure `self` keeps its old store.
-        let memory = instance
-            .get_memory(&mut store, "memory")
-            .ok_or_else(|| {
-                TropelError::Other(
-                    "WASM driver module must export a linear 'memory' (cdylib pattern)".into(),
-                )
-            })?;
+        let memory = instance.get_memory(&mut store, "memory").ok_or_else(|| {
+            TropelError::Other(
+                "WASM driver module must export a linear 'memory' (cdylib pattern)".into(),
+            )
+        })?;
         let run_iteration = instance
             .get_typed_func::<(i32, i32), i32>(&mut store, "adapter_run_iteration")
             .map_err(wasm_err)?;
-        let malloc_fn = instance.get_typed_func::<i32, i32>(&mut store, "malloc").ok();
+        let malloc_fn = instance
+            .get_typed_func::<i32, i32>(&mut store, "malloc")
+            .ok();
         // C's free is (i32) -> () — looking it up as (i32) -> i32 returns
         // None for every real cdylib (same reasoning as in init()).
         let free_fn = instance.get_typed_func::<i32, ()>(&mut store, "free").ok();
@@ -376,9 +384,7 @@ impl DriverInstance for WasmDriverInstance {
 
         // Reset the per-call instruction budget (fuel is consumed per call;
         // set_fuel replaces, so each iteration gets a fresh DoS budget).
-        self.store
-            .set_fuel(self.call_fuel)
-            .map_err(wasm_err)?;
+        self.store.set_fuel(self.call_fuel).map_err(wasm_err)?;
 
         let input = serde_json::json!({
             "vu_id": ctx.vu_id,
@@ -624,9 +630,10 @@ fn http_request_host(
     // original stays alive for sample-tag construction below.
     let req_for_io = req.clone();
     let client_for_io = http_client.clone();
-    let result = tropel_http::blocking::execute_blocking(async move {
-        client_for_io.execute(&req_for_io).await
-    });
+    let result =
+        tropel_http::blocking::execute_blocking(
+            async move { client_for_io.execute(&req_for_io).await },
+        );
     let resp = match result {
         Ok(r) => r,
         Err(e) => {
@@ -643,15 +650,8 @@ fn http_request_host(
         // Exact wire size via the SINGLE serializer (percent-encoded
         // urlencoded, multipart framing) — the deleted Body::encoded_len
         // measured raw k=v&k=v with no encoding.
-        let data_sent = req
-            .body
-            .as_ref()
-            .map(tropel_http::body_size)
-            .unwrap_or(0) as f64;
-        let chain = resp
-            .redirects
-            .iter()
-            .chain(std::iter::once(&resp));
+        let data_sent = req.body.as_ref().map(tropel_http::body_size).unwrap_or(0) as f64;
+        let chain = resp.redirects.iter().chain(std::iter::once(&resp));
         for hop in chain {
             let now = SystemTime::now();
             let mut tags = TagMap::with_capacity(5);
@@ -739,7 +739,10 @@ fn http_request_host(
     if bytes.len() > resp_cap.max(0) as usize {
         return -6; // response buffer too small
     }
-    if memory.write(&mut caller, resp_ptr.max(0) as usize, &bytes).is_err() {
+    if memory
+        .write(&mut caller, resp_ptr.max(0) as usize, &bytes)
+        .is_err()
+    {
         return -7;
     }
     bytes.len() as i32
@@ -850,11 +853,7 @@ fn push_iteration_sample(state: &mut WasmDriverState, sample: Sample) {
         state.metric_spam_exceeded = true;
         return;
     }
-    let tag_bytes: usize = sample
-        .tags
-        .iter()
-        .map(|(k, v)| k.len() + v.len())
-        .sum();
+    let tag_bytes: usize = sample.tags.iter().map(|(k, v)| k.len() + v.len()).sum();
     if state.iteration_tag_bytes.saturating_add(tag_bytes) > MAX_ITERATION_TAG_BYTES {
         state.metric_spam_exceeded = true;
         return;
@@ -1154,7 +1153,9 @@ mod tests {
         let mut ctx = VuContext::new(1, 0, "default".into());
         ctx.http_client = Some(Arc::new(StubClient));
 
-        inst.run_iteration(&mut ctx).await.expect("iteration must succeed");
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration must succeed");
 
         let names: Vec<&str> = ctx.samples.iter().map(|s| s.metric.as_ref()).collect();
         assert!(
@@ -1263,7 +1264,9 @@ mod tests {
         // pages_after_grow=65 sample, then traps via `unreachable`.
         let err = match inst.run_iteration(&mut ctx).await {
             Err(e) => e,
-            Ok(()) => panic!("iteration 0 must trap (input layout at fixed offsets p+27..p+38 may have drifted)"),
+            Ok(()) => panic!(
+                "iteration 0 must trap (input layout at fixed offsets p+27..p+38 may have drifted)"
+            ),
         };
         assert!(
             format!("{}", err).contains("WASM driver error"),
@@ -1296,8 +1299,7 @@ mod tests {
         // pages, the module reads iteration digit '1' (49), and reports
         // mem_pages = 64 (a reused store would report 65).
         ctx.iteration = 1;
-        inst
-            .run_iteration(&mut ctx)
+        inst.run_iteration(&mut ctx)
             .await
             .expect("iteration 1 must succeed on the reset store");
         let digit = ctx
@@ -1328,7 +1330,9 @@ mod tests {
         let mut ctx = VuContext::new(1, 0, "default".into());
         ctx.http_client = Some(Arc::new(StubClient));
 
-        inst.run_iteration(&mut ctx).await.expect("iteration must succeed");
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration must succeed");
 
         let names: Vec<&str> = ctx.samples.iter().map(|s| s.metric.as_ref()).collect();
         assert!(
@@ -1363,7 +1367,10 @@ mod tests {
             .iter()
             .find(|s| s.metric == "driver_ok")
             .unwrap();
-        assert_eq!(driver_ok.sample_type, tropel_core::types::SampleType::Counter);
+        assert_eq!(
+            driver_ok.sample_type,
+            tropel_core::types::SampleType::Counter
+        );
     }
 
     #[tokio::test]
@@ -1482,7 +1489,11 @@ mod tests {
         let mut ctx = VuContext::new(1, 0, "default".into());
         let start = std::time::Instant::now();
         let result = inst.run_iteration(&mut ctx).await;
-        assert!(result.is_err(), "tag-bytes spam must fail the iteration, got {:?}", result);
+        assert!(
+            result.is_err(),
+            "tag-bytes spam must fail the iteration, got {:?}",
+            result
+        );
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "tag-bytes cap must trip quickly"

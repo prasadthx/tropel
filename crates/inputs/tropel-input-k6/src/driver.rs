@@ -50,8 +50,12 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tropel_js::JsContext;
-use tropel_sdk::{AuthConfig, Body, Method, Request, Response, Sample, SampleType, TagMap, Timings};
-use tropel_sdk::{Driver, DriverDeclaredOptions, DriverHttpClient, DriverInstance, DriverRegistration, VuContext};
+use tropel_sdk::{
+    AuthConfig, Body, Method, Request, Response, Sample, SampleType, TagMap, Timings,
+};
+use tropel_sdk::{
+    Driver, DriverDeclaredOptions, DriverHttpClient, DriverInstance, DriverRegistration, VuContext,
+};
 use tropel_sdk::{Result, TropelError};
 
 // ══════════════════════════════════════════════════════════════════
@@ -191,11 +195,11 @@ impl Driver for K6Driver {
             Err(_) => return Ok(None),
         };
         let script_dir = source_path.and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        let json_str = match eval_module_export_json(&module_source, "options", env, script_dir).await
-        {
-            Ok(Some(s)) => s,
-            _ => return Ok(None),
-        };
+        let json_str =
+            match eval_module_export_json(&module_source, "options", env, script_dir).await {
+                Ok(Some(s)) => s,
+                _ => return Ok(None),
+            };
         let options: K6Options = match serde_json::from_str(&json_str) {
             Ok(o) => o,
             Err(e) => {
@@ -280,14 +284,9 @@ impl Driver for K6Driver {
             return;
         };
         let script_dir = source_path.and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        if let Err(e) = eval_module_call_export(
-            &module_source,
-            "teardown",
-            setup_data_json,
-            env,
-            script_dir,
-        )
-        .await
+        if let Err(e) =
+            eval_module_call_export(&module_source, "teardown", setup_data_json, env, script_dir)
+                .await
         {
             tracing::warn!("k6 teardown() failed: {}", e);
         }
@@ -295,8 +294,7 @@ impl Driver for K6Driver {
 }
 
 // Register K6Driver for compile-time discovery.
-inventory::submit!(DriverRegistration::new("k6", || Box::new(K6Driver))
-.with_priority(10));
+inventory::submit!(DriverRegistration::new("k6", || Box::new(K6Driver)).with_priority(10));
 
 // ──────────────────────────────────────────────────────────────────────
 // k6 `open()` + `k6/data` SharedArray native cache
@@ -323,9 +321,8 @@ inventory::submit!(DriverRegistration::new("k6", || Box::new(K6Driver))
 // building / element serialization, and concurrent readers never collide
 // (the old `Mutex` serialized every VU thread on every element read — the
 // one place all VUs collided). Writers clone the small map and swap it in.
-static SHARED_ARRAY_CACHE: OnceLock<
-    RwLock<Arc<HashMap<String, Arc<Vec<serde_json::Value>>>>>,
-> = OnceLock::new();
+static SHARED_ARRAY_CACHE: OnceLock<RwLock<Arc<HashMap<String, Arc<Vec<serde_json::Value>>>>>> =
+    OnceLock::new();
 
 fn shared_array_cache() -> &'static RwLock<Arc<HashMap<String, Arc<Vec<serde_json::Value>>>>> {
     SHARED_ARRAY_CACHE.get_or_init(|| RwLock::new(Arc::new(HashMap::new())))
@@ -381,8 +378,7 @@ fn register_k6_file_bridges(ctx: &mut JsContext, script_dir: Option<PathBuf>) {
                         Ok(bytes) => {
                             if mode == "b" {
                                 use base64::Engine;
-                                Ok(base64::engine::general_purpose::STANDARD
-                                    .encode(bytes))
+                                Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
                             } else {
                                 Ok(String::from_utf8_lossy(&bytes).into_owned())
                             }
@@ -482,10 +478,7 @@ fn register_shared_array_bridges<'js>(rq_ctx: &rquickjs::Ctx<'js>, cache_prefix:
     let _ = globals.set(
         "__tropel_k6_shared_array_get",
         Func::from(
-            move |ctx: rquickjs::Ctx<'js>,
-                  name: String,
-                  i: i32|
-                  -> rquickjs::Value<'js> {
+            move |ctx: rquickjs::Ctx<'js>, name: String, i: i32| -> rquickjs::Value<'js> {
                 let key = format!("{}|{}", get_prefix, name);
                 // Snapshot: one shared read lock to clone the Arc (refcount
                 // bump), then drop the guard and read lock-free.
@@ -522,8 +515,7 @@ fn register_shared_array_bridges<'js>(rq_ctx: &rquickjs::Ctx<'js>, cache_prefix:
 
 /// The k6 `open()` + `k6/data` SharedArray shim (globals `open` and
 /// `SharedArray`), which delegates to the native bridges above.
-const OPEN_DATA_SHIM: &str =
-    include_str!("../../../../js/k6-shim/open-data-shim.js");
+const OPEN_DATA_SHIM: &str = include_str!("../../../../js/k6-shim/open-data-shim.js");
 
 // ══════════════════════════════════════════════════════════════════
 // K6DriverInstance — per-iteration execution
@@ -673,7 +665,14 @@ fn http_tags(
     extra: Option<&HashMap<String, String>>,
     group: Option<&str>,
 ) -> TagMap {
-    http_tags_for(&req.url, req.method.as_str(), status, scenario, extra, group)
+    http_tags_for(
+        &req.url,
+        req.method.as_str(),
+        status,
+        scenario,
+        extra,
+        group,
+    )
 }
 
 /// [`http_tags`] with explicit URL/method (redirect hops reuse it).
@@ -922,10 +921,7 @@ fn k6_error_code(msg: &str) -> i32 {
 /// separate I/O runtime (not the VU's reactor), so parking this VU thread for
 /// a few ms never deadlocks it — while `blocking_send` would panic inside the
 /// VU runtime (it calls `block_on`). Returns false if the session is gone.
-fn try_send_cmd(
-    tx: &tokio::sync::mpsc::Sender<WsCommand>,
-    mut cmd: WsCommand,
-) -> bool {
+fn try_send_cmd(tx: &tokio::sync::mpsc::Sender<WsCommand>, mut cmd: WsCommand) -> bool {
     for _ in 0..50 {
         match tx.try_send(cmd) {
             Ok(()) => return true,
@@ -1113,7 +1109,8 @@ fn build_k6_response_object<'js>(
     // `responseType: "binary"` → native ArrayBuffer body (raw bytes survive);
     // otherwise UTF-8 text. `none` (k6) sends an empty body.
     if response_type.eq_ignore_ascii_case("binary") {
-        let ab = rquickjs::ArrayBuffer::new(ctx.clone(), body).expect("ArrayBuffer for k6 binary body");
+        let ab =
+            rquickjs::ArrayBuffer::new(ctx.clone(), body).expect("ArrayBuffer for k6 binary body");
         let _ = obj.set("body", ab);
     } else {
         let _ = obj.set("body", String::from_utf8_lossy(&body).into_owned());
@@ -1187,474 +1184,492 @@ fn register_http_bridges<'js>(
         "__tropel_k6_http_request",
         Func::from(
             move |ctx: rquickjs::Ctx<'js>,
-                          method: String,
-                          url: String,
-                          headers_json: String,
-                          body: String,
-                          response_type: String,
-                          extras_json: String|
-                          -> rquickjs::Object<'js> {
-                        // Backlog line 140: the shim packs per-request
-                        // params.timeout/tags/auth/redirects/compression into
-                        // ONE JSON string (the bridge closure is arity-capped
-                        // at ctx + 6 script args). Unpack them here and apply
-                        // each: timeout bounds the request, tags merge into
-                        // the http_req_* sample tags, auth becomes
-                        // Request.auth (the client impl builds the signer),
-                        // redirects controls follow_redirects, and compression
-                        // gzip/deflates the request body.
-                        let extras: serde_json::Value = serde_json::from_str(&extras_json)
-                            .unwrap_or(serde_json::Value::Null);
-                        let timeout_ms: f64 = extras
-                            .get("timeoutMs")
-                            .and_then(|t| t.as_f64())
-                            .unwrap_or(0.0);
-                        let extra_tags: HashMap<String, String> = extras
-                            .get("tags")
-                            .and_then(|t| t.as_object())
-                            .map(|o| {
-                                o.iter()
-                                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let auth: Option<AuthConfig> = extras
-                            .get("auth")
-                            .filter(|a| !a.is_null())
-                            .and_then(|a| serde_json::from_value(a.clone()).ok());
-                        // k6 params.redirects: 0 = don't follow, -1 = follow
-                        // all, N = follow up to N hops. Our Request only has a
-                        // bool; N>0 and -1 both mean follow.
-                        let redirects: i64 = extras
-                            .get("redirects")
-                            .and_then(|r| r.as_i64())
-                            .unwrap_or(-1);
-                        let compression: String = extras
-                            .get("compression")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        // Backlog line 150: the shim base64-encodes binary
-                        // request bodies (ArrayBuffer / Uint8Array / http.file
-                        // data) and flags bodyB64 — the bridge is arity-capped
-                        // at String, so raw bytes ride as base64 and are
-                        // decoded here to Body::Binary.
-                        let body_b64: bool = extras
-                            .get("bodyB64")
-                            .and_then(|b| b.as_bool())
-                            .unwrap_or(false);
+                  method: String,
+                  url: String,
+                  headers_json: String,
+                  body: String,
+                  response_type: String,
+                  extras_json: String|
+                  -> rquickjs::Object<'js> {
+                // Backlog line 140: the shim packs per-request
+                // params.timeout/tags/auth/redirects/compression into
+                // ONE JSON string (the bridge closure is arity-capped
+                // at ctx + 6 script args). Unpack them here and apply
+                // each: timeout bounds the request, tags merge into
+                // the http_req_* sample tags, auth becomes
+                // Request.auth (the client impl builds the signer),
+                // redirects controls follow_redirects, and compression
+                // gzip/deflates the request body.
+                let extras: serde_json::Value =
+                    serde_json::from_str(&extras_json).unwrap_or(serde_json::Value::Null);
+                let timeout_ms: f64 = extras
+                    .get("timeoutMs")
+                    .and_then(|t| t.as_f64())
+                    .unwrap_or(0.0);
+                let extra_tags: HashMap<String, String> = extras
+                    .get("tags")
+                    .and_then(|t| t.as_object())
+                    .map(|o| {
+                        o.iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let auth: Option<AuthConfig> = extras
+                    .get("auth")
+                    .filter(|a| !a.is_null())
+                    .and_then(|a| serde_json::from_value(a.clone()).ok());
+                // k6 params.redirects: 0 = don't follow, -1 = follow
+                // all, N = follow up to N hops. Our Request only has a
+                // bool; N>0 and -1 both mean follow.
+                let redirects: i64 = extras
+                    .get("redirects")
+                    .and_then(|r| r.as_i64())
+                    .unwrap_or(-1);
+                let compression: String = extras
+                    .get("compression")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                // Backlog line 150: the shim base64-encodes binary
+                // request bodies (ArrayBuffer / Uint8Array / http.file
+                // data) and flags bodyB64 — the bridge is arity-capped
+                // at String, so raw bytes ride as base64 and are
+                // decoded here to Body::Binary.
+                let body_b64: bool = extras
+                    .get("bodyB64")
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(false);
 
-                        let mut headers = parse_headers_tolerant(&headers_json);
-                        // k6 params.compression: "gzip" / "deflate" — compress
-                        // the request body and stamp Content-Encoding. Only
-                        // when a body exists (k6 compresses the body, and an
-                        // empty-body GET has nothing to compress).
-                        let mut req_body: Option<Body> = if body.is_empty() {
-                            None
-                        } else if body_b64 {
-                            use base64::Engine as _;
-                            base64::engine::general_purpose::STANDARD
-                                .decode(&body)
-                                .ok()
-                                .map(Body::Binary)
-                        } else {
-                            Some(Body::Raw(body))
-                        };
-                        if !compression.is_empty() {
-                            if let Some(Body::Raw(text)) = &req_body {
-                                if let Some(compressed) =
-                                    compress_k6_body(&compression, text.as_bytes())
-                                {
-                                    req_body = Some(Body::Binary(compressed));
-                                    headers.insert(
-                                        "Content-Encoding".to_string(),
-                                        if compression.contains("gzip") {
-                                            "gzip".to_string()
-                                        } else {
-                                            "deflate".to_string()
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                        // A genuinely invalid method token must not silently
-                        // become GET (a write-path "PURGE" must not degrade
-                        // into a read-path GET that reports green). Surfaced
-                        // as a status-0 error response the shim returns to
-                        // the script (checks fail, http_req_failed counts).
-                        // Valid-but-uncommon tokens (PURGE/LINK/…)
-                        // parse fine via Method::Custom.
-                        // NOTE: inside the let-else else-block, `method` still
-                        // refers to the original String (the parsed binding is
-                        // only visible after the statement).
-                        let Some(parsed_method) = Method::parse(&method) else {
-                            return build_k6_response_object(
-                                &ctx,
-                                0,
-                                format!("invalid HTTP method {}", method),
-                                Vec::new(),
-                                &HashMap::new(),
-                                0.0,
-                                None,
-                                &format!("invalid HTTP method {}", method),
-                                1000,
-                                &response_type,
+                let mut headers = parse_headers_tolerant(&headers_json);
+                // k6 params.compression: "gzip" / "deflate" — compress
+                // the request body and stamp Content-Encoding. Only
+                // when a body exists (k6 compresses the body, and an
+                // empty-body GET has nothing to compress).
+                let mut req_body: Option<Body> = if body.is_empty() {
+                    None
+                } else if body_b64 {
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD
+                        .decode(&body)
+                        .ok()
+                        .map(Body::Binary)
+                } else {
+                    Some(Body::Raw(body))
+                };
+                if !compression.is_empty() {
+                    if let Some(Body::Raw(text)) = &req_body {
+                        if let Some(compressed) = compress_k6_body(&compression, text.as_bytes()) {
+                            req_body = Some(Body::Binary(compressed));
+                            headers.insert(
+                                "Content-Encoding".to_string(),
+                                if compression.contains("gzip") {
+                                    "gzip".to_string()
+                                } else {
+                                    "deflate".to_string()
+                                },
                             );
-                        };
-                        let req = Request {
-                            url,
-                            method: parsed_method,
-                            headers,
-                            query_params: HashMap::new(),
-                            body: req_body,
-                            auth,
-                            certificate: None,
-                            follow_redirects: redirects != 0,
-                            // Backlog line 140: timeout was parsed by the shim
-                            // then DISCARDED here (`_timeout_ms`) — wire it
-                            // through so a per-request timeout actually bounds
-                            // the request.
-                            timeout: if timeout_ms > 0.0 {
-                                Some(Duration::from_millis(timeout_ms as u64))
-                            } else {
-                                None
-                            },
-                            response_type: tropel_sdk::ResponseType::from_k6(&response_type),
-                        };
-                        // Execute on the dedicated I/O runtime via the shared
-                        // blocking helper — safe from inside ctx.with on a
-                        // current-thread VU runtime. No block_on here: that
-                        // deadlocks the VU's own reactor.
-                        // Clone the request into the 'static I/O future; the
-                        // original stays alive for sample-tag construction.
-                        let req_for_io = req.clone();
-                        let http_for_io = http_client_request.clone();
-                        let result = tropel_http::blocking::execute_blocking(async move {
-                            http_for_io.execute(&req_for_io).await
-                        });
-                        match result {
-                            Ok(resp) => {
-                                // Record the standard http_req_* samples so
-                                // the summary/thresholds see this request
-                                // (mirrors the declarative runner + WASM
-                                // driver). The req body is counted for
-                                // data_sent; k6 semantics: 2xx-3xx success.
-                                // Exact wire size via the SINGLE serializer
-                                // (percent-encoded urlencoded, multipart
-                                // framing) — the deleted Body::encoded_len
-                                // measured raw k=v&k=v with no encoding.
-                                let sent = req
-                                    .body
-                                    .as_ref()
-                                    .map(tropel_http::body_size)
-                                    .unwrap_or(0);
-                                // k6 parity: every redirect hop counts as its
-                                // own request (test.k6.io 302 chain = 2 reqs
-                                // per iteration, not 1).
-                                let group = group_stack_req.lock().unwrap().last().cloned();
-                                push_redirect_hops(&sink_req, &resp, req.method.as_str(), &scenario_req, Some(&extra_tags), group.as_deref());
-                                push_http_samples(
-                                    &sink_req,
-                                    &req,
-                                    resp.status_code,
-                                    resp.response_time,
-                                    resp.size,
-                                    sent,
-                                    resp.timings.as_ref(),
-                                    &scenario_req,
-                                    Some(&extra_tags),
-                                    group.as_deref(),
-                                );
-                                build_k6_response_object(
-                                    &ctx,
-                                    resp.status_code,
-                                    resp.status_text,
-                                    resp.body,
-                                    &resp.headers,
-                                    resp.response_time.as_secs_f64() * 1000.0,
-                                    resp.timings.as_ref(),
-                                    "",
-                                    0,
-                                    &response_type,
-                                )
-                            }
-                            Err(e) => {
-                                tracing::debug!("k6 http request failed: {}", e);
-                                let group = group_stack_req.lock().unwrap().last().cloned();
-                                push_http_failure(&sink_req, &req, &scenario_req, Some(&extra_tags), group.as_deref());
-                                let err = e.to_string();
-                                build_k6_response_object(
-                                    &ctx,
-                                    0,
-                                    format!("HTTP error: {}", err),
-                                    Vec::new(),
-                                    &HashMap::new(),
-                                    0.0,
-                                    None,
-                                    &err,
-                                    k6_error_code(&err),
-                                    &response_type,
-                                )
-                            }
                         }
+                    }
+                }
+                // A genuinely invalid method token must not silently
+                // become GET (a write-path "PURGE" must not degrade
+                // into a read-path GET that reports green). Surfaced
+                // as a status-0 error response the shim returns to
+                // the script (checks fail, http_req_failed counts).
+                // Valid-but-uncommon tokens (PURGE/LINK/…)
+                // parse fine via Method::Custom.
+                // NOTE: inside the let-else else-block, `method` still
+                // refers to the original String (the parsed binding is
+                // only visible after the statement).
+                let Some(parsed_method) = Method::parse(&method) else {
+                    return build_k6_response_object(
+                        &ctx,
+                        0,
+                        format!("invalid HTTP method {}", method),
+                        Vec::new(),
+                        &HashMap::new(),
+                        0.0,
+                        None,
+                        &format!("invalid HTTP method {}", method),
+                        1000,
+                        &response_type,
+                    );
+                };
+                let req = Request {
+                    url,
+                    method: parsed_method,
+                    headers,
+                    query_params: HashMap::new(),
+                    body: req_body,
+                    auth,
+                    certificate: None,
+                    follow_redirects: redirects != 0,
+                    // Backlog line 140: timeout was parsed by the shim
+                    // then DISCARDED here (`_timeout_ms`) — wire it
+                    // through so a per-request timeout actually bounds
+                    // the request.
+                    timeout: if timeout_ms > 0.0 {
+                        Some(Duration::from_millis(timeout_ms as u64))
+                    } else {
+                        None
                     },
-                ),
-            );
+                    response_type: tropel_sdk::ResponseType::from_k6(&response_type),
+                };
+                // Execute on the dedicated I/O runtime via the shared
+                // blocking helper — safe from inside ctx.with on a
+                // current-thread VU runtime. No block_on here: that
+                // deadlocks the VU's own reactor.
+                // Clone the request into the 'static I/O future; the
+                // original stays alive for sample-tag construction.
+                let req_for_io = req.clone();
+                let http_for_io = http_client_request.clone();
+                let result = tropel_http::blocking::execute_blocking(async move {
+                    http_for_io.execute(&req_for_io).await
+                });
+                match result {
+                    Ok(resp) => {
+                        // Record the standard http_req_* samples so
+                        // the summary/thresholds see this request
+                        // (mirrors the declarative runner + WASM
+                        // driver). The req body is counted for
+                        // data_sent; k6 semantics: 2xx-3xx success.
+                        // Exact wire size via the SINGLE serializer
+                        // (percent-encoded urlencoded, multipart
+                        // framing) — the deleted Body::encoded_len
+                        // measured raw k=v&k=v with no encoding.
+                        let sent = req.body.as_ref().map(tropel_http::body_size).unwrap_or(0);
+                        // k6 parity: every redirect hop counts as its
+                        // own request (test.k6.io 302 chain = 2 reqs
+                        // per iteration, not 1).
+                        let group = group_stack_req.lock().unwrap().last().cloned();
+                        push_redirect_hops(
+                            &sink_req,
+                            &resp,
+                            req.method.as_str(),
+                            &scenario_req,
+                            Some(&extra_tags),
+                            group.as_deref(),
+                        );
+                        push_http_samples(
+                            &sink_req,
+                            &req,
+                            resp.status_code,
+                            resp.response_time,
+                            resp.size,
+                            sent,
+                            resp.timings.as_ref(),
+                            &scenario_req,
+                            Some(&extra_tags),
+                            group.as_deref(),
+                        );
+                        build_k6_response_object(
+                            &ctx,
+                            resp.status_code,
+                            resp.status_text,
+                            resp.body,
+                            &resp.headers,
+                            resp.response_time.as_secs_f64() * 1000.0,
+                            resp.timings.as_ref(),
+                            "",
+                            0,
+                            &response_type,
+                        )
+                    }
+                    Err(e) => {
+                        tracing::debug!("k6 http request failed: {}", e);
+                        let group = group_stack_req.lock().unwrap().last().cloned();
+                        push_http_failure(
+                            &sink_req,
+                            &req,
+                            &scenario_req,
+                            Some(&extra_tags),
+                            group.as_deref(),
+                        );
+                        let err = e.to_string();
+                        build_k6_response_object(
+                            &ctx,
+                            0,
+                            format!("HTTP error: {}", err),
+                            Vec::new(),
+                            &HashMap::new(),
+                            0.0,
+                            None,
+                            &err,
+                            k6_error_code(&err),
+                            &response_type,
+                        )
+                    }
+                }
+            },
+        ),
+    );
 
     let batch_sink = sink.clone();
     let scenario_batch = Arc::from(scenario);
     let group_stack_batch = group_stack.clone();
-            let _ = globals.set(
-                "__tropel_k6_http_batch",
-                Func::from(move |requests_json: String| -> String {
-                    let batch_requests: Vec<serde_json::Value> =
-                        serde_json::from_str(&requests_json).unwrap_or_default();
+    let _ = globals.set(
+        "__tropel_k6_http_batch",
+        Func::from(move |requests_json: String| -> String {
+            let batch_requests: Vec<serde_json::Value> =
+                serde_json::from_str(&requests_json).unwrap_or_default();
 
-                    let http_for_io = http_client.clone();
-                    let futures = batch_requests.into_iter().map(move |entry| {
-                        let key = entry.get("key").cloned().unwrap_or_else(|| serde_json::Value::String(String::new()));
-                        let method = entry
-                            .get("method")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("GET")
-                            .to_string();
-                        let url = entry
-                            .get("url")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let headers_json = entry
-                            .get("headers_json")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("{}");
-                        let mut headers = parse_headers_tolerant(headers_json);
-                        let body = entry
-                            .get("body")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        // Backlog line 140: batch entries carry the same
-                        // per-request params.tags/auth/redirects/compression
-                        // as the single-request bridge (the shim packs them
-                        // into the entry object).
-                        let extra_tags: HashMap<String, String> = entry
-                            .get("tags_json")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| serde_json::from_str(s).ok())
-                            .unwrap_or_default();
-                        // auth_json is DOUBLE-ENCODED: the shim sends
-                        // JSON.stringify(auth) — a JSON string whose CONTENT is
-                        // the tagged auth object. from_value(Value::String)
-                        // would try to deserialize the internally-tagged
-                        // AuthConfig enum from a string and fail silently
-                        // (auth → None, the exact silent-drop this backlog
-                        // line kills) — read the inner string instead.
-                        let auth: Option<AuthConfig> = entry
-                            .get("auth_json")
-                            .and_then(|v| v.as_str())
-                            .filter(|s| *s != "null")
-                            .and_then(|s| serde_json::from_str(s).ok());
-                        let redirects: i64 = entry
-                            .get("redirects")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(-1);
-                        let compression: String = entry
-                            .get("compression")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        // Backlog line 150: binary batch bodies arrive base64
-                        // (the shim flags body_b64), decoded here to raw bytes.
-                        let body_b64: bool = entry
-                            .get("body_b64")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let mut request_body: Option<Body> = if body.is_empty() {
-                            None
-                        } else if body_b64 {
-                            use base64::Engine as _;
-                            base64::engine::general_purpose::STANDARD
-                                .decode(&body)
-                                .ok()
-                                .map(Body::Binary)
-                        } else {
-                            Some(Body::Raw(body))
-                        };
-                        if !compression.is_empty() {
-                            if let Some(Body::Raw(text)) = &request_body {
-                                if let Some(compressed) =
-                                    compress_k6_body(&compression, text.as_bytes())
-                                {
-                                    request_body = Some(Body::Binary(compressed));
-                                    headers.insert(
-                                        "Content-Encoding".to_string(),
-                                        if compression.contains("gzip") {
-                                            "gzip".to_string()
-                                        } else {
-                                            "deflate".to_string()
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                        let timeout_ms = entry
-                            .get("timeout_ms")
-                            .and_then(|v| v.as_f64())
-                            .unwrap_or(30000.0);
-                        let timeout = if timeout_ms > 0.0 {
-                            Some(Duration::from_millis(timeout_ms as u64))
-                        } else {
-                            None
-                        };
-                        let response_type = entry
-                            .get("response_type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("text");
-                        // Same loud-failure guard as the first bridge: an
-                        // invalid method token must not silently become GET.
-                        // This closure must return a UNIFORM future type, so
-                        // the invalid-method case is carried as an immediate
-                        // Err result inside the async block (never executed)
-                        // instead of a String — the caller maps it to a
-                        // status-0 response + failure samples.
-                        let parsed_method = Method::parse(&method);
-                        let req = Request {
-                            url,
-                            method: parsed_method
-                                .clone()
-                                .unwrap_or_else(|| Method::Custom(method.clone())),
-                            headers,
-                            query_params: HashMap::new(),
-                            body: request_body,
-                            auth,
-                            certificate: None,
-                            follow_redirects: redirects != 0,
-                            timeout,
-                            response_type: tropel_sdk::ResponseType::from_k6(response_type),
-                        };
-                        let http_client = http_for_io.clone();
-                        async move {
-                            let resp = match parsed_method {
-                                Some(_) => http_client.execute(&req).await,
-                                None => Err(TropelError::Other(format!(
-                                    "invalid HTTP method {}",
-                                    method
-                                ))),
-                            };
-                            (key, req, resp, extra_tags)
-                        }
-                    });
-
-                    let responses = tropel_http::blocking::execute_blocking(async move {
-                        let results = join_all(futures).await;
-                        Ok(results)
-                    });
-
-                    let mut response_map = serde_json::Map::new();
-                    if let Ok(results) = responses {
-                        for (key, req, result, extra_tags) in results {
-                            let key_str = match key {
-                                serde_json::Value::String(s) => s,
-                                serde_json::Value::Number(n) => n.to_string(),
-                                serde_json::Value::Bool(b) => b.to_string(),
-                                other => serde_json::to_string(&other).unwrap_or_default(),
-                            };
-                            let entry_resp = match result {
-                                Ok(resp) => {
-                                    // Record the standard http_req_* samples
-                                    // for each batch request (mirrors the
-                                    // single-request bridge).
-                                    // Exact wire size via the SINGLE
-                                    // serializer (see single-request path).
-                                    let sent = req
-                                        .body
-                                        .as_ref()
-                                        .map(tropel_http::body_size)
-                                        .unwrap_or(0);
-                                    // k6 parity: every redirect hop counts as
-                                    // its own request, same as the single-
-                                    // request path.
-                                    let group = group_stack_batch.lock().unwrap().last().cloned();
-                                    push_redirect_hops(&batch_sink, &resp, req.method.as_str(), &scenario_batch, Some(&extra_tags), group.as_deref());
-                                    push_http_samples(
-                                        &batch_sink,
-                                        &req,
-                                        resp.status_code,
-                                        resp.response_time,
-                                        resp.size,
-                                        sent,
-                                        resp.timings.as_ref(),
-                                        &scenario_batch,
-                                        Some(&extra_tags),
-                                        group.as_deref(),
-                                    );
-                                    // Backlog line 150: batch responses now
-                                    // carry real timings + error/error_code
-                                    // (k6 parity), and binary bodies arrive
-                                    // base64 (body_b64) since JSON can't hold
-                                    // raw bytes — the shim decodes to an
-                                    // ArrayBuffer. Timings serialize to ms.
-                                    let mut resp_json = serde_json::json!({
-                                        "code": resp.status_code,
-                                        "status": resp.status_code,
-                                        "status_text": resp.status_text,
-                                        "headers": resp.headers,
-                                        "response_time": resp.response_time.as_secs_f64() * 1000.0,
-                                        "error": "",
-                                        "error_code": 0,
-                                    });
-                                    if let Some(t) = &resp.timings {
-                                        resp_json["timings"] = serde_json::json!({
-                                            "blocked": t.blocked.as_secs_f64() * 1000.0,
-                                            "dns": t.dns.as_secs_f64() * 1000.0,
-                                            "connecting": t.connecting.as_secs_f64() * 1000.0,
-                                            "tls_handshaking": t.tls_handshaking.as_secs_f64() * 1000.0,
-                                            "sending": t.sending.as_secs_f64() * 1000.0,
-                                            "waiting": t.waiting.as_secs_f64() * 1000.0,
-                                            "receiving": t.receiving.as_secs_f64() * 1000.0,
-                                            "duration": resp.response_time.as_secs_f64() * 1000.0,
-                                        });
-                                    }
-                                    // `response_type` (a &str borrowed from
-                                    // `entry`) is not capturable into this
-                                    // async block; the Request already carries
-                                    // the parsed ResponseType — use it.
-                                    if req.response_type == tropel_sdk::ResponseType::Binary {
-                                        use base64::Engine as _;
-                                        resp_json["body"] = serde_json::Value::String(
-                                            base64::engine::general_purpose::STANDARD.encode(&resp.body),
-                                        );
-                                        resp_json["body_b64"] = serde_json::Value::Bool(true);
-                                    } else {
-                                        resp_json["body"] =
-                                            serde_json::Value::String(String::from_utf8_lossy(&resp.body).into_owned());
-                                    }
-                                    resp_json
-                                }
-                                Err(e) => {
-                                    tracing::debug!("k6 batch request failed: {}", e);
-                                    let group = group_stack_batch.lock().unwrap().last().cloned();
-                                    push_http_failure(&batch_sink, &req, &scenario_batch, Some(&extra_tags), group.as_deref());
-                                    let err = e.to_string();
-                                    serde_json::json!({
-                                        "code": 0,
-                                        "status": 0,
-                                        "status_text": format!("HTTP error: {}", err),
-                                        "body": "",
-                                        "headers": {},
-                                        "response_time": 0,
-                                        "error": err,
-                                        "error_code": k6_error_code(&err),
-                                    })
-                                }
-                            };
-                            response_map.insert(key_str, entry_resp);
+            let http_for_io = http_client.clone();
+            let futures = batch_requests.into_iter().map(move |entry| {
+                let key = entry
+                    .get("key")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::Value::String(String::new()));
+                let method = entry
+                    .get("method")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("GET")
+                    .to_string();
+                let url = entry
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let headers_json = entry
+                    .get("headers_json")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("{}");
+                let mut headers = parse_headers_tolerant(headers_json);
+                let body = entry
+                    .get("body")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                // Backlog line 140: batch entries carry the same
+                // per-request params.tags/auth/redirects/compression
+                // as the single-request bridge (the shim packs them
+                // into the entry object).
+                let extra_tags: HashMap<String, String> = entry
+                    .get("tags_json")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_default();
+                // auth_json is DOUBLE-ENCODED: the shim sends
+                // JSON.stringify(auth) — a JSON string whose CONTENT is
+                // the tagged auth object. from_value(Value::String)
+                // would try to deserialize the internally-tagged
+                // AuthConfig enum from a string and fail silently
+                // (auth → None, the exact silent-drop this backlog
+                // line kills) — read the inner string instead.
+                let auth: Option<AuthConfig> = entry
+                    .get("auth_json")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| *s != "null")
+                    .and_then(|s| serde_json::from_str(s).ok());
+                let redirects: i64 = entry
+                    .get("redirects")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(-1);
+                let compression: String = entry
+                    .get("compression")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                // Backlog line 150: binary batch bodies arrive base64
+                // (the shim flags body_b64), decoded here to raw bytes.
+                let body_b64: bool = entry
+                    .get("body_b64")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let mut request_body: Option<Body> = if body.is_empty() {
+                    None
+                } else if body_b64 {
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD
+                        .decode(&body)
+                        .ok()
+                        .map(Body::Binary)
+                } else {
+                    Some(Body::Raw(body))
+                };
+                if !compression.is_empty() {
+                    if let Some(Body::Raw(text)) = &request_body {
+                        if let Some(compressed) = compress_k6_body(&compression, text.as_bytes()) {
+                            request_body = Some(Body::Binary(compressed));
+                            headers.insert(
+                                "Content-Encoding".to_string(),
+                                if compression.contains("gzip") {
+                                    "gzip".to_string()
+                                } else {
+                                    "deflate".to_string()
+                                },
+                            );
                         }
                     }
+                }
+                let timeout_ms = entry
+                    .get("timeout_ms")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(30000.0);
+                let timeout = if timeout_ms > 0.0 {
+                    Some(Duration::from_millis(timeout_ms as u64))
+                } else {
+                    None
+                };
+                let response_type = entry
+                    .get("response_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("text");
+                // Same loud-failure guard as the first bridge: an
+                // invalid method token must not silently become GET.
+                // This closure must return a UNIFORM future type, so
+                // the invalid-method case is carried as an immediate
+                // Err result inside the async block (never executed)
+                // instead of a String — the caller maps it to a
+                // status-0 response + failure samples.
+                let parsed_method = Method::parse(&method);
+                let req = Request {
+                    url,
+                    method: parsed_method
+                        .clone()
+                        .unwrap_or_else(|| Method::Custom(method.clone())),
+                    headers,
+                    query_params: HashMap::new(),
+                    body: request_body,
+                    auth,
+                    certificate: None,
+                    follow_redirects: redirects != 0,
+                    timeout,
+                    response_type: tropel_sdk::ResponseType::from_k6(response_type),
+                };
+                let http_client = http_for_io.clone();
+                async move {
+                    let resp = match parsed_method {
+                        Some(_) => http_client.execute(&req).await,
+                        None => Err(TropelError::Other(format!(
+                            "invalid HTTP method {}",
+                            method
+                        ))),
+                    };
+                    (key, req, resp, extra_tags)
+                }
+            });
 
-                    serde_json::Value::Object(response_map).to_string()
-                }),
-            );
+            let responses = tropel_http::blocking::execute_blocking(async move {
+                let results = join_all(futures).await;
+                Ok(results)
+            });
+
+            let mut response_map = serde_json::Map::new();
+            if let Ok(results) = responses {
+                for (key, req, result, extra_tags) in results {
+                    let key_str = match key {
+                        serde_json::Value::String(s) => s,
+                        serde_json::Value::Number(n) => n.to_string(),
+                        serde_json::Value::Bool(b) => b.to_string(),
+                        other => serde_json::to_string(&other).unwrap_or_default(),
+                    };
+                    let entry_resp = match result {
+                        Ok(resp) => {
+                            // Record the standard http_req_* samples
+                            // for each batch request (mirrors the
+                            // single-request bridge).
+                            // Exact wire size via the SINGLE
+                            // serializer (see single-request path).
+                            let sent = req.body.as_ref().map(tropel_http::body_size).unwrap_or(0);
+                            // k6 parity: every redirect hop counts as
+                            // its own request, same as the single-
+                            // request path.
+                            let group = group_stack_batch.lock().unwrap().last().cloned();
+                            push_redirect_hops(
+                                &batch_sink,
+                                &resp,
+                                req.method.as_str(),
+                                &scenario_batch,
+                                Some(&extra_tags),
+                                group.as_deref(),
+                            );
+                            push_http_samples(
+                                &batch_sink,
+                                &req,
+                                resp.status_code,
+                                resp.response_time,
+                                resp.size,
+                                sent,
+                                resp.timings.as_ref(),
+                                &scenario_batch,
+                                Some(&extra_tags),
+                                group.as_deref(),
+                            );
+                            // Backlog line 150: batch responses now
+                            // carry real timings + error/error_code
+                            // (k6 parity), and binary bodies arrive
+                            // base64 (body_b64) since JSON can't hold
+                            // raw bytes — the shim decodes to an
+                            // ArrayBuffer. Timings serialize to ms.
+                            let mut resp_json = serde_json::json!({
+                                "code": resp.status_code,
+                                "status": resp.status_code,
+                                "status_text": resp.status_text,
+                                "headers": resp.headers,
+                                "response_time": resp.response_time.as_secs_f64() * 1000.0,
+                                "error": "",
+                                "error_code": 0,
+                            });
+                            if let Some(t) = &resp.timings {
+                                resp_json["timings"] = serde_json::json!({
+                                    "blocked": t.blocked.as_secs_f64() * 1000.0,
+                                    "dns": t.dns.as_secs_f64() * 1000.0,
+                                    "connecting": t.connecting.as_secs_f64() * 1000.0,
+                                    "tls_handshaking": t.tls_handshaking.as_secs_f64() * 1000.0,
+                                    "sending": t.sending.as_secs_f64() * 1000.0,
+                                    "waiting": t.waiting.as_secs_f64() * 1000.0,
+                                    "receiving": t.receiving.as_secs_f64() * 1000.0,
+                                    "duration": resp.response_time.as_secs_f64() * 1000.0,
+                                });
+                            }
+                            // `response_type` (a &str borrowed from
+                            // `entry`) is not capturable into this
+                            // async block; the Request already carries
+                            // the parsed ResponseType — use it.
+                            if req.response_type == tropel_sdk::ResponseType::Binary {
+                                use base64::Engine as _;
+                                resp_json["body"] = serde_json::Value::String(
+                                    base64::engine::general_purpose::STANDARD.encode(&resp.body),
+                                );
+                                resp_json["body_b64"] = serde_json::Value::Bool(true);
+                            } else {
+                                resp_json["body"] = serde_json::Value::String(
+                                    String::from_utf8_lossy(&resp.body).into_owned(),
+                                );
+                            }
+                            resp_json
+                        }
+                        Err(e) => {
+                            tracing::debug!("k6 batch request failed: {}", e);
+                            let group = group_stack_batch.lock().unwrap().last().cloned();
+                            push_http_failure(
+                                &batch_sink,
+                                &req,
+                                &scenario_batch,
+                                Some(&extra_tags),
+                                group.as_deref(),
+                            );
+                            let err = e.to_string();
+                            serde_json::json!({
+                                "code": 0,
+                                "status": 0,
+                                "status_text": format!("HTTP error: {}", err),
+                                "body": "",
+                                "headers": {},
+                                "response_time": 0,
+                                "error": err,
+                                "error_code": k6_error_code(&err),
+                            })
+                        }
+                    };
+                    response_map.insert(key_str, entry_resp);
+                }
+            }
+
+            serde_json::Value::Object(response_map).to_string()
+        }),
+    );
 }
 
 impl K6DriverInstance {
@@ -1676,26 +1691,28 @@ impl K6DriverInstance {
             let _ = globals.set(
                 "__tropel_pm_test",
                 // 3rd arg: optional k6 check() tags JSON (backlog line 149).
-                Func::from(move |name: String, passed: bool, tags_json: Option<String>| {
-                    let mut v = sink_test.lock().unwrap();
-                    let now = tropel_core::clock::monotonic_wall_now();
-                    let mut tags = TagMap::with_capacity(2);
-                    tags.insert("check", name);
-                    if let Some(j) = tags_json {
-                        if let Ok(extra) = serde_json::from_str::<HashMap<String, String>>(&j) {
-                            for (k, val) in extra {
-                                tags.insert(k, val);
+                Func::from(
+                    move |name: String, passed: bool, tags_json: Option<String>| {
+                        let mut v = sink_test.lock().unwrap();
+                        let now = tropel_core::clock::monotonic_wall_now();
+                        let mut tags = TagMap::with_capacity(2);
+                        tags.insert("check", name);
+                        if let Some(j) = tags_json {
+                            if let Ok(extra) = serde_json::from_str::<HashMap<String, String>>(&j) {
+                                for (k, val) in extra {
+                                    tags.insert(k, val);
+                                }
                             }
                         }
-                    }
-                    v.push(Sample {
-                        metric: "checks".into(),
-                        value: if passed { 1.0 } else { 0.0 },
-                        tags: Arc::new(tags),
-                        timestamp: now,
-                        sample_type: SampleType::Rate,
-                    });
-                }),
+                        v.push(Sample {
+                            metric: "checks".into(),
+                            value: if passed { 1.0 } else { 0.0 },
+                            tags: Arc::new(tags),
+                            timestamp: now,
+                            sample_type: SampleType::Rate,
+                        });
+                    },
+                ),
             );
 
             // Custom metric .add() → typed sample (Counter/Gauge/Rate/Trend).
@@ -2425,10 +2442,7 @@ impl Resolver for K6ModuleResolver {
     ) -> rquickjs::Result<String> {
         // Only relative/absolute specifiers can point at files. Bare
         // specifiers (k6 virtual modules, npm packages) error loudly.
-        if !(name.starts_with("./")
-            || name.starts_with("../")
-            || Path::new(name).is_absolute())
-        {
+        if !(name.starts_with("./") || name.starts_with("../") || Path::new(name).is_absolute()) {
             return Err(rquickjs::Error::new_loading_message(
                 name,
                 "bare module specifiers are not supported (k6 virtual modules are provided by the shim)",
@@ -2513,7 +2527,6 @@ impl Loader for K6ModuleLoader {
 // ══════════════════════════════════════════════════════════════════
 // Source pre-processing
 // ══════════════════════════════════════════════════════════════════
-
 
 /// Pre-process a k6 source string for ES-module evaluation.
 ///
@@ -2606,9 +2619,12 @@ async fn eval_module_export_json(
         },
         K6ModuleLoader,
     );
-    js_ctx.bootstrap_library(OPEN_DATA_SHIM).await.map_err(|e| {
-        TropelError::Other(format!("k6 open/SharedArray shim bootstrap failed: {}", e))
-    })?;
+    js_ctx
+        .bootstrap_library(OPEN_DATA_SHIM)
+        .await
+        .map_err(|e| {
+            TropelError::Other(format!("k6 open/SharedArray shim bootstrap failed: {}", e))
+        })?;
     // The k6 shim libs (Rate/check/http/…) must be present: options blocks
     // commonly run k6 API at module top level (e.g. `new Rate('errors')`),
     // which threw QuickJS exceptions when the shim was missing.
@@ -2622,7 +2638,9 @@ async fn eval_module_export_json(
     // becoming undefined. Backlog line 142: __VU/__ITER are NUMBERS in k6
     // (script code doing `__ITER === 0` or `__VU + 1` must not see strings).
     let _ = js_ctx.set_global_json("__VU", &serde_json::json!(0)).await;
-    let _ = js_ctx.set_global_json("__ITER", &serde_json::json!(0)).await;
+    let _ = js_ctx
+        .set_global_json("__ITER", &serde_json::json!(0))
+        .await;
     let env_json = serde_json::to_value(env).unwrap_or_else(|_| serde_json::json!({}));
     let _ = js_ctx.set_global_json("__ENV", &env_json).await;
     let _ = js_ctx.set_global_json("__tropel_env", &env_json).await;
@@ -2664,19 +2682,27 @@ async fn eval_module_handle_summary(
         },
         K6ModuleLoader,
     );
-    js_ctx.bootstrap_library(OPEN_DATA_SHIM).await.map_err(|e| {
-        TropelError::Other(format!("k6 open/SharedArray shim bootstrap failed: {}", e))
-    })?;
+    js_ctx
+        .bootstrap_library(OPEN_DATA_SHIM)
+        .await
+        .map_err(|e| {
+            TropelError::Other(format!("k6 open/SharedArray shim bootstrap failed: {}", e))
+        })?;
     // Same k6-shim requirement as the options eval: a script that touches
     // k6 API at module top level must not throw while handleSummary is read.
     bootstrap_js_libs(&mut js_ctx).await.map_err(|e| {
-        TropelError::Other(format!("k6 shim bootstrap failed for handleSummary eval: {}", e))
+        TropelError::Other(format!(
+            "k6 shim bootstrap failed for handleSummary eval: {}",
+            e
+        ))
     })?;
 
     // Minimal globals a k6 script may reference while building its summary.
     // Backlog line 142: numbers, not strings (see options eval above).
     let _ = js_ctx.set_global_json("__VU", &serde_json::json!(0)).await;
-    let _ = js_ctx.set_global_json("__ITER", &serde_json::json!(0)).await;
+    let _ = js_ctx
+        .set_global_json("__ITER", &serde_json::json!(0))
+        .await;
     let env_json = serde_json::to_value(env).unwrap_or_else(|_| serde_json::json!({}));
     let _ = js_ctx.set_global_json("__ENV", &env_json).await;
     let _ = js_ctx.set_global_json("__tropel_env", &env_json).await;
@@ -2722,9 +2748,12 @@ async fn eval_module_call_export(
         },
         K6ModuleLoader,
     );
-    js_ctx.bootstrap_library(OPEN_DATA_SHIM).await.map_err(|e| {
-        TropelError::Other(format!("k6 open/SharedArray shim bootstrap failed: {}", e))
-    })?;
+    js_ctx
+        .bootstrap_library(OPEN_DATA_SHIM)
+        .await
+        .map_err(|e| {
+            TropelError::Other(format!("k6 open/SharedArray shim bootstrap failed: {}", e))
+        })?;
     bootstrap_js_libs(&mut js_ctx).await.map_err(|e| {
         TropelError::Other(format!("k6 shim bootstrap failed for {export} eval: {}", e))
     })?;
@@ -2733,7 +2762,9 @@ async fn eval_module_call_export(
     // defining setup()/teardown() (same set as the options/handleSummary
     // evals). Backlog line 142: numbers, not strings.
     let _ = js_ctx.set_global_json("__VU", &serde_json::json!(0)).await;
-    let _ = js_ctx.set_global_json("__ITER", &serde_json::json!(0)).await;
+    let _ = js_ctx
+        .set_global_json("__ITER", &serde_json::json!(0))
+        .await;
     let env_json = serde_json::to_value(env).unwrap_or_else(|_| serde_json::json!({}));
     let _ = js_ctx.set_global_json("__ENV", &env_json).await;
     let _ = js_ctx.set_global_json("__tropel_env", &env_json).await;
@@ -2839,7 +2870,10 @@ fn call_module_handle_summary(
     // k6 allows handleSummary to return a single string (→ stdout) or an
     // object map of filename → content.
     if let Some(text) = parsed.as_str() {
-        return Ok(Some(HashMap::from([("stdout".to_string(), text.to_string())])));
+        return Ok(Some(HashMap::from([(
+            "stdout".to_string(),
+            text.to_string(),
+        )])));
     }
     let mut map = HashMap::new();
     if let Some(obj) = parsed.as_object() {
@@ -2882,14 +2916,17 @@ fn read_module_export_string(
 /// `__tropel_iteration` (what `run_iteration` invokes). When `exec` names a
 /// specific exported function (k6 multi-scenario `exec` selection), that
 /// export is installed; otherwise the module's `default` export is used.
-fn install_iteration_global(js_ctx: &mut JsContext, source: &str, exec: Option<&str>) -> Result<()> {
+fn install_iteration_global(
+    js_ctx: &mut JsContext,
+    source: &str,
+    exec: Option<&str>,
+) -> Result<()> {
     // Arm the per-eval timeout: this evals the module directly via with_ctx,
     // bypassing the eval-family methods that normally reset the deadline.
     js_ctx.reset_interrupt();
     js_ctx.with_ctx(|rq_ctx| {
-        let module = rquickjs::Module::declare(rq_ctx.clone(), "k6-script", source).map_err(|e| {
-            TropelError::Other(format!("k6 script module declare error: {}", e))
-        })?;
+        let module = rquickjs::Module::declare(rq_ctx.clone(), "k6-script", source)
+            .map_err(|e| TropelError::Other(format!("k6 script module declare error: {}", e)))?;
         let (module, promise) = module
             .eval()
             .map_err(|e| TropelError::Other(format!("k6 script module eval error: {}", e)))?;
@@ -2904,10 +2941,7 @@ fn install_iteration_global(js_ctx: &mut JsContext, source: &str, exec: Option<&
                     .globals()
                     .set("__tropel_iteration", entry_fn)
                     .map_err(|e| {
-                        TropelError::Other(format!(
-                            "failed to install __tropel_iteration: {}",
-                            e
-                        ))
+                        TropelError::Other(format!("failed to install __tropel_iteration: {}", e))
                     })?;
             }
             Err(e) => {
@@ -3074,7 +3108,9 @@ async fn bootstrap_js_libs(ctx: &mut JsContext) -> Result<()> {
 
     // Phase 3: Bootstrapping libraries that depend on native functions — a
     // SEPARATE bytecode cache (it must run after install_all above).
-    K6_NATIVE_BYTECODE.bootstrap(ctx, K6_NATIVE_SHIM_BUNDLE).await;
+    K6_NATIVE_BYTECODE
+        .bootstrap(ctx, K6_NATIVE_SHIM_BUNDLE)
+        .await;
 
     // Install __tropel_native_sleep (blocks the OS thread, safe under thread-per-core)
     ctx.with_ctx(|rq_ctx| {
@@ -3207,7 +3243,10 @@ mod tests {
         "#;
         let result = preprocess_k6_source_module(code);
         // k6 virtual imports are removed (shim provides globals)
-        assert!(!result.contains("from \"k6/http\""), "k6 import kept: {result}");
+        assert!(
+            !result.contains("from \"k6/http\""),
+            "k6 import kept: {result}"
+        );
         assert!(!result.contains("from \"k6\""), "k6 import kept: {result}");
         // exports are PRESERVED — module eval needs them
         assert!(
@@ -3238,11 +3277,26 @@ mod tests {
             export default function() {}
         "#;
         let result = preprocess_k6_source_module(code);
-        assert!(result.contains("./other"), "local re-export stripped: {result}");
-        assert!(result.contains("./helpers"), "local re-export stripped: {result}");
-        assert!(!result.contains("from \"k6\""), "k6 re-export kept: {result}");
-        assert!(!result.contains("from \"k6/http\""), "k6 re-export kept: {result}");
-        assert!(result.contains("export const options"), "options lost: {result}");
+        assert!(
+            result.contains("./other"),
+            "local re-export stripped: {result}"
+        );
+        assert!(
+            result.contains("./helpers"),
+            "local re-export stripped: {result}"
+        );
+        assert!(
+            !result.contains("from \"k6\""),
+            "k6 re-export kept: {result}"
+        );
+        assert!(
+            !result.contains("from \"k6/http\""),
+            "k6 re-export kept: {result}"
+        );
+        assert!(
+            result.contains("export const options"),
+            "options lost: {result}"
+        );
         assert!(
             result.contains("export default function"),
             "default export lost: {result}"
@@ -3265,10 +3319,22 @@ mod tests {
             export default function() {}
         "#;
         let result = preprocess_k6_source_module(code);
-        assert!(!result.contains("from \"k6\""), "multiline k6 import kept: {result}");
-        assert!(!result.contains("check,"), "multiline k6 import body kept: {result}");
-        assert!(!result.contains("from \"k6/http\""), "k6/http import kept: {result}");
-        assert!(result.contains("export const options"), "options lost: {result}");
+        assert!(
+            !result.contains("from \"k6\""),
+            "multiline k6 import kept: {result}"
+        );
+        assert!(
+            !result.contains("check,"),
+            "multiline k6 import body kept: {result}"
+        );
+        assert!(
+            !result.contains("from \"k6/http\""),
+            "k6/http import kept: {result}"
+        );
+        assert!(
+            result.contains("export const options"),
+            "options lost: {result}"
+        );
     }
 
     #[test]
@@ -3277,13 +3343,17 @@ mod tests {
         // required the line to END after the specifier, so the trailing
         // comment made it survive. The AST splice strips the statement
         // regardless of trailing comment.
-        let code = "import http from 'k6/http'; // shim provides this\nexport default function() {}\n";
+        let code =
+            "import http from 'k6/http'; // shim provides this\nexport default function() {}\n";
         let result = preprocess_k6_source_module(code);
         assert!(
             !result.contains("from 'k6/http'"),
             "k6 import with trailing comment kept: {result}"
         );
-        assert!(result.contains("export default function"), "default export lost: {result}");
+        assert!(
+            result.contains("export default function"),
+            "default export lost: {result}"
+        );
     }
 
     #[test]
@@ -3297,7 +3367,10 @@ mod tests {
             !result.contains("jslib.k6.io"),
             "jslib URL import kept: {result}"
         );
-        assert!(result.contains("export default function"), "default export lost: {result}");
+        assert!(
+            result.contains("export default function"),
+            "default export lost: {result}"
+        );
     }
 
     #[test]
@@ -3352,8 +3425,8 @@ mod tests {
             export const options = { vus: 5, duration: "30s" };
             export default function() {}
         "#;
-        let json = read_export_for_test(source, "options")
-            .expect("options export should be readable");
+        let json =
+            read_export_for_test(source, "options").expect("options export should be readable");
         let opts: crate::options::K6Options = serde_json::from_str(&json).unwrap();
         assert_eq!(opts.vus, Some(5));
         assert_eq!(opts.duration.as_deref(), Some("30s"));
@@ -3508,7 +3581,9 @@ mod tests {
                 "lowercase multipart boundary missing: {mp_lower}"
             );
             assert!(
-                !mp_lower.to_lowercase().contains("\"content-type\":\"multipart/form-data\""),
+                !mp_lower
+                    .to_lowercase()
+                    .contains("\"content-type\":\"multipart/form-data\""),
                 "boundary-less content-type variant leaked into header: {mp_lower}"
             );
         });
@@ -3670,9 +3745,18 @@ mod tests {
                 .eval("JSON.stringify(__captured[0])")
                 .expect("read batch entries");
             // Entry 1: every per-request param present.
-            assert!(entries.contains("\"tags_json\":\"{\\\"name\\\":\\\"b1\\\"}\""), "batch tags missing: {entries}");
-            assert!(entries.contains("\"redirects\":0"), "batch redirects missing: {entries}");
-            assert!(entries.contains("\"timeout_ms\":1000"), "batch timeout missing: {entries}");
+            assert!(
+                entries.contains("\"tags_json\":\"{\\\"name\\\":\\\"b1\\\"}\""),
+                "batch tags missing: {entries}"
+            );
+            assert!(
+                entries.contains("\"redirects\":0"),
+                "batch redirects missing: {entries}"
+            );
+            assert!(
+                entries.contains("\"timeout_ms\":1000"),
+                "batch timeout missing: {entries}"
+            );
             // auth_json is a STRING containing the tagged auth JSON — the
             // Rust side must parse the inner string.
             assert!(
@@ -3680,7 +3764,10 @@ mod tests {
                 "batch auth not translated to tagged AuthConfig: {entries}"
             );
             // Entry 2 (no params): no auth, no tags, default redirects.
-            assert!(entries.contains("\"auth_json\":\"null\""), "batch auth not null when absent: {entries}");
+            assert!(
+                entries.contains("\"auth_json\":\"null\""),
+                "batch auth not null when absent: {entries}"
+            );
         });
     }
 
@@ -3705,8 +3792,14 @@ mod tests {
         assert_eq!(out2, data, "deflate round-trip must restore the body");
 
         // Unsupported algorithm → None (k6 proceeds uncompressed).
-        assert!(compress_k6_body("br", &data).is_none(), "unsupported must be None");
-        assert!(compress_k6_body("gzip", b"").is_none(), "empty body must be None");
+        assert!(
+            compress_k6_body("br", &data).is_none(),
+            "unsupported must be None"
+        );
+        assert!(
+            compress_k6_body("gzip", b"").is_none(),
+            "empty body must be None"
+        );
     }
 
     #[test]
@@ -3883,9 +3976,21 @@ mod tests {
             )
             .expect("script should eval");
 
-            assert_eq!(ctx.eval::<String, _>("__type_code").unwrap(), "number", "pm.response.code must be a number value, not a function");
-            assert_eq!(ctx.eval::<String, _>("__type_headers").unwrap(), "object", "pm.response.headers must be a Headers object");
-            assert_eq!(ctx.eval::<String, _>("__type_cookies").unwrap(), "object", "pm.response.cookies must be a list");
+            assert_eq!(
+                ctx.eval::<String, _>("__type_code").unwrap(),
+                "number",
+                "pm.response.code must be a number value, not a function"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__type_headers").unwrap(),
+                "object",
+                "pm.response.headers must be a Headers object"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__type_cookies").unwrap(),
+                "object",
+                "pm.response.cookies must be a list"
+            );
             assert_eq!(ctx.eval::<i64, _>("__code").unwrap(), 200);
             assert_eq!(ctx.eval::<String, _>("__status").unwrap(), "OK");
             assert_eq!(ctx.eval::<f64, _>("__rtime").unwrap(), 42.5);
@@ -3895,7 +4000,9 @@ mod tests {
                 "pm.response.headers.get() must work (was a TypeError)"
             );
             assert!(
-                ctx.eval::<String, _>("__hdr_all").unwrap().contains("Content-Type"),
+                ctx.eval::<String, _>("__hdr_all")
+                    .unwrap()
+                    .contains("Content-Type"),
                 "headers.toObject() must expose the map"
             );
             assert_eq!(
@@ -4638,10 +4745,22 @@ mod tests {
         ] {
             assert!(names.contains(&m), "k6 path must emit {m}, got {names:?}");
         }
-        let waiting = samples.iter().find(|s| s.metric == "http_req_waiting").unwrap();
-        assert_eq!(waiting.value, 4000.0, "waiting must carry the microsecond TTFB");
-        let blocked = samples.iter().find(|s| s.metric == "http_req_blocked").unwrap();
-        assert_eq!(blocked.value, 100.0, "blocked must carry the microsecond pool-wait");
+        let waiting = samples
+            .iter()
+            .find(|s| s.metric == "http_req_waiting")
+            .unwrap();
+        assert_eq!(
+            waiting.value, 4000.0,
+            "waiting must carry the microsecond TTFB"
+        );
+        let blocked = samples
+            .iter()
+            .find(|s| s.metric == "http_req_blocked")
+            .unwrap();
+        assert_eq!(
+            blocked.value, 100.0,
+            "blocked must carry the microsecond pool-wait"
+        );
         assert_eq!(samples.len(), 12, "5 base + 7 sub-timing samples");
     }
 
@@ -4821,7 +4940,10 @@ mod tests {
             .unwrap()
         });
         let map = map.expect("handleSummary must produce output");
-        assert_eq!(map.get("stdout").map(|s| s.as_str()), Some("custom stdout: 7"));
+        assert_eq!(
+            map.get("stdout").map(|s| s.as_str()),
+            Some("custom stdout: 7")
+        );
         assert_eq!(
             map.get("summary.html").map(|s| s.as_str()),
             Some("<html>counter</html>")
@@ -4833,9 +4955,8 @@ mod tests {
         let source = "export default function() {}\n";
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
-        let result: Option<HashMap<String, String>> = ctx.with(|ctx| {
-            call_module_handle_summary(&ctx, source, "{}").unwrap()
-        });
+        let result: Option<HashMap<String, String>> =
+            ctx.with(|ctx| call_module_handle_summary(&ctx, source, "{}").unwrap());
         assert!(result.is_none(), "no handleSummary export → None");
     }
 
@@ -4851,12 +4972,7 @@ mod tests {
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         let result: Option<HashMap<String, String>> = ctx.with(|ctx| {
-            call_module_handle_summary(
-                &ctx,
-                source,
-                r#"{"state":{"vusMax":3}}"#,
-            )
-            .unwrap()
+            call_module_handle_summary(&ctx, source, r#"{"state":{"vusMax":3}}"#).unwrap()
         });
         let map = result.expect("async handleSummary must produce output");
         assert_eq!(map.get("stdout").map(|s| s.as_str()), Some("async 3"));
@@ -4909,7 +5025,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(out, "[42,3,\"fallback\"]", "bracket paths + primitive .length + default");
+        assert_eq!(
+            out, "[42,3,\"fallback\"]",
+            "bracket paths + primitive .length + default"
+        );
     }
 
     #[tokio::test]
@@ -4970,7 +5089,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(out, "[true,12345,true,true]", "Dates preserved + cycles handled");
+        assert_eq!(
+            out, "[true,12345,true,true]",
+            "Dates preserved + cycles handled"
+        );
     }
 
     #[tokio::test]
@@ -4999,7 +5121,10 @@ mod tests {
         // happens synchronously in the same eval BEFORE the microtask. Assert
         // debounced is 0 here and verify the coalesced single-fire below via
         // an awaited tick.
-        assert_eq!(out, "[0,3]", "debounce must not fire per call; throttle(no wait) fires");
+        assert_eq!(
+            out, "[0,3]",
+            "debounce must not fire per call; throttle(no wait) fires"
+        );
     }
 
     #[tokio::test]
@@ -5021,7 +5146,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(out, "1", "3 sync calls must coalesce to ONE trailing invocation");
+        assert_eq!(
+            out, "1",
+            "3 sync calls must coalesce to ONE trailing invocation"
+        );
     }
 
     #[tokio::test]
@@ -5045,8 +5173,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            out,
-            "[[2,4],[1,3],2,[],[1,2,3],[]]",
+            out, "[[2,4],[1,3],2,[],[1,2,3],[]]",
             "object collections + n===0 semantics"
         );
     }
@@ -5066,7 +5193,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(out, "[{\"a\":{\"b\":1,\"c\":2}},10]", "merge deep-merges; reduce sums");
+        assert_eq!(
+            out, "[{\"a\":{\"b\":1,\"c\":2}},10]",
+            "merge deep-merges; reduce sums"
+        );
     }
 
     #[tokio::test]
@@ -5135,8 +5265,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            out,
-            "[\"hello\",\"hi\",\"12345678\"]",
+            out, "[\"hello\",\"hi\",\"12345678\"]",
             "padded base64 round-trips; WordArray.create honors args"
         );
     }
@@ -5154,7 +5283,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(out, "f09f9880", "emoji must encode as a single 4-byte UTF-8 sequence");
+        assert_eq!(
+            out, "f09f9880",
+            "emoji must encode as a single 4-byte UTF-8 sequence"
+        );
     }
 
     #[tokio::test]
@@ -5188,8 +5320,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            out,
-            "[\"hello world\",\"abc\"]",
+            out, "[\"hello world\",\"abc\"]",
             "CBC/PKCS7 with mode+pad namespaces must round-trip"
         );
     }
@@ -5213,7 +5344,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(out, "[\"sixteen\",\"twentyfour\"]", "AES-128/192 must round-trip");
+        assert_eq!(
+            out, "[\"sixteen\",\"twentyfour\"]",
+            "AES-128/192 must round-trip"
+        );
     }
 
     #[tokio::test]
@@ -5237,7 +5371,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(out, "true", "wrong key must fail (not silently use embedded key)");
+        assert_eq!(
+            out, "true",
+            "wrong key must fail (not silently use embedded key)"
+        );
     }
 
     #[tokio::test]
@@ -5255,15 +5392,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(out, "[true,\"phrase msg\"]", "passphrase encrypt/decrypt round-trips");
+        assert_eq!(
+            out, "[true,\"phrase msg\"]",
+            "passphrase encrypt/decrypt round-trips"
+        );
     }
 
     fn temp_script_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "tropel-k6-open-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("tropel-k6-open-{}-{}", tag, std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -5303,10 +5440,7 @@ mod tests {
             )
             .await
             .expect("iteration should run");
-        let result = js_ctx
-            .get_global("__tropel_import_result")
-            .await
-            .unwrap();
+        let result = js_ctx.get_global("__tropel_import_result").await.unwrap();
         assert_eq!(result.as_deref(), Some("42"));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -5506,7 +5640,9 @@ mod tests {
         assert!(decl.execution.is_some());
         assert!(decl.scenarios.is_none());
         match decl.execution.unwrap() {
-            tropel_sdk::ExecutionConfig::SharedIterations { iterations, vus, .. } => {
+            tropel_sdk::ExecutionConfig::SharedIterations {
+                iterations, vus, ..
+            } => {
                 assert_eq!(iterations, 10);
                 assert_eq!(vus, 3);
             }
@@ -5529,9 +5665,7 @@ mod tests {
             };
             export default function() {}
         "#;
-        let res = driver
-            .declared_options(script, None, &HashMap::new())
-            .await;
+        let res = driver.declared_options(script, None, &HashMap::new()).await;
         assert!(
             res.is_err(),
             "malformed options must return Err, got {res:?}"
@@ -5548,9 +5682,7 @@ mod tests {
             export const options = { vus: 2, duration: "10s" };
             export default function() {}
         "#;
-        let res = driver
-            .declared_options(good, None, &HashMap::new())
-            .await;
+        let res = driver.declared_options(good, None, &HashMap::new()).await;
         assert!(res.is_ok(), "well-formed options must be Ok, got {res:?}");
         assert!(res.unwrap().is_some(), "declared options must be Some");
     }
@@ -5631,7 +5763,9 @@ mod tests {
         let mut inst = driver.init(script, None, None).await.unwrap();
         let mut ctx = VuContext::new(0, 0, "default".into());
         ctx.setup_data = Some("{\"token\":\"abc\"}".to_string());
-        inst.run_iteration(&mut ctx).await.expect("iteration must succeed with setup data");
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration must succeed with setup data");
     }
 
     #[tokio::test]
@@ -5646,7 +5780,9 @@ mod tests {
         "#;
         let mut inst = driver.init(script, None, None).await.unwrap();
         let mut ctx = VuContext::new(0, 0, "default".into());
-        inst.run_iteration(&mut ctx).await.expect("iteration must succeed with undefined data");
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration must succeed with undefined data");
     }
 
     #[tokio::test]
@@ -5670,6 +5806,8 @@ mod tests {
         "#;
         let mut inst = driver.init(script, None, None).await.unwrap();
         let mut ctx = VuContext::new(0, 0, "default".into());
-        inst.run_iteration(&mut ctx).await.expect("iteration must succeed with numeric __VU/__ITER");
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("iteration must succeed with numeric __VU/__ITER");
     }
 }

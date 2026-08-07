@@ -200,26 +200,55 @@ impl Service<http::Request<Body>> for GreeterService {
                     // encoder = response message (method.output).
                     let codec = tropel_x_grpc::DynamicCodec::new(method.output(), method.input());
                     let mut grpc = tonic::server::Grpc::new(codec);
-                    grpc.unary(UnaryHandler { out_desc: method.output() }, req).await
+                    grpc.unary(
+                        UnaryHandler {
+                            out_desc: method.output(),
+                        },
+                        req,
+                    )
+                    .await
                 }
                 "/test.Greeter/StreamHello" => {
-                    let method = service.methods().find(|m| m.name() == "StreamHello").unwrap();
+                    let method = service
+                        .methods()
+                        .find(|m| m.name() == "StreamHello")
+                        .unwrap();
                     let codec = tropel_x_grpc::DynamicCodec::new(method.output(), method.input());
                     let mut grpc = tonic::server::Grpc::new(codec);
-                    grpc.server_streaming(StreamHandler { out_desc: method.output() }, req).await
+                    grpc.server_streaming(
+                        StreamHandler {
+                            out_desc: method.output(),
+                        },
+                        req,
+                    )
+                    .await
                 }
                 "/test.Greeter/CollectHellos" => {
-                    let method = service.methods().find(|m| m.name() == "CollectHellos").unwrap();
+                    let method = service
+                        .methods()
+                        .find(|m| m.name() == "CollectHellos")
+                        .unwrap();
                     let codec = tropel_x_grpc::DynamicCodec::new(method.output(), method.input());
                     let mut grpc = tonic::server::Grpc::new(codec);
-                    grpc.client_streaming(ClientStreamHandler { out_desc: method.output() }, req)
-                        .await
+                    grpc.client_streaming(
+                        ClientStreamHandler {
+                            out_desc: method.output(),
+                        },
+                        req,
+                    )
+                    .await
                 }
                 "/test.Greeter/Chat" => {
                     let method = service.methods().find(|m| m.name() == "Chat").unwrap();
                     let codec = tropel_x_grpc::DynamicCodec::new(method.output(), method.input());
                     let mut grpc = tonic::server::Grpc::new(codec);
-                    grpc.streaming(BidiHandler { out_desc: method.output() }, req).await
+                    grpc.streaming(
+                        BidiHandler {
+                            out_desc: method.output(),
+                        },
+                        req,
+                    )
+                    .await
                 }
                 _ => {
                     let mut resp = http::Response::new(Body::empty());
@@ -244,7 +273,8 @@ async fn spawn_server(pool: DescriptorPool) -> std::net::SocketAddr {
     // (A oneshot sender dropped at the end of this fn would close the channel
     // and fire the signal immediately, killing the server before any call.)
     let shutdown = std::future::pending::<()>();
-    let server = tonic::transport::Server::builder().serve_with_incoming_shutdown(svc, incoming, shutdown);
+    let server =
+        tonic::transport::Server::builder().serve_with_incoming_shutdown(svc, incoming, shutdown);
     tokio::spawn(async move {
         match server.await {
             Ok(()) => eprintln!("[tropel-x-grpc test] server exited cleanly (unexpected)"),
@@ -295,7 +325,10 @@ async fn unary_roundtrip() {
         .any(|s| s.metric == "grpc_req_duration"));
     assert!(outcome.samples.iter().any(|s| s.metric == "grpc_reqs"));
     // k6 parity: the built-in gRPC module has no `grpc_req_failed` metric.
-    assert!(!outcome.samples.iter().any(|s| s.metric == "grpc_req_failed"));
+    assert!(!outcome
+        .samples
+        .iter()
+        .any(|s| s.metric == "grpc_req_failed"));
 }
 
 #[tokio::test]
@@ -344,7 +377,10 @@ async fn client_streaming_roundtrip() {
         .unwrap();
 
     let resp = outcome.response.unwrap();
-    assert_eq!(resp.status_code, 200, "client-streaming should return HTTP 200");
+    assert_eq!(
+        resp.status_code, 200,
+        "client-streaming should return HTTP 200"
+    );
     let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
     assert_eq!(body["message"], "collected a,b,c");
 }

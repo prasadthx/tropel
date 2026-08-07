@@ -1,6 +1,6 @@
 use crate::error::*;
 use rquickjs::function::{Func, Rest};
-use rquickjs::{Context, Coerced, Ctx, FromJs, Function, Persistent, Promise, Runtime, Value};
+use rquickjs::{Coerced, Context, Ctx, FromJs, Function, Persistent, Promise, Runtime, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
@@ -316,21 +316,30 @@ impl JsContext {
                     "log",
                     Func::from(|ctx, args| {
                         let ConsoleArgs(ctx, args) = ConsoleArgs(ctx, args);
-                        tracing::info!("[JS console.log] {}", console_args_to_string(&ctx, &args.0));
+                        tracing::info!(
+                            "[JS console.log] {}",
+                            console_args_to_string(&ctx, &args.0)
+                        );
                     }),
                 );
                 let _ = console.set(
                     "warn",
                     Func::from(|ctx, args| {
                         let ConsoleArgs(ctx, args) = ConsoleArgs(ctx, args);
-                        tracing::warn!("[JS console.warn] {}", console_args_to_string(&ctx, &args.0));
+                        tracing::warn!(
+                            "[JS console.warn] {}",
+                            console_args_to_string(&ctx, &args.0)
+                        );
                     }),
                 );
                 let _ = console.set(
                     "error",
                     Func::from(|ctx, args| {
                         let ConsoleArgs(ctx, args) = ConsoleArgs(ctx, args);
-                        tracing::error!("[JS console.error] {}", console_args_to_string(&ctx, &args.0));
+                        tracing::error!(
+                            "[JS console.error] {}",
+                            console_args_to_string(&ctx, &args.0)
+                        );
                     }),
                 );
                 let _ = global.set("console", console);
@@ -653,7 +662,11 @@ impl JsContext {
     }
 
     /// Set a global variable from a JSON value.
-    pub async fn set_global_json(&mut self, name: &str, json_value: &serde_json::Value) -> Result<()> {
+    pub async fn set_global_json(
+        &mut self,
+        name: &str,
+        json_value: &serde_json::Value,
+    ) -> Result<()> {
         let s = serde_json::to_string(json_value)
             .map_err(|e| JsError::Conversion(format!("JSON serialization error: {}", e)))?;
         let name = name.to_string();
@@ -664,9 +677,9 @@ impl JsContext {
             // string on every call (the old path ran QuickJS's parser + JIT
             // each time). `json_parse` takes a Vec<u8>, so the String is
             // moved in directly.
-            let val: rquickjs::Value = ctx
-                .json_parse(s)
-                .map_err(|e| JsError::Conversion(format!("JSON parse in JS context error: {}", e)))?;
+            let val: rquickjs::Value = ctx.json_parse(s).map_err(|e| {
+                JsError::Conversion(format!("JSON parse in JS context error: {}", e))
+            })?;
 
             let globals = ctx.globals();
             globals
@@ -910,13 +923,7 @@ impl JsContext {
             let flags = (rquickjs::qjs::JS_EVAL_TYPE_GLOBAL
                 | rquickjs::qjs::JS_EVAL_FLAG_COMPILE_ONLY) as i32;
             let val = unsafe {
-                rquickjs::qjs::JS_Eval(
-                    raw,
-                    code_c.as_ptr(),
-                    code_len,
-                    filename.as_ptr(),
-                    flags,
-                )
+                rquickjs::qjs::JS_Eval(raw, code_c.as_ptr(), code_len, filename.as_ptr(), flags)
             };
             if unsafe { rquickjs::qjs::JS_IsException(val) } {
                 let caught = ctx.catch();
@@ -1156,10 +1163,7 @@ mod tests {
         let mut ctx = new_ctx().await;
 
         // Object argument — previously threw "cannot convert".
-        let r = ctx
-            .eval_async("console.log({a: 1}); 'done'")
-            .await
-            .unwrap();
+        let r = ctx.eval_async("console.log({a: 1}); 'done'").await.unwrap();
         assert_eq!(r, "done");
 
         // Multiple heterogeneous args with a trailing expression.
@@ -1191,7 +1195,10 @@ mod tests {
             let num: rquickjs::Value = c.eval("42").unwrap();
 
             let s = console_args_to_string(&c, &[obj, nul, undef, num]);
-            assert!(s.starts_with('{'), "object must stringify as JSON, got: {s}");
+            assert!(
+                s.starts_with('{'),
+                "object must stringify as JSON, got: {s}"
+            );
             assert!(s.contains("\"a\":1") || s.contains("\"a\": 1"));
             assert!(s.contains("null"), "null must print as 'null', got: {s}");
             assert!(s.contains("undefined"), "undefined must print, got: {s}");
@@ -1218,7 +1225,11 @@ mod tests {
             .eval_async("Promise.resolve({a: 1, b: [2, 3]})")
             .await
             .unwrap();
-        assert!(r.contains("\"a\":1") || r.contains("\"a\": 1"), "got: {}", r);
+        assert!(
+            r.contains("\"a\":1") || r.contains("\"a\": 1"),
+            "got: {}",
+            r
+        );
         assert!(r.contains("\"b\""));
     }
 
@@ -1265,7 +1276,10 @@ mod tests {
         // A cached script whose returned promise rejects must surface the
         // error instead of silently swallowing it.
         let err = ctx
-            .run_script_cached("return Promise.reject(new Error('kaboom'))", Some("reject.js".to_string()))
+            .run_script_cached(
+                "return Promise.reject(new Error('kaboom'))",
+                Some("reject.js".to_string()),
+            )
             .await
             .err();
         let msg = format!("{:?}", err);
@@ -1351,9 +1365,7 @@ mod tests {
     #[tokio::test]
     async fn compile_global_bytecode_surfaces_compile_errors() {
         let mut ctx = new_ctx().await;
-        let err = ctx
-            .compile_global_bytecode("function { syntax error")
-            .err();
+        let err = ctx.compile_global_bytecode("function { syntax error").err();
         assert!(err.is_some(), "invalid source must fail to compile");
         let msg = format!("{:?}", err);
         assert!(

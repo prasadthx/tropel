@@ -22,8 +22,8 @@ use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tropel_report::PrometheusRemoteWriteOutput;
 use tropel_report::Output as _; // bring `sample`/`stop` into scope (anonymous, avoids the name clash with sdk::Output)
+use tropel_report::PrometheusRemoteWriteOutput;
 use tropel_sdk::{Output, OutputConfig, OutputRegistration, Result, Sample};
 
 /// How often buffered samples are pushed to the endpoint while the run is

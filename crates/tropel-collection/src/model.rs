@@ -96,11 +96,13 @@ where
         Str(String),
         Obj { content: Option<String> },
     }
-    Ok(match Option::<DescriptionForm>::deserialize(deserializer)? {
-        Some(DescriptionForm::Str(s)) => Some(s),
-        Some(DescriptionForm::Obj { content }) => content,
-        None => None,
-    })
+    Ok(
+        match Option::<DescriptionForm>::deserialize(deserializer)? {
+            Some(DescriptionForm::Str(s)) => Some(s),
+            Some(DescriptionForm::Obj { content }) => content,
+            None => None,
+        },
+    )
 }
 
 /// Accept Postman's two schema-legal `script.exec` shapes: an array of

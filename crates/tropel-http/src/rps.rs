@@ -156,11 +156,10 @@ mod tests {
         for rate in [1e-30f64, 1e-20, 1e-19, 1e-300] {
             let limiter = RpsLimiter::new(rate);
             limiter.acquire().await; // first acquire is always immediate
-            // The clamped wait is ~584 years, so 10 ms is plenty.
-            let blocked =
-                tokio::time::timeout(Duration::from_millis(10), limiter.acquire())
-                    .await
-                    .is_err();
+                                     // The clamped wait is ~584 years, so 10 ms is plenty.
+            let blocked = tokio::time::timeout(Duration::from_millis(10), limiter.acquire())
+                .await
+                .is_err();
             assert!(
                 blocked,
                 "a {rate} rps limiter must block (clamped interval), not fire"
@@ -168,7 +167,14 @@ mod tests {
         }
         // Non-positive / NaN / infinite rates stay zero-interval (never
         // block) — and must never panic either.
-        for rate in [0.0f64, -1.0, -1e30, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        for rate in [
+            0.0f64,
+            -1.0,
+            -1e30,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
             let limiter = RpsLimiter::new(rate);
             let start = Instant::now();
             limiter.acquire().await;

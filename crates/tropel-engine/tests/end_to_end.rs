@@ -16,7 +16,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tropel_core::config::{ExecutionConfig, JobConfig, OutputConfig, ThresholdConfig, ThinkTimeConfig};
+use tropel_core::config::{
+    ExecutionConfig, JobConfig, OutputConfig, ThinkTimeConfig, ThresholdConfig,
+};
 use tropel_core::Result;
 use tropel_engine::Engine;
 use tropel_ext::registry::ExtensionRegistry;
@@ -31,7 +33,9 @@ async fn start_echo_server(seen: Arc<Mutex<Vec<String>>>) -> std::net::SocketAdd
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { break };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
             let seen = seen.clone();
             tokio::spawn(async move {
                 // Read until the request-head terminator (headers end at
@@ -75,7 +79,9 @@ async fn start_auth_capture_server(seen: Arc<Mutex<Vec<String>>>) -> std::net::S
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { break };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
             let seen = seen.clone();
             tokio::spawn(async move {
                 let mut head = Vec::new();
@@ -97,7 +103,9 @@ async fn start_auth_capture_server(seen: Arc<Mutex<Vec<String>>>) -> std::net::S
                     // would corrupt "Bearer s3cret" into "bearer s3cret").
                     if line.to_ascii_lowercase().starts_with("authorization:") {
                         if let Some(idx) = line.find(':') {
-                            seen.lock().unwrap().push(line[idx + 1..].trim().to_string());
+                            seen.lock()
+                                .unwrap()
+                                .push(line[idx + 1..].trim().to_string());
                         }
                     }
                 }
@@ -224,7 +232,11 @@ async fn end_to_end_two_vu_with_header_check_and_threshold() -> Result<()> {
     //    a status check (passes regardless) and a prerequest-var check. If
     //    `pm.variables.get` were broken, only the second would fail, leaving
     //    checks_passed > 0 true. Zero failures pins the bridge down.
-    assert!(m.checks_total > 0, "checks_total > 0, got {}", m.checks_total);
+    assert!(
+        m.checks_total > 0,
+        "checks_total > 0, got {}",
+        m.checks_total
+    );
     assert_eq!(
         m.checks_failed, 0,
         "all checks passed, got {} failed of {} total",
@@ -238,7 +250,10 @@ async fn end_to_end_two_vu_with_header_check_and_threshold() -> Result<()> {
         .as_ref()
         .expect("http_req_duration summary present");
     assert!(dur.count > 0, "http_req_duration has samples");
-    assert!(dur.max > 0, "http_req_duration max > 0 (real latency measured)");
+    assert!(
+        dur.max > 0,
+        "http_req_duration max > 0 (real latency measured)"
+    );
 
     let threshold_results = evaluate_thresholds(&result.effective_thresholds, m);
     let t = threshold_results

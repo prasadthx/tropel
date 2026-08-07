@@ -133,10 +133,9 @@ struct HarPostParam {
 /// Input adapter for HTTP Archive (HAR) files.
 pub struct HarInputAdapter;
 
-inventory::submit!(InputAdapterRegistration::new("har", || Box::new(
-    HarInputAdapter
-))
-.with_priority(30));
+inventory::submit!(
+    InputAdapterRegistration::new("har", || Box::new(HarInputAdapter)).with_priority(30)
+);
 
 impl InputAdapter for HarInputAdapter {
     fn id(&self) -> &str {
@@ -328,10 +327,7 @@ fn har_entry_to_item(entry: HarEntry, index: usize) -> Result<ScenarioItem> {
             .map(|q| (q.name.clone(), q.value.clone()))
             .collect();
         if has_duplicate_keys(&pairs) {
-            let qs: Vec<String> = pairs
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .collect();
+            let qs: Vec<String> = pairs.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
             url.push('?');
             url.push_str(&qs.join("&"));
             HashMap::new()
@@ -789,8 +785,7 @@ mod tests {
         let scenario = adapter.parse(data).unwrap();
         let req = scenario.items[0].request.as_ref().unwrap();
         assert_eq!(
-            req.url,
-            "https://api.example.com/search?tag=a&tag=b&sort=asc",
+            req.url, "https://api.example.com/search?tag=a&tag=b&sort=asc",
             "duplicate query keys must be preserved in the URL"
         );
         assert!(
@@ -828,7 +823,10 @@ mod tests {
         }"#;
         let scenario = adapter.parse(data).unwrap();
         let req = scenario.items[0].request.as_ref().unwrap();
-        assert_eq!(req.headers.get("Cookie").unwrap(), "session=abc; theme=dark");
+        assert_eq!(
+            req.headers.get("Cookie").unwrap(),
+            "session=abc; theme=dark"
+        );
         // Non-Cookie duplicates still join with `, `.
         assert_eq!(req.headers.get("X-Trace").unwrap(), "a, b");
     }
@@ -937,7 +935,11 @@ mod tests {
             scenario
                 .items
                 .iter()
-                .map(|i| i.request.as_ref().map(|r| r.url.clone()).unwrap_or_default())
+                .map(|i| i
+                    .request
+                    .as_ref()
+                    .map(|r| r.url.clone())
+                    .unwrap_or_default())
                 .collect::<Vec<_>>()
         );
         let urls: Vec<&str> = scenario

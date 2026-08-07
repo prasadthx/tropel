@@ -54,7 +54,9 @@ pub async fn run_cloud(config: &JobConfig, agents: u32, token: &str) -> Result<M
         return Err(TropelError::Config("--agents must be >= 1".into()));
     }
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.map_err(TropelError::Io)?;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(TropelError::Io)?;
     let addr = listener.local_addr().map_err(TropelError::Io)?;
     tracing::info!("Cloud-run: controller on {addr}, spawning {agents} in-process agent(s)");
 
@@ -135,8 +137,16 @@ pub fn generate_k8s_manifests(
     if agents == 0 {
         return Err(TropelError::Config("agents must be >= 1".into()));
     }
-    let ns = if namespace.is_empty() { "default" } else { namespace };
-    let img = if image.is_empty() { "tropel:latest" } else { image };
+    let ns = if namespace.is_empty() {
+        "default"
+    } else {
+        namespace
+    };
+    let img = if image.is_empty() {
+        "tropel:latest"
+    } else {
+        image
+    };
 
     // Agent pods have no access to the operator's filesystem: they resolve
     // the scenario from `config.input` (a local path) and the only shared
@@ -322,8 +332,6 @@ pub fn generate_k8s_manifests(
     Ok(y.finish())
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,7 +347,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 4096];
                     let _ = sock.read(&mut buf).await;
@@ -357,7 +367,10 @@ mod tests {
         let json = format!(
             r#"{{"info":{{"_postman_id":"e2e","name":"cloud","schema":"https://schema.getpostman.com/json/collection/v2.1.0/collection.json"}},"item":[{{"name":"r1","request":{{"method":"GET","url":"{base}/","header":[]}},"response":[]}}]}}"#
         );
-        std::fs::File::create(&path).unwrap().write_all(json.as_bytes()).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(json.as_bytes())
+            .unwrap();
         path.to_string_lossy().to_string()
     }
 
@@ -380,7 +393,11 @@ mod tests {
         };
 
         let merged = run_cloud(&config, 2, "test-token").await?;
-        assert_eq!(merged.http_reqs, 4, "merged http_reqs = 4: {}", merged.http_reqs);
+        assert_eq!(
+            merged.http_reqs, 4,
+            "merged http_reqs = 4: {}",
+            merged.http_reqs
+        );
         assert_eq!(merged.iterations, 4, "merged iterations = 4");
         let dur = merged.http_req_duration.expect("merged http_req_duration");
         assert_eq!(dur.count, 4);
@@ -403,8 +420,8 @@ mod tests {
             },
             ..Default::default()
         };
-        let yaml =
-            generate_k8s_manifests(&config, 3, "reg/tropel:v1", "loadtest", 17890, "tok123").unwrap();
+        let yaml = generate_k8s_manifests(&config, 3, "reg/tropel:v1", "loadtest", 17890, "tok123")
+            .unwrap();
 
         for needle in [
             "kind: ConfigMap",
@@ -437,7 +454,10 @@ mod tests {
         // Run-to-completion: Deployments/StatefulSets would make kubelet
         // re-run finished pods forever — a Job must not contain them.
         assert!(!yaml.contains("kind: Deployment"), "no Deployment allowed");
-        assert!(!yaml.contains("kind: StatefulSet"), "no StatefulSet allowed");
+        assert!(
+            !yaml.contains("kind: StatefulSet"),
+            "no StatefulSet allowed"
+        );
         // The job config JSON must be embedded verbatim in the ConfigMap.
         assert!(yaml.contains("\"input\": \"coll.json\""));
         assert!(yaml.contains("\"type\": \"constant-vus\""));
@@ -455,7 +475,8 @@ mod tests {
         assert!(yaml.contains("namespace: \"my ns:qa#1\""));
         assert!(!yaml.contains("namespace: my ns:qa#1"));
         // Image with a quote is escaped, not a raw `"` breaking the doc.
-        let yaml = generate_k8s_manifests(&config, 2, "img\"evil:latest", "ns", 9000, "tok").unwrap();
+        let yaml =
+            generate_k8s_manifests(&config, 2, "img\"evil:latest", "ns", 9000, "tok").unwrap();
         assert!(yaml.contains("image: \"img\\\"evil:latest\""));
     }
 
@@ -493,8 +514,14 @@ mod tests {
         // The embedded job.json rewrites input to the mount path.
         assert!(yaml.contains("\"input\": \"/etc/tropel/input.json\""));
         // The file bytes themselves are in the ConfigMap under input.json.
-        assert!(yaml.contains("input.json: |-"), "input bytes missing from ConfigMap");
-        assert!(yaml.contains("{\"item\":[{\"request\":{}}]}"), "file contents missing");
+        assert!(
+            yaml.contains("input.json: |-"),
+            "input bytes missing from ConfigMap"
+        );
+        assert!(
+            yaml.contains("{\"item\":[{\"request\":{}}]}"),
+            "file contents missing"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -519,11 +546,20 @@ mod tests {
         // agent pods can read it (agents authenticate before the controller
         // dispatches the credential-bearing config).
         let yaml =
-            generate_k8s_manifests(&JobConfig::default(), 2, "img:v1", "ns", 9000, "secret123").unwrap();
+            generate_k8s_manifests(&JobConfig::default(), 2, "img:v1", "ns", 9000, "secret123")
+                .unwrap();
         assert!(yaml.contains("token: |-"), "token block missing");
         assert!(yaml.contains("secret123"), "token value missing");
         // Both jobs mount /etc/tropel (job.json + token) and pass --token-file.
-        assert_eq!(yaml.matches("--token-file").count(), 2, "both jobs need --token-file");
-        assert_eq!(yaml.matches("mountPath: /etc/tropel").count(), 2, "both jobs mount the config");
+        assert_eq!(
+            yaml.matches("--token-file").count(),
+            2,
+            "both jobs need --token-file"
+        );
+        assert_eq!(
+            yaml.matches("mountPath: /etc/tropel").count(),
+            2,
+            "both jobs mount the config"
+        );
     }
 }

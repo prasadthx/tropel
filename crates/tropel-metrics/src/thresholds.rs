@@ -1,4 +1,6 @@
-use crate::collector::{parse_percentile, percentile_value, MetricSummary, MetricType, MetricsResult};
+use crate::collector::{
+    parse_percentile, percentile_value, MetricSummary, MetricType, MetricsResult,
+};
 use std::collections::HashMap;
 use std::time::Duration;
 use tropel_core::config::ThresholdConfig;
@@ -55,9 +57,7 @@ pub fn evaluate_thresholds(
 /// operator, or a non-numeric RHS. Backlog line 154: compound `&&`/`||`
 /// expressions are now ACCEPTED (k6 supports them) — each clause is validated
 /// independently instead of the whole expression being rejected.
-pub fn validate_thresholds(
-    thresholds: &HashMap<String, ThresholdConfig>,
-) -> Result<(), String> {
+pub fn validate_thresholds(thresholds: &HashMap<String, ThresholdConfig>) -> Result<(), String> {
     for (name, config) in thresholds {
         let expr = config.expression.trim();
         // Compound AND/OR: validate every clause the same way a single
@@ -256,7 +256,12 @@ fn evaluate_single_threshold_opt(
     if expression.contains("&&") || expression.contains("||") {
         let groups: Vec<Vec<&str>> = expression
             .split("||")
-            .map(|g| g.split("&&").map(|c| c.trim()).filter(|c| !c.is_empty()).collect())
+            .map(|g| {
+                g.split("&&")
+                    .map(|c| c.trim())
+                    .filter(|c| !c.is_empty())
+                    .collect()
+            })
             .filter(|g: &Vec<&str>| !g.is_empty())
             .collect();
         let mut last_pair = (0.0f64, 0.0f64);
@@ -264,8 +269,7 @@ fn evaluate_single_threshold_opt(
         for group in groups {
             let mut group_passed = true;
             for clause in group {
-                let (passed, actual, threshold) =
-                    evaluate_single_threshold_opt(clause, metrics)?;
+                let (passed, actual, threshold) = evaluate_single_threshold_opt(clause, metrics)?;
                 last_pair = (actual, threshold);
                 if !passed {
                     group_passed = false;
@@ -350,8 +354,7 @@ fn evaluate_single_threshold_opt(
 /// Fail-closed wrapper used by the final summary: no data → FAILED (k6 marks
 /// no-data thresholds as failed).
 fn evaluate_single_threshold(expression: &str, metrics: &MetricsResult) -> (bool, f64, f64) {
-    evaluate_single_threshold_opt(expression, metrics)
-        .unwrap_or((false, 0.0, 0.0))
+    evaluate_single_threshold_opt(expression, metrics).unwrap_or((false, 0.0, 0.0))
 }
 
 /// Extract the base metric name from a series key string, stripping any
@@ -480,7 +483,10 @@ fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
     Some(match stat {
         // Percentiles: worst (highest) across matched series, mirroring
         // the tag-scoped path.
-        Some("min") => matched.iter().map(|m| m.min as f64).fold(f64::MAX, f64::min),
+        Some("min") => matched
+            .iter()
+            .map(|m| m.min as f64)
+            .fold(f64::MAX, f64::min),
         Some("max") => matched.iter().map(|m| m.max as f64).fold(0.0_f64, f64::max),
         Some("p50") | Some("median") | Some("med") => {
             matched.iter().map(|m| m.p50 as f64).fold(0.0_f64, f64::max)
@@ -818,7 +824,10 @@ mod tests {
         let metrics = make_histogram_metrics();
         // p75 of 100..1000 (10 values) is ~775-800 µs. The mean is 550.
         let result = evaluate_single_threshold("http_req_duration.p75 < 600", &metrics);
-        assert!(!result.0, "p75 must be > 600 (mean fallback would false-PASS)");
+        assert!(
+            !result.0,
+            "p75 must be > 600 (mean fallback would false-PASS)"
+        );
         assert!(
             result.1 > 600.0 && result.1 < 850.0,
             "p75 should be an exact histogram percentile, got {}",
@@ -881,10 +890,13 @@ mod tests {
             rate: 0.0,
             histogram: Some(h),
         });
-        let result =
-            evaluate_single_threshold("http_req_duration{status=200}.p(99.9) < 2000", &m);
+        let result = evaluate_single_threshold("http_req_duration{status=200}.p(99.9) < 2000", &m);
         assert!(result.0);
-        assert!(result.1 > 950.0, "tag-scoped p(99.9) must be exact, got {}", result.1);
+        assert!(
+            result.1 > 950.0,
+            "tag-scoped p(99.9) must be exact, got {}",
+            result.1
+        );
     }
 
     #[test]
@@ -914,8 +926,7 @@ mod tests {
             rate: 0.0,
             histogram: Some(h),
         });
-        let result =
-            evaluate_single_threshold("http_req_duration{status=200}.p75 < 600", &metrics);
+        let result = evaluate_single_threshold("http_req_duration{status=200}.p75 < 600", &metrics);
         assert!(!result.0, "tag-scoped p75 must also be exact, not the mean");
         assert_ne!(result.1, 550.0);
     }
@@ -1065,10 +1076,12 @@ mod tests {
         });
         // Merged: 120 failures / 200 samples = 0.60 — not the 1.00 that a
         // first-match lookup would have returned for series b.
-        let (passed, actual, _) =
-            evaluate_single_threshold("http_req_failed.rate < 0.5", &metrics);
+        let (passed, actual, _) = evaluate_single_threshold("http_req_failed.rate < 0.5", &metrics);
         assert!(!passed, "merged rate 0.60 must not pass < 0.5");
-        assert!((actual - 0.6).abs() < 1e-9, "merged rate should be 0.6, got {actual}");
+        assert!(
+            (actual - 0.6).abs() < 1e-9,
+            "merged rate should be 0.6, got {actual}"
+        );
 
         let (passed, _, _) = evaluate_single_threshold("http_req_failed.rate < 0.7", &metrics);
         assert!(passed, "merged rate 0.60 should pass < 0.7");
@@ -1176,7 +1189,10 @@ mod tests {
         // `login.count < 10` must evaluate against ONLY the `login` series
         // (count 5). Prefix folding would have summed all three → 1005 → fail.
         let (passed, actual, _) = evaluate_single_threshold("login.count < 10", &metrics);
-        assert!(passed, "login.count must be 5 (only the exact series), not 1005");
+        assert!(
+            passed,
+            "login.count must be 5 (only the exact series), not 1005"
+        );
         assert_eq!(actual, 5.0);
 
         // A threshold on login_errors itself still resolves its own series.
@@ -1227,7 +1243,10 @@ mod tests {
 
         let (passed, actual, _) =
             evaluate_single_threshold("login{status=200}.count < 10", &metrics);
-        assert!(passed, "must match only the login{{status=200}} series (count 2)");
+        assert!(
+            passed,
+            "must match only the login{{status=200}} series (count 2)"
+        );
         assert_eq!(actual, 2.0);
     }
 

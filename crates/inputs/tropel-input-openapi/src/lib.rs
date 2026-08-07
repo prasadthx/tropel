@@ -330,10 +330,9 @@ struct OauthFlow {
 /// Input adapter for OpenAPI 3.x / Swagger 2.0 specification files.
 pub struct OpenApiInputAdapter;
 
-inventory::submit!(InputAdapterRegistration::new("openapi", || Box::new(
-    OpenApiInputAdapter
-))
-.with_priority(20));
+inventory::submit!(
+    InputAdapterRegistration::new("openapi", || Box::new(OpenApiInputAdapter)).with_priority(20)
+);
 
 impl InputAdapter for OpenApiInputAdapter {
     fn id(&self) -> &str {

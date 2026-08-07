@@ -258,9 +258,7 @@ impl InfluxdbOutput {
                 let client = reqwest::Client::new();
                 let (url, builder) = if let (Some(org), Some(bucket)) = (org, bucket) {
                     // v2 write endpoint.
-                    let url = format!(
-                        "{base}/api/v2/write?org={org}&bucket={bucket}&precision=ns"
-                    );
+                    let url = format!("{base}/api/v2/write?org={org}&bucket={bucket}&precision=ns");
                     let builder = client.post(&url);
                     let builder = match token {
                         Some(t) => builder.header("Authorization", format!("Token {t}")),
@@ -284,11 +282,9 @@ impl InfluxdbOutput {
                 };
 
                 let body = lines.join("\n");
-                let resp = builder
-                    .body(body)
-                    .send()
-                    .await
-                    .map_err(|e| TropelError::Http(format!("influxdb HTTP write to {url} failed: {e}")))?;
+                let resp = builder.body(body).send().await.map_err(|e| {
+                    TropelError::Http(format!("influxdb HTTP write to {url} failed: {e}"))
+                })?;
                 if !resp.status().is_success() {
                     let status = resp.status();
                     let text = resp.text().await.unwrap_or_default();
@@ -316,18 +312,16 @@ fn parse_http_target(url_str: &str) -> Result<InfluxTarget> {
         "{}://{}",
         url.scheme(),
         url.host_str().unwrap_or("localhost")
-    ) + &url
-        .port()
-        .map(|p| format!(":{p}"))
-        .unwrap_or_default();
+    ) + &url.port().map(|p| format!(":{p}")).unwrap_or_default();
 
-    let pairs: std::collections::HashMap<String, String> =
-        url.query_pairs().into_owned().collect();
+    let pairs: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
     let org = pairs.get("org").cloned().filter(|s| !s.is_empty());
     let bucket = pairs.get("bucket").cloned().filter(|s| !s.is_empty());
     if let (Some(org), Some(bucket)) = (&org, &bucket) {
         let token = pairs.get("token").cloned().or_else(|| {
-            std::env::var("INFLUXDB_V2_TOKEN").ok().filter(|t| !t.is_empty())
+            std::env::var("INFLUXDB_V2_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
         });
         let (user, password) = userinfo_from_url(&url);
         return Ok(InfluxTarget::Http {
@@ -342,10 +336,11 @@ fn parse_http_target(url_str: &str) -> Result<InfluxTarget> {
     }
 
     // v1: db from path (first non-empty segment) or ?db=.
-    let db = pairs
-        .get("db")
-        .cloned()
-        .or_else(|| url.path_segments().and_then(|mut s| s.find(|p| !p.is_empty())).map(str::to_string));
+    let db = pairs.get("db").cloned().or_else(|| {
+        url.path_segments()
+            .and_then(|mut s| s.find(|p| !p.is_empty()))
+            .map(str::to_string)
+    });
     let (user, password) = userinfo_from_url(&url);
     Ok(InfluxTarget::Http {
         base,
@@ -510,7 +505,10 @@ mod tests {
         let udp = InfluxdbOutput::new("127.0.0.1:8089").unwrap();
         udp.buffer(&sample("http_reqs", 1.0, &[]));
         let line = udp.buffer.lock().unwrap().first().unwrap().clone();
-        assert_eq!(line, "http_reqs value=1i", "UDP line has no timestamp: {line}");
+        assert_eq!(
+            line, "http_reqs value=1i",
+            "UDP line has no timestamp: {line}"
+        );
     }
 
     /// End-to-end: send to a live UDP socket and verify the datagram.

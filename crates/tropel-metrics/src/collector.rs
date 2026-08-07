@@ -72,8 +72,16 @@ impl MetricKey {
         }
     }
 
-    /// Render the key to its canonical string form (e.g. `"http_req_duration{status=200}"`).
+    /// Render the key to its canonical string form (e.g.
+    /// `"http_req_duration{status=200,method=GET}"`).
     /// Used when building MetricSummary for the public API.
+    ///
+    /// k6 format: comma-separated `key=value` pairs INSIDE one brace group
+    /// (`{status=200,method=GET}`), matching `thresholds.rs:216` and k6's
+    /// `handleSummary`/threshold references. The old code emitted
+    /// `{status=200},{method=GET}` (comma between brace groups), which
+    /// contradicted its own doc and every downstream parser (backlog line
+    /// 218).
     pub fn to_key_string(&self) -> String {
         if self.tags.is_empty() {
             self.metric.to_string()
@@ -81,10 +89,10 @@ impl MetricKey {
             let tag_str: String = self
                 .tags
                 .iter()
-                .map(|(k, v)| format!("{{{}}}", [k.as_ref(), v.as_ref()].join("=")))
+                .map(|(k, v)| format!("{}={}", k.as_ref(), v.as_ref()))
                 .collect::<Vec<_>>()
                 .join(",");
-            format!("{}{}", self.metric, tag_str)
+            format!("{}{{{}}}", self.metric, tag_str)
         }
     }
 }
@@ -283,10 +291,8 @@ enum MetricsEvent {
     /// Configure summary presentation before results are snapshotted.
     SetSummaryConfig {
         summary_trend_stats: Vec<String>,
-        effective_thresholds: std::collections::HashMap<
-            String,
-            tropel_core::config::ThresholdConfig,
-        >,
+        effective_thresholds:
+            std::collections::HashMap<String, tropel_core::config::ThresholdConfig>,
     },
     /// Set the latency histogram ceiling (microseconds) before any samples
     /// are recorded. `None` = auto-resize (no ceiling).
@@ -392,7 +398,10 @@ impl MetricsCollector {
     /// recorded. `None` selects auto-resize (no ceiling). Best-effort.
     pub async fn set_histogram_max(&self, max_micros: Option<u64>) {
         self.ensure_aggregator();
-        let _ = self.tx.send(MetricsEvent::SetHistogramMax(max_micros)).await;
+        let _ = self
+            .tx
+            .send(MetricsEvent::SetHistogramMax(max_micros))
+            .await;
     }
 
     /// Configure summary presentation (trend stats + effective thresholds)
@@ -553,10 +562,7 @@ struct Aggregator {
     /// Trend stats to surface in the summary (k6 `summaryTrendStats`).
     summary_trend_stats: Vec<String>,
     /// Effective threshold set (job + script-declared) for reporting.
-    effective_thresholds: std::collections::HashMap<
-        String,
-        tropel_core::config::ThresholdConfig,
-    >,
+    effective_thresholds: std::collections::HashMap<String, tropel_core::config::ThresholdConfig>,
     /// Latency histogram ceiling in microseconds (None = auto-resize).
     histogram_max_micros: Option<u64>,
     /// Whether any configured threshold/summary stat needs EXACT non-tracked
@@ -680,9 +686,10 @@ impl Aggregator {
         }
 
         // Use the type from the first sample for this key
-        let metric_set = self.data.entry(key).or_insert_with(|| {
-            MetricSet::new(metric_type, self.histogram_max_micros)
-        });
+        let metric_set = self
+            .data
+            .entry(key)
+            .or_insert_with(|| MetricSet::new(metric_type, self.histogram_max_micros));
         metric_set.record(sample.value, &sample.sample_type);
 
         // Maintain the incremental merged accumulators (headline http_req_
@@ -963,7 +970,9 @@ impl Aggregator {
                 p99: stats.p99,
                 last: 0.0,
                 rate: 0.0,
-                histogram: retain_histograms.then(|| merged.histogram.clone()).flatten(),
+                histogram: retain_histograms
+                    .then(|| merged.histogram.clone())
+                    .flatten(),
             });
         }
 
@@ -990,7 +999,9 @@ impl Aggregator {
                         p99: stats.p99,
                         last: 0.0,
                         rate: 0.0,
-                        histogram: retain_histograms.then(|| merged.histogram.clone()).flatten(),
+                        histogram: retain_histograms
+                            .then(|| merged.histogram.clone())
+                            .flatten(),
                     }
                 }
                 MetricType::Counter => MetricSummary {
@@ -1075,7 +1086,9 @@ impl Aggregator {
                 p99: stats.p99,
                 last: 0.0,
                 rate: 0.0,
-                histogram: retain_histograms.then(|| merged.histogram.clone()).flatten(),
+                histogram: retain_histograms
+                    .then(|| merged.histogram.clone())
+                    .flatten(),
             });
         }
 
@@ -1097,7 +1110,9 @@ impl Aggregator {
                 p99: stats.p99,
                 last: 0.0,
                 rate: 0.0,
-                histogram: retain_histograms.then(|| merged.histogram.clone()).flatten(),
+                histogram: retain_histograms
+                    .then(|| merged.histogram.clone())
+                    .flatten(),
             });
         }
 
@@ -1449,10 +1464,8 @@ pub struct MetricsResult {
     pub summary_trend_stats: Vec<String>,
     /// The thresholds actually applied to the run (job + script-declared).
     /// Reporters evaluate and display pass/fail against this set.
-    pub effective_thresholds: std::collections::HashMap<
-        String,
-        tropel_core::config::ThresholdConfig,
-    >,
+    pub effective_thresholds:
+        std::collections::HashMap<String, tropel_core::config::ThresholdConfig>,
 }
 
 impl Default for MetricsResult {
@@ -1541,7 +1554,8 @@ pub(crate) fn stat_needs_histogram(stat: &str) -> bool {
     let s = stat.trim();
     if matches!(
         s,
-        "avg" | "mean"
+        "avg"
+            | "mean"
             | "min"
             | "max"
             | "count"
@@ -1603,7 +1617,6 @@ pub fn percentile_value(m: &MetricSummary, pct: f64) -> f64 {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1619,9 +1632,14 @@ mod tests {
         // pending (spawn deferred), and construction must not have panicked.
         {
             let guard = c.pending_rx.lock().unwrap_or_else(|e| e.into_inner());
-            assert!(guard.is_some(), "aggregator must not have spawned without a runtime");
+            assert!(
+                guard.is_some(),
+                "aggregator must not have spawned without a runtime"
+            );
         }
-        assert!(!c.aggregator_spawned.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!c
+            .aggregator_spawned
+            .load(std::sync::atomic::Ordering::Relaxed));
         drop(c); // clean drop with a pending receiver
     }
 
@@ -1680,9 +1698,14 @@ mod tests {
     #[test]
     fn test_stat_needs_histogram() {
         // Tracked buckets + aliases — no histogram needed.
-        for tracked in ["avg", "min", "max", "count", "sum", "rate", "last",
-                        "p50", "median", "med", "p90", "p95", "p99"] {
-            assert!(!stat_needs_histogram(tracked), "{tracked} should not need a histogram");
+        for tracked in [
+            "avg", "min", "max", "count", "sum", "rate", "last", "p50", "median", "med", "p90",
+            "p95", "p99",
+        ] {
+            assert!(
+                !stat_needs_histogram(tracked),
+                "{tracked} should not need a histogram"
+            );
         }
         // Tracked values in any syntax (incl. k6 p(NN) form) — exact already.
         assert!(!stat_needs_histogram("p(90)"));
@@ -1712,7 +1735,10 @@ mod tests {
                 delay_abort_eval: None,
             },
         );
-        assert!(!config_needs_histograms(&k6_default_trend_stats(), &thresholds));
+        assert!(!config_needs_histograms(
+            &k6_default_trend_stats(),
+            &thresholds
+        ));
 
         thresholds.insert(
             "p75".into(),
@@ -1722,11 +1748,17 @@ mod tests {
                 delay_abort_eval: None,
             },
         );
-        assert!(config_needs_histograms(&k6_default_trend_stats(), &thresholds));
+        assert!(config_needs_histograms(
+            &k6_default_trend_stats(),
+            &thresholds
+        ));
 
         // summaryTrendStats p(99.9) also triggers retention.
         let stats = vec!["avg".into(), "p(99.9)".into()];
-        assert!(config_needs_histograms(&stats, &std::collections::HashMap::new()));
+        assert!(config_needs_histograms(
+            &stats,
+            &std::collections::HashMap::new()
+        ));
     }
 
     #[test]
@@ -1765,7 +1797,10 @@ mod tests {
             mean
         );
         // With 9990/10000 zeros, even p99 sits in the zero bucket.
-        assert_eq!(stats.p99, 1, "p99 should reflect the zero-majority population");
+        assert_eq!(
+            stats.p99, 1,
+            "p99 should reflect the zero-majority population"
+        );
     }
 
     #[test]
@@ -1851,11 +1886,152 @@ mod tests {
         });
 
         let res = agg.build_results();
-        assert_eq!(res.checks_total, 2, "checks_latency must not fold into checks_total");
+        assert_eq!(
+            res.checks_total, 2,
+            "checks_latency must not fold into checks_total"
+        );
         assert_eq!(res.checks_passed, 1);
         assert_eq!(res.checks_failed, 1);
         // The custom metric still exists as its own series.
         assert!(res.metrics.iter().any(|m| m.key == "checks_latency"));
+    }
+
+    #[test]
+    fn golden_numbers_every_result_field_exact() {
+        // Backlog §6 P1: every metric assertion in the real-load tests is
+        // `> 0` / `>= 2` / config-derived — nothing validates a reported
+        // number. Feed a FIXED sample stream into the Aggregator and assert
+        // EVERY field of MetricsResult exactly (the golden template the
+        // distributed/controller.rs:239 `http_reqs == 4` test was supposed to
+        // be).
+        let ts = std::time::SystemTime::now();
+        let mut agg = Aggregator::new();
+        let rec = |agg: &mut Aggregator, metric: &str, value: f64, st: SampleType, tags: Vec<(&str, &str)>| {
+            let mut t = tropel_core::types::TagMap::new();
+            for (k, v) in tags {
+                t.insert(k, v);
+            }
+            agg.record(Sample {
+                metric: metric.to_string().into(),
+                value,
+                tags: Arc::new(t),
+                timestamp: ts,
+                sample_type: st,
+            });
+        };
+
+        // 2 URLs × 2 statuses × fixed durations (µs).
+        // url=/a status=200: 1000, 2000
+        // url=/a status=500: 4000, 8000
+        // url=/b status=200: 3000, 6000
+        // url=/b status=500: 12000, 16000
+        let cases: Vec<(&str, &str, u64, u64)> = vec![
+            ("/a", "200", 1000, 2000),
+            ("/a", "500", 4000, 8000),
+            ("/b", "200", 3000, 6000),
+            ("/b", "500", 12000, 16000),
+        ];
+        for (url, status, d1, d2) in &cases {
+            for d in [*d1, *d2] {
+                let tags = vec![
+                    ("url", *url),
+                    ("status", *status),
+                    ("method", "GET"),
+                    ("name", *url),
+                    ("group", "http"),
+                ];
+                rec(&mut agg, "http_req_duration", d as f64, SampleType::Trend, tags);
+                rec(&mut agg, "http_reqs", 1.0, SampleType::Counter, vec![("url", *url), ("status", *status), ("method", "GET")]);
+                // Failures: the 500 responses fail; 200s succeed.
+                let failed = if *status == "500" { 1.0 } else { 0.0 };
+                rec(&mut agg, "http_req_failed", failed, SampleType::Rate, vec![("url", *url), ("status", *status)]);
+                // Per-request data: 100 B received, 20 B sent.
+                rec(&mut agg, "data_received", 100.0, SampleType::Counter, vec![]);
+                rec(&mut agg, "data_sent", 20.0, SampleType::Counter, vec![]);
+            }
+        }
+        // 3 checks: 2 pass, 1 fail.
+        rec(&mut agg, "checks", 1.0, SampleType::Rate, vec![]);
+        rec(&mut agg, "checks", 1.0, SampleType::Rate, vec![]);
+        rec(&mut agg, "checks", 0.0, SampleType::Rate, vec![]);
+        // 2 iterations (iteration_duration Trend).
+        rec(&mut agg, "iterations", 1.0, SampleType::Counter, vec![]);
+        rec(&mut agg, "iterations", 1.0, SampleType::Counter, vec![]);
+        rec(&mut agg, "iteration_duration", 500_000.0, SampleType::Trend, vec![]);
+        rec(&mut agg, "iteration_duration", 900_000.0, SampleType::Trend, vec![]);
+        // 1 error.
+        rec(&mut agg, "errors", 1.0, SampleType::Counter, vec![]);
+
+        let res = agg.build_results();
+
+        // ── Exact headline numbers ──
+        assert_eq!(res.http_reqs, 8, "8 requests total (2 per url×status combo)");
+        assert_eq!(res.checks_total, 3);
+        assert_eq!(res.checks_passed, 2);
+        assert_eq!(res.checks_failed, 1);
+        assert_eq!(res.iterations, 2);
+        assert_eq!(res.errors, 1);
+        assert_eq!(res.data_received, 800.0, "8 requests × 100 B");
+        assert_eq!(res.data_sent, 160.0, "8 requests × 20 B");
+        // http_req_failed: 4 failures out of 8 requests → 0.5.
+        assert_eq!(res.http_req_failed, 0.5);
+
+        // ── Exact trend stats (µs) for the merged http_req_duration ──
+        let dur = res.http_req_duration.as_ref().expect("headline http_req_duration");
+        assert_eq!(dur.count, 8);
+        assert_eq!(dur.sum, 52_000.0); // 1k+2k+4k+8k+3k+6k+12k+16k
+        assert_eq!(dur.mean, 6500.0);
+        // min/max come from hdr-histogram, whose max() reports the bucket
+        // UPPER EDGE (16007 for 16000 at sigfig 3), so assert coverage not
+        // exact equality — the sample must never be excluded.
+        assert!(dur.min <= 1000 && dur.min >= 990, "min={} covers 1000", dur.min);
+        assert!(dur.max >= 16000 && dur.max <= 16150, "max={} covers 16000", dur.max);
+
+        let iter = res.iteration_duration.as_ref().expect("headline iteration_duration");
+        assert_eq!(iter.count, 2);
+        assert_eq!(iter.sum, 1_400_000.0);
+        assert_eq!(iter.mean, 700_000.0);
+
+        // ── Series-level exactness ──
+        // 4 per-(url,status,method) http_req_duration series × 2 samples each.
+        let dur_series: Vec<_> = res
+            .metrics
+            .iter()
+            .filter(|m| m.metric_type == MetricType::Trend && m.key.starts_with("http_req_duration{"))
+            .collect();
+        assert_eq!(dur_series.len(), 4, "4 url×status duration series");
+        for s in &dur_series {
+            assert_eq!(s.count, 2);
+        }
+        // Exact min/max per (url, status) series.
+        let expect_min_max: std::collections::HashMap<(&str, &str), (u64, u64)> =
+            std::collections::HashMap::from([
+                (("/a", "200"), (1000, 2000)),
+                (("/a", "500"), (4000, 8000)),
+                (("/b", "200"), (3000, 6000)),
+                (("/b", "500"), (12000, 16000)),
+            ]);
+        for s in &dur_series {
+            let url = s.tags.iter().find(|(k, _)| k == "url").unwrap().1.as_str();
+            let status = s.tags.iter().find(|(k, _)| k == "status").unwrap().1.as_str();
+            let (want_min, want_max) = expect_min_max[&(url, status)];
+            // Bucket-quantized min/max: assert coverage, not exact equality.
+            assert!(
+                s.min <= want_min && s.min >= want_min.saturating_sub(want_min / 100),
+                "min {} covers {want_min} for {url} {status}",
+                s.min
+            );
+            assert!(
+                s.max >= want_max && s.max <= want_max + want_max / 100 + 1,
+                "max {} covers {want_max} for {url} {status}",
+                s.max
+            );
+        }
+        // The url tag is present on every duration series.
+        assert!(dur_series.iter().all(|m| m.tags.iter().any(|(k, _)| k == "url")));
+
+        // ── Checks headline counts survive per-tag splits ──
+        assert!(res.metrics.iter().any(|m| m.key == "checks"));
     }
 
     #[test]
@@ -1885,7 +2061,10 @@ mod tests {
         });
 
         let res = agg.build_results();
-        assert_eq!(res.http_reqs, 3, "http_reqs_total must not fold into http_reqs");
+        assert_eq!(
+            res.http_reqs, 3,
+            "http_reqs_total must not fold into http_reqs"
+        );
     }
 
     #[test]
@@ -1917,7 +2096,10 @@ mod tests {
             .find(|m| m.key == "my_counter")
             .expect("my_counter series");
         assert_eq!(m.metric_type, MetricType::Counter);
-        assert_eq!(m.count, 25, "Counter count must be the accumulated value, not samples");
+        assert_eq!(
+            m.count, 25,
+            "Counter count must be the accumulated value, not samples"
+        );
         assert_eq!(m.sum, 25.0);
     }
 
@@ -1945,7 +2127,10 @@ mod tests {
         }
 
         let res = agg.build_results();
-        assert_eq!(res.http_reqs, 6, "headline must use accumulated value, not sample count");
+        assert_eq!(
+            res.http_reqs, 6,
+            "headline must use accumulated value, not sample count"
+        );
         // A second fresh aggregator with the same input must produce the
         // identical headline — the old code's per-series loop read sample
         // count (3) while the totals-map fallback read the accumulated sum
@@ -1994,7 +2179,10 @@ mod tests {
         });
 
         let res = agg.build_results();
-        assert_eq!(res.vus_max, 5, "vus_max headline must be the observed peak, not 20");
+        assert_eq!(
+            res.vus_max, 5,
+            "vus_max headline must be the observed peak, not 20"
+        );
     }
 
     #[test]
@@ -2058,7 +2246,10 @@ mod tests {
             err.to_string().contains("http_req_duration"),
             "error must name the metric: {err}"
         );
-        assert!(err.to_string().contains("base64"), "error must explain: {err}");
+        assert!(
+            err.to_string().contains("base64"),
+            "error must explain: {err}"
+        );
     }
 
     #[test]
@@ -2072,9 +2263,7 @@ mod tests {
                 metric_type: MetricType::Trend,
                 // "garbage" base64-encodes to a few bytes that will never
                 // parse as a V2 histogram header.
-                histogram: Some(
-                    base64::engine::general_purpose::STANDARD.encode(b"garbage"),
-                ),
+                histogram: Some(base64::engine::general_purpose::STANDARD.encode(b"garbage")),
                 count: 10.0,
                 sum: 1000.0,
                 min: 1.0,
@@ -2139,20 +2328,36 @@ mod tests {
         // keep `histogram: None` — only Trend records allocate.
         let mut counter = MetricSet::new(MetricType::Counter, None);
         counter.record(5.0, &SampleType::Counter);
-        assert!(counter.histogram.is_none(), "Counter must not allocate a histogram");
+        assert!(
+            counter.histogram.is_none(),
+            "Counter must not allocate a histogram"
+        );
 
         let mut rate = MetricSet::new(MetricType::Rate, None);
         rate.record(1.0, &SampleType::Rate);
-        assert!(rate.histogram.is_none(), "Rate must not allocate a histogram");
+        assert!(
+            rate.histogram.is_none(),
+            "Rate must not allocate a histogram"
+        );
 
         let mut gauge = MetricSet::new(MetricType::Gauge, None);
         gauge.record(3.0, &SampleType::Point);
-        assert!(gauge.histogram.is_none(), "Gauge must not allocate a histogram");
+        assert!(
+            gauge.histogram.is_none(),
+            "Gauge must not allocate a histogram"
+        );
 
         let mut trend = MetricSet::new(MetricType::Trend, None);
         trend.record(1.5, &SampleType::Trend);
-        assert!(trend.histogram.is_some(), "Trend must allocate on first sample");
-        assert_eq!(trend.trend_stats().count, 1, "trend_stats reads the lazy histogram");
+        assert!(
+            trend.histogram.is_some(),
+            "Trend must allocate on first sample"
+        );
+        assert_eq!(
+            trend.trend_stats().count,
+            1,
+            "trend_stats reads the lazy histogram"
+        );
     }
 
     #[test]
@@ -2166,10 +2371,7 @@ mod tests {
         agg.max_series = 2;
         let ts = std::time::SystemTime::now();
 
-        for (metric, url) in [
-            ("http_req_duration", "/a"),
-            ("http_req_duration", "/b"),
-        ] {
+        for (metric, url) in [("http_req_duration", "/a"), ("http_req_duration", "/b")] {
             let tags = Arc::new(tropel_core::types::TagMap::from_pairs([
                 ("url", url),
                 ("name", url),
@@ -2279,7 +2481,10 @@ mod tests {
 
         // Per-group: http_req_duration{group=http} plus iteration_duration
         // has NO group tag, so only the duration series land here.
-        assert!(res.per_group.iter().any(|g| g.count == 6), "duration group merged");
+        assert!(
+            res.per_group.iter().any(|g| g.count == 6),
+            "duration group merged"
+        );
 
         let id = res.iteration_duration.expect("headline iteration_duration");
         assert_eq!(id.count, 2);

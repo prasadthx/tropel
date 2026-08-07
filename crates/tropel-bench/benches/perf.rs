@@ -72,8 +72,8 @@ fn process_rss_bytes() -> Option<u64> {
         // The struct embeds time_value_t fields (nested structs), so it is
         // zero-initialized rather than spelled out field-by-field.
         use libc::{
-            mach_task_basic_info, mach_task_self, task_info, KERN_SUCCESS,
-            MACH_TASK_BASIC_INFO, MACH_TASK_BASIC_INFO_COUNT,
+            mach_task_basic_info, mach_task_self, task_info, KERN_SUCCESS, MACH_TASK_BASIC_INFO,
+            MACH_TASK_BASIC_INFO_COUNT,
         };
         let mut info: mach_task_basic_info = unsafe { std::mem::zeroed() };
         // task_info writes the count back, so it must be a mutable binding.
@@ -157,12 +157,14 @@ fn native_vs_js(c: &mut Criterion) {
 
     // Native: hex-encode via the Rust bridge, 1000 calls per script invocation.
     // The bridge takes a byte array (rquickjs Vec<u8> <-> JS Array), so the
-    // payload string is converted to char codes first — exactly what the JS
-    // shim layer does before calling the native function.
+    // payload string must be converted to char codes first. The conversion is
+    // deliberately INSIDE the loop — the shim does it per call, and hoisting
+    // it out would inflate the native speedup by exactly the hoisted work
+    // (backlog line 204: the old bench hoisted it, the JS side did not).
     let native_src = r#"
-        const bytes = Array.from('benchmark payload 0123456789', (c) => c.charCodeAt(0));
         let s = '';
         for (let i = 0; i < 1000; i++) {
+            const bytes = Array.from('benchmark payload 0123456789', (c) => c.charCodeAt(0));
             s = __tropel_native_hex_encode(bytes);
         }
     "#;
@@ -185,8 +187,12 @@ fn native_vs_js(c: &mut Criterion) {
 
     group.bench_function("native_hex_encode_x1000", |b| {
         // Compile once, then measure repeated invocations of the loop.
-        rt.block_on(ctx.run_script_cached(native_src, None)).unwrap();
-        b.iter(|| rt.block_on(ctx.run_script_cached(native_src, None)).unwrap());
+        rt.block_on(ctx.run_script_cached(native_src, None))
+            .unwrap();
+        b.iter(|| {
+            rt.block_on(ctx.run_script_cached(native_src, None))
+                .unwrap()
+        });
     });
 
     group.bench_function("js_hex_encode_x1000", |b| {
@@ -236,8 +242,16 @@ fn pool_dispatch(c: &mut Criterion) {
 /// the same fixed number with a noise floor, and on macOS (no RSS path) it
 /// was always 0. Now each iteration creates a fresh batch of N contexts and
 /// measures the RSS delta within the timed body, so the reported value is a
-/// real per-context allocation. If RSS is unsupported the bench degrades to
-/// a context-creation throughput number (still honest) instead of a fake 0.
+/// real per-context allocation.
+///
+/// Honesty notes (backlog line 204):
+/// - Criterion reports the timed body's WALL TIME (ns) — that is context
+///   CREATION throughput, not memory. The memory number is the RSS delta
+///   printed after the group; the `Throughput::Elements(N)` annotation frames
+///   the ns number as contexts/sec so it is not mistaken for bytes.
+/// - The mean RSS delta includes ZERO deltas. The old bench filtered
+///   `delta > 0` from the mean, biasing it upward (a batch where the allocator
+///   happened to reuse freed pages counted as "missing" instead of 0).
 fn memory_per_vu(c: &mut Criterion) {
     let rt = tokio_rt();
     const N: usize = 25;
@@ -251,6 +265,9 @@ fn memory_per_vu(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("memory_per_vu");
     group.sample_size(10);
+    // Criterion's reported metric is ns/iteration (context creation). Frame it
+    // as contexts/sec so it is never read as a byte count.
+    group.throughput(Throughput::Elements(N as u64));
 
     group.bench_function("contexts_created_and_rss_delta", |b| {
         b.iter(|| {
@@ -262,10 +279,9 @@ fn memory_per_vu(c: &mut Criterion) {
             let after = process_rss_bytes();
             if let (Some(b), Some(a)) = (before, after) {
                 rss_available = true;
-                let delta = a.saturating_sub(b);
-                if delta > 0 {
-                    observed.push(delta);
-                }
+                // Include zero deltas in the mean — filtering them biased the
+                // per-context estimate upward (backlog line 204).
+                observed.push(a.saturating_sub(b));
             }
             // Keep the batch alive until the measurement is taken; black_box
             // the whole tuple so neither the creation nor the measurement is
@@ -280,10 +296,6 @@ fn memory_per_vu(c: &mut Criterion) {
     if !rss_available {
         eprintln!(
             "[memory_per_vu] RSS unsupported on this platform — reporting context-creation throughput only"
-        );
-    } else if observed.is_empty() {
-        eprintln!(
-            "[memory_per_vu] RSS measured but no growth observed (lazy QuickJS allocation / retained pages)"
         );
     } else {
         let mean: u64 = observed.iter().sum::<u64>() / observed.len() as u64;

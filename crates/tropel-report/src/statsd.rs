@@ -7,7 +7,14 @@
 //! - `Counter` → `c` (count)
 //! - `Gauge` → `g` (gauge)
 //! - `Rate` → `c` (count; the agent computes the rate)
-//! - `Trend` / `Point` → `g` (raw observation)
+//! - `Trend` → `h` (histogram; the agent computes percentiles)
+//! - `Point` → `g` (raw observation)
+//!
+//! A latency `Trend` emitted as a `g` (gauge) is a silent data loss: the
+//! agent stores only the last value, so percentiles can never be computed
+//! (backlog P0: "statsd.rs locks a latency Trend being emitted as a StatsD
+//! gauge"). Datadog's `h` type is unitless and the agent derives
+//! p50/p90/p99 from the histogram it builds.
 //!
 //! Samples are buffered and sent every `FLUSH_INTERVAL` (or when the
 //! buffer exceeds `MAX_BUFFERED_SAMPLES`) over UDP — best-effort, fire
@@ -119,7 +126,12 @@ impl StatsdOutput {
     fn buffer(&self, sample: &Sample) {
         let stype = match sample.sample_type {
             SampleType::Counter | SampleType::Rate => "c",
-            SampleType::Trend | SampleType::Point => "g",
+            // Trends carry latency distributions (http_req_duration,
+            // iteration_duration, custom Trends) — emit the agent-side
+            // HISTOGRAM type so percentiles are computed, not a gauge that
+            // keeps only the last value (backlog P0).
+            SampleType::Trend => "h",
+            SampleType::Point => "g",
         };
         // Sanitize: a raw `:`, `|`, `,`, or `#` in the metric name or a tag
         // key/value would break the `metric:value|type|#k:v,k:v` line into a
@@ -191,7 +203,13 @@ impl StatsdOutput {
 /// rate marker.
 fn sanitize_component(s: &str) -> String {
     s.chars()
-        .map(|c| if matches!(c, ':' | '|' | ',' | '#' | '@') { '_' } else { c })
+        .map(|c| {
+            if matches!(c, ':' | '|' | ',' | '#' | '@') {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -238,7 +256,10 @@ mod tests {
         output.buffer(&sample("http_req_duration", 12.5, SampleType::Trend));
         let lines = output.buffer.lock().unwrap().clone();
         assert_eq!(lines[0], "http_reqs:1|c|#status:200");
-        assert_eq!(lines[1], "http_req_duration:12.5|g|#status:200");
+        // A latency Trend must be a HISTOGRAM (`h`), not a gauge (`g`): the
+        // agent computes percentiles from `h`; a gauge keeps only the last
+        // value (backlog P0).
+        assert_eq!(lines[1], "http_req_duration:12.5|h|#status:200");
     }
 
     #[test]
@@ -259,9 +280,11 @@ mod tests {
         s.tags = std::sync::Arc::new(tags);
         output.buffer(&s);
         let lines = output.buffer.lock().unwrap().clone();
+        // Trends emit `|h|` (histogram) — see the P0 backlog fix — so the
+        // sanitized line carries `h`, not the old gauge `g`.
         assert_eq!(
             lines[0],
-            "http_req_duration_weird_name:1|g|#url:https_//x/y?a=1_b_c_d_0.5"
+            "http_req_duration_weird_name:1|h|#url:https_//x/y?a=1_b_c_d_0.5"
         );
     }
 

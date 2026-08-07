@@ -157,9 +157,8 @@ mod tests {
         let send = tokio::spawn(async move {
             write_frame(&mut tx, &msg).await.unwrap();
         });
-        let recv = tokio::spawn(async move {
-            read_frame::<_, SnapshotMsg>(&mut rx).await.unwrap()
-        });
+        let recv =
+            tokio::spawn(async move { read_frame::<_, SnapshotMsg>(&mut rx).await.unwrap() });
         send.await.unwrap();
         let got = recv.await.unwrap();
         assert!(got.snapshot.series.is_empty());

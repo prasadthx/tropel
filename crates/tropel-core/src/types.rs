@@ -71,9 +71,8 @@ impl<'de> Deserialize<'de> for Method {
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        Method::parse(&s).ok_or_else(|| {
-            serde::de::Error::custom(format!("invalid HTTP method {:?}", s))
-        })
+        Method::parse(&s)
+            .ok_or_else(|| serde::de::Error::custom(format!("invalid HTTP method {:?}", s)))
     }
 }
 
@@ -97,7 +96,10 @@ impl Method {
             return None;
         }
         // RFC 7230 tchar = "!#$%&'*+-.^_`|~" / DIGIT / ALPHA.
-        if !s.chars().all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~" .contains(c)) {
+        if !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c))
+        {
             return None;
         }
         match s.to_uppercase().as_str() {
@@ -255,10 +257,7 @@ impl Serialize for Body {
                 map.serialize_entry("data", data)?;
                 map.end()
             }
-            Body::GraphQL {
-                query,
-                variables,
-            } => {
+            Body::GraphQL { query, variables } => {
                 let mut map = serializer.serialize_map(Some(3))?;
                 map.serialize_entry("__tropel_body", "graphql")?;
                 map.serialize_entry("query", query)?;
@@ -353,7 +352,10 @@ impl Body {
         variables: &Option<HashMap<String, serde_json::Value>>,
     ) -> String {
         let mut body = serde_json::Map::new();
-        body.insert("query".to_string(), serde_json::Value::String(query.to_string()));
+        body.insert(
+            "query".to_string(),
+            serde_json::Value::String(query.to_string()),
+        );
         if let Some(vars) = variables {
             if !vars.is_empty() {
                 let mut obj = serde_json::Map::new();
@@ -724,8 +726,7 @@ pub struct Sample {
 }
 
 /// Type of metric sample.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum SampleType {
     #[default]
     Point,
@@ -760,7 +761,9 @@ mod tests {
         // NOTE 2: trailing/leading whitespace is TRIMMED by design, so a
         // bare "GET\n" (CRLF artifact) parses as GET — the genuinely invalid
         // case is whitespace INSIDE the token ("GE\nT").
-        for bad in ["", " ", "  ", "GE T", "GE\nT", "GET,", "{GET}", "POTS(", " GET"] {
+        for bad in [
+            "", " ", "  ", "GE T", "GE\nT", "GET,", "{GET}", "POTS(", " GET",
+        ] {
             assert!(
                 Method::parse(bad).is_none(),
                 "method {:?} must not parse",
@@ -770,10 +773,7 @@ mod tests {
         // Trailing newline is trimmed like any other outer whitespace.
         assert_eq!(Method::parse("GET\n"), Some(Method::GET));
         // Sanity: a punctuation-only token is still valid (Custom).
-        assert_eq!(
-            Method::parse("!*+"),
-            Some(Method::Custom("!*+".into()))
-        );
+        assert_eq!(Method::parse("!*+"), Some(Method::Custom("!*+".into())));
     }
 
     #[test]
@@ -829,7 +829,10 @@ mod tests {
         assert_eq!(text, "\u{FFFD}(A");
 
         // Valid UTF-8 passes through unchanged.
-        assert_eq!(resp_with(b"ok".to_vec()).body_text(), Some("ok".to_string()));
+        assert_eq!(
+            resp_with(b"ok".to_vec()).body_text(),
+            Some("ok".to_string())
+        );
     }
 
     #[test]
@@ -899,4 +902,3 @@ mod tests {
         assert!(matches!(arr, Body::Json(_)));
     }
 }
-

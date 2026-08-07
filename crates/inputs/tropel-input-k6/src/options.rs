@@ -232,7 +232,10 @@ impl K6Options {
         let has_anything = execution.is_some()
             || !thresholds.is_empty()
             || self.discard_response_bodies.is_some()
-            || self.summary_trend_stats.as_ref().is_some_and(|s| !s.is_empty())
+            || self
+                .summary_trend_stats
+                .as_ref()
+                .is_some_and(|s| !s.is_empty())
             || self.dns.is_some()
             || self.no_connection_reuse.is_some()
             || self.no_vu_connection_reuse.is_some()
@@ -451,11 +454,10 @@ impl K6Scenario {
 }
 
 fn spec_to_configs(metric: &str, spec: &K6ThresholdSpec) -> Vec<ThresholdConfig> {
-    match spec {            K6ThresholdSpec::Single(s) => vec![build_threshold(metric, s, false, None)],
+    match spec {
+        K6ThresholdSpec::Single(s) => vec![build_threshold(metric, s, false, None)],
         K6ThresholdSpec::Other(_) => {
-            tracing::warn!(
-                "k6 threshold '{metric}' has an unsupported shape — ignored"
-            );
+            tracing::warn!("k6 threshold '{metric}' has an unsupported shape — ignored");
             vec![]
         }
         K6ThresholdSpec::Array(items) => {
@@ -621,9 +623,7 @@ mod tests {
         let decl = opts.to_declared().unwrap();
         match decl.execution {
             Some(ExecutionConfig::RampingVus {
-                start_vus,
-                stages,
-                ..
+                start_vus, stages, ..
             }) => {
                 assert_eq!(start_vus, 2);
                 assert_eq!(stages.len(), 1);
@@ -646,8 +646,13 @@ mod tests {
         let scenarios = decl.scenarios.expect("scenarios present");
         let sc = scenarios.get("s").expect("scenario s");
         match &sc.execution {
-            tropel_sdk::ExecutionConfig::RampingVus { start_vus, stages, .. } => {
-                assert_eq!(*start_vus, 0, "startVUs must be honored (not fall back to vus/1)");
+            tropel_sdk::ExecutionConfig::RampingVus {
+                start_vus, stages, ..
+            } => {
+                assert_eq!(
+                    *start_vus, 0,
+                    "startVUs must be honored (not fall back to vus/1)"
+                );
                 assert_eq!(stages.len(), 1);
             }
             other => panic!("expected RampingVus, got {other:?}"),
@@ -784,7 +789,10 @@ mod tests {
         // correct outcomes; the scenario must never silently run 1 VU.
         let declared = opts.to_declared();
         assert!(
-            declared.as_ref().and_then(|d| d.scenarios.as_ref()).is_none(),
+            declared
+                .as_ref()
+                .and_then(|d| d.scenarios.as_ref())
+                .is_none(),
             "arrival-rate scenario without preAllocatedVUs must be skipped (k6 rejects it)"
         );
     }
@@ -849,10 +857,7 @@ mod tests {
     fn test_duration_threshold_tag_scoped_scaled() {
         // Tag-scoped duration thresholds must be scaled too — the key
         // carries a `{scenario:…}` filter that must not defeat the µs check.
-        let expr = translate_k6_expression(
-            "http_req_duration{scenario:api_load}",
-            "p(95)<300",
-        );
+        let expr = translate_k6_expression("http_req_duration{scenario:api_load}", "p(95)<300");
         assert_eq!(expr, "http_req_duration{scenario:api_load}.p(95) < 300000");
     }
 
@@ -929,15 +934,23 @@ mod tests {
                 "summaryTrendStats": ["avg", "p(99)"]
             }"#,
         );
-        let decl = opts.to_declared().expect("safety options must not be discarded");
+        let decl = opts
+            .to_declared()
+            .expect("safety options must not be discarded");
         assert!(decl.execution.is_none());
         assert!(decl.scenarios.is_none());
         assert_eq!(decl.thresholds.len(), 1);
         assert_eq!(decl.dns_ttl.as_deref(), Some("1m"));
         assert_eq!(decl.dns_select.as_deref(), Some("roundRobin"));
         assert_eq!(decl.dns_policy.as_deref(), Some("any"));
-        assert_eq!(decl.hosts.as_ref().and_then(|h| h.get("test.k6.io")), Some(&"1.2.3.4".to_string()));
-        assert_eq!(decl.blacklist_ips.as_deref(), Some(&["10.0.0.0/8".to_string()][..]));
+        assert_eq!(
+            decl.hosts.as_ref().and_then(|h| h.get("test.k6.io")),
+            Some(&"1.2.3.4".to_string())
+        );
+        assert_eq!(
+            decl.blacklist_ips.as_deref(),
+            Some(&["10.0.0.0/8".to_string()][..])
+        );
         assert_eq!(decl.rps, Some(100.0));
         assert_eq!(decl.no_connection_reuse, Some(true));
         assert_eq!(decl.discard_response_bodies, Some(true));
@@ -969,13 +982,17 @@ mod tests {
         // script declaring ONLY this option must still yield Some(decl) with
         // the flag set, even without any load profile.
         let opts = parse(r#"{"insecureSkipTLSVerify": true}"#);
-        let decl = opts.to_declared().expect("insecureSkipTLSVerify alone must survive");
+        let decl = opts
+            .to_declared()
+            .expect("insecureSkipTLSVerify alone must survive");
         assert!(decl.execution.is_none());
         assert_eq!(decl.insecure_skip_tls_verify, Some(true));
 
         // Explicitly false must also survive (not collapse into None).
         let opts = parse(r#"{"insecureSkipTLSVerify": false}"#);
-        let decl = opts.to_declared().expect("insecureSkipTLSVerify=false must survive");
+        let decl = opts
+            .to_declared()
+            .expect("insecureSkipTLSVerify=false must survive");
         assert_eq!(decl.insecure_skip_tls_verify, Some(false));
 
         // And it rides along with a normal load profile.
@@ -1021,7 +1038,10 @@ mod tests {
         assert_eq!(opts.no_vu_connection_reuse, Some(true));
         assert_eq!(opts.rps, Some(50.0));
         assert_eq!(
-            opts.hosts.as_ref().and_then(|h| h.get("api.example.com")).map(|s| s.as_str()),
+            opts.hosts
+                .as_ref()
+                .and_then(|h| h.get("api.example.com"))
+                .map(|s| s.as_str()),
             Some("10.0.0.1")
         );
         assert_eq!(opts.blacklist_ips.as_ref().map(|b| b.len()), Some(2));

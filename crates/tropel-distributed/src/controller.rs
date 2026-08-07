@@ -1,6 +1,6 @@
 //! Controller orchestration: accept N agents, dispatch segments, merge.
 
-use crate::protocol::{token_matches, write_frame, read_frame, AssignMsg, HelloMsg, SnapshotMsg};
+use crate::protocol::{read_frame, token_matches, write_frame, AssignMsg, HelloMsg, SnapshotMsg};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tropel_core::config::JobConfig;
@@ -97,13 +97,10 @@ pub async fn run_controller(
         let token = token.to_string();
         agent_tasks.push(tokio::spawn(async move {
             tracing::info!("Controller: waiting for agent {}/{}...", i + 1, num_agents);
-            let (mut stream, peer) = tokio::time::timeout(
-                per_agent_timeout,
-                listener.accept(),
-            )
-            .await
-            .map_err(|_| TropelError::Execution("timed out waiting for an agent".into()))?
-            .map_err(TropelError::Io)?;
+            let (mut stream, peer) = tokio::time::timeout(per_agent_timeout, listener.accept())
+                .await
+                .map_err(|_| TropelError::Execution("timed out waiting for an agent".into()))?
+                .map_err(TropelError::Io)?;
             tracing::info!("Controller: agent {i} connected from {peer}");
 
             // Authentication gate: the agent MUST present the shared token
@@ -112,20 +109,15 @@ pub async fn run_controller(
             // sees the JobConfig (which carries env credentials) and can't
             // forge a SnapshotMsg. Timeout-wrapped like the connect so a
             // hostile stream that connects and stays silent cannot hang.
-            let hello: HelloMsg = tokio::time::timeout(
-                per_agent_timeout,
-                read_frame(&mut stream),
-            )
-            .await
-            .map_err(|_| {
-                TropelError::Execution(format!(
-                    "agent {i} did not authenticate within {per_agent_timeout:?}"
-                ))
-            })??;
+            let hello: HelloMsg = tokio::time::timeout(per_agent_timeout, read_frame(&mut stream))
+                .await
+                .map_err(|_| {
+                    TropelError::Execution(format!(
+                        "agent {i} did not authenticate within {per_agent_timeout:?}"
+                    ))
+                })??;
             if !token_matches(&token, &hello.token) {
-                tracing::warn!(
-                    "Controller: refusing agent {i} from {peer} — bad auth token"
-                );
+                tracing::warn!("Controller: refusing agent {i} from {peer} — bad auth token");
                 return Err(TropelError::Execution(
                     "agent authentication failed: token mismatch".into(),
                 ));
@@ -144,24 +136,21 @@ pub async fn run_controller(
             };
             write_frame(&mut stream, &assign).await?;
 
-            let snapshot = tokio::time::timeout(
-                per_agent_timeout,
-                read_agent_snapshot(&mut stream),
-            )
-            .await
-            .map_err(|_| {
-                TropelError::Execution(format!(
-                    "agent {i} timed out before shipping its snapshot"
-                ))
-            })??;
+            let snapshot =
+                tokio::time::timeout(per_agent_timeout, read_agent_snapshot(&mut stream))
+                    .await
+                    .map_err(|_| {
+                        TropelError::Execution(format!(
+                            "agent {i} timed out before shipping its snapshot"
+                        ))
+                    })??;
             Ok::<_, TropelError>((i as u32, snapshot))
         }));
     }
 
     // Join all agent tasks. Results are placed back at their agent index so
     // the merged snapshot ordering matches the original deterministic order.
-    let mut snapshots: Vec<Option<MetricsSnapshot>> =
-        vec![None; num_agents as usize];
+    let mut snapshots: Vec<Option<MetricsSnapshot>> = vec![None; num_agents as usize];
     for task in agent_tasks {
         match task.await {
             Ok(Ok((i, snapshot))) => {
@@ -177,9 +166,7 @@ pub async fn run_controller(
                 return Err(e);
             }
             Err(e) => {
-                return Err(TropelError::Execution(format!(
-                    "agent task panicked: {e}"
-                )));
+                return Err(TropelError::Execution(format!("agent task panicked: {e}")));
             }
         }
     }
@@ -213,19 +200,22 @@ fn agent_timeout(config: &JobConfig) -> Duration {
             .map(|s| parse_duration(&s.duration))
             .sum::<Duration>(),
         ExecutionConfig::ConstantArrivalRate { duration, .. } => parse_duration(duration),
-        ExecutionConfig::SharedIterations { max_duration, .. } => {
-            max_duration.as_deref().map(parse_duration).unwrap_or(Duration::ZERO)
-        }
+        ExecutionConfig::SharedIterations { max_duration, .. } => max_duration
+            .as_deref()
+            .map(parse_duration)
+            .unwrap_or(Duration::ZERO),
         ExecutionConfig::RampingArrivalRate { stages, .. } => stages
             .iter()
             .map(|s| parse_duration(&s.duration))
             .sum::<Duration>(),
-        ExecutionConfig::PerVUIterations { max_duration, .. } => {
-            max_duration.as_deref().map(parse_duration).unwrap_or(Duration::ZERO)
-        }
-        ExecutionConfig::ExternallyControlled { duration, .. } => {
-            duration.as_deref().map(parse_duration).unwrap_or(Duration::ZERO)
-        }
+        ExecutionConfig::PerVUIterations { max_duration, .. } => max_duration
+            .as_deref()
+            .map(parse_duration)
+            .unwrap_or(Duration::ZERO),
+        ExecutionConfig::ExternallyControlled { duration, .. } => duration
+            .as_deref()
+            .map(parse_duration)
+            .unwrap_or(Duration::ZERO),
     };
     AGENT_BASE_TIMEOUT + declared + AGENT_GRACE
 }
@@ -251,7 +241,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 4096];
                     let _ = sock.read(&mut buf).await;
@@ -271,11 +263,17 @@ mod tests {
     /// read the other's config (or a truncated file) and reported 0 requests.
     fn write_collection(base: &str, tag: &str) -> String {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("tropel-distributed-e2e-{tag}-{}.json", std::process::id()));
+        let path = dir.join(format!(
+            "tropel-distributed-e2e-{tag}-{}.json",
+            std::process::id()
+        ));
         let json = format!(
             r#"{{"info":{{"_postman_id":"e2e","name":"dist","schema":"https://schema.getpostman.com/json/collection/v2.1.0/collection.json"}},"item":[{{"name":"r1","request":{{"method":"GET","url":"{base}/","header":[]}},"response":[]}}]}}"#
         );
-        std::fs::File::create(&path).unwrap().write_all(json.as_bytes()).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(json.as_bytes())
+            .unwrap();
         path.to_string_lossy().to_string()
     }
 
@@ -302,11 +300,14 @@ mod tests {
         let addr_str = addr.to_string();
         let cfg = config.clone();
 
-        let controller = tokio::spawn(async move { run_controller(listener, &cfg, 2, "test-token").await });
+        let controller =
+            tokio::spawn(async move { run_controller(listener, &cfg, 2, "test-token").await });
         let mut agents = Vec::new();
         for _ in 0..2 {
             let a = addr_str.clone();
-            agents.push(tokio::spawn(async move { crate::agent::run_agent(&a, "test-token").await }));
+            agents.push(tokio::spawn(async move {
+                crate::agent::run_agent(&a, "test-token").await
+            }));
         }
         for h in agents {
             h.await.unwrap()?;
@@ -315,7 +316,11 @@ mod tests {
 
         // 4 iterations split across 2 agents → 4 total requests, merged
         // histogram holds all 4 samples.
-        assert_eq!(merged.http_reqs, 4, "merged http_reqs = 4: {}", merged.http_reqs);
+        assert_eq!(
+            merged.http_reqs, 4,
+            "merged http_reqs = 4: {}",
+            merged.http_reqs
+        );
         let dur = merged.http_req_duration.expect("merged http_req_duration");
         assert_eq!(dur.count, 4, "merged histogram count = 4");
         assert!(dur.max > 0, "merged max latency recorded");
@@ -360,7 +365,9 @@ mod tests {
         };
         let listener = TokioListener::bind("127.0.0.1:0").await.unwrap();
         // 3 boundaries in the sequence vs --agents 2 → hard error, no hang.
-        let err = run_controller(listener, &config, 2, "test-token").await.unwrap_err();
+        let err = run_controller(listener, &config, 2, "test-token")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("boundaries"));
     }
 
@@ -392,7 +399,8 @@ mod tests {
 
         let controller =
             tokio::spawn(async move { run_controller(listener, &cfg, 1, "right-token").await });
-        let agent = tokio::spawn(async move { crate::agent::run_agent(&addr_str, "wrong-token").await });
+        let agent =
+            tokio::spawn(async move { crate::agent::run_agent(&addr_str, "wrong-token").await });
 
         let merged = controller.await.unwrap();
         let agent_res = agent.await.unwrap();
@@ -406,4 +414,3 @@ mod tests {
         let _ = std::fs::remove_file(&coll);
     }
 }
-

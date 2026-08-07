@@ -138,9 +138,7 @@ impl IpCidr {
                 let mask = if self.prefix >= 128 {
                     u128::MAX
                 } else {
-                    u128::MAX
-                        .checked_shl(128 - self.prefix as u32)
-                        .unwrap_or(0)
+                    u128::MAX.checked_shl(128 - self.prefix as u32).unwrap_or(0)
                 };
                 (u128::from(base) & mask) == (u128::from(ip) & mask)
             }
@@ -191,7 +189,12 @@ impl DnsResolver {
             Some(ttl) => parse_cache_mode(Some(ttl)),
             None => DnsCacheMode::Ttl(K6_DEFAULT_TTL),
         };
-        let select = match config.dns_select.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        let select = match config
+            .dns_select
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
             Some("roundrobin" | "round_robin" | "round-robin") => DnsSelect::RoundRobin,
             Some("random") => DnsSelect::Random,
             None => DnsSelect::Random, // k6 default
@@ -511,9 +514,7 @@ fn cache_get(inner: &DnsShared, host: &str) -> Option<Vec<SocketAddr>> {
                 DnsCacheMode::Forever => true,
                 // The entry stores its precomputed expiry, so the configured
                 // TTL duration itself is not needed here.
-                DnsCacheMode::Ttl(_t) => entry
-                    .expires_at
-                    .is_some_and(|e| Instant::now() < e),
+                DnsCacheMode::Ttl(_t) => entry.expires_at.is_some_and(|e| Instant::now() < e),
                 DnsCacheMode::Off => false,
             };
             if fresh {
@@ -652,7 +653,10 @@ mod tests {
     #[test]
     fn hosts_parsing_and_lookup() {
         let mut map = HashMap::new();
-        map.insert("api.example.com".to_string(), "10.0.0.1, 10.0.0.2".to_string());
+        map.insert(
+            "api.example.com".to_string(),
+            "10.0.0.1, 10.0.0.2".to_string(),
+        );
         map.insert("*.wild.com".to_string(), "10.9.9.9".to_string());
         map.insert("bad.host".to_string(), "not-an-ip".to_string());
 
@@ -692,7 +696,10 @@ mod tests {
             "3.3.3.3:80".parse().unwrap(),
         ];
         let rotation = Mutex::new(HashMap::new());
-        assert_eq!(select_addrs("h.com", &addrs, DnsSelect::First, &rotation)[0], addrs[0]);
+        assert_eq!(
+            select_addrs("h.com", &addrs, DnsSelect::First, &rotation)[0],
+            addrs[0]
+        );
         assert_eq!(
             select_addrs("h.com", &addrs, DnsSelect::RoundRobin, &rotation)[0],
             addrs[0]
@@ -728,15 +735,30 @@ mod tests {
         // Rotation must be independent per host. Both hosts have TWO
         // addresses so the old global counter would have skipped A's second
         // entry after B's lookup advanced the shared cursor.
-        let a = vec!["1.1.1.1:80".parse::<SocketAddr>().unwrap(), "2.2.2.2:80".parse().unwrap()];
-        let b = vec!["9.9.9.9:80".parse::<SocketAddr>().unwrap(), "8.8.8.8:80".parse().unwrap()];
+        let a = vec![
+            "1.1.1.1:80".parse::<SocketAddr>().unwrap(),
+            "2.2.2.2:80".parse().unwrap(),
+        ];
+        let b = vec![
+            "9.9.9.9:80".parse::<SocketAddr>().unwrap(),
+            "8.8.8.8:80".parse().unwrap(),
+        ];
         let rotation = Mutex::new(HashMap::new());
-        assert_eq!(select_addrs("a.com", &a, DnsSelect::RoundRobin, &rotation)[0], a[0]);
-        assert_eq!(select_addrs("b.com", &b, DnsSelect::RoundRobin, &rotation)[0], b[0]);
+        assert_eq!(
+            select_addrs("a.com", &a, DnsSelect::RoundRobin, &rotation)[0],
+            a[0]
+        );
+        assert_eq!(
+            select_addrs("b.com", &b, DnsSelect::RoundRobin, &rotation)[0],
+            b[0]
+        );
         // B's lookup advanced B's counter only: A still advances to its
         // SECOND address (under the old shared cursor, B's lookup advanced
         // the shared counter past A's second entry, so A repeated a[0]).
-        assert_eq!(select_addrs("a.com", &a, DnsSelect::RoundRobin, &rotation)[0], a[1]);
+        assert_eq!(
+            select_addrs("a.com", &a, DnsSelect::RoundRobin, &rotation)[0],
+            a[1]
+        );
     }
 
     #[test]
@@ -840,7 +862,10 @@ mod tests {
         cache_put(&shared, "live.com", &addrs);
         {
             let store = shared.cache_store.lock().unwrap();
-            assert!(!store.contains_key("dead.com"), "expired entry must be purged");
+            assert!(
+                !store.contains_key("dead.com"),
+                "expired entry must be purged"
+            );
             assert!(store.contains_key("live.com"));
         }
 
@@ -869,7 +894,8 @@ mod tests {
             dns_policy: Some("onlyIPv4".to_string()),
             ..Default::default()
         };
-        cfg.hosts.insert("local.test".to_string(), "127.0.0.1".to_string());
+        cfg.hosts
+            .insert("local.test".to_string(), "127.0.0.1".to_string());
         cfg.blacklist_ips.push("10.0.0.0/8".to_string());
 
         let r = DnsResolver::from_config(&cfg);
@@ -904,7 +930,11 @@ mod tests {
         assert_eq!(pinned.len(), 1);
         assert_eq!(pinned[0], "10.0.0.1:8080".parse::<SocketAddr>().unwrap());
         let plain = &hosts["plain.test"];
-        assert_eq!(plain[0].port(), 0, "bare IP keeps port 0 (request port applies)");
+        assert_eq!(
+            plain[0].port(),
+            0,
+            "bare IP keeps port 0 (request port applies)"
+        );
     }
 
     #[test]

@@ -27,9 +27,7 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
     if args.controller.is_empty() {
-        return Err(TropelError::Config(
-            "--controller must not be empty".into(),
-        ));
+        return Err(TropelError::Config("--controller must not be empty".into()));
     }
     // An agent runs a FULL load-test engine, not just a socket loop — the
     // old hardcoded `#[tokio::main(worker_threads = 2)]` starved it. Build a

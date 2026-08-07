@@ -125,12 +125,7 @@ impl PmState {
     /// Record a test/check with optional extra tags (backlog line 149:
     /// k6's check() 3rd `tags` arg). The `check` tag always carries the raw
     /// check name — k6 does NOT prefix it with "check ".
-    pub fn record_test_tagged(
-        &mut self,
-        name: &str,
-        passed: bool,
-        extra: HashMap<String, String>,
-    ) {
+    pub fn record_test_tagged(&mut self, name: &str, passed: bool, extra: HashMap<String, String>) {
         self.assertions.total += 1;
         if passed {
             self.assertions.passed += 1;

@@ -26,8 +26,7 @@ pub struct IterationResult {
 }
 
 /// Configuration for a VU runner.
-#[derive(Clone)]
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct RunnerConfig {
     pub max_iterations: Option<u64>,
     pub max_duration: Option<Duration>,
@@ -40,7 +39,6 @@ pub struct RunnerConfig {
 /// inside ONE iteration — the JS interrupt doesn't apply to this Rust item
 /// loop, so the run never terminates (backlog line 161).
 const MAX_SET_NEXT_REQUEST_JUMPS: usize = 10_000;
-
 
 /// Per-VU iteration runner with full HTTP/JS/PM integration.
 ///
@@ -249,9 +247,7 @@ impl VURunner {
                 // Run prerequest script
                 if let Some(script) = &item.prerequest {
                     let source_url = Some(format!("{}.prerequest.js", item.name));
-                    if let Err(e) =
-                        Self::run_script(&mut self.js_ctx, script, source_url).await
-                    {
+                    if let Err(e) = Self::run_script(&mut self.js_ctx, script, source_url).await {
                         tracing::warn!("VU {} prerequest script error: {}", iteration_index, e);
                         // Backlog line 98: script failures were swallowed —
                         // no failed check, no metric, exit 0. Record a failed
@@ -291,7 +287,9 @@ impl VURunner {
                     let request = {
                         let st = self.pm_state.lock().unwrap();
                         st.request.clone().unwrap_or_else(|| {
-                            item.request.clone().expect("guarded by item.request.is_some()")
+                            item.request
+                                .clone()
+                                .expect("guarded by item.request.is_some()")
                         })
                     };
                     // Resolve variables across the entire request. The URL gets
@@ -414,180 +412,181 @@ impl VURunner {
                         // Warned above; skip — never send a non-HTTP scheme to
                         // the HTTP client (reqwest would fail confusingly).
                     } else {
-                    // Build auth signer from request auth config, or use the scenario-level auth
-                    let auth_signer = resolved_req
-                        .auth
-                        .as_ref()
-                        .or(self.scenario.auth.as_ref())
-                        .and_then(|auth| tropel_http::auth::build_auth_signer(auth));
+                        // Build auth signer from request auth config, or use the scenario-level auth
+                        let auth_signer = resolved_req
+                            .auth
+                            .as_ref()
+                            .or(self.scenario.auth.as_ref())
+                            .and_then(|auth| tropel_http::auth::build_auth_signer(auth));
 
-                    // Execute the request directly via the per-VU HTTP client
-                    tracing::trace!("VU runner: executing request to {}", resolved_req.url);
+                        // Execute the request directly via the per-VU HTTP client
+                        tracing::trace!("VU runner: executing request to {}", resolved_req.url);
 
-                    let exec_start = Instant::now();
-                    let exec_result = self
-                        .client
-                        .execute(&resolved_req, auth_signer.as_deref())
-                        .await;
-                    let duration = exec_start.elapsed();
+                        let exec_start = Instant::now();
+                        let exec_result = self
+                            .client
+                            .execute(&resolved_req, auth_signer.as_deref())
+                            .await;
+                        let duration = exec_start.elapsed();
 
-                    tracing::trace!(
-                        "VU runner: request to {} completed in {:?}",
-                        resolved_req.url,
-                        duration
-                    );
+                        tracing::trace!(
+                            "VU runner: request to {} completed in {:?}",
+                            resolved_req.url,
+                            duration
+                        );
 
-                    match exec_result {
-                        Ok(http_response) => {
-                            // Convert to core Response and store in PM state (by move — no shared slot)
-                            let pm_response = tropel_core::types::Response::from(&http_response);
-                            {
-                                let mut state = self.pm_state.lock().unwrap();
-                                state.response = Some(pm_response);
-                            }
+                        match exec_result {
+                            Ok(http_response) => {
+                                // Convert to core Response and store in PM state (by move — no shared slot)
+                                let pm_response =
+                                    tropel_core::types::Response::from(&http_response);
+                                {
+                                    let mut state = self.pm_state.lock().unwrap();
+                                    state.response = Some(pm_response);
+                                }
 
-                            // Emit samples for EVERY redirect hop plus the final
-                            // response (k6 parity: a 302 chain counts as hops + 1
-                            // requests, not just the final — the earlier
-                            // k6_sample_basic comparison showed 136 reqs for 68
-                            // iterations while Tropel recorded 64). The final
-                            // response's URL/status/body is what pm.response
-                            // exposes; each hop gets its own sample set.
-                            let chain = http_response
-                                .redirects
-                                .iter()
-                                .chain(std::iter::once(&http_response));
-                            for resp in chain {
-                                // Build tags for all request-level metrics
-                                let mut tags = TagMap::with_capacity(5);
-                                tags.insert("url", resp.url.clone());
-                                tags.insert("method", resolved_req.method.to_string());
-                                tags.insert("status", resp.status_code.to_string());
-                                tags.insert("name", resp.url.clone());
-                                tags.insert("group", "http");
-                                // Share one Arc so all ~12 per-request samples bump a
-                                // refcount instead of copying the whole map.
-                                let tags = Arc::new(tags);
+                                // Emit samples for EVERY redirect hop plus the final
+                                // response (k6 parity: a 302 chain counts as hops + 1
+                                // requests, not just the final — the earlier
+                                // k6_sample_basic comparison showed 136 reqs for 68
+                                // iterations while Tropel recorded 64). The final
+                                // response's URL/status/body is what pm.response
+                                // exposes; each hop gets its own sample set.
+                                let chain = http_response
+                                    .redirects
+                                    .iter()
+                                    .chain(std::iter::once(&http_response));
+                                for resp in chain {
+                                    // Build tags for all request-level metrics
+                                    let mut tags = TagMap::with_capacity(5);
+                                    tags.insert("url", resp.url.clone());
+                                    tags.insert("method", resolved_req.method.to_string());
+                                    tags.insert("status", resp.status_code.to_string());
+                                    tags.insert("name", resp.url.clone());
+                                    tags.insert("group", "http");
+                                    // Share one Arc so all ~12 per-request samples bump a
+                                    // refcount instead of copying the whole map.
+                                    let tags = Arc::new(tags);
 
-                                let now = std::time::SystemTime::now();
+                                    let now = std::time::SystemTime::now();
 
-                                // http_req_duration (Trend) — this hop's own time
-                                result.samples.push(Sample {
-                                    metric: "http_req_duration".into(),
-                                    value: resp.response_time.as_micros() as f64,
-                                    tags: tags.clone(),
-                                    timestamp: now,
-                                    sample_type: SampleType::Trend,
-                                });
+                                    // http_req_duration (Trend) — this hop's own time
+                                    result.samples.push(Sample {
+                                        metric: "http_req_duration".into(),
+                                        value: resp.response_time.as_micros() as f64,
+                                        tags: tags.clone(),
+                                        timestamp: now,
+                                        sample_type: SampleType::Trend,
+                                    });
 
-                                // http_reqs (Counter)
-                                result.samples.push(Sample {
-                                    metric: "http_reqs".into(),
-                                    value: 1.0,
-                                    tags: tags.clone(),
-                                    timestamp: now,
-                                    sample_type: SampleType::Counter,
-                                });
+                                    // http_reqs (Counter)
+                                    result.samples.push(Sample {
+                                        metric: "http_reqs".into(),
+                                        value: 1.0,
+                                        tags: tags.clone(),
+                                        timestamp: now,
+                                        sample_type: SampleType::Counter,
+                                    });
 
-                                // http_req_failed (Rate) — true when status not in expected list
-                                let is_failed = !tropel_core::config::status_is_expected(
-                                    resp.status_code,
-                                    &self.expected_statuses,
-                                );
-                                result.samples.push(Sample {
-                                    metric: "http_req_failed".into(),
-                                    value: if is_failed { 1.0 } else { 0.0 },
-                                    tags: tags.clone(),
-                                    timestamp: now,
-                                    sample_type: SampleType::Rate,
-                                });
+                                    // http_req_failed (Rate) — true when status not in expected list
+                                    let is_failed = !tropel_core::config::status_is_expected(
+                                        resp.status_code,
+                                        &self.expected_statuses,
+                                    );
+                                    result.samples.push(Sample {
+                                        metric: "http_req_failed".into(),
+                                        value: if is_failed { 1.0 } else { 0.0 },
+                                        tags: tags.clone(),
+                                        timestamp: now,
+                                        sample_type: SampleType::Rate,
+                                    });
 
-                                // data_received (Counter) — response body bytes
-                                result.samples.push(Sample {
-                                    metric: "data_received".into(),
-                                    value: resp.size as f64,
-                                    tags: tags.clone(),
-                                    timestamp: now,
-                                    sample_type: SampleType::Counter,
-                                });
+                                    // data_received (Counter) — response body bytes
+                                    result.samples.push(Sample {
+                                        metric: "data_received".into(),
+                                        value: resp.size as f64,
+                                        tags: tags.clone(),
+                                        timestamp: now,
+                                        sample_type: SampleType::Counter,
+                                    });
 
-                                // data_sent (Counter) — request body bytes
-                                result.samples.push(Sample {
-                                    metric: "data_sent".into(),
-                                    value: resp.request_body_size as f64,
-                                    tags: tags.clone(),
-                                    timestamp: now,
-                                    sample_type: SampleType::Counter,
-                                });
+                                    // data_sent (Counter) — request body bytes
+                                    result.samples.push(Sample {
+                                        metric: "data_sent".into(),
+                                        value: resp.request_body_size as f64,
+                                        tags: tags.clone(),
+                                        timestamp: now,
+                                        sample_type: SampleType::Counter,
+                                    });
 
-                                // ═══════════════════════════════════════
-                                // HTTP sub-timing metrics (Trend, all in μs)
-                                // ═══════════════════════════════════════
-                                // These match k6's http_req_* sub-timing
-                                // metrics. http_req_dns is a Tropel extra (k6
-                                // folds DNS into http_req_blocked).
-                                // blocked/dns/connecting are REAL (from
-                                // reqwest's dns_resolver + connector_layer
-                                // hooks); tls_handshaking/sending are always
-                                // ZERO (folded into connecting / waiting by
-                                // reqwest). waiting (TTFB) and receiving are
-                                // always measured. Note: on a pooled keep-alive
-                                // reuse no connector call happens, so
-                                // blocked/dns/connecting are 0.
-                                if let Some(timings) = &resp.timings {
-                                    let sub_timing_metrics = [
-                                        ("http_req_blocked", timings.blocked),
-                                        ("http_req_dns", timings.dns),
-                                        ("http_req_connecting", timings.connecting),
-                                        ("http_req_tls_handshaking", timings.tls_handshaking),
-                                        ("http_req_sending", timings.sending),
-                                        ("http_req_waiting", timings.waiting),
-                                        ("http_req_receiving", timings.receiving),
-                                    ];
-                                    let sub_tags = tags.clone();
-                                    for (metric_name, dur) in &sub_timing_metrics {
-                                        result.samples.push(Sample {
-                                            metric: (*metric_name).into(),
-                                            value: dur.as_micros() as f64,
-                                            tags: sub_tags.clone(),
-                                            timestamp: now,
-                                            sample_type: SampleType::Trend,
-                                        });
+                                    // ═══════════════════════════════════════
+                                    // HTTP sub-timing metrics (Trend, all in μs)
+                                    // ═══════════════════════════════════════
+                                    // These match k6's http_req_* sub-timing
+                                    // metrics. http_req_dns is a Tropel extra (k6
+                                    // folds DNS into http_req_blocked).
+                                    // blocked/dns/connecting are REAL (from
+                                    // reqwest's dns_resolver + connector_layer
+                                    // hooks); tls_handshaking/sending are always
+                                    // ZERO (folded into connecting / waiting by
+                                    // reqwest). waiting (TTFB) and receiving are
+                                    // always measured. Note: on a pooled keep-alive
+                                    // reuse no connector call happens, so
+                                    // blocked/dns/connecting are 0.
+                                    if let Some(timings) = &resp.timings {
+                                        let sub_timing_metrics = [
+                                            ("http_req_blocked", timings.blocked),
+                                            ("http_req_dns", timings.dns),
+                                            ("http_req_connecting", timings.connecting),
+                                            ("http_req_tls_handshaking", timings.tls_handshaking),
+                                            ("http_req_sending", timings.sending),
+                                            ("http_req_waiting", timings.waiting),
+                                            ("http_req_receiving", timings.receiving),
+                                        ];
+                                        let sub_tags = tags.clone();
+                                        for (metric_name, dur) in &sub_timing_metrics {
+                                            result.samples.push(Sample {
+                                                metric: (*metric_name).into(),
+                                                value: dur.as_micros() as f64,
+                                                tags: sub_tags.clone(),
+                                                timestamp: now,
+                                                sample_type: SampleType::Trend,
+                                            });
+                                        }
                                     }
                                 }
                             }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "VU {} request '{}' failed: {}",
+                                    iteration_index,
+                                    item.name,
+                                    e
+                                );
+                                let err_tags = Arc::new(TagMap::from_pairs([
+                                    ("url", resolved_url.clone()),
+                                    ("method", request.method.to_string()),
+                                    ("name", item.name.clone()),
+                                    ("error", e.to_string()),
+                                ]));
+                                let now = std::time::SystemTime::now();
+                                result.samples.push(tropel_core::types::Sample {
+                                    metric: "errors".into(),
+                                    value: 1.0,
+                                    tags: err_tags.clone(),
+                                    timestamp: now,
+                                    sample_type: SampleType::Counter,
+                                });
+                                // Connection errors always count as failed requests
+                                result.samples.push(tropel_core::types::Sample {
+                                    metric: "http_req_failed".into(),
+                                    value: 1.0,
+                                    tags: err_tags,
+                                    timestamp: now,
+                                    sample_type: SampleType::Rate,
+                                });
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!(
-                                "VU {} request '{}' failed: {}",
-                                iteration_index,
-                                item.name,
-                                e
-                            );
-                            let err_tags = Arc::new(TagMap::from_pairs([
-                                ("url", resolved_url.clone()),
-                                ("method", request.method.to_string()),
-                                ("name", item.name.clone()),
-                                ("error", e.to_string()),
-                            ]));
-                            let now = std::time::SystemTime::now();
-                            result.samples.push(tropel_core::types::Sample {
-                                metric: "errors".into(),
-                                value: 1.0,
-                                tags: err_tags.clone(),
-                                timestamp: now,
-                                sample_type: SampleType::Counter,
-                            });
-                            // Connection errors always count as failed requests
-                            result.samples.push(tropel_core::types::Sample {
-                                metric: "http_req_failed".into(),
-                                value: 1.0,
-                                tags: err_tags,
-                                timestamp: now,
-                                sample_type: SampleType::Rate,
-                            });
-                        }
-                    }
                     }
                 }
 
@@ -595,8 +594,7 @@ impl VURunner {
                 if !skip_item {
                     if let Some(script) = &item.test {
                         let source_url = Some(format!("{}.test.js", item.name));
-                        if let Err(e) =
-                            Self::run_script(&mut self.js_ctx, script, source_url).await
+                        if let Err(e) = Self::run_script(&mut self.js_ctx, script, source_url).await
                         {
                             tracing::warn!("VU {} test script error: {}", iteration_index, e);
                             // Backlog line 98: record a failed check so the
@@ -941,12 +939,8 @@ mod tests {
             auth: None,
         });
         let execution_items = Arc::new(flatten_execution_items(&scenario.items));
-        let names: Arc<Vec<String>> = Arc::new(
-            execution_items
-                .iter()
-                .map(|i| i.name.clone())
-                .collect(),
-        );
+        let names: Arc<Vec<String>> =
+            Arc::new(execution_items.iter().map(|i| i.name.clone()).collect());
         let client = HttpClient::new(&tropel_core::config::HttpConfig::default())
             .expect("http client should construct");
         let runner = VURunner::new(
@@ -994,7 +988,10 @@ mod tests {
         // writes. The most common Postman pattern — request 1 saves a token,
         // request 2 sends `Bearer {{authToken}}` — sent the literal string.
         let mut static_env = HashMap::new();
-        static_env.insert("BASE_URL".to_string(), "https://api.example.com".to_string());
+        static_env.insert(
+            "BASE_URL".to_string(),
+            "https://api.example.com".to_string(),
+        );
         let mut script_set = HashMap::new();
         script_set.insert("authToken".to_string(), "tok-abc-123".to_string());
         let (_, scope) = runner_with_env_override(static_env.clone(), script_set);
@@ -1069,19 +1066,11 @@ mod tests {
             auth: None,
         });
         let execution_items = Arc::new(flatten_execution_items(&scenario.items));
-        let names: Arc<Vec<String>> = Arc::new(
-            execution_items.iter().map(|i| i.name.clone()).collect(),
-        );
+        let names: Arc<Vec<String>> =
+            Arc::new(execution_items.iter().map(|i| i.name.clone()).collect());
         let client = HttpClient::new(&tropel_core::config::HttpConfig::default())
             .expect("http client should construct");
-        let mut runner = VURunner::new(
-            scenario,
-            execution_items,
-            names,
-            client,
-            0,
-            "loop".into(),
-        );
+        let mut runner = VURunner::new(scenario, execution_items, names, client, 0, "loop".into());
 
         // Wire a real JS context with the pm shim + bridge so the prerequest
         // script can actually call setNextRequest.
@@ -1106,12 +1095,10 @@ mod tests {
         let env = HashMap::new();
         // 30s outer guard: if the jump counter regresses, the loop spins and
         // this times out instead of hanging the whole test suite.
-        let result = tokio::time::timeout(
-            Duration::from_secs(30),
-            runner.run_iteration(0, None, &env),
-        )
-        .await
-        .expect("setNextRequest self-loop must terminate (jump guard)");
+        let result =
+            tokio::time::timeout(Duration::from_secs(30), runner.run_iteration(0, None, &env))
+                .await
+                .expect("setNextRequest self-loop must terminate (jump guard)");
         assert!(
             result.script_failures >= 1,
             "runaway jump must be recorded as a script failure"

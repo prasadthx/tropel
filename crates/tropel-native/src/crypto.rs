@@ -409,8 +409,8 @@ pub fn aes_gcm_decrypt(key: &[u8], nonce: &[u8], ciphertext: &[u8]) -> Result<Ve
 
 /// AES-CBC encrypt with PKCS7 padding, key-size dispatch (16/24/32 bytes).
 pub fn aes_cbc_encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
-    use cbc::cipher::{Array, BlockModeEncrypt, KeyIvInit as _};
     use cbc::cipher::block_padding::Pkcs7;
+    use cbc::cipher::{Array, BlockModeEncrypt, KeyIvInit as _};
 
     if iv.len() != 16 {
         return Err(tropel_core::TropelError::Crypto(
@@ -430,20 +430,20 @@ pub fn aes_cbc_encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8
     };
     let encrypted = match key.len() {
         16 => {
-            let key_arr =
-                Array::<u8, aes::cipher::consts::U16>::try_from(key).map_err(|_| err_key(key.len()))?;
+            let key_arr = Array::<u8, aes::cipher::consts::U16>::try_from(key)
+                .map_err(|_| err_key(key.len()))?;
             cbc::Encryptor::<aes::Aes128>::new(&key_arr, &iv_arr)
                 .encrypt_padded::<Pkcs7>(&mut buf, plaintext.len())
         }
         24 => {
-            let key_arr =
-                Array::<u8, aes::cipher::consts::U24>::try_from(key).map_err(|_| err_key(key.len()))?;
+            let key_arr = Array::<u8, aes::cipher::consts::U24>::try_from(key)
+                .map_err(|_| err_key(key.len()))?;
             cbc::Encryptor::<aes::Aes192>::new(&key_arr, &iv_arr)
                 .encrypt_padded::<Pkcs7>(&mut buf, plaintext.len())
         }
         32 => {
-            let key_arr =
-                Array::<u8, aes::cipher::consts::U32>::try_from(key).map_err(|_| err_key(key.len()))?;
+            let key_arr = Array::<u8, aes::cipher::consts::U32>::try_from(key)
+                .map_err(|_| err_key(key.len()))?;
             cbc::Encryptor::<aes::Aes256>::new(&key_arr, &iv_arr)
                 .encrypt_padded::<Pkcs7>(&mut buf, plaintext.len())
         }
@@ -456,8 +456,8 @@ pub fn aes_cbc_encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8
 
 /// AES-CBC decrypt with PKCS7 padding, key-size dispatch (16/24/32 bytes).
 pub fn aes_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
-    use cbc::cipher::{Array, BlockModeDecrypt, KeyIvInit as _};
     use cbc::cipher::block_padding::Pkcs7;
+    use cbc::cipher::{Array, BlockModeDecrypt, KeyIvInit as _};
 
     if iv.len() != 16 {
         return Err(tropel_core::TropelError::Crypto(
@@ -480,18 +480,18 @@ pub fn aes_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u
     };
     let decrypted = match key.len() {
         16 => {
-            let key_arr =
-                Array::<u8, aes::cipher::consts::U16>::try_from(key).map_err(|_| err_key(key.len()))?;
+            let key_arr = Array::<u8, aes::cipher::consts::U16>::try_from(key)
+                .map_err(|_| err_key(key.len()))?;
             cbc::Decryptor::<aes::Aes128>::new(&key_arr, &iv_arr).decrypt_padded::<Pkcs7>(&mut buf)
         }
         24 => {
-            let key_arr =
-                Array::<u8, aes::cipher::consts::U24>::try_from(key).map_err(|_| err_key(key.len()))?;
+            let key_arr = Array::<u8, aes::cipher::consts::U24>::try_from(key)
+                .map_err(|_| err_key(key.len()))?;
             cbc::Decryptor::<aes::Aes192>::new(&key_arr, &iv_arr).decrypt_padded::<Pkcs7>(&mut buf)
         }
         32 => {
-            let key_arr =
-                Array::<u8, aes::cipher::consts::U32>::try_from(key).map_err(|_| err_key(key.len()))?;
+            let key_arr = Array::<u8, aes::cipher::consts::U32>::try_from(key)
+                .map_err(|_| err_key(key.len()))?;
             cbc::Decryptor::<aes::Aes256>::new(&key_arr, &iv_arr).decrypt_padded::<Pkcs7>(&mut buf)
         }
         n => return Err(err_key(n)),
@@ -588,9 +588,9 @@ mod tests {
         let nonce = b"012345678901";
         let pt = b"hello world";
         for key in [
-            b"0123456789abcdef".as_slice(),                    // 16 = AES-128
-            b"0123456789abcdef01234567".as_slice(),            // 24 = AES-192
-            b"0123456789abcdef0123456789abcdef".as_slice(),    // 32 = AES-256
+            b"0123456789abcdef".as_slice(),                 // 16 = AES-128
+            b"0123456789abcdef01234567".as_slice(),         // 24 = AES-192
+            b"0123456789abcdef0123456789abcdef".as_slice(), // 32 = AES-256
         ] {
             let ct = aes_gcm_encrypt(key, nonce, pt).unwrap();
             assert_eq!(aes_gcm_decrypt(key, nonce, &ct).unwrap(), pt);

@@ -74,27 +74,26 @@ impl VariableResolver {
         let after_dynamic = self.dynamic_catalog.resolve(input);
 
         // Then resolve scoped variables ({{var_name}})
-        let result = var_re()
-            .replace_all(&after_dynamic, |caps: &regex::Captures| {
-                let var_name = caps.get(1).unwrap().as_str().trim();
+        let result = var_re().replace_all(&after_dynamic, |caps: &regex::Captures| {
+            let var_name = caps.get(1).unwrap().as_str().trim();
 
-                // Skip dynamic vars (already handled)
-                if var_name.starts_with('$') {
-                    return caps.get(0).unwrap().as_str().to_string();
-                }
+            // Skip dynamic vars (already handled)
+            if var_name.starts_with('$') {
+                return caps.get(0).unwrap().as_str().to_string();
+            }
 
-                let value = self.resolve_variable(var_name, scope);
-                if value.starts_with("{{") && value.ends_with("}}") {
-                    // Unresolved — keep the literal placeholder.
-                    value
-                } else {
-                    match mode {
-                        EscapeMode::None => value,
-                        EscapeMode::Json => json_escape(&value),
-                        EscapeMode::Url => url_escape(&value),
-                    }
+            let value = self.resolve_variable(var_name, scope);
+            if value.starts_with("{{") && value.ends_with("}}") {
+                // Unresolved — keep the literal placeholder.
+                value
+            } else {
+                match mode {
+                    EscapeMode::None => value,
+                    EscapeMode::Json => json_escape(&value),
+                    EscapeMode::Url => url_escape(&value),
                 }
-            });
+            }
+        });
 
         result.to_string()
     }
@@ -229,7 +228,8 @@ fn json_escape(value: &str) -> String {
 /// `%` that turns out to be literal `%` is harmless, while leaving one
 /// unencoded could let a crafted value smuggle reserved characters through.
 fn url_escape(value: &str) -> String {
-    const UNRESERVED: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/:@";
+    const UNRESERVED: &str =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/:@";
     let mut out = String::with_capacity(value.len() + 8);
     for b in value.bytes() {
         if UNRESERVED.contains(b as char) {
@@ -408,7 +408,9 @@ mod tests {
         // {{$randomInt}} — fresh integer in [0, 1000) per occurrence.
         for _ in 0..20 {
             let ri = resolver.resolve("{{$randomInt}}", &scope);
-            let n: i64 = ri.parse().unwrap_or_else(|_| panic!("randomInt is numeric: {ri}"));
+            let n: i64 = ri
+                .parse()
+                .unwrap_or_else(|_| panic!("randomInt is numeric: {ri}"));
             assert!((0..1000).contains(&n), "randomInt in range: {ri}");
         }
     }

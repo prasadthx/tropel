@@ -316,7 +316,9 @@ pub fn parse_dep_spec(spec: &str) -> Result<ExtensionDep> {
     // A git dep without a reference also floats (default branch moves under
     // you between builds). Same loud guidance as the registry `*` case.
     if let ExtensionDep::Git {
-        name, reference: None, ..
+        name,
+        reference: None,
+        ..
     } = &dep
     {
         println!(

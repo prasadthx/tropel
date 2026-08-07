@@ -25,8 +25,25 @@ fn plain_safe(s: &str) -> bool {
     // Indicator characters that would change the node kind if leading.
     if matches!(
         first,
-        '-' | '?' | ':' | ',' | '[' | ']' | '{' | '}' | '#' | '&' | '*' | '!' | '|' | '>' | '\''
-            | '"' | '%' | '@' | '`' | '~'
+        '-' | '?'
+            | ':'
+            | ','
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '#'
+            | '&'
+            | '*'
+            | '!'
+            | '|'
+            | '>'
+            | '\''
+            | '"'
+            | '%'
+            | '@'
+            | '`'
+            | '~'
     ) {
         return false;
     }
@@ -97,7 +114,10 @@ fn is_yaml_resolvable(s: &str) -> bool {
         return true;
     }
     let lower = s.to_ascii_lowercase();
-    if matches!(lower.as_str(), "true" | "false" | "yes" | "no" | "on" | "off" | "null") {
+    if matches!(
+        lower.as_str(),
+        "true" | "false" | "yes" | "no" | "on" | "off" | "null"
+    ) {
         return true;
     }
     if s.contains(':') {
@@ -262,7 +282,13 @@ mod tests {
     #[test]
     fn resolvable_lookalikes_stay_plain() {
         // `:`-bearing and multi-token strings never type-resolve.
-        for s in ["0.0.0.0:17890", "reg/tropel:v1", "tropel:latest", "None", "loadtest"] {
+        for s in [
+            "0.0.0.0:17890",
+            "reg/tropel:v1",
+            "tropel:latest",
+            "None",
+            "loadtest",
+        ] {
             assert_eq!(scalar(s), s, "expected {s:?} to stay plain");
         }
     }
@@ -280,7 +306,10 @@ mod tests {
         d.key(0, "data");
         d.block(1, "job.json", "{\n  \"a\": 1\n}");
         let out = d.finish();
-        assert_eq!(out, "data:\n  job.json: |-\n      {\n        \"a\": 1\n      }\n");
+        assert_eq!(
+            out,
+            "data:\n  job.json: |-\n      {\n        \"a\": 1\n      }\n"
+        );
     }
 
     #[test]

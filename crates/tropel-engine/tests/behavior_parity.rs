@@ -23,7 +23,9 @@ use std::collections::HashMap;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tropel_core::config::{ExecutionConfig, JobConfig, OutputConfig, Stage, ThresholdConfig, ThinkTimeConfig};
+use tropel_core::config::{
+    ExecutionConfig, JobConfig, OutputConfig, Stage, ThinkTimeConfig, ThresholdConfig,
+};
 use tropel_core::Result;
 use tropel_engine::Engine;
 use tropel_ext::registry::ExtensionRegistry;
@@ -35,7 +37,9 @@ async fn start_echo_server() -> std::net::SocketAddr {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { break };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
             tokio::spawn(async move {
                 let mut head = Vec::new();
                 let mut buf = [0u8; 4096];
@@ -134,7 +138,11 @@ async fn k6_script_records_requests_checks_and_real_latency() -> Result<()> {
 
     // 2. The k6 shim's check() recorded — and everything passed (the server
     //    always answers 200, so a single failure means the bridge is broken).
-    assert!(m.checks_total > 0, "checks_total > 0, got {}", m.checks_total);
+    assert!(
+        m.checks_total > 0,
+        "checks_total > 0, got {}",
+        m.checks_total
+    );
     assert_eq!(
         m.checks_failed, 0,
         "all checks passed, got {} failed of {} total",
@@ -147,7 +155,10 @@ async fn k6_script_records_requests_checks_and_real_latency() -> Result<()> {
         .as_ref()
         .expect("http_req_duration summary present");
     assert!(dur.count > 0, "http_req_duration has samples");
-    assert!(dur.max > 0, "http_req_duration max > 0 (real latency measured)");
+    assert!(
+        dur.max > 0,
+        "http_req_duration max > 0 (real latency measured)"
+    );
 
     // 4. The threshold evaluation passes on the real series.
     let threshold_results = evaluate_thresholds(&result.effective_thresholds, m);
@@ -226,7 +237,11 @@ async fn ramping_stages_span_wall_clock_and_reach_target() -> Result<()> {
     );
 
     // 3. Requests actually fired during the ramp.
-    assert!(m.http_reqs > 0, "http_reqs > 0 during ramp, got {}", m.http_reqs);
+    assert!(
+        m.http_reqs > 0,
+        "http_reqs > 0 during ramp, got {}",
+        m.http_reqs
+    );
 
     let _ = std::fs::remove_file(&coll);
     Ok(())

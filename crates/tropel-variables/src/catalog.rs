@@ -10,9 +10,7 @@ use regex::Regex;
 macro_rules! cached_re {
     ($name:ident, $pattern:literal) => {{
         static $name: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-        $name.get_or_init(|| {
-            regex::Regex::new($pattern).expect("valid dynamic-variable regex")
-        })
+        $name.get_or_init(|| regex::Regex::new($pattern).expect("valid dynamic-variable regex"))
     }};
 }
 
@@ -126,7 +124,10 @@ impl DynamicCatalog {
 
         // {{$randomAlphabetic[:length]}}
         if result.contains("{{$randomAlphabetic") {
-            let re = cached_re!(RE_RANDOM_ALPHABETIC, r"\{\{\$randomAlphabetic(?::(\d+))?\}\}");
+            let re = cached_re!(
+                RE_RANDOM_ALPHABETIC,
+                r"\{\{\$randomAlphabetic(?::(\d+))?\}\}"
+            );
             result = self.replace_with_func(&result, &re, |caps| {
                 let len = capped_len(caps.get(1).map(|m| m.as_str()), 10);
                 random_string(
@@ -139,7 +140,10 @@ impl DynamicCatalog {
 
         // {{$randomAlphanumeric[:length]}}
         if result.contains("{{$randomAlphanumeric") {
-            let re = cached_re!(RE_RANDOM_ALPHANUMERIC, r"\{\{\$randomAlphanumeric(?::(\d+))?\}\}");
+            let re = cached_re!(
+                RE_RANDOM_ALPHANUMERIC,
+                r"\{\{\$randomAlphanumeric(?::(\d+))?\}\}"
+            );
             result = self.replace_with_func(&result, &re, |caps| {
                 let len = capped_len(caps.get(1).map(|m| m.as_str()), 10);
                 random_string(
@@ -820,8 +824,15 @@ mod tests {
         assert_eq!(capped_len(Some("5"), 10), 5);
         // Overflowing usize parse (the regex only feeds digits, so a parse
         // failure IS an overflow) clamps to the cap — the attack case.
-        assert_eq!(capped_len(Some("999999999999999999999999"), 10), MAX_DYNAMIC_LENGTH);
-        assert_eq!(capped_len(Some("abc"), 8), MAX_DYNAMIC_LENGTH, "any parse failure clamps to the cap");
+        assert_eq!(
+            capped_len(Some("999999999999999999999999"), 10),
+            MAX_DYNAMIC_LENGTH
+        );
+        assert_eq!(
+            capped_len(Some("abc"), 8),
+            MAX_DYNAMIC_LENGTH,
+            "any parse failure clamps to the cap"
+        );
         assert_eq!(capped_len(None, 12), 12);
     }
 

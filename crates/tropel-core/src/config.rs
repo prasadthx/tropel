@@ -28,7 +28,6 @@ pub struct ThinkTimeConfig {
     pub iteration_pacing: Option<String>,
 }
 
-
 /// Configuration for a single named scenario within a multi-scenario run.
 /// Each scenario has its own executor, input, env, tags, and optional start time.
 /// When only a single scenario is running, the top-level `execution` field is used
@@ -718,7 +717,6 @@ pub struct TlsConfig {
     pub client_passphrase: Option<String>,
     pub allowed_ciphers: Vec<String>,
 }
-
 
 impl Default for JobConfig {
     fn default() -> Self {

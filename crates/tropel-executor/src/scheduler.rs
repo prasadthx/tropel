@@ -157,7 +157,10 @@ pub struct ControlSpawnGuard<'a> {
 
 impl<'a> ControlSpawnGuard<'a> {
     pub fn new(sched: &'a VUScheduler) -> Self {
-        Self { sched, claimed: false }
+        Self {
+            sched,
+            claimed: false,
+        }
     }
 
     /// Mark that the ramp-down claim path already decremented the count.
@@ -313,8 +316,13 @@ impl VUScheduler {
 
     /// Whether this scheduler is in arrival-rate mode.
     pub fn is_arrival_rate(&self) -> bool {
-        matches!(self.config.as_ref(), ExecutionConfig::ConstantArrivalRate { .. })
-            || matches!(self.config.as_ref(), ExecutionConfig::RampingArrivalRate { .. })
+        matches!(
+            self.config.as_ref(),
+            ExecutionConfig::ConstantArrivalRate { .. }
+        ) || matches!(
+            self.config.as_ref(),
+            ExecutionConfig::RampingArrivalRate { .. }
+        )
     }
 
     /// Mark a VU as idle (waiting for an arrival token). Prefer the RAII
@@ -441,12 +449,8 @@ impl VUScheduler {
         match self.config.as_ref() {
             ExecutionConfig::ConstantVus { vus, .. } => *vus,
             ExecutionConfig::RampingVus {
-                stages,
-                start_vus,
-                ..
-            } => stages
-                .iter()
-                .fold(*start_vus, |acc, s| acc.max(s.target)),
+                stages, start_vus, ..
+            } => stages.iter().fold(*start_vus, |acc, s| acc.max(s.target)),
             ExecutionConfig::SharedIterations { vus, .. } => *vus,
             ExecutionConfig::ConstantArrivalRate { max_vus, .. } => *max_vus,
             ExecutionConfig::PerVUIterations { vus, .. } => *vus,
@@ -614,9 +618,7 @@ impl VUScheduler {
                 graceful_stop,
                 ..
             } => {
-                let duration = duration
-                    .as_ref()
-                    .and_then(|d| parse_duration(d).ok());
+                let duration = duration.as_ref().and_then(|d| parse_duration(d).ok());
                 let grace = graceful_stop_duration(graceful_stop);
                 self.run_externally_controlled(*vus, *max_vus, duration, grace, &run_vu)
                     .await;
@@ -658,8 +660,7 @@ impl VUScheduler {
         // Bounded: a VU ignoring force_stop and never tripping the JS
         // interrupt cannot hang the run forever (P2 · maxDuration trailing
         // join untimed).
-        Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND)
-            .await;
+        Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND).await;
 
         tracing::info!("Constant VUs finished");
     }
@@ -812,8 +813,7 @@ impl VUScheduler {
         self.wait_for_drain(grace).await;
 
         // Wait for all JoinHandles (bounded — see await_handles_bounded)
-        Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND)
-            .await;
+        Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND).await;
 
         tracing::info!("Ramping VUs finished");
     }
@@ -1048,8 +1048,7 @@ impl VUScheduler {
         self.wait_for_drain(grace).await;
 
         // Bounded join — a stuck VU cannot hang the run (P2 trailing join)
-        Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND)
-            .await;
+        Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND).await;
 
         let dropped_total = self.arrival_dropped.load(Ordering::Relaxed);
         tracing::info!(
@@ -1199,8 +1198,7 @@ impl VUScheduler {
         self.wait_for_drain(grace).await;
 
         // Bounded join — a stuck VU cannot hang the run (P2 trailing join)
-        Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND)
-            .await;
+        Self::await_handles_bounded(&mut handles, HANDLE_JOIN_BOUND).await;
 
         let dropped_total = self.arrival_dropped.load(Ordering::Relaxed);
         tracing::info!("Ramping arrival rate finished (dropped: {})", dropped_total);
@@ -1298,7 +1296,8 @@ impl VUScheduler {
         // configured ceiling the control API can never raise past.
         self.control_hard_max.store(max_vus, Ordering::Release);
         self.control_max_vus.store(max_vus, Ordering::Release);
-        self.control_target_vus.store(vus.min(max_vus), Ordering::Release);
+        self.control_target_vus
+            .store(vus.min(max_vus), Ordering::Release);
 
         let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         // Ids come from the process-wide monotonic allocator — globally unique
@@ -1391,7 +1390,11 @@ impl VUScheduler {
                 if self.ramp_down_remaining.load(Ordering::Relaxed) == 0 {
                     self.set_ramp_down_target(target, spawned);
                 }
-                tracing::debug!("Externally-controlled: shrinking pool {} → {}", spawned, target);
+                tracing::debug!(
+                    "Externally-controlled: shrinking pool {} → {}",
+                    spawned,
+                    target
+                );
             }
 
             tokio::select! {
@@ -1786,7 +1789,11 @@ mod tests {
             let _guard = sched.idle_guard();
             assert_eq!(sched.idle_vu_count(), 1);
         }
-        assert_eq!(sched.idle_vu_count(), 0, "idle count must be restored on drop");
+        assert_eq!(
+            sched.idle_vu_count(),
+            0,
+            "idle count must be restored on drop"
+        );
 
         // mark_busy at 0 must saturate, not wrap to u32::MAX.
         sched.mark_busy();
@@ -1815,7 +1822,12 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         let before = handles.len();
         handles.retain(|h| !h.is_finished());
-        assert_eq!(handles.len(), 1, "finished handles must be reaped ({before} → {})", handles.len());
+        assert_eq!(
+            handles.len(),
+            1,
+            "finished handles must be reaped ({before} → {})",
+            handles.len()
+        );
 
         // The remaining live handle still completes normally.
         handles.remove(0).await.unwrap();

@@ -240,7 +240,8 @@ impl Default for LatencyHistogram {
     fn default() -> Self {
         Self::new()
     }
-}/// Snapshot of histogram statistics.
+}
+/// Snapshot of histogram statistics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HistogramStats {
     pub count: u64,
@@ -284,6 +285,32 @@ mod tests {
     }
 
     #[test]
+    fn percentiles_track_ground_truth() {
+        // Backlog §6 P1: the old tests were self-consistency only (h == h2,
+        // merged == direct) — a p50() returning the mean would pass all of
+        // them. Record 1..=1000 µs (mean = 500.5) and assert each percentile
+        // tracks its own ground truth, NOT the mean.
+        let mut h = LatencyHistogram::new();
+        for v in 1..=1000u64 {
+            h.record_micros(v);
+        }
+        // hdr-histogram returns the upper edge of the bucket containing the
+        // requested percentile, so allow ±3 µs of quantization tolerance. The
+        // point is p50 ≈ 500 while p90 ≈ 900 — a mean-returning p50 would
+        // give ~500.5 for ALL of them.
+        let approx = |got: u64, want: u64| (got as i64 - want as i64).abs() <= 3;
+        assert!(approx(h.p50(), 500), "p50={} ~= 500", h.p50());
+        assert!(approx(h.p90(), 900), "p90={} ~= 900", h.p90());
+        assert!(approx(h.p95(), 950), "p95={} ~= 950", h.p95());
+        assert!(approx(h.p99(), 990), "p99={} ~= 990", h.p99());
+        // min/max/sum/mean must also be exact-ish for this uniform set.
+        assert_eq!(h.min(), 1);
+        assert_eq!(h.max(), 1000);
+        assert_eq!(h.count(), 1000);
+        assert!((h.mean() - 500.5).abs() < 1.0, "mean={}", h.mean());
+    }
+
+    #[test]
     fn garbage_bounds_fall_back_to_auto_resize() {
         // Backlog P3: hdr-histogram requires high >= 2*low (low >= 1); a
         // garbage ceiling must fall back gracefully, never panic inside the
@@ -296,12 +323,20 @@ mod tests {
         let mut h = LatencyHistogram::with_bounds(0, 0);
         h.record_micros(5_000_000); // 5 s — above any fixed tiny ceiling
         assert_eq!(h.count(), 1, "the sample must not be dropped");
-        assert!(h.max() >= 5_000_000, "max={} must cover the recorded value", h.max());
+        assert!(
+            h.max() >= 5_000_000,
+            "max={} must cover the recorded value",
+            h.max()
+        );
 
         let mut h2 = LatencyHistogram::with_bounds(1, 1); // high < 2*low
         h2.record_micros(1_000);
         assert_eq!(h2.count(), 1);
-        assert!(h2.max() >= 1_000, "max={} must cover the recorded value", h2.max());
+        assert!(
+            h2.max() >= 1_000,
+            "max={} must cover the recorded value",
+            h2.max()
+        );
     }
 
     #[test]

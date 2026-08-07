@@ -314,7 +314,10 @@ impl LiveState {
         let (filled, pct) = match self.total_duration {
             Some(total) if total > Duration::ZERO => {
                 let frac = (elapsed.as_secs_f64() / total.as_secs_f64()).clamp(0.0, 1.0);
-                (((frac * BAR_WIDTH as f64).round()) as usize, (frac * 100.0) as u64)
+                (
+                    ((frac * BAR_WIDTH as f64).round()) as usize,
+                    (frac * 100.0) as u64,
+                )
             }
             _ => (0, 0),
         };
@@ -322,7 +325,12 @@ impl LiveState {
             .map(|i| if i < filled { '█' } else { '░' })
             .collect();
 
-        let elapsed_str = format!("{:02}m{:02}.{:01}s", mins, secs_remainder, elapsed.subsec_millis() / 100);
+        let elapsed_str = format!(
+            "{:02}m{:02}.{:01}s",
+            mins,
+            secs_remainder,
+            elapsed.subsec_millis() / 100
+        );
         let line2 = match self.total_duration {
             // Fixed target: bar fills toward 100% with elapsed/total.
             Some(t) if t > Duration::ZERO => {

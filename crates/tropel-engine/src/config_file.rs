@@ -210,8 +210,7 @@ fn env_execution(
     }
 
     if stages.is_some() {
-        let stage_list = stages
-            .and_then(|s| serde_json::from_str::<Vec<Stage>>(s).ok())?;
+        let stage_list = stages.and_then(|s| serde_json::from_str::<Vec<Stage>>(s).ok())?;
         if !stage_list.is_empty() {
             return Some(ExecutionConfig::RampingVus {
                 stages: stage_list,

@@ -13,7 +13,7 @@
 use base64::Engine;
 use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use rand::RngExt;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -136,9 +136,10 @@ impl AuthSigner for ApiKeyAuth {
     fn sign(&self, request: &mut reqwest::Request) -> Result<()> {
         match self.location {
             ApiKeyLocation::Header => {
-                let key = reqwest::header::HeaderName::from_bytes(self.key.as_bytes()).map_err(
-                    |_| TropelError::Http("API key name is not a valid header name".into()),
-                )?;
+                let key =
+                    reqwest::header::HeaderName::from_bytes(self.key.as_bytes()).map_err(|_| {
+                        TropelError::Http("API key name is not a valid header name".into())
+                    })?;
                 let value = self.value.parse().map_err(|_| {
                     TropelError::Http("API key value is not a valid header value".into())
                 })?;
@@ -360,8 +361,8 @@ fn hex_sha256(bytes: &[u8]) -> String {
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key)
-        .expect("HMAC-SHA256 accepts any key length");
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }
@@ -522,7 +523,10 @@ impl AuthSigner for OAuth1Auth {
         let mut oauth: Vec<(String, String)> = vec![
             ("oauth_consumer_key".to_string(), self.consumer_key.clone()),
             ("oauth_nonce".to_string(), nonce.clone()),
-            ("oauth_signature_method".to_string(), "HMAC-SHA1".to_string()),
+            (
+                "oauth_signature_method".to_string(),
+                "HMAC-SHA1".to_string(),
+            ),
             ("oauth_timestamp".to_string(), timestamp.clone()),
             ("oauth_version".to_string(), "1.0".to_string()),
         ];
@@ -563,10 +567,7 @@ impl AuthSigner for OAuth1Auth {
 /// component is percent-encoded per RFC 3986 (unreserved chars pass
 /// through); the params are sorted by encoded name (then value).
 fn oauth1_base_string(method: &str, base_uri: &str, params: &[(String, String)]) -> String {
-    let mut encoded: Vec<(String, String)> = params
-        .iter()
-        .map(|(k, v)| (enc(k), enc(v)))
-        .collect();
+    let mut encoded: Vec<(String, String)> = params.iter().map(|(k, v)| (enc(k), enc(v))).collect();
     encoded.sort();
     let param_string = encoded
         .iter()
@@ -598,7 +599,10 @@ fn is_form_urlencoded(request: &reqwest::Request) -> bool {
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_ascii_lowercase().starts_with("application/x-www-form-urlencoded"))
+        .map(|v| {
+            v.to_ascii_lowercase()
+                .starts_with("application/x-www-form-urlencoded")
+        })
         .unwrap_or(false)
 }
 
@@ -620,7 +624,10 @@ fn parse_form(bytes: &[u8]) -> Vec<(String, String)> {
 
 fn percent_decode(s: &str) -> Option<String> {
     use percent_encoding::percent_decode_str;
-    percent_decode_str(s).decode_utf8().ok().map(|c| c.to_string())
+    percent_decode_str(s)
+        .decode_utf8()
+        .ok()
+        .map(|c| c.to_string())
 }
 
 fn base_url(url: &reqwest::Url) -> String {
@@ -673,13 +680,9 @@ impl AuthSigner for HawkAuth {
             None => url.path().to_string(),
         };
         let host = bracket_host(url.host_str().unwrap_or(""));
-        let port = url.port().unwrap_or_else(|| {
-            if url.scheme() == "https" {
-                443
-            } else {
-                80
-            }
-        });
+        let port = url
+            .port()
+            .unwrap_or_else(|| if url.scheme() == "https" { 443 } else { 80 });
 
         // Normalized string per the Hawk spec (mozilla/hawk lib/crypto.js
         // generateNormalizedString): ts and nonce come FIRST, immediately
@@ -688,9 +691,8 @@ impl AuthSigner for HawkAuth {
         // previous ordering (method…port before ts/nonce) produced a MAC that
         // mismatches a Hawk server (verified against the Hawk API.md
         // reference vectors in the tests below).
-        let normalized = hawk_normalized_string(
-            &method, &ts, &nonce, &resource, &host, port, "", "",
-        );
+        let normalized =
+            hawk_normalized_string(&method, &ts, &nonce, &resource, &host, port, "", "");
         let mac = hawk_mac(&normalized, &self.auth_key, self.algorithm.as_deref());
 
         let header = format!(
@@ -723,9 +725,7 @@ fn hawk_normalized_string(
 ) -> String {
     let method = method.to_uppercase();
     let host = host.to_lowercase();
-    format!(
-        "hawk.1.header\n{ts}\n{nonce}\n{method}\n{resource}\n{host}\n{port}\n{hash}\n{ext}\n"
-    )
+    format!("hawk.1.header\n{ts}\n{nonce}\n{method}\n{resource}\n{host}\n{port}\n{hash}\n{ext}\n")
 }
 
 /// Hawk request MAC = base64(HMAC(algorithm, key, normalized)).
@@ -904,7 +904,9 @@ fn build_digest_authorization(
     // emit the field when the challenge actually specified it (some
     // strict servers reject an explicit `algorithm=MD5`).
     let server_algorithm = sess.algorithm.as_ref().map(|s| s.to_ascii_uppercase());
-    let algorithm = server_algorithm.clone().unwrap_or_else(|| "MD5".to_string());
+    let algorithm = server_algorithm
+        .clone()
+        .unwrap_or_else(|| "MD5".to_string());
     // RFC 7616 §3.4.4: the "-sess" variants (MD5-sess / SHA-256-sess)
     // only change how HA1 is derived (nonce + cnonce are folded in); the
     // hash function itself is always the base algorithm (MD5 or SHA-256).
@@ -1107,9 +1109,8 @@ fn set_auth_header(request: &mut reqwest::Request, value: &str) -> Result<()> {
 }
 
 fn insert_header(request: &mut reqwest::Request, name: &str, value: &str) -> Result<()> {
-    let header_name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-        TropelError::Http(format!("'{name}' is not a valid HTTP header name"))
-    })?;
+    let header_name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| TropelError::Http(format!("'{name}' is not a valid HTTP header name")))?;
     let header_value = value.parse().map_err(|_| {
         TropelError::Http(format!("'{name}' value is not a valid HTTP header value"))
     })?;
@@ -1130,7 +1131,10 @@ fn generate_nonce() -> String {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let counter = NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{:016x}", seed ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+    format!(
+        "{:016x}",
+        seed ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    )
 }
 
 /// Cryptographically secure random nonce (16 bytes → 32 hex chars) for the
@@ -1287,10 +1291,20 @@ mod tests {
 
     #[test]
     fn sigv4_sets_required_headers() {
-        let mut req = build_request("GET", "https://examplebucket.s3.amazonaws.com/test.txt", None);
-        AwsSigV4Auth::new("AKID", "SECRET", Some("us-east-1".into()), Some("s3".into()), None)
-            .sign(&mut req)
-            .unwrap();
+        let mut req = build_request(
+            "GET",
+            "https://examplebucket.s3.amazonaws.com/test.txt",
+            None,
+        );
+        AwsSigV4Auth::new(
+            "AKID",
+            "SECRET",
+            Some("us-east-1".into()),
+            Some("s3".into()),
+            None,
+        )
+        .sign(&mut req)
+        .unwrap();
         let h = auth_header(&req);
         assert!(h.starts_with("AWS4-HMAC-SHA256 Credential=AKID/"));
         assert!(h.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date"));
@@ -1310,11 +1324,20 @@ mod tests {
         let canonical = sigv4_canonical_uri("/my%20file%2Fname", "execute-api");
         assert_eq!(canonical, "/my%2520file%252Fname");
         // The S3 family signs the single-encoded path exactly as sent.
-        assert_eq!(sigv4_canonical_uri("/my%20file%2Fname", "s3"), "/my%20file%2Fname");
-        assert_eq!(sigv4_canonical_uri("/my%20file%2Fname", "s3-object-lambda"), "/my%20file%2Fname");
+        assert_eq!(
+            sigv4_canonical_uri("/my%20file%2Fname", "s3"),
+            "/my%20file%2Fname"
+        );
+        assert_eq!(
+            sigv4_canonical_uri("/my%20file%2Fname", "s3-object-lambda"),
+            "/my%20file%2Fname"
+        );
         // S3 Control's signing name is hyphenated ("s3-control") — must not
         // double-encode either.
-        assert_eq!(sigv4_canonical_uri("/my%20file%2Fname", "s3-control"), "/my%20file%2Fname");
+        assert_eq!(
+            sigv4_canonical_uri("/my%20file%2Fname", "s3-control"),
+            "/my%20file%2Fname"
+        );
         // Empty path → "/".
         assert_eq!(sigv4_canonical_uri("", "execute-api"), "/");
         // Empty segments (leading/trailing slash) are preserved.
@@ -1388,12 +1411,19 @@ mod tests {
         .unwrap();
         // x-amz-date may differ across seconds; signature differs only if date
         // rolled over — instead compare shape.
-        assert_eq!(req.headers().get("x-amz-content-sha256"), req2.headers().get("x-amz-content-sha256"));
+        assert_eq!(
+            req.headers().get("x-amz-content-sha256"),
+            req2.headers().get("x-amz-content-sha256")
+        );
     }
 
     #[test]
     fn oauth1_produces_authorization_header() {
-        let mut req = build_request("GET", "http://example.com/request?b5=%3D%253D&a3=a&c%40=&a2=r%20b", None);
+        let mut req = build_request(
+            "GET",
+            "http://example.com/request?b5=%3D%253D&a3=a&c%40=&a2=r%20b",
+            None,
+        );
         OAuth1Auth::new(
             "dpf43f3p2l4k3l03",
             "kd94hf93k423kf44",
@@ -1427,9 +1457,13 @@ mod tests {
     #[test]
     fn hawk_produces_header() {
         let mut req = build_request("GET", "http://example.com:8000/resource/1?b=1&a=2", None);
-        HawkAuth::new("dh37fgj492je", "werxhqb98rpaxn39848xrunpaw3489ruxnpa98w4rxn", None)
-            .sign(&mut req)
-            .unwrap();
+        HawkAuth::new(
+            "dh37fgj492je",
+            "werxhqb98rpaxn39848xrunpaw3489ruxnpa98w4rxn",
+            None,
+        )
+        .sign(&mut req)
+        .unwrap();
         let h = auth_header(&req);
         assert!(h.starts_with("Hawk id=\"dh37fgj492je\""));
         assert!(h.contains("ts=\""));
@@ -1518,7 +1552,11 @@ mod tests {
             normalized,
             "hawk.1.header\n1353832234\nj4h3g2\nGET\n/resource/1?b=1&a=2\nexample.com\n8000\n\nsome-app-ext-data\n"
         );
-        let mac = hawk_mac(&normalized, "werxhqb98rpaxn39848xrunpaw3489ruxnpa98w4rxn", None);
+        let mac = hawk_mac(
+            &normalized,
+            "werxhqb98rpaxn39848xrunpaw3489ruxnpa98w4rxn",
+            None,
+        );
         assert_eq!(mac, "6R4rV5iE+NPoym+WwjeHzjAGXUtLNIxmo1vpMofpLAE=");
     }
 
@@ -1536,7 +1574,11 @@ mod tests {
             "Yi9LfIIFRtBEPt74PVmbTF/xVAwPn7ub15ePICfgnuY=",
             "some-app-ext-data",
         );
-        let mac = hawk_mac(&normalized, "werxhqb98rpaxn39848xrunpaw3489ruxnpa98w4rxn", None);
+        let mac = hawk_mac(
+            &normalized,
+            "werxhqb98rpaxn39848xrunpaw3489ruxnpa98w4rxn",
+            None,
+        );
         assert_eq!(mac, "aSe1DERmZuRl3pI36/9BdZmnErTw3sNzOOAUlfeKjVw=");
     }
 
@@ -1545,7 +1587,9 @@ mod tests {
         let www = r#"Digest realm="testrealm@host.com", qop="auth, auth-int", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", opaque="5ccc069c403ebaf9f0171e9517f40e41""#;
         let req = build_request("GET", "http://www.example.com/dir/index.html", None);
         let auth = DigestAuth::new("Mufasa", "Circle Of Life");
-        let header = auth.challenge_response(www, &req).expect("challenge response");
+        let header = auth
+            .challenge_response(www, &req)
+            .expect("challenge response");
         assert!(header.starts_with("Digest "));
         assert!(header.contains("username=\"Mufasa\""));
         assert!(header.contains("realm=\"testrealm@host.com\""));
@@ -1769,7 +1813,11 @@ mod tests {
                 .unwrap()
                 .to_string()
         };
-        assert_ne!(cnonce(&h1), cnonce(&h2), "Digest cnonce must vary per request");
+        assert_ne!(
+            cnonce(&h1),
+            cnonce(&h2),
+            "Digest cnonce must vary per request"
+        );
     }
 
     #[test]
@@ -1788,7 +1836,8 @@ mod tests {
         // Regression (backlog line 176): `WWW-Authenticate: Basic …, Digest …`
         // in ONE header line — the old parser only looked at the first
         // scheme, so Digest after Basic was silently skipped.
-        let www = r#"Basic realm="basic-realm", Digest realm="digest-realm", qop="auth", nonce="n1""#;
+        let www =
+            r#"Basic realm="basic-realm", Digest realm="digest-realm", qop="auth", nonce="n1""#;
         let m = find_digest_challenge(www).expect("digest challenge must be found");
         assert_eq!(m.get("realm").map(|s| s.as_str()), Some("digest-realm"));
         assert_eq!(m.get("nonce").map(|s| s.as_str()), Some("n1"));
@@ -1804,7 +1853,11 @@ mod tests {
         // value must still resolve the Digest challenge correctly.
         let joined = r#"Basic realm="b", Digest realm="d", nonce="n2", algorithm=SHA-256"#;
         let challenges = parse_challenges(joined);
-        assert_eq!(challenges.len(), 2, "two schemes must be split: {challenges:?}");
+        assert_eq!(
+            challenges.len(),
+            2,
+            "two schemes must be split: {challenges:?}"
+        );
         assert_eq!(challenges[0].0, "Basic");
         assert_eq!(challenges[1].0, "Digest");
         assert_eq!(challenges[1].1.get("realm").map(|s| s.as_str()), Some("d"));
@@ -1834,7 +1887,9 @@ mod tests {
         let www = r#"Digest realm="r", qop="auth", nonce="n1""#;
         let auth = DigestAuth::new("u", "p");
         let req1 = build_request("GET", "http://example.com/", None);
-        let h1 = auth.challenge_response(www, &req1).expect("first challenge");
+        let h1 = auth
+            .challenge_response(www, &req1)
+            .expect("first challenge");
         assert!(h1.contains("nc=00000001"), "first use must be nc=1: {h1}");
 
         // A fresh request to the SAME host: sign() must attach the cached
@@ -1848,7 +1903,10 @@ mod tests {
             .expect("sign must pre-attach the digest header")
             .to_string();
         assert!(auth_header.starts_with("Digest "));
-        assert!(auth_header.contains("nc=00000002"), "second use must be nc=2: {auth_header}");
+        assert!(
+            auth_header.contains("nc=00000002"),
+            "second use must be nc=2: {auth_header}"
+        );
 
         // A DIFFERENT host has no session: sign() must not attach anything.
         let mut req3 = build_request("GET", "http://other.example.com/", None);
@@ -1873,7 +1931,10 @@ mod tests {
         let h2 = auth
             .challenge_response(r#"Digest realm="r", qop="auth", nonce="nonce-a""#, &req)
             .unwrap();
-        assert!(h2.contains("nc=00000002"), "same nonce continues counting: {h2}");
+        assert!(
+            h2.contains("nc=00000002"),
+            "same nonce continues counting: {h2}"
+        );
         let h3 = auth
             .challenge_response(r#"Digest realm="r", qop="auth", nonce="nonce-b""#, &req)
             .unwrap();

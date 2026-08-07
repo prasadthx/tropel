@@ -72,13 +72,9 @@ impl Protocol for WebSocketProtocol {
         }
 
         // ── Build the handshake request, carrying request headers ──
-        let mut handshake = req
-            .url
-            .clone()
-            .into_client_request()
-            .map_err(|e| {
-                TropelError::Config(format!("invalid WebSocket URL '{}': {}", req.url, e))
-            })?;
+        let mut handshake = req.url.clone().into_client_request().map_err(|e| {
+            TropelError::Config(format!("invalid WebSocket URL '{}': {}", req.url, e))
+        })?;
         for (k, v) in &req.headers {
             // http 1.x `IntoHeaderName` is only implemented for `&'static
             // str` and `HeaderName` — convert the (borrowed, method-scoped)
@@ -97,10 +93,7 @@ impl Protocol for WebSocketProtocol {
             tokio_tungstenite::connect_async(handshake)
                 .await
                 .map_err(|e| {
-                    TropelError::Extension(format!(
-                        "WebSocket connect to '{}': {}",
-                        req.url, e
-                    ))
+                    TropelError::Extension(format!("WebSocket connect to '{}': {}", req.url, e))
                 })?;
         let connecting = connect_start.elapsed();
         let session_status = handshake_resp.status().as_u16();
@@ -147,29 +140,25 @@ impl Protocol for WebSocketProtocol {
         // long-lived server drives the session length. The request timeout and
         // MAX_BODY_BYTES remain as hard safety caps so an unresponsive peer
         // can never hang the VU.
-        let wait: Option<Duration> = match config
-            .and_then(|c| c.get("wait"))
-            .and_then(|w| w.as_str())
-        {
-            Some("until-close") => None,
-            Some(s) => parse_duration(s).or(Some(DEFAULT_WAIT)),
-            // Absent `wait` keeps the historical 1s default — only the
-            // explicit "until-close" opts into an unbounded (request-timeout
-            // capped) session.
-            None => Some(DEFAULT_WAIT),
-        };
+        let wait: Option<Duration> =
+            match config.and_then(|c| c.get("wait")).and_then(|w| w.as_str()) {
+                Some("until-close") => None,
+                Some(s) => parse_duration(s).or(Some(DEFAULT_WAIT)),
+                // Absent `wait` keeps the historical 1s default — only the
+                // explicit "until-close" opts into an unbounded (request-timeout
+                // capped) session.
+                None => Some(DEFAULT_WAIT),
+            };
         // Hard ceiling when the wait window is unbounded: the request timeout.
         let hard_cap = req.timeout.unwrap_or(Duration::from_secs(30));
-        let session_deadline = tokio::time::Instant::now()
-            + wait.unwrap_or(hard_cap);
+        let session_deadline = tokio::time::Instant::now() + wait.unwrap_or(hard_cap);
         let mut received: Vec<String> = Vec::new();
         let mut bytes_received: u64 = 0;
         loop {
             if tokio::time::Instant::now() >= session_deadline {
                 break;
             }
-            let remaining = session_deadline
-                .saturating_duration_since(tokio::time::Instant::now());
+            let remaining = session_deadline.saturating_duration_since(tokio::time::Instant::now());
             match tokio::time::timeout(remaining, ws.next()).await {
                 Ok(Some(Ok(Message::Text(t)))) => {
                     let s = t.to_string();
@@ -181,7 +170,7 @@ impl Protocol for WebSocketProtocol {
                     received.push(format!("<binary {} bytes>", b.len()));
                 }
                 Ok(Some(Ok(Message::Close(_)))) => break, // server closed — event-driven end
-                Ok(Some(Ok(_))) => {}                      // ping/pong frames
+                Ok(Some(Ok(_))) => {}                     // ping/pong frames
                 Ok(Some(Err(e))) => {
                     tracing::debug!("WebSocket read error: {}", e);
                     break;

@@ -1173,8 +1173,8 @@ mod tests {
         // Sidecar authenticates the ARTIFACT: it must equal the hash of the
         // .cwasm bytes (not the source) — tampering with the artifact breaks
         // the match and forces a recompile.
-        let sidecar = std::fs::read_to_string(wasm_cache_dir().join(format!("{key}.sha256")))
-            .unwrap();
+        let sidecar =
+            std::fs::read_to_string(wasm_cache_dir().join(format!("{key}.sha256"))).unwrap();
         let artifact = std::fs::read(&cache_path).unwrap();
         assert_eq!(sidecar.trim(), sha256_hex(&artifact));
 
@@ -1229,8 +1229,7 @@ mod tests {
         // A plugin claiming an absurd written length must not OOM/abort the
         // host. parse() clamps to MAX_OUTPUT_BYTES, reads that many bytes
         // (mostly zeroed memory -> invalid JSON) and returns a Parse error.
-        let plugin = WasmPlugin::load(HOSTILE_LENGTH_WAT.as_bytes())
-            .expect("module must load");
+        let plugin = WasmPlugin::load(HOSTILE_LENGTH_WAT.as_bytes()).expect("module must load");
         assert_eq!(plugin.id(), "hostile-length-plugin");
 
         let start = std::time::Instant::now();

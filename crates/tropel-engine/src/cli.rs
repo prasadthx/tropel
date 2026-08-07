@@ -555,8 +555,8 @@ async fn run_command(cli: Cli) -> Result<()> {
         cli_iteration_data_empty,
     );
 
-    tracing::info!("Execution config: {:?}", config.execution);    // Create the engine with extension registry (subprocess + WASM plugins
-    // registered the same way `inspect`/`list` do — one shared builder).
+    tracing::info!("Execution config: {:?}", config.execution); // Create the engine with extension registry (subprocess + WASM plugins
+                                                                // registered the same way `inspect`/`list` do — one shared builder).
     let registry = build_registry(subprocess_adapter, plugins_dir.as_deref())?;
     let engine = Engine::new(registry);
     let result = engine.run(&config).await?;
@@ -696,7 +696,10 @@ fn apply_overlay(
     }
     // Thresholds: overlay adds; CLI keys (threshold_N) don't collide.
     for (k, v) in &overlay.thresholds {
-        config.thresholds.entry(k.clone()).or_insert_with(|| v.clone());
+        config
+            .thresholds
+            .entry(k.clone())
+            .or_insert_with(|| v.clone());
     }
     // Output: CLI flags win; overlay fills reporters/file/urls. The CLI's
     // --reporter has a "stdout" default on a Vec, so `is_empty()` would never
@@ -758,7 +761,9 @@ fn apply_overlay(
         config.globals.extend(overlay.globals.clone());
     }
     if !overlay.collection_vars.is_empty() {
-        config.collection_vars.extend(overlay.collection_vars.clone());
+        config
+            .collection_vars
+            .extend(overlay.collection_vars.clone());
     }
     // Data file: `--data-file` (CLI) already loaded into iteration_data; a
     // config-file data_file is run through the same loader so it isn't dead.
@@ -773,7 +778,11 @@ fn apply_overlay(
             match load_data_file(&std::path::PathBuf::from(&data_path)) {
                 Ok(data) => config.iteration_data = data,
                 Err(e) => {
-                    tracing::warn!("Failed to load config-file data_file '{}': {}", data_path, e);
+                    tracing::warn!(
+                        "Failed to load config-file data_file '{}': {}",
+                        data_path,
+                        e
+                    );
                 }
             }
         }
@@ -1038,7 +1047,9 @@ async fn archive_command(
     // Input file — the core of the bundle.
     let input_name = input
         .file_name()
-        .ok_or_else(|| TropelError::Config(format!("Input '{}' has no file name", input.display())))?
+        .ok_or_else(|| {
+            TropelError::Config(format!("Input '{}' has no file name", input.display()))
+        })?
         .to_string_lossy()
         .to_string();
     let bundled_input = out_dir.join(&input_name);
@@ -1086,8 +1097,14 @@ async fn archive_command(
 
     // Manifest: how to re-run this bundle.
     let mut manifest = serde_json::Map::new();
-    manifest.insert("version".into(), serde_json::Value::String(env!("CARGO_PKG_VERSION").into()));
-    manifest.insert("input".into(), serde_json::Value::String(input_name.clone()));
+    manifest.insert(
+        "version".into(),
+        serde_json::Value::String(env!("CARGO_PKG_VERSION").into()),
+    );
+    manifest.insert(
+        "input".into(),
+        serde_json::Value::String(input_name.clone()),
+    );
     if let Some(fmt) = format {
         manifest.insert("format".into(), serde_json::Value::String(fmt.to_string()));
     }
@@ -1096,7 +1113,10 @@ async fn archive_command(
         dep_map.insert(
             role.clone(),
             serde_json::Value::String(
-                dest.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                dest.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
             ),
         );
     }
@@ -1133,7 +1153,11 @@ async fn archive_command(
 
     println!("Tropel Archive — v{}", env!("CARGO_PKG_VERSION"));
     println!("Bundle created in: {}", out_dir.display());
-    println!("  input:  {} (from {})", bundled_input.display(), input.display());
+    println!(
+        "  input:  {} (from {})",
+        bundled_input.display(),
+        input.display()
+    );
     for (role, src, dest) in &deps {
         println!("  {}: {} (from {})", role, dest.display(), src.display());
     }
@@ -1291,9 +1315,18 @@ mod overlay_tests {
             }),
             ..Default::default()
         };
-        apply_overlay(&mut cfg, overlay, &["stdout".to_string()], false, false, true);
+        apply_overlay(
+            &mut cfg,
+            overlay,
+            &["stdout".to_string()],
+            false,
+            false,
+            true,
+        );
         match cfg.execution {
-            ExecutionConfig::SharedIterations { iterations, vus, .. } => {
+            ExecutionConfig::SharedIterations {
+                iterations, vus, ..
+            } => {
                 assert_eq!(iterations, 50);
                 assert_eq!(vus, 5);
             }
@@ -1315,7 +1348,14 @@ mod overlay_tests {
             }),
             ..Default::default()
         };
-        apply_overlay(&mut cfg, overlay, &["stdout".to_string()], false, true, true);
+        apply_overlay(
+            &mut cfg,
+            overlay,
+            &["stdout".to_string()],
+            false,
+            true,
+            true,
+        );
         // CLI load profile explicit → overlay execution ignored.
         match cfg.execution {
             ExecutionConfig::ConstantVus { vus, .. } => assert_eq!(vus, 1),
@@ -1334,7 +1374,14 @@ mod overlay_tests {
             }),
             ..Default::default()
         };
-        apply_overlay(&mut cfg, overlay, &["stdout".to_string()], false, false, true);
+        apply_overlay(
+            &mut cfg,
+            overlay,
+            &["stdout".to_string()],
+            false,
+            false,
+            true,
+        );
         assert_eq!(cfg.output.reporters, vec!["json".to_string()]);
     }
 
@@ -1358,13 +1405,22 @@ mod overlay_tests {
         let mut cfg = base_config();
         cfg.env.insert("CLI_ONLY".to_string(), "1".to_string());
         let overlay = PartialConfig {
-            env: [("CLI_ONLY".to_string(), "overridden".to_string()),
-                ("NEW".to_string(), "2".to_string())]
-                .into_iter()
-                .collect(),
+            env: [
+                ("CLI_ONLY".to_string(), "overridden".to_string()),
+                ("NEW".to_string(), "2".to_string()),
+            ]
+            .into_iter()
+            .collect(),
             ..Default::default()
         };
-        apply_overlay(&mut cfg, overlay, &["stdout".to_string()], false, false, true);
+        apply_overlay(
+            &mut cfg,
+            overlay,
+            &["stdout".to_string()],
+            false,
+            false,
+            true,
+        );
         assert_eq!(cfg.env.get("CLI_ONLY").map(|s| s.as_str()), Some("1"));
         assert_eq!(cfg.env.get("NEW").map(|s| s.as_str()), Some("2"));
     }
@@ -1379,14 +1435,23 @@ mod overlay_tests {
             }),
             ..Default::default()
         };
-        apply_overlay(&mut cfg, overlay, &["stdout".to_string()], true, false, true);
+        apply_overlay(
+            &mut cfg,
+            overlay,
+            &["stdout".to_string()],
+            true,
+            false,
+            true,
+        );
         assert!(cfg.tls.insecure_skip_verify);
     }
 
     #[test]
     fn test_merge_partial_file_wins_over_env() {
         let base = PartialConfig {
-            env: [("K".to_string(), "base".to_string())].into_iter().collect(),
+            env: [("K".to_string(), "base".to_string())]
+                .into_iter()
+                .collect(),
             execution: Some(ExecutionConfig::ConstantVus {
                 vus: 1,
                 duration: "10s".to_string(),
@@ -1396,7 +1461,9 @@ mod overlay_tests {
             ..Default::default()
         };
         let file = PartialConfig {
-            env: [("K".to_string(), "file".to_string())].into_iter().collect(),
+            env: [("K".to_string(), "file".to_string())]
+                .into_iter()
+                .collect(),
             ..Default::default()
         };
         let merged = merge_partial(base, file);

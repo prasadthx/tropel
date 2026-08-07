@@ -205,7 +205,11 @@ impl Protocol for GrpcProtocol {
         "grpc"
     }
 
-    async fn execute(&self, req: &Request, config: Option<&serde_json::Value>) -> Result<ProtocolOutcome> {
+    async fn execute(
+        &self,
+        req: &Request,
+        config: Option<&serde_json::Value>,
+    ) -> Result<ProtocolOutcome> {
         // ── Parse the URL: grpc://host:port/package.Service/Method ──
         let url = url::Url::parse(&req.url)
             .map_err(|e| TropelError::Config(format!("invalid gRPC URL '{}': {}", req.url, e)))?;
@@ -263,15 +267,13 @@ impl Protocol for GrpcProtocol {
                 }
             }
         };
-        let service = pool
-            .get_service_by_name(service_full)
-            .ok_or_else(|| {
-                TropelError::Config(format!(
-                    "service '{}' not found in proto (have: {})",
-                    service_full,
-                    list_services(&pool)
-                ))
-            })?;
+        let service = pool.get_service_by_name(service_full).ok_or_else(|| {
+            TropelError::Config(format!(
+                "service '{}' not found in proto (have: {})",
+                service_full,
+                list_services(&pool)
+            ))
+        })?;
         let method = service
             .methods()
             .find(|m| m.name() == method_name)
@@ -348,18 +350,11 @@ impl Protocol for GrpcProtocol {
                     if is_tls {
                         endpoint = endpoint
                             .tls_config(ClientTlsConfig::new().domain_name(&host))
-                            .map_err(|e| {
-                                TropelError::Extension(format!("gRPC TLS config: {e}"))
-                            })?;
+                            .map_err(|e| TropelError::Extension(format!("gRPC TLS config: {e}")))?;
                     }
-                    let connected = endpoint
-                        .connect()
-                        .await
-                        .map_err(|e| {
-                            TropelError::Extension(format!(
-                                "gRPC connect to {host}:{port}: {e}"
-                            ))
-                        })?;
+                    let connected = endpoint.connect().await.map_err(|e| {
+                        TropelError::Extension(format!("gRPC connect to {host}:{port}: {e}"))
+                    })?;
                     let mut channels = self.channels.lock().unwrap();
                     let mut order = self.channel_order.lock().unwrap();
                     // Bounded: a caller that varies the authority per request
@@ -433,7 +428,9 @@ impl Protocol for GrpcProtocol {
             let fut = client.streaming(tonic_req, path, codec);
             let result = with_timeout(deadline, fut).await;
             match result {
-                Ok(stream) => drain_bounded(deadline, stream.into_inner(), &mut status_override).await,
+                Ok(stream) => {
+                    drain_bounded(deadline, stream.into_inner(), &mut status_override).await
+                }
                 Err(e) => {
                     status_override = Some(e.code());
                     serde_json::Value::Null
@@ -445,8 +442,9 @@ impl Protocol for GrpcProtocol {
             let fut = client.client_streaming(tonic_req, path, codec);
             let result = with_timeout(deadline, fut).await;
             match result {
-                Ok(resp) => serde_json::to_value(resp.into_inner())
-                    .unwrap_or(serde_json::Value::Null),
+                Ok(resp) => {
+                    serde_json::to_value(resp.into_inner()).unwrap_or(serde_json::Value::Null)
+                }
                 Err(e) => {
                     status_override = Some(e.code());
                     serde_json::Value::Null
@@ -462,7 +460,9 @@ impl Protocol for GrpcProtocol {
             let fut = client.server_streaming(tonic_req, path, codec);
             let result = with_timeout(deadline, fut).await;
             match result {
-                Ok(stream) => drain_bounded(deadline, stream.into_inner(), &mut status_override).await,
+                Ok(stream) => {
+                    drain_bounded(deadline, stream.into_inner(), &mut status_override).await
+                }
                 Err(e) => {
                     status_override = Some(e.code());
                     serde_json::Value::Null
@@ -478,8 +478,9 @@ impl Protocol for GrpcProtocol {
             let fut = client.unary(tonic_req, path, codec);
             let result = with_timeout(deadline, fut).await;
             match result {
-                Ok(resp) => serde_json::to_value(resp.into_inner())
-                    .unwrap_or(serde_json::Value::Null),
+                Ok(resp) => {
+                    serde_json::to_value(resp.into_inner()).unwrap_or(serde_json::Value::Null)
+                }
                 Err(e) => {
                     status_override = Some(e.code());
                     serde_json::Value::Null
@@ -523,7 +524,11 @@ impl Protocol for GrpcProtocol {
         let tags = std::sync::Arc::new(tags);
 
         let sent = body_to_json(req)
-            .map(|v| serde_json::to_vec(&v).map(|b| b.len() as f64).unwrap_or(0.0))
+            .map(|v| {
+                serde_json::to_vec(&v)
+                    .map(|b| b.len() as f64)
+                    .unwrap_or(0.0)
+            })
             .unwrap_or(0.0);
         let samples = vec![
             Sample {
@@ -699,26 +704,26 @@ fn resolve_proto(
 /// newline; file paths pass through unchanged.
 pub fn compile_proto(source: &str, include_dir: Option<&str>) -> Result<DescriptorPool> {
     let tmp;
-    let proto_path = if source.contains('\n') || source.contains("syntax") || source.trim().is_empty()
-    {
-        // Inline source → write to a temp file.
-        if source.len() > MAX_INLINE_PROTO {
-            return Err(TropelError::Config(format!(
-                "inline proto source exceeds {} bytes",
-                MAX_INLINE_PROTO
-            )));
-        }
-        tmp = tempfile::Builder::new()
-            .prefix("tropel-grpc-")
-            .suffix(".proto")
-            .tempfile()
-            .map_err(|e| TropelError::Extension(format!("temp proto file: {e}")))?;
-        std::fs::write(tmp.path(), source)
-            .map_err(|e| TropelError::Extension(format!("write temp proto: {e}")))?;
-        tmp.path().to_path_buf()
-    } else {
-        std::path::PathBuf::from(source)
-    };
+    let proto_path =
+        if source.contains('\n') || source.contains("syntax") || source.trim().is_empty() {
+            // Inline source → write to a temp file.
+            if source.len() > MAX_INLINE_PROTO {
+                return Err(TropelError::Config(format!(
+                    "inline proto source exceeds {} bytes",
+                    MAX_INLINE_PROTO
+                )));
+            }
+            tmp = tempfile::Builder::new()
+                .prefix("tropel-grpc-")
+                .suffix(".proto")
+                .tempfile()
+                .map_err(|e| TropelError::Extension(format!("temp proto file: {e}")))?;
+            std::fs::write(tmp.path(), source)
+                .map_err(|e| TropelError::Extension(format!("write temp proto: {e}")))?;
+            tmp.path().to_path_buf()
+        } else {
+            std::path::PathBuf::from(source)
+        };
 
     let mut includes: Vec<std::path::PathBuf> = Vec::new();
     if let Some(dir) = include_dir {
@@ -795,7 +800,10 @@ mod tests {
         cache_insert_bounded(&mut map, &mut order, 5, "e", 3);
         cache_insert_bounded(&mut map, &mut order, 6, "f", 3);
         assert_eq!(map.len(), 3);
-        assert!(!map.contains_key(&2), "re-inserted key 2 is still the FIFO front and must be evicted first");
+        assert!(
+            !map.contains_key(&2),
+            "re-inserted key 2 is still the FIFO front and must be evicted first"
+        );
         assert!(!map.contains_key(&3));
         assert_eq!(map.get(&4), Some(&"d"));
         assert_eq!(map.get(&5), Some(&"e"));

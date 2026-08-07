@@ -60,7 +60,10 @@ async fn spawn_echo_server() -> std::net::SocketAddr {
 #[tokio::test]
 async fn text_echo_roundtrip() {
     let addr = spawn_echo_server().await;
-    let req = make_request(&format!("ws://{addr}/echo"), Some(Body::Raw("hello".into())));
+    let req = make_request(
+        &format!("ws://{addr}/echo"),
+        Some(Body::Raw("hello".into())),
+    );
     let outcome = WebSocketProtocol.execute(&req, None).await.unwrap();
     let resp = outcome.response.expect("response");
     assert_eq!(resp.status_code, 101, "handshake must switch protocols");
@@ -94,7 +97,10 @@ async fn binary_messages() {
         "binary": true,
         "wait": "500ms",
     });
-    let outcome = WebSocketProtocol.execute(&req, Some(&config)).await.unwrap();
+    let outcome = WebSocketProtocol
+        .execute(&req, Some(&config))
+        .await
+        .unwrap();
     let resp = outcome.response.expect("response");
     assert_eq!(resp.status_code, 101);
     // Binary payloads are summarized as `<binary N bytes>`.
@@ -110,9 +116,11 @@ async fn multiple_messages_via_config() {
         "messages": ["a", "b", "c"],
         "wait": "500ms",
     });
-    let outcome = WebSocketProtocol.execute(&req, Some(&config)).await.unwrap();
-    let received: Vec<String> =
-        serde_json::from_slice(&outcome.response.unwrap().body).unwrap();
+    let outcome = WebSocketProtocol
+        .execute(&req, Some(&config))
+        .await
+        .unwrap();
+    let received: Vec<String> = serde_json::from_slice(&outcome.response.unwrap().body).unwrap();
     assert_eq!(received, vec!["a", "b", "c"]);
     let msgs_sent = outcome
         .samples
@@ -164,13 +172,19 @@ async fn until_close_ends_session_when_server_closes() {
     );
     let config = serde_json::json!({ "wait": "until-close" });
     let start = std::time::Instant::now();
-    let outcome = WebSocketProtocol.execute(&req, Some(&config)).await.unwrap();
+    let outcome = WebSocketProtocol
+        .execute(&req, Some(&config))
+        .await
+        .unwrap();
     let elapsed = start.elapsed();
     let resp = outcome.response.unwrap();
     assert_eq!(resp.status_code, 101);
     // The server closes right after echoing, so the session ends promptly —
     // far below the 5s request-timeout cap. This proves no fixed-wait drain.
-    assert!(elapsed < Duration::from_secs(1), "until-close took {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "until-close took {elapsed:?}"
+    );
     let received: Vec<String> = serde_json::from_slice(&resp.body).unwrap();
     assert_eq!(received, vec!["ping"]);
 }
@@ -182,7 +196,11 @@ async fn connection_refused_is_error() {
     let addr = listener.local_addr().unwrap();
     drop(listener);
     let req = make_request(&format!("ws://{addr}/nope"), None);
-    let err = WebSocketProtocol.execute(&req, None).await.err().expect("expected error");
+    let err = WebSocketProtocol
+        .execute(&req, None)
+        .await
+        .err()
+        .expect("expected error");
     assert!(
         err.to_string().contains("connect"),
         "expected connect error, got: {err}"

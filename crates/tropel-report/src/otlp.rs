@@ -325,12 +325,7 @@ mod tests {
         sample_typed(metric, value, sample_type, tags)
     }
 
-    fn sample_typed(
-        metric: &str,
-        value: f64,
-        sample_type: SampleType,
-        tags: TagMap,
-    ) -> Sample {
+    fn sample_typed(metric: &str, value: f64, sample_type: SampleType, tags: TagMap) -> Sample {
         Sample {
             metric: std::borrow::Cow::Owned(metric.to_string()),
             value,
@@ -470,7 +465,8 @@ mod tests {
             }
             let head_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
             let body = buf[head_end..].to_vec();
-            let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK".to_string();
+            let resp =
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK".to_string();
             sock.write_all(resp.as_bytes()).await.unwrap();
             sock.flush().await.unwrap();
             body

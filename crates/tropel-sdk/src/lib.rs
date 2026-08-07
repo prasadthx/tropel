@@ -73,11 +73,11 @@
 // Core types — the shared Scenario IR used by all adapters
 // ═══════════════════════════════════════════════════════════════════
 
-pub use tropel_core::scenario::{Scenario, ScenarioInfo, ScenarioItem};
 pub use tropel_core::config::{
     ArrivalRateStage, ExecutionConfig, HttpConfig, OutputConfig, ScenarioConfig, Stage,
     ThinkTimeConfig, ThresholdConfig, TlsConfig,
 };
+pub use tropel_core::scenario::{Scenario, ScenarioInfo, ScenarioItem};
 pub use tropel_core::types::{
     ApiKeyLocation, AuthConfig, Body, CertificateConfig, Cookie, Method, Request, Response,
     ResponseType, Sample, SampleType, Timings,

@@ -100,7 +100,9 @@ async fn connect_with_retry(controller_addr: &str) -> Result<TcpStream> {
         attempt += 1;
         // Timeout each attempt so a single hanging connect cannot extend the
         // run past CONNECT_TOTAL_BOUND (deadline is only checked on failure).
-        match tokio::time::timeout(CONNECT_ATTEMPT_TIMEOUT, TcpStream::connect(controller_addr)).await {
+        match tokio::time::timeout(CONNECT_ATTEMPT_TIMEOUT, TcpStream::connect(controller_addr))
+            .await
+        {
             Ok(Ok(stream)) => return Ok(stream),
             Ok(Err(e)) => {
                 if std::time::Instant::now() >= deadline {
@@ -119,7 +121,9 @@ async fn connect_with_retry(controller_addr: &str) -> Result<TcpStream> {
                 if std::time::Instant::now() >= deadline {
                     return Err(TropelError::Io(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
-                        format!("controller {controller_addr} unreachable after {attempt} attempts"),
+                        format!(
+                            "controller {controller_addr} unreachable after {attempt} attempts"
+                        ),
                     )));
                 }
                 tracing::warn!(

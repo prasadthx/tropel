@@ -84,8 +84,11 @@ pub fn collection_to_scenario(
 
     // Convert items, threading collection-level auth down as the inherited
     // scope (Postman inheritance: request > folder > collection).
-    scenario.items =
-        convert_items(&collection.item, &collection.event, collection.auth.as_ref());
+    scenario.items = convert_items(
+        &collection.item,
+        &collection.event,
+        collection.auth.as_ref(),
+    );
 
     scenario
 }
@@ -101,8 +104,7 @@ fn convert_items(
     for item in items {
         match item {
             CollectionItem::Request(req) => {
-                let scenario_item =
-                    convert_request_item(req, parent_events, inherited_auth, index);
+                let scenario_item = convert_request_item(req, parent_events, inherited_auth, index);
                 result.push(scenario_item);
                 index += 1;
             }
@@ -232,10 +234,7 @@ fn build_query_params(detail: &RequestDetail, url: &mut String) -> HashMap<Strin
         return HashMap::new();
     }
     if has_duplicate_keys(&pairs) {
-        let qs: Vec<String> = pairs
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect();
+        let qs: Vec<String> = pairs.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
         url.push('?');
         url.push_str(&qs.join("&"));
         HashMap::new()
@@ -694,8 +693,14 @@ mod tests {
 
         let create = scenario.items[0].request.as_ref().unwrap();
         assert_eq!(create.url, "https://api.example.com/items");
-        assert_eq!(create.query_params.get("page").map(String::as_str), Some("2"));
-        assert_eq!(create.query_params.get("per_page").map(String::as_str), Some("50"));
+        assert_eq!(
+            create.query_params.get("page").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            create.query_params.get("per_page").map(String::as_str),
+            Some("50")
+        );
         assert!(matches!(create.body, Some(Body::Raw(ref s)) if s == "{\"name\":\"x\"}"));
 
         // String-form URL: the custom UrlDetail deserializer handles it.
@@ -971,14 +976,21 @@ mod tests {
         }"#;
 
         let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
-        assert_eq!(scenario.items.len(), 1, "request must not fall through to a folder");
+        assert_eq!(
+            scenario.items.len(),
+            1,
+            "request must not fall through to a folder"
+        );
         assert_eq!(scenario.items[0].name, "Shape Req");
         let req = scenario.items[0].request.as_ref().expect("request parsed");
         assert_eq!(req.url, "https://api.example.com/shapes");
         assert_eq!(req.headers.get("X-No-Value").map(String::as_str), Some(""));
         // String-form exec must still surface as a test script.
         let test = scenario.items[0].test.as_ref().expect("test script parsed");
-        assert!(test.contains("pm.test"), "string-form exec joined into script");
+        assert!(
+            test.contains("pm.test"),
+            "string-form exec joined into script"
+        );
     }
 
     #[test]

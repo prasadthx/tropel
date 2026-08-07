@@ -57,10 +57,7 @@ impl JsonStreamOutput {
 
     /// Spawn a consumer task that appends samples as NDJSON lines.
     /// Returns a `JoinHandle` that completes when the stream closes.
-    pub fn spawn(
-        mut rx: broadcast::Receiver<Sample>,
-        path: String,
-    ) -> tokio::task::JoinHandle<()> {
+    pub fn spawn(mut rx: broadcast::Receiver<Sample>, path: String) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let output = JsonStreamOutput::new(path);
             let mut tick = tokio::time::interval(FLUSH_INTERVAL);
@@ -166,7 +163,9 @@ impl JsonStreamOutput {
             .create(true)
             .append(true)
             .open(&self.path)
-            .map_err(|e| TropelError::Report(format!("json-stream open '{}' failed: {e}", self.path)))?;
+            .map_err(|e| {
+                TropelError::Report(format!("json-stream open '{}' failed: {e}", self.path))
+            })?;
         for line in &lines {
             writeln!(file, "{line}")
                 .map_err(|e| TropelError::Report(format!("json-stream write failed: {e}")))?;
@@ -268,15 +267,25 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             output.sample(&[sample("http_reqs", 1.0)]).await.unwrap();
-            output.sample(&[sample("http_req_duration", 12.5)]).await.unwrap();
-            output.sample(&[sample("http_req_duration", 14.0)]).await.unwrap();
+            output
+                .sample(&[sample("http_req_duration", 12.5)])
+                .await
+                .unwrap();
+            output
+                .sample(&[sample("http_req_duration", 14.0)])
+                .await
+                .unwrap();
             output.stop().await.unwrap();
         });
 
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         // 2 Metric definitions (http_reqs, http_req_duration) + 3 Points.
-        assert_eq!(lines.len(), 5, "defs once + one point per sample: {content}");
+        assert_eq!(
+            lines.len(),
+            5,
+            "defs once + one point per sample: {content}"
+        );
         let mut metric_defs = 0;
         let mut points = 0;
         let mut duration_points = 0;
@@ -318,6 +327,9 @@ mod tests {
     #[test]
     fn empty_flush_is_noop() {
         let output = JsonStreamOutput::new("/nonexistent-dir/x.ndjson");
-        assert!(output.flush().is_ok(), "empty flush must not touch the file");
+        assert!(
+            output.flush().is_ok(),
+            "empty flush must not touch the file"
+        );
     }
 }

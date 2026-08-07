@@ -108,8 +108,7 @@ enum Cmd {
 
 fn load_config(path: &PathBuf) -> Result<JobConfig> {
     let raw = std::fs::read_to_string(path).map_err(TropelError::Io)?;
-    serde_json::from_str(&raw)
-        .map_err(|e| TropelError::Parse(format!("invalid job config: {e}")))
+    serde_json::from_str(&raw).map_err(|e| TropelError::Parse(format!("invalid job config: {e}")))
 }
 
 fn main() -> Result<()> {
@@ -149,7 +148,8 @@ async fn run(args: Args) -> Result<()> {
             let listener = TcpListener::bind(&listen).await.map_err(TropelError::Io)?;
             tracing::info!("Controller listening on {listen}. Waiting for {agents} agent(s)...");
             let test_start = std::time::Instant::now();
-            let result = tropel_distributed::run_controller(listener, &config, agents, &token).await?;
+            let result =
+                tropel_distributed::run_controller(listener, &config, agents, &token).await?;
             tropel_distributed::report_and_thresholds(&config, &result, test_start).await
         }
         Cmd::Agent {

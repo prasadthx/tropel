@@ -403,7 +403,10 @@ mod tests {
         // connect phases are exactly zero (matching k6 for reused connections).
         let resp2 = client.execute(&req, None).await.unwrap();
         let t2 = resp2.timings.as_ref().unwrap();
-        assert_eq!(t2.blocked + t2.dns + t2.connecting, std::time::Duration::ZERO);
+        assert_eq!(
+            t2.blocked + t2.dns + t2.connecting,
+            std::time::Duration::ZERO
+        );
         assert!(t2.waiting + t2.receiving > std::time::Duration::ZERO);
         let sum2 = t2.blocked + t2.dns + t2.connecting + t2.waiting + t2.receiving;
         assert!(sum2 <= t2.total, "phase sum must not exceed total");

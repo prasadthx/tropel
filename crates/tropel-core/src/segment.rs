@@ -48,7 +48,9 @@ impl ExecutionSegment {
     fn parse_fraction(s: &str) -> Result<f64> {
         let s = s.trim();
         if s.is_empty() {
-            return Err(TropelError::Config("empty execution segment fraction".into()));
+            return Err(TropelError::Config(
+                "empty execution segment fraction".into(),
+            ));
         }
         if let Some((num, den)) = s.split_once('/') {
             let n: f64 = num
@@ -75,11 +77,11 @@ impl ExecutionSegment {
     /// the (sorted) sequence boundaries, and the sequence must start at 0 and
     /// end at 1.
     pub fn parse(segment: &str, sequence: Option<&str>) -> Result<Self> {
-        let (from_s, to_s) = segment
-            .split_once(':')
-            .ok_or_else(|| TropelError::Config(format!(
+        let (from_s, to_s) = segment.split_once(':').ok_or_else(|| {
+            TropelError::Config(format!(
                 "invalid execution segment '{segment}' — expected 'from:to' e.g. '0:1/3'"
-            )))?;
+            ))
+        })?;
         let from = Self::parse_fraction(from_s)?;
         let to = Self::parse_fraction(to_s)?;
         let seg = Self::new(from, to)?;
@@ -312,10 +314,7 @@ mod tests {
 
     #[test]
     fn parses_fraction_forms() {
-        assert_eq!(
-            ExecutionSegment::parse_fraction("1/3").unwrap(),
-            1.0 / 3.0
-        );
+        assert_eq!(ExecutionSegment::parse_fraction("1/3").unwrap(), 1.0 / 3.0);
         assert_eq!(ExecutionSegment::parse_fraction("0.5").unwrap(), 0.5);
         assert_eq!(ExecutionSegment::parse_fraction("0").unwrap(), 0.0);
         assert_eq!(ExecutionSegment::parse_fraction("2/3").unwrap(), 2.0 / 3.0);
@@ -404,11 +403,11 @@ mod tests {
         let s3 = ExecutionSegment::parse("2/3:1", None).unwrap();
 
         // VUs 10/N3 → 3+3+4 = 10 (TODO's example)
+        assert_eq!(s1.scale_vus(10) + s2.scale_vus(10) + s3.scale_vus(10), 10);
         assert_eq!(
-            s1.scale_vus(10) + s2.scale_vus(10) + s3.scale_vus(10),
-            10
+            (s1.scale_vus(10), s2.scale_vus(10), s3.scale_vus(10)),
+            (3, 3, 4)
         );
-        assert_eq!((s1.scale_vus(10), s2.scale_vus(10), s3.scale_vus(10)), (3, 3, 4));
 
         // Iters 10/N4 → 2+3+2+3 = 10 (TODO's example)
         let q1 = ExecutionSegment::parse("0:1/4", None).unwrap();
@@ -433,18 +432,18 @@ mod tests {
         );
 
         // VUs 2/N3 → 0+1+1 = 2 (no `.max(1)` over-provision)
-        assert_eq!((s1.scale_vus(2), s2.scale_vus(2), s3.scale_vus(2)), (0, 1, 1));
+        assert_eq!(
+            (s1.scale_vus(2), s2.scale_vus(2), s3.scale_vus(2)),
+            (0, 1, 1)
+        );
 
         // Arbitrary total sums back to itself for all segment counts
         for vus in [1u32, 7, 100, 999] {
             for n in [1usize, 2, 3, 7] {
                 let mut total = 0u64;
                 for i in 0..n {
-                    let seg = ExecutionSegment::new(
-                        i as f64 / n as f64,
-                        (i + 1) as f64 / n as f64,
-                    )
-                    .unwrap();
+                    let seg = ExecutionSegment::new(i as f64 / n as f64, (i + 1) as f64 / n as f64)
+                        .unwrap();
                     total += seg.scale_vus(vus) as u64;
                 }
                 assert_eq!(total, vus as u64, "VUs {vus} across {n} segments");
@@ -488,8 +487,14 @@ mod tests {
 
         let exec = ExecutionConfig::RampingVus {
             stages: vec![
-                Stage { duration: "1m".into(), target: 10 },
-                Stage { duration: "1m".into(), target: 20 },
+                Stage {
+                    duration: "1m".into(),
+                    target: 10,
+                },
+                Stage {
+                    duration: "1m".into(),
+                    target: 20,
+                },
             ],
             start_vus: 3,
             graceful_ramp_down: None,
@@ -498,7 +503,9 @@ mod tests {
         };
         let scaled = third.apply(&exec);
         match scaled {
-            ExecutionConfig::RampingVus { stages, start_vus, .. } => {
+            ExecutionConfig::RampingVus {
+                stages, start_vus, ..
+            } => {
                 assert_eq!(start_vus, 1);
                 assert_eq!(stages[0].target, 3); // 10/3 = 3.33 → 3
                 assert_eq!(stages[1].target, 6); // 20/3 = 6.67 → 6

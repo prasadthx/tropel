@@ -34,7 +34,7 @@ members = [
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/prasadthx/tropel"
-rust-version = "1.82"
+rust-version = "1.85"
 
 [workspace.dependencies]
 # Async runtime

@@ -27,7 +27,11 @@ pub(crate) fn build_summary_data(
                 // k6 handleSummary Counter values: `count` (accumulated) +
                 // `rate` = count / elapsed seconds (backlog line 154).
                 let secs = results.run_duration.as_secs_f64();
-                let rate = if secs > 0.0 { m.count as f64 / secs } else { 0.0 };
+                let rate = if secs > 0.0 {
+                    m.count as f64 / secs
+                } else {
+                    0.0
+                };
                 (
                     "counter",
                     "default",

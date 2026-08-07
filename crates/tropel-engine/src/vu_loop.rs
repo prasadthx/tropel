@@ -16,7 +16,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tropel_core::config::{ExecutionConfig, HttpConfig, ThinkTimeConfig, ThresholdConfig, TlsConfig};
+use tropel_core::config::{
+    ExecutionConfig, HttpConfig, ThinkTimeConfig, ThresholdConfig, TlsConfig,
+};
 use tropel_core::scenario::{Scenario, ScenarioItem};
 use tropel_core::types::{Request, Response, Sample, TagMap};
 use tropel_core::Result;
@@ -68,7 +70,10 @@ impl VuIterationSource for ScenarioVuSource {
         data_row: Option<HashMap<String, serde_json::Value>>,
         vu_env: &HashMap<String, String>,
     ) -> VuIterationOutcome {
-        let iter_result = self.runner.run_iteration(iteration_index, data_row, vu_env).await;
+        let iter_result = self
+            .runner
+            .run_iteration(iteration_index, data_row, vu_env)
+            .await;
         let abort_message = {
             let state = self.pm_state.lock().unwrap();
             if state.abort_requested {
@@ -254,8 +259,8 @@ async fn run_vu_loop(
         }
 
         vu_sample_counter += 1;
-        let vu_gauge_due = vu_sample_counter % 100 == 0
-            || last_vu_gauge.elapsed() >= Duration::from_secs(2);
+        let vu_gauge_due =
+            vu_sample_counter % 100 == 0 || last_vu_gauge.elapsed() >= Duration::from_secs(2);
         if vu_gauge_due {
             let active = sched.active_vus().await;
             let peak = sched.peak_vus();
@@ -305,8 +310,8 @@ async fn run_vu_loop(
                 None
             } else {
                 Some(
-                    shared.data_rows[(iteration_index as usize + vu_id as usize)
-                        % shared.data_rows.len()]
+                    shared.data_rows
+                        [(iteration_index as usize + vu_id as usize) % shared.data_rows.len()]
                     .clone(),
                 )
             };
@@ -428,7 +433,10 @@ async fn run_vus<F>(
     run_vu: F,
 ) -> (u32, u64)
 where
-    F: Fn(Arc<VUScheduler>, u32, &VuRunShared) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
+    F: Fn(Arc<VUScheduler>, u32, &VuRunShared) -> tokio::task::JoinHandle<()>
+        + Send
+        + Sync
+        + 'static,
 {
     if start_delay > Duration::ZERO {
         tokio::time::sleep(start_delay).await;
@@ -637,7 +645,8 @@ pub(crate) async fn run_scenario_vus(
     // deliberate (a blocking script `sleep()` must never freeze a co-located
     // VU — there is no co-located VU), so this cuts the client/RSS/fd part of
     // the per-VU cost without touching the scheduling model.
-    let shared_client = match HttpClient::with_tls_and_rps(&http_cfg, &tls_cfg, rps_limiter.clone()) {
+    let shared_client = match HttpClient::with_tls_and_rps(&http_cfg, &tls_cfg, rps_limiter.clone())
+    {
         Ok(c) => Arc::new(c),
         Err(e) => {
             tracing::error!(
@@ -655,14 +664,11 @@ pub(crate) async fn run_scenario_vus(
     // every VU — a large collection must not be re-flattened/re-cloned per
     // VU at runner construction (VURunner::new). Request names for
     // setNextRequest are derived from the same flatten and shared too.
-    let flattened_c: Arc<Vec<ScenarioItem>> =
-        Arc::new(tropel_executor::runner::flatten_execution_items(&scenario.items));
-    let names_c: Arc<Vec<String>> = Arc::new(
-        flattened_c
-            .iter()
-            .map(|item| item.name.clone())
-            .collect(),
+    let flattened_c: Arc<Vec<ScenarioItem>> = Arc::new(
+        tropel_executor::runner::flatten_execution_items(&scenario.items),
     );
+    let names_c: Arc<Vec<String>> =
+        Arc::new(flattened_c.iter().map(|item| item.name.clone()).collect());
 
     run_vus(
         sc_name,
@@ -710,13 +716,13 @@ pub(crate) async fn run_scenario_vus(
                     vu_id,
                     sc_name_vu.clone(),
                 )
-                    .with_expected_statuses(expected_statuses_vu)
-                    .with_protocols(protocols_vu.clone())
-                    .with_exec_context(
-                        executor_name,
-                        sched.active_vus_handle(),
-                        sched.total_iterations_handle(),
-                    );
+                .with_expected_statuses(expected_statuses_vu)
+                .with_protocols(protocols_vu.clone())
+                .with_exec_context(
+                    executor_name,
+                    sched.active_vus_handle(),
+                    sched.total_iterations_handle(),
+                );
                 let pm_state = runner.state_handle();
 
                 let js_ctx = create_vu_js_context(vu_id, &pm_state, &bridge_client).await;
@@ -724,10 +730,7 @@ pub(crate) async fn run_scenario_vus(
                     runner = runner.with_js_context(Box::new(ctx));
                 }
 
-                let mut source = ScenarioVuSource {
-                    runner,
-                    pm_state,
-                };
+                let mut source = ScenarioVuSource { runner, pm_state };
                 run_vu_loop(sched, &shared, vu_id, &mut source).await;
             });
             handle
@@ -788,7 +791,8 @@ pub(crate) async fn run_driver_vus(
     // it carry connection pools / DNS resolver / TLS context — Arc-backed
     // handles designed for concurrent use, so per-VU construction would
     // duplicate all of that VU-times. Per-VU cost is now a cheap struct clone.
-    let shared_client = match HttpClient::with_tls_and_rps(&http_cfg, &tls_cfg, rps_limiter.clone()) {
+    let shared_client = match HttpClient::with_tls_and_rps(&http_cfg, &tls_cfg, rps_limiter.clone())
+    {
         Ok(c) => Arc::new(c),
         Err(e) => {
             tracing::error!(
@@ -851,7 +855,11 @@ pub(crate) async fn run_driver_vus(
                 let driver = match registry.resolve_driver_by_id(&driver_id) {
                     Some(d) => d,
                     None => {
-                        tracing::error!("VU {}: Driver '{}' not found in registry", vu_id, driver_id);
+                        tracing::error!(
+                            "VU {}: Driver '{}' not found in registry",
+                            vu_id,
+                            driver_id
+                        );
                         shared.vu_init_failures.fetch_add(1, Ordering::SeqCst);
                         // This VU bails BEFORE `run_vu_loop` creates its
                         // ControlSpawnGuard — decrement here so the
@@ -913,7 +921,12 @@ pub(crate) async fn run_driver_vus(
     // driver's to log (a throwing teardown never changes the run's exit
     // status — k6 parity).
     driver
-        .teardown(&input_bytes, Some(&input_p), setup_data.as_deref(), &setup_env)
+        .teardown(
+            &input_bytes,
+            Some(&input_p),
+            setup_data.as_deref(),
+            &setup_env,
+        )
         .await;
 
     // `run_vus` returns (vu_init_failures, script_failures) — VUs that
@@ -1090,4 +1103,3 @@ async fn apply_think_time(config: &ThinkTimeConfig, iter_duration: Option<Durati
 }
 
 // ── JS context creation ──
-

@@ -135,7 +135,10 @@ mod tests {
     fn test_invalid_inputs_error_not_panic() {
         // All of these previously PANICKED inside Duration::from_secs_f64.
         for bad in ["-30s", "nans", "1e400s", "abc", "", "s", "1xs"] {
-            assert!(parse_duration(bad).is_err(), "'{bad}' must error, not panic");
+            assert!(
+                parse_duration(bad).is_err(),
+                "'{bad}' must error, not panic"
+            );
         }
     }
 }

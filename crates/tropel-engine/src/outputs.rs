@@ -58,7 +58,10 @@ pub(crate) fn spawn_extension_output(
         // Final flush on stream close.
         if !batch.is_empty() {
             if let Err(e) = output.emit(&batch).await {
-                tracing::warn!("extension output '{}' final emit failed: {e}", output.name());
+                tracing::warn!(
+                    "extension output '{}' final emit failed: {e}",
+                    output.name()
+                );
             }
         }
         if let Err(e) = output.flush().await {

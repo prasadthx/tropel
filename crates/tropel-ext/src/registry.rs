@@ -216,7 +216,10 @@ impl ExtensionRegistry {
             // (ties → registration order), and inventory adapters beat
             // equal-priority factory adapters (factories are probed after).
             if adapter.detect(bytes)
-                && best.as_ref().map(|(p, _)| registration.priority > *p).unwrap_or(true)
+                && best
+                    .as_ref()
+                    .map(|(p, _)| registration.priority > *p)
+                    .unwrap_or(true)
             {
                 best = Some((registration.priority, adapter));
             }
@@ -242,7 +245,10 @@ impl ExtensionRegistry {
             let driver = (registration.create)();
             // Strictly-greater: first registration wins on equal priority.
             if driver.detect(bytes)
-                && best.as_ref().map(|(p, _)| registration.priority > *p).unwrap_or(true)
+                && best
+                    .as_ref()
+                    .map(|(p, _)| registration.priority > *p)
+                    .unwrap_or(true)
             {
                 best = Some((registration.priority, driver));
             }

@@ -7,9 +7,7 @@
 
 use std::collections::HashMap;
 use tropel_core::config::ThresholdConfig;
-use tropel_metrics::collector::{
-    k6_default_trend_stats, MetricSummary, MetricType, MetricsResult,
-};
+use tropel_metrics::collector::{k6_default_trend_stats, MetricSummary, MetricType, MetricsResult};
 use tropel_report::{CsvReporter, JsonReporter, StdoutReporter};
 
 /// A fully-populated `MetricsResult` that exercises every summary section:
