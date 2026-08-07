@@ -1563,6 +1563,59 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn client_level_request_timeout_bounds_hung_server() {
+        // Backlog P1: the GLOBAL HttpConfig.request_timeout must bound a
+        // server that accepts but never responds — not just k6's per-request
+        // params.timeout. Isolation test at the client level: build with a
+        // 300ms request_timeout and hit a hung server; the request must error
+        // within seconds, not hang.
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                });
+            }
+        });
+
+        let cfg = HttpConfig {
+            request_timeout: Some("300ms".to_string()),
+            ..Default::default()
+        };
+        let client = HttpClient::new(&cfg).unwrap();
+        let req = Request {
+            url: format!("http://{addr}/hi"),
+            method: Method::GET,
+            response_type: tropel_core::types::ResponseType::None,
+            ..Default::default()
+        };
+        let start = std::time::Instant::now();
+        let result = client.execute(&req, None).await;
+        let elapsed = start.elapsed();
+        assert!(
+            result.is_err(),
+            "hung request must time out at the client level, got {:?}",
+            result
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "client-level timeout fired, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn follow_redirects_false_returns_redirect_not_followed() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

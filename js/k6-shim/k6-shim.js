@@ -173,23 +173,34 @@ function normalizeK6Request(method, url, body, params) {
             if (srcHeaders.hasOwnProperty(hk)) headers[hk] = srcHeaders[hk];
         }
     }
-    var timeout = params.timeout || '30s';
+    // Backlog P1: the GLOBAL HttpConfig.request_timeout must bound k6
+    // requests too (it is the client-level ceiling, applied via reqwest's
+    // `.timeout()` at build time). Before this fix the shim hardcoded
+    // `params.timeout || '30s'` and packed timeoutMs=30000 into extras, so
+    // the driver set `request.timeout = Some(30s)` and `execute()`'s
+    // `req_builder.timeout(30s)` OVERRODE the global 500ms — the global
+    // config was dead on the k6 path. Now timeoutMs is only packed when the
+    // script EXPLICITLY sets params.timeout; absent, it stays 0 and the
+    // driver leaves request.timeout None so the client-level global applies
+    // (falling back to the engine's default, like Postman requests).
+    var timeoutMs = 0;
+    if (params.timeout !== undefined && params.timeout !== null && params.timeout !== '') {
+        var timeout = params.timeout;
+        if (typeof timeout === 'string') {
+            var match = timeout.match(/^(\d+)(ms|s|m)?$/);
+            if (match) {
+                var val = parseInt(match[1], 10);
+                var unit = match[2] || 'ms';
+                if (unit === 's') timeoutMs = val * 1000;
+                else if (unit === 'm') timeoutMs = val * 60000;
+                else timeoutMs = val;
+            }
+        } else if (typeof timeout === 'number') {
+            timeoutMs = timeout;
+        }
+    }
     // k6 params.responseType: "text" (default) | "binary" | "none"
     var responseType = params.responseType || 'text';
-
-    var timeoutMs = 30000;
-    if (typeof timeout === 'string') {
-        var match = timeout.match(/^(\d+)(ms|s|m)?$/);
-        if (match) {
-            var val = parseInt(match[1], 10);
-            var unit = match[2] || 'ms';
-            if (unit === 's') timeoutMs = val * 1000;
-            else if (unit === 'm') timeoutMs = val * 60000;
-            else timeoutMs = val;
-        }
-    } else if (typeof timeout === 'number') {
-        timeoutMs = timeout;
-    }
 
     // k6 params.cookies: {name: value} — merged into the Cookie header
     // (k6 sends cookies as a Cookie header), combined with any explicit

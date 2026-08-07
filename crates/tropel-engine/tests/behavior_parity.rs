@@ -27,7 +27,7 @@ use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tropel_core::config::{
-    ExecutionConfig, JobConfig, OutputConfig, Stage, ThinkTimeConfig, ThresholdConfig,
+    ExecutionConfig, HttpConfig, JobConfig, OutputConfig, Stage, ThinkTimeConfig, ThresholdConfig,
 };
 use tropel_core::Result;
 use tropel_engine::Engine;
@@ -225,10 +225,10 @@ export default function () {{
 }
 
 /// Variant with an explicit per-request `params.timeout` — k6's native way
-/// to bound a single request. The k6 driver wires `params.timeout` through
-/// to the client's per-request ceiling (the postman-path global
-/// `HttpConfig.request_timeout` does NOT reach the k6 driver), so a hung
-/// server is bounded by this.
+/// to bound a single request shorter than the global ceiling. The k6 shim
+/// only packs `timeoutMs` when the script EXPLICITLY sets `params.timeout`
+/// (the old hardcoded `params.timeout || '30s'` default shadowed the global
+/// `HttpConfig.request_timeout`, so the global never fired on the k6 path).
 fn write_k6_timeout_script(base: &str, tag: &str, timeout: &str) -> String {
     let dir = std::env::temp_dir();
     let path = dir.join(format!("tropel-k6-e2e-{}-{}.js", std::process::id(), tag));
@@ -455,9 +455,10 @@ async fn non_2xx_drives_http_req_failed() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hung_server_is_bounded_by_request_timeout() -> Result<()> {
     let srv = start_hung_server().await;
-    // k6's native per-request timeout: the k6 driver wires `params.timeout`
-    // through to the client ceiling (the postman-path global
-    // `HttpConfig.request_timeout` never reaches the k6 driver).
+    // k6's native per-request timeout: the k6 shim packs `params.timeout`
+    // and the driver wires it through to the per-request ceiling. (The
+    // global HttpConfig.request_timeout covers the absent-params case — see
+    // hung_server_is_bounded_by_global_request_timeout below.)
     let coll = write_k6_timeout_script(&format!("http://{srv}"), "hung", "500ms");
     let config = JobConfig {
         input: coll.clone(),
@@ -487,6 +488,61 @@ async fn hung_server_is_bounded_by_request_timeout() -> Result<()> {
     assert!(
         elapsed < std::time::Duration::from_secs(20),
         "run terminated despite hung server, took {elapsed:?}"
+    );
+    assert!(m.http_reqs > 0, "requests fired against the hung server");
+    assert_eq!(
+        m.http_req_failed, 1.0,
+        "every request timed out -> http_req_failed == 1.0, got {}",
+        m.http_req_failed
+    );
+
+    let _ = std::fs::remove_file(&coll);
+    Ok(())
+}
+
+/// Backlog P1 · the GLOBAL `HttpConfig.request_timeout` must bound the k6
+/// driver path too — not just k6's per-request `params.timeout`. This uses a
+/// plain script (no `params.timeout`) and relies solely on the config-level
+/// ceiling, proving the shared client built from `http_cfg` carries it.
+///
+/// Regression for the shim bug: `k6-shim.js` used to hardcode
+/// `params.timeout || '30s'` and pack timeoutMs=30000, which the driver
+/// turned into `request.timeout = Some(30s)` — overriding the global 500ms
+/// via `req_builder.timeout(30s)` and letting a hung request run to the
+/// engine's 30s join bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hung_server_is_bounded_by_global_request_timeout() -> Result<()> {
+    let srv = start_hung_server().await;
+    let coll = write_k6_script(&format!("http://{srv}"), "hungglobal");
+    let config = JobConfig {
+        input: coll.clone(),
+        input_type: Some("k6".to_string()),
+        execution: ExecutionConfig::ConstantVus {
+            vus: 2,
+            duration: "2s".to_string(),
+            graceful_stop: Some("3s".to_string()),
+            think_time: ThinkTimeConfig::default(),
+        },
+        http: HttpConfig {
+            request_timeout: Some("500ms".to_string()),
+            ..Default::default()
+        },
+        output: OutputConfig {
+            reporters: vec![],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let engine = Engine::new(ExtensionRegistry::new());
+    let start = Instant::now();
+    let result = engine.run(&config).await?;
+    let elapsed = start.elapsed();
+    let m = &result.metrics;
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "global request_timeout bounded the run, took {elapsed:?}"
     );
     assert!(m.http_reqs > 0, "requests fired against the hung server");
     assert_eq!(
