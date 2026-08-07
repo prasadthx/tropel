@@ -33,8 +33,16 @@
 
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
+
+/// How long `Drop` waits for a worker thread to exit before detaching it.
+/// Matches the engine's VU-drain bound (see `vu_loop.rs`: "VU drain timed
+/// out after 30s") so a worker wedged in a blocking eval or
+/// `std::thread::sleep` can never hang teardown past the drain bound.
+const JOIN_BOUND: Duration = Duration::from_secs(30);
 
 /// A pool of dedicated worker threads, each running a current-thread tokio
 /// runtime. VU tasks are pinned to their own worker (`spawn_vu`), so a VU is
@@ -44,6 +52,9 @@ pub struct VUWorkerPool {
     /// its own OS thread. Mutex: growth is rare (once per VU id) and cheap.
     workers: Mutex<Vec<WorkerInner>>,
     next_idx: AtomicUsize,
+    /// How long `Drop` waits for a worker to exit before detaching it. 30s by
+    /// default (matching the engine's drain bound); short in tests.
+    join_bound: Duration,
 }
 
 struct WorkerInner {
@@ -53,6 +64,10 @@ struct WorkerInner {
     shutdown: Arc<tokio::sync::Notify>,
     /// The dedicated OS thread that polls this runtime's task queue.
     thread: Option<thread::JoinHandle<()>>,
+    /// Receives `()` once the worker thread has returned from `block_on` (i.e.
+    /// it is about to exit). Lets `Drop` wait on a *bounded* join instead of
+    /// blocking forever on a wedged worker.
+    exited: Option<mpsc::Receiver<()>>,
 }
 
 impl VUWorkerPool {
@@ -61,12 +76,18 @@ impl VUWorkerPool {
     /// Each worker runs a current-thread tokio runtime on a dedicated OS thread.
     /// Panics if `count` is 0.
     pub fn new(count: usize) -> Self {
+        Self::with_join_bound(count, JOIN_BOUND)
+    }
+
+    /// Create a pool with a custom join bound (tests use a short one).
+    fn with_join_bound(count: usize, join_bound: Duration) -> Self {
         assert!(count > 0, "VUWorkerPool requires at least 1 worker");
 
         let workers = (0..count).map(Self::make_worker).collect();
         Self {
             workers: Mutex::new(workers),
             next_idx: AtomicUsize::new(0),
+            join_bound,
         }
     }
 
@@ -80,6 +101,7 @@ impl VUWorkerPool {
         let handle = runtime.handle().clone();
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let sig = shutdown.clone();
+        let (exited_tx, exited_rx) = mpsc::channel::<()>();
 
         let thread = thread::Builder::new()
             .name(format!("tropel-worker-{}", i))
@@ -89,6 +111,10 @@ impl VUWorkerPool {
                 runtime.block_on(async {
                     sig.notified().await;
                 });
+                // The worker is exiting — signal the pool so `Drop` can join
+                // it within the join bound. If the pool is gone (detached),
+                // the send fails silently.
+                let _ = exited_tx.send(());
             })
             .expect("Failed to spawn worker thread");
 
@@ -96,15 +122,45 @@ impl VUWorkerPool {
             handle,
             shutdown,
             thread: Some(thread),
+            exited: Some(exited_rx),
         }
     }
 
     /// Ensure at least `n` workers exist, growing the pool on demand.
+    ///
+    /// Workers (runtime + OS thread) are created OUTSIDE the pool mutex: this
+    /// is called from the async ramp loop, and creating a current-thread
+    /// runtime + spawning a thread can take milliseconds — holding a
+    /// `std::sync::Mutex` across that would stall the ramp loop and every
+    /// other pool operation. The lock is only held for the final insert.
     fn ensure_workers(&self, n: usize) {
-        let mut workers = self.workers.lock().unwrap();
-        while workers.len() < n {
-            let i = workers.len();
-            workers.push(Self::make_worker(i));
+        loop {
+            let current = self.workers.lock().unwrap().len();
+            if current >= n {
+                return;
+            }
+            // Build the worker outside the lock (runtime + thread creation).
+            let worker = Self::make_worker(current);
+            let mut workers = self.workers.lock().unwrap();
+            if workers.len() == current {
+                // No concurrent growth — commit, then continue growing until
+                // the pool reaches `n` (one worker per loop iteration).
+                workers.push(worker);
+                continue;
+            }
+            // Another thread grew the pool between our snapshot and lock
+            // acquisition; the freshly-built worker is surplus. Signal it to
+            // stop and reap it, then re-check. The surplus worker is
+            // GUARANTEED idle (never inserted, so `spawn_on` can't reach it),
+            // so the notify is consumed promptly and `recv()` can't deadlock.
+            drop(workers);
+            worker.shutdown.notify_one();
+            if let Some(exited) = &worker.exited {
+                let _ = exited.recv();
+            }
+            if let Some(thread) = worker.thread {
+                let _ = thread.join();
+            }
         }
     }
 
@@ -179,14 +235,50 @@ impl Drop for VUWorkerPool {
             .workers
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Signal each worker to stop, which unblocks the `notified().await` call.
+        // Signal each worker to stop. Each worker has its OWN Notify, and we
+        // use `notify_one()` (not `notify_waiters()`): notify_waiters stores
+        // no permit, so a notification fired before the worker thread has
+        // registered its `notified().await` waiter would be LOST and the
+        // worker would hang. `notify_one()` stores a permit when no waiter is
+        // present yet, so the wake can never be missed — race-free whether
+        // the worker is starting, parked, or wedged in a blocking call.
         for worker in workers.iter() {
-            worker.shutdown.notify_waiters();
+            worker.shutdown.notify_one();
         }
-        // Join the worker threads.
+        // Join the worker threads within a BOUNDED window. A worker whose VU
+        // is wedged in a blocking eval or `std::thread::sleep` cannot poll the
+        // shutdown notify until that blocking call returns, so an unbounded
+        // `join()` would hang teardown past the engine's 30s drain bound.
+        // Wait up to `join_bound` for each worker; a straggler is DETACHED
+        // (its handle dropped without joining) so the run finishes on time —
+        // the abandoned VU keeps running in the background, its late samples
+        // land after the summary snapshot (so they can't corrupt it), and the
+        // OS thread is reclaimed whenever its blocking call finally returns.
+        let deadline = Instant::now() + self.join_bound;
         for worker in workers.iter_mut() {
-            if let Some(thread) = worker.thread.take() {
-                let _ = thread.join();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let exited = match &worker.exited {
+                Some(rx) => matches!(rx.recv_timeout(remaining), Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected)),
+                None => false,
+            };
+            if exited {
+                // Worker returned from `block_on` — it is about to exit, so
+                // `join` returns promptly.
+                if let Some(thread) = worker.thread.take() {
+                    let _ = thread.join();
+                }
+            } else if let Some(thread) = worker.thread.take() {
+                // Wedged past the bound: detach. The OS thread keeps running
+                // (the VU's blocking call is stuck) and exits whenever that
+                // call finally returns; we simply stop waiting so teardown is
+                // bounded. The `exited` sender is dropped with the thread, so
+                // nothing leaks — the detached thread is reclaimed by the OS
+                // when its task completes.
+                tracing::warn!(
+                    "VU worker {} did not exit within the {}s join bound — detaching (its VU is wedged in a blocking call)",
+                    thread.thread().name().unwrap_or("?"),
+                    self.join_bound.as_secs()
+                );
             }
         }
     }
@@ -270,5 +362,54 @@ mod tests {
         let (idx, h) = pool.spawn(async {});
         assert!(h.await.is_ok());
         assert!(idx < pool.worker_count());
+    }
+
+    /// Backlog line 168: `Drop` used to `join()` every worker unconditionally,
+    /// so a VU wedged in a blocking eval / `std::thread::sleep` hung teardown
+    /// past the engine's 30s drain bound. Drop must now return within the
+    /// join bound by DETACHING the wedged worker instead of waiting for it.
+    #[test]
+    fn drop_detaches_wedged_worker_within_join_bound() {
+        // Short join bound so the test is fast; the worker is wedged for far
+        // longer than the bound.
+        let pool = VUWorkerPool::with_join_bound(1, Duration::from_millis(150));
+
+        // A VU that blocks its OS thread for 2s (what a script `sleep(2.0)`
+        // does via the native bridge). While wedged, the worker cannot poll
+        // the shutdown notify, so an unbounded join would hang ~2s here —
+        // and with a truly stuck eval, forever.
+        let _h = pool.spawn_vu(
+            0,
+            async {
+                std::thread::sleep(Duration::from_secs(2));
+            },
+        );
+
+        let start = Instant::now();
+        drop(pool);
+        let elapsed = start.elapsed();
+        // Must return near the join bound (detaching), NOT after the 2s sleep.
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "drop blocked for {elapsed:?} on a wedged worker instead of detaching"
+        );
+
+    }
+
+    /// A healthy pool (no wedged VUs) must still tear down cleanly and
+    /// promptly — the bounded join must not regress the fast path.
+    #[test]
+    fn drop_joins_healthy_workers_promptly() {
+        let pool = VUWorkerPool::with_join_bound(2, Duration::from_secs(5));
+        let _h = pool.spawn_vu(0, async {});
+        let _h2 = pool.spawn_vu(1, async {});
+        let start = Instant::now();
+        drop(pool);
+        // Both workers exited on the shutdown notify immediately.
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "healthy teardown took {:?}",
+            start.elapsed()
+        );
     }
 }
