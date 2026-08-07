@@ -19,7 +19,8 @@
 //! 4. If the transform emitted `babelHelpers.*` calls (decorator lowering),
 //!    prepend a minimal [`BABEL_HELPERS_SHIM`] so the output runs standalone
 //!    in QuickJS.
-//! 5. Optionally strip `export` keywords (script-mode eval).
+//! 5. Optionally remove the `export` nodes from the AST (script-mode eval)
+//!    — see [`strip_exports_ast`].
 //!
 //! Diagnostics are classified by severity: **recoverable** ones (oxc's
 //! parser recovers and still produces a valid AST) are logged as warnings
@@ -32,23 +33,28 @@
 //! - [`typescript_to_javascript_keep_exports`] — exports preserved
 //!   (module-mode eval, e.g. reading a k6 script's `export const options`).
 
-use oxc_allocator::Allocator;
-use oxc_ast::ast::Statement;
+use std::cell::Cell;
+
+use oxc_allocator::{Allocator, Box};
+use oxc_ast::ast::{
+    ClassType, Declaration, ExportDefaultDeclaration, ExportDefaultDeclarationKind,
+    ExportNamedDeclaration, Expression, ExpressionStatement, FunctionType, ParenthesizedExpression,
+    Program, Statement,
+};
 use oxc_codegen::Codegen;
 use oxc_diagnostics::Severity;
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
-use oxc_span::{GetSpan, SourceType};
+use oxc_span::{GetSpan, SourceType, Span};
+use oxc_syntax::node::NodeId;
 use oxc_transformer::{
     DecoratorOptions, HelperLoaderMode, HelperLoaderOptions, TransformOptions, Transformer,
 };
-use regex::Regex;
 
 /// Transpile TypeScript source code to plain JavaScript.
 /// Strips types via oxc, then removes `export` keywords (script-mode eval).
 pub fn typescript_to_javascript(source: &str, filename: &str) -> anyhow::Result<String> {
-    let js = transpile_typescript(source, filename)?;
-    Ok(remove_exports(&js))
+    transpile_typescript(source, filename, true)
 }
 
 /// Transpile TypeScript source code to plain JavaScript, **keeping** the
@@ -63,12 +69,16 @@ pub fn typescript_to_javascript_keep_exports(
     source: &str,
     filename: &str,
 ) -> anyhow::Result<String> {
-    transpile_typescript(source, filename)
+    transpile_typescript(source, filename, false)
 }
 
 /// The shared oxc pipeline: parse → transform (strip TS + lower decorators)
 /// → codegen → prepend the decorator helper shim when needed.
-fn transpile_typescript(source: &str, filename: &str) -> anyhow::Result<String> {
+fn transpile_typescript(
+    source: &str,
+    filename: &str,
+    strip_exports: bool,
+) -> anyhow::Result<String> {
     let allocator = Allocator::default();
 
     // SourceType: honor a real .ts/.mts/.tsx path, otherwise force TypeScript
@@ -129,6 +139,13 @@ fn transpile_typescript(source: &str, filename: &str) -> anyhow::Result<String> 
     }
     for d in &transform_return.errors {
         tracing::warn!("TypeScript transform diagnostic (recoverable): {d}");
+    }
+
+    // Script-mode eval cannot contain `export` statements — remove the export
+    // nodes on the AST (the old regex pass rewrote string/template-literal
+    // contents and emitted invalid JS; see `strip_exports_ast`).
+    if strip_exports {
+        strip_exports_ast(&mut program, &allocator);
     }
 
     let codegen_return = Codegen::new().build(&program);
@@ -198,81 +215,149 @@ fn format_diagnostics(diagnostics: &[oxc_diagnostics::OxcDiagnostic]) -> String 
 // ---------------------------------------------------------------------------
 // Export stripping (script mode)
 //
-// oxc strips the types first, so these regexes only ever run against clean
-// JavaScript — the fragile TS constructs that poisoned the old regexes are
-// already gone. The remaining job is purely removing real `export` keywords.
+// Script-mode eval rejects `export` statements, so they are removed on the
+// oxc AST — the SAME AST the transformer produced — before codegen. This
+// replaces the old regex pass, which ran on raw output text with no lexical
+// awareness: it rewrote string/template-literal contents
+// (`` const p = `export default function () { return 1; }` `` got mangled, so
+// the load test POSTed a different body than the script said) and emitted
+// invalid JS (`export default function(` → `function(` is a SyntaxError —
+// anonymous function declarations are legal only as an `export default`
+// operand). Every test re-parses its output; see `assert_reparses`.
 // ---------------------------------------------------------------------------
 
-/// Remove `export` keywords from transpiled JS (script-mode eval).
-fn remove_exports(s: &str) -> String {
-    let mut result = s.to_string();
-
-    // `export default function Name(...` → `function Name(...`
-    // Requires a name after `function|class` — an *anonymous* default
-    // (`export default class {`) must NOT match here: emitting `class {` as a
-    // statement is a SyntaxError in script mode, so it falls through to re3's
-    // `/* export default */` comment form instead. The name's first char is
-    // captured and re-emitted (the regex crate has no lookahead, so matching
-    // it naively would swallow the `F` of `Foo` → `class oo`).
-    let re1 = Regex::new(r"\bexport\s+default\s+(function|class)\s+([A-Za-z_$])").unwrap();
-    result = re1.replace_all(&result, "$1 $2").to_string();
-
-    // `export default function(...` → `function(...` (anonymous default)
-    let re2 = Regex::new(r"\bexport\s+default\s+(function|class)\s*\(").unwrap();
-    result = re2.replace_all(&result, "$1(").to_string();
-
-    // `export default X` → `/* export default */ X` (any other default)
-    let re3 = Regex::new(r"\bexport\s+default\s+").unwrap();
-    result = re3
-        .replace_all(&result, "/* export default */ ")
-        .to_string();
-
-    // `export function Name(...` → `function Name(...`
-    let re4 = Regex::new(r"\bexport\s+(async\s+)?function\b").unwrap();
-    result = re4
-        .replace_all(&result, |caps: &regex::Captures| {
-            let async_prefix = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            format!("{}function", async_prefix)
-        })
-        .to_string();
-
-    // `export class Name` → `class Name`
-    let re5 = Regex::new(r"\bexport\s+class\b").unwrap();
-    result = re5.replace_all(&result, "class").to_string();
-
-    // `export const/let/var` → `const/let/var`
-    let re6 = Regex::new(r"\bexport\s+(const|let|var)\b").unwrap();
-    result = re6.replace_all(&result, "$1").to_string();
-
-    // `export { ... }` — named export block, comment it out
-    let re7 = Regex::new(r"\bexport\s*\{[^}]*\}\s*;").unwrap();
-    result = re7
-        .replace_all(&result, "/* named exports stripped */")
-        .to_string();
-
-    // `export * from '...'` / `export { x } from '...'` — re-exports
-    result = result
-        .lines()
-        .map(|line| {
-            let trimmed = line.trim();
-            if trimmed.starts_with("export ")
-                && trimmed.contains(" from ")
-                && (trimmed.contains('"') || trimmed.contains('\''))
-            {
-                if trimmed.starts_with("//") || trimmed.starts_with("/*") {
-                    line.to_string()
-                } else {
-                    format!("// re-export stripped: {}", trimmed)
-                }
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    result
+/// Remove `export` nodes from the AST (script-mode eval).
+///
+/// Runs on the AST oxc already built — never on raw output text — so string
+/// and template-literal contents are untouched and every replacement is valid
+/// script-mode JavaScript:
+///
+/// - `export const/let/var/function/class X` → the bare declaration.
+/// - `export default function f(){}` / `export default class C {}` → the bare
+///   declaration (named declarations are legal statements).
+/// - `export default function(){}` / `export default class {}` (anonymous)
+///   → `(function(){});` / `(class{});` — a parenthesized EXPRESSION, the
+///   only legal anonymous form at statement position.
+/// - `export default <expr>` → `(<expr>);` (parens keep object literals from
+///   parsing as blocks and function/class expressions legal).
+/// - `export { a, b }`, `export { a } from './m'`, `export * from './m'`
+///   → dropped (script mode has no module bindings to re-export).
+fn strip_exports_ast<'a>(program: &mut Program<'a>, allocator: &'a Allocator) {
+    let old_body = std::mem::replace(&mut program.body, oxc_allocator::Vec::new_in(allocator));
+    let stripped = old_body
+        .into_iter()
+        .filter_map(|stmt| strip_export(stmt, allocator));
+    program.body = oxc_allocator::Vec::from_iter_in(stripped, allocator);
 }
+
+/// Rewrite one top-level statement: strip `export` wrappers, drop module
+/// re-export statements. Returns `None` for statements to remove entirely.
+fn strip_export<'a>(stmt: Statement<'a>, allocator: &'a Allocator) -> Option<Statement<'a>> {
+    match stmt {
+        Statement::ExportNamedDeclaration(b) => {
+            // Unbox so the declaration field can be moved out and spliced
+            // into a plain statement.
+            let ExportNamedDeclaration { declaration, .. } = b.unbox();
+            match declaration {
+                // `export const x = 1` / `export function f(){}` / `export class C {}`
+                Some(Declaration::VariableDeclaration(v)) => {
+                    Some(Statement::VariableDeclaration(v))
+                }
+                Some(Declaration::FunctionDeclaration(f)) => {
+                    Some(Statement::FunctionDeclaration(f))
+                }
+                Some(Declaration::ClassDeclaration(c)) => Some(Statement::ClassDeclaration(c)),
+                // TS-only declarations (interface/type) are erased by the
+                // transform; re-exports (`export { x } from './m'`, `export
+                // { y };`) have `declaration: None` — drop them.
+                _ => None,
+            }
+        }
+        Statement::ExportDefaultDeclaration(b) => {
+            let ExportDefaultDeclaration {
+                node_id,
+                span,
+                declaration,
+            } = b.unbox();
+            match declaration {
+                ExportDefaultDeclarationKind::FunctionDeclaration(mut f) => {
+                    if f.id.is_some() {
+                        Some(Statement::FunctionDeclaration(f))
+                    } else {
+                        // Codegen auto-parens function EXPRESSIONS at statement
+                        // start (is_expression()); a declaration-typed node
+                        // would be emitted bare as `function(){};` — a
+                        // SyntaxError. Flip the kind so the wrap triggers.
+                        f.r#type = FunctionType::FunctionExpression;
+                        Some(paren_expr_stmt(
+                            allocator,
+                            node_id,
+                            span,
+                            Expression::FunctionExpression(f),
+                        ))
+                    }
+                }
+                ExportDefaultDeclarationKind::ClassDeclaration(mut c) => {
+                    if c.id.is_some() {
+                        Some(Statement::ClassDeclaration(c))
+                    } else {
+                        c.r#type = ClassType::ClassExpression;
+                        Some(paren_expr_stmt(
+                            allocator,
+                            node_id,
+                            span,
+                            Expression::ClassExpression(c),
+                        ))
+                    }
+                }
+                // `export default interface` — TS-only, drop defensively.
+                ExportDefaultDeclarationKind::TSInterfaceDeclaration(_) => None,
+                // `export default <expr>` — any inherited Expression variant.
+                expr => Some(paren_expr_stmt(
+                    allocator,
+                    node_id,
+                    span,
+                    expr.into_expression(),
+                )),
+            }
+        }
+        // `export * from './m'` — no local bindings to keep.
+        Statement::ExportAllDeclaration(_) => None,
+        other => Some(other),
+    }
+}
+
+/// Build `(<expr>);` — a parenthesized expression statement. Parens are
+/// REQUIRED: a bare `function(){}` / `class{}` / `{}` at statement position
+/// is a SyntaxError or a block, not an expression. Callers must have already
+/// flipped the node's `r#type` to the *Expression* variant — codegen's
+/// `is_expression()` wrap (which emits the parens) only fires for expression-
+/// typed nodes.
+fn paren_expr_stmt<'a>(
+    allocator: &'a Allocator,
+    node_id: Cell<NodeId>,
+    span: Span,
+    expression: Expression<'a>,
+) -> Statement<'a> {
+    let paren = Expression::ParenthesizedExpression(Box::new_in(
+        ParenthesizedExpression {
+            node_id: node_id.clone(),
+            span,
+            expression,
+        },
+        allocator,
+    ));
+    Statement::ExpressionStatement(Box::new_in(
+        ExpressionStatement {
+            node_id,
+            span,
+            expression: paren,
+        },
+        allocator,
+    ))
+}
+
+
 
 /// Strip k6 virtual-module imports / re-exports from a module source using the
 /// oxc AST (NOT regex).
@@ -655,14 +740,11 @@ mod tests {
 
     #[test]
     fn test_export_default_class() {
-        // anonymous default class must not emit a bare `class {` statement
-        // (script-mode SyntaxError) — re3's `/* export default */` comment
-        // form catches it (the comment intentionally keeps the text).
-        // Note: `/* export default */ class { ... }` is still not *evaluable*
-        // script-mode JS (anonymous class declarations are illegal; only class
-        // expressions may be anonymous) — but that is a pre-existing P3 edge
-        // case nobody hits in load-test scripts; the guard here only prevents
-        // the named-class regression (see test_export_default_named_class).
+        // anonymous default class must become a parenthesized CLASS
+        // EXPRESSION `(class { ... });` — a bare `class {` statement is a
+        // script-mode SyntaxError. This is the AST stripper's job; the old
+        // regex pass could only emit the comment form, which was still not
+        // evaluable.
         let ts = r#"export default class { method() { return 1; } }"#;
         let js = strip_types(ts);
         assert!(
@@ -670,7 +752,7 @@ mod tests {
             "got: {js}"
         );
         assert!(
-            js.contains("class {") || js.contains("class {\n"),
+            js.contains("(class") || js.contains("class {"),
             "got: {js}"
         );
         assert!(js.contains("method()"), "got: {js}");
@@ -720,6 +802,89 @@ mod tests {
         let js = typescript_to_javascript_keep_exports(ts, "script.ts").unwrap();
         assert!(js.contains("export const options"), "got: {js}");
         assert!(js.contains("export default function"), "got: {js}");
+        // The keep-exports output must still re-parse as a module.
+        let allocator = Allocator::default();
+        let ret =
+            Parser::new(&allocator, &js, SourceType::default().with_module(true)).parse();
+        assert!(
+            ret.errors
+                .iter()
+                .find(|d| d.severity == Severity::Error)
+                .is_none()
+                && !ret.panicked,
+            "keep-exports output does not re-parse as a module:\n{js}\n{}",
+            format_diagnostics(&ret.errors)
+        );
+    }
+
+    // --- Regression: the old regex export-stripper (backlog line 224) ---
+    // It rewrote string/template-literal contents and emitted invalid JS.
+    // These pin the AST-based strip: contents preserved, output re-parses.
+
+    #[test]
+    fn test_export_default_text_inside_string_preserved() {
+        // `export default` inside a string literal must survive verbatim.
+        let ts = r#"
+            const msg = "export default function() { return 1; }";
+            export default function() { return msg; }
+        "#;
+        let js = strip_types(ts);
+        assert!(
+            js.contains("\"export default function() { return 1; }\""),
+            "got: {js}"
+        );
+    }
+
+    #[test]
+    fn test_export_text_inside_template_literal_preserved() {
+        // `export const` text inside a template literal must survive verbatim.
+        let ts = r#"
+            const tmpl = `export const options = { vus: 10 };`;
+            export default function() { return tmpl; }
+        "#;
+        let js = strip_types(ts);
+        assert!(
+            js.contains("export const options = { vus: 10 }"),
+            "got: {js}"
+        );
+    }
+
+    #[test]
+    fn test_anonymous_default_function_is_parenthesized() {
+        // `export default function() {}` must become `(function() {});` — a
+        // bare `function(){}` at statement position is a SyntaxError.
+        let ts = r#"export default function() { return 42; }"#;
+        let js = strip_types(ts);
+        assert!(js.contains("(function"), "got: {js}");
+        assert!(!js.contains("export default"), "got: {js}");
+    }
+
+    #[test]
+    fn test_object_literal_default_is_parenthesized() {
+        // `export default { a: 1 };` must become `({ a: 1 });` — a bare `{}`
+        // at statement position is a block, not an object literal.
+        let ts = r#"export default { a: 1, b: "x" };"#;
+        let js = strip_types(ts);
+        // Codegen may expand the object across lines, so pin the parens (a
+        // bare `{}` statement would be a block) and the member presence.
+        assert!(js.contains("({"), "got: {js}");
+        assert!(js.contains("a: 1"), "got: {js}");
+    }
+
+    #[test]
+    fn test_reexport_statements_dropped() {
+        // `export { x } from './m'` and `export * from './n'` have no local
+        // binding — drop the whole statement. Local `export { y };` is also
+        // a no-op after stripping; only the binding must survive.
+        let ts = r#"
+            export { x } from "./m";
+            export * from "./n";
+            const y = 1;
+            export { y };
+        "#;
+        let js = strip_types(ts);
+        assert!(!js.contains("export"), "got: {js}");
+        assert!(js.contains("const y = 1"), "got: {js}");
     }
 
     // --- Decorator lowering (the point this file previously missed) ---
@@ -793,8 +958,25 @@ mod tests {
         );
     }
 
-    /// Test helper: strip types + exports (script mode).
+    /// Re-parse `js` as plain script-mode JavaScript and panic with the
+    /// source on any Error-severity diagnostic — every test pins this, since
+    /// the old regex export-stripper emitted invalid JS.
+    fn assert_reparses(js: &str) {
+        let allocator = Allocator::default();
+        let ret = Parser::new(&allocator, js, SourceType::default()).parse();
+        let err = ret.errors.iter().find(|d| d.severity == Severity::Error);
+        assert!(
+            err.is_none() && !ret.panicked,
+            "output does not re-parse as script JS:\n{js}\n{}",
+            format_diagnostics(&ret.errors)
+        );
+    }
+
+    /// Test helper: strip types + exports (script mode), then re-parse the
+    /// output to guarantee it is valid script JS.
     fn strip_types(source: &str) -> String {
-        typescript_to_javascript(source, "test.ts").unwrap()
+        let js = typescript_to_javascript(source, "test.ts").unwrap();
+        assert_reparses(&js);
+        js
     }
 }

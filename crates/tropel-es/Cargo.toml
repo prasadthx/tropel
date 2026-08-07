@@ -9,7 +9,6 @@ description = "TypeScript transpilation and ES module bundling for Tropel load-t
 
 [dependencies]
 tropel-core.workspace = true
-regex.workspace = true
 pathdiff = "0.2.3"
 once_cell.workspace = true
 anyhow.workspace = true
@@ -22,6 +21,7 @@ oxc_parser.workspace = true
 oxc_span.workspace = true
 oxc_ast.workspace = true
 oxc_semantic.workspace = true
+oxc_syntax.workspace = true
 oxc_transformer.workspace = true
 oxc_codegen.workspace = true
 oxc_diagnostics.workspace = true
