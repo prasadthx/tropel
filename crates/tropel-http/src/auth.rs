@@ -864,6 +864,44 @@ impl AuthSigner for DigestAuth {
     }
 }
 
+/// Compute the RFC 7616 §3.4.1 `response` digest for a session with a KNOWN
+/// cnonce. Extracted from `build_digest_authorization` (which supplies a
+/// fresh random cnonce) so the published RFC reference vectors can be pinned
+/// EXACTLY — the RFC examples fix the cnonce, and a random one can never be
+/// compared against the published answer (backlog line 210).
+///
+/// `qop = Some(...)` containing `auth` uses the qop form
+/// `H(H(A1):nonce:nc:cnonce:auth:H(A2))`; any other combination falls back
+/// to the no-qop form `H(H(A1):nonce:H(A2))` (with `-sess` folding the
+/// nonce+cnonce into HA1 first).
+fn digest_response_value(
+    base_ha1: &str,
+    is_sess: bool,
+    nonce: &str,
+    nc: &str,
+    cnonce: &str,
+    qop: Option<&str>,
+    ha2: &str,
+    base_algorithm: &str,
+) -> String {
+    if let Some(qop) = qop {
+        if qop.split(',').any(|q| q.trim() == "auth") {
+            let ha1 = sess_fold_ha1(base_ha1, is_sess, nonce, cnonce, base_algorithm);
+            return digest_with(
+                &format!("{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}"),
+                base_algorithm,
+            );
+        }
+    }
+    // No qop (or qop without `auth`) — the no-qop form; nc/cnonce unused.
+    if is_sess {
+        let ha1 = sess_fold_ha1(base_ha1, true, nonce, cnonce, base_algorithm);
+        digest_with(&format!("{ha1}:{nonce}:{ha2}"), base_algorithm)
+    } else {
+        digest_with(&format!("{base_ha1}:{nonce}:{ha2}"), base_algorithm)
+    }
+}
+
 /// RFC 7616 §3.4.4: the `-sess` HA1 folds nonce + cnonce into the base HA1
 /// (`H(base_ha1:nonce:cnonce)`); non-sess algorithms use the base HA1 as-is.
 fn sess_fold_ha1(
@@ -947,9 +985,16 @@ fn build_digest_authorization(
     let response = if let Some(qop) = qop {
         if qop.split(',').any(|q| q.trim() == "auth") {
             let c = generate_crypto_nonce();
-            let ha1 = sess_fold_ha1(&base_ha1, is_sess, nonce, &c, base_algorithm);
-            let response_input = format!("{ha1}:{nonce}:{nc}:{c}:auth:{ha2}");
-            let response = digest_with(&response_input, base_algorithm);
+            let response = digest_response_value(
+                &base_ha1,
+                is_sess,
+                nonce,
+                &nc,
+                &c,
+                Some(qop),
+                &ha2,
+                base_algorithm,
+            );
             fields.push(("qop".into(), "auth".into()));
             fields.push(("nc".into(), nc));
             fields.push(("cnonce".into(), c));
@@ -958,20 +1003,18 @@ fn build_digest_authorization(
             // qop present but no 'auth' — fall back to the no-qop form.
             if is_sess {
                 let c = generate_crypto_nonce();
-                let ha1 = sess_fold_ha1(&base_ha1, true, nonce, &c, base_algorithm);
                 fields.push(("cnonce".into(), c.clone()));
-                digest_with(&format!("{ha1}:{nonce}:{ha2}"), base_algorithm)
+                digest_response_value(&base_ha1, true, nonce, &nc, &c, None, &ha2, base_algorithm)
             } else {
-                digest_with(&format!("{base_ha1}:{nonce}:{ha2}"), base_algorithm)
+                digest_response_value(&base_ha1, false, nonce, &nc, "", None, &ha2, base_algorithm)
             }
         }
     } else if is_sess {
         let c = generate_crypto_nonce();
-        let ha1 = sess_fold_ha1(&base_ha1, true, nonce, &c, base_algorithm);
         fields.push(("cnonce".into(), c.clone()));
-        digest_with(&format!("{ha1}:{nonce}:{ha2}"), base_algorithm)
+        digest_response_value(&base_ha1, true, nonce, &nc, &c, None, &ha2, base_algorithm)
     } else {
-        digest_with(&format!("{base_ha1}:{nonce}:{ha2}"), base_algorithm)
+        digest_response_value(&base_ha1, false, nonce, &nc, "", None, &ha2, base_algorithm)
     };
     fields.push(("response".into(), response));
     if let Some(alg) = server_algorithm {
@@ -1417,6 +1460,56 @@ mod tests {
         );
     }
 
+    /// Backlog line 210: SigV4 must reproduce the PUBLISHED AWS reference
+    /// vector, not just `contains("Signature=")`. This is the canonical
+    /// "Signature Calculations for the Authorization Header: Transferring a
+    /// Payload in a Single Chunk" (ListUsers) example from the AWS docs:
+    /// secret `wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY`, region us-east-1,
+    /// service iam, date 20150830T123600Z. The canonical-request hash and
+    /// the final signature below were re-derived with openssl and match the
+    /// values published in the AWS documentation byte-for-byte.
+    #[test]
+    fn sigv4_matches_aws_docs_reference_vector() {
+        // The canonical request exactly as the AWS docs example publishes it
+        // (GET /?Action=ListUsers&Version=2010-05-08, host iam.amazonaws.com,
+        // content-type, x-amz-date; empty payload hash).
+        let canonical_request = concat!(
+            "GET\n",
+            "/\n",
+            "Action=ListUsers&Version=2010-05-08\n",
+            "content-type:application/x-www-form-urlencoded; charset=utf-8\n",
+            "host:iam.amazonaws.com\n",
+            "x-amz-date:20150830T123600Z\n",
+            "\n",
+            "content-type;host;x-amz-date\n",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        );
+        assert_eq!(
+            hex_sha256(canonical_request.as_bytes()),
+            "f536975d06c0309214f805bb90ccff089219ecd68b2577efef23edd43b7e1a59",
+            "canonical request must hash to the AWS-published value"
+        );
+
+        // String to sign (date + scope + canonical-request hash) → signature.
+        let string_to_sign = concat!(
+            "AWS4-HMAC-SHA256\n",
+            "20150830T123600Z\n",
+            "20150830/us-east-1/iam/aws4_request\n",
+            "f536975d06c0309214f805bb90ccff089219ecd68b2577efef23edd43b7e1a59",
+        );
+        let key = derive_signing_key(
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            "20150830",
+            "us-east-1",
+            "iam",
+        );
+        assert_eq!(
+            hex_hmac_sha256(&key, string_to_sign.as_bytes()),
+            "5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7",
+            "signature must match the AWS-published value (kDate→kRegion→kService→kSigning chain)"
+        );
+    }
+
     #[test]
     fn oauth1_produces_authorization_header() {
         let mut req = build_request(
@@ -1610,6 +1703,80 @@ mod tests {
             .unwrap();
         assert_eq!(response.len(), 32);
         assert!(response.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// Backlog line 210: the RFC 2617 §3.5 reference vector (reproduced in
+    /// RFC 7616 §3.9.1). Username Mufasa / realm testrealm@host.com /
+    /// password "Circle Of Life", nonce dcd98b7102dd2f0e8b11d0f600bfb0c093,
+    /// uri /dir/index.html, qop=auth, nc=00000001, cnonce 0a4f113b. The
+    /// published response `6629fae4…` was re-derived with openssl and the
+    /// test now compares the ANSWER instead of just its length.
+    #[test]
+    fn digest_matches_rfc2617_md5_reference_vector() {
+        let base_ha1 = digest_with("Mufasa:testrealm@host.com:Circle Of Life", "MD5");
+        assert_eq!(base_ha1, "939e7578ed9e3c518a452acee763bce9");
+        let ha2 = digest_with("GET:/dir/index.html", "MD5");
+        assert_eq!(ha2, "39aff3a2bab6126f332b942af96d3366");
+        let response = digest_response_value(
+            &base_ha1,
+            false,
+            "dcd98b7102dd2f0e8b11d0f600bfb0c093",
+            "00000001",
+            "0a4f113b",
+            Some("auth"),
+            &ha2,
+            "MD5",
+        );
+        assert_eq!(
+            response,
+            "6629fae49393a05397450978507c4ef1",
+            "RFC 2617 §3.5 published response"
+        );
+    }
+
+    /// Backlog line 210: RFC 7616 §3.9.1 reference vectors (MD5 + SHA-256).
+    /// Realm http-auth@example.org, password "Circle of Life", nonce
+    /// 7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v, uri /dir/index.html,
+    /// nc=00000001, cnonce f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ.
+    /// Both published responses were re-derived with openssl.
+    #[test]
+    fn digest_matches_rfc7616_reference_vectors() {
+        // NOTE: RFC 7616 spells the password "Circle of Life" (lowercase o)
+        // while RFC 2617 uses "Circle Of Life" — the two RFCs genuinely
+        // differ; keep each test faithful to its own source.
+        let base_ha1 = digest_with("Mufasa:http-auth@example.org:Circle of Life", "MD5");
+        let ha2 = digest_with("GET:/dir/index.html", "MD5");
+        assert_eq!(
+            digest_response_value(
+                &base_ha1,
+                false,
+                "7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v",
+                "00000001",
+                "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ",
+                Some("auth"),
+                &ha2,
+                "MD5",
+            ),
+            "8ca523f5e9506fed4657c9700eebdbec",
+            "RFC 7616 §3.9.1 published MD5 response"
+        );
+
+        let base_ha1 = digest_with("Mufasa:http-auth@example.org:Circle of Life", "SHA-256");
+        let ha2 = digest_with("GET:/dir/index.html", "SHA-256");
+        assert_eq!(
+            digest_response_value(
+                &base_ha1,
+                false,
+                "7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v",
+                "00000001",
+                "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ",
+                Some("auth"),
+                &ha2,
+                "SHA-256",
+            ),
+            "753927fa0e85d155564e2e272a28d1802ca10daf4496794697cf8db5856cb6c1",
+            "RFC 7616 §3.9.1 published SHA-256 response"
+        );
     }
 
     #[test]
