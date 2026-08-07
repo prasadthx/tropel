@@ -1291,4 +1291,83 @@ mod tests {
         assert!(tags.is_empty());
         assert_eq!(stat, Some("pass_rate"));
     }
+
+    // ── check_abort_on_fail (backlog §6 P1: zero coverage before) ──
+
+    fn abort_config(expression: &str, abort_on_fail: bool, delay: Option<&str>) -> ThresholdConfig {
+        ThresholdConfig {
+            expression: expression.to_string(),
+            abort_on_fail,
+            delay_abort_eval: delay.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn abort_fires_on_breach_with_abort_on_fail() {
+        // p95 = 1200, threshold 1000 → breached, abort_on_fail → true.
+        let mut thresholds = HashMap::new();
+        thresholds.insert(
+            "dur".to_string(),
+            abort_config("http_req_duration.p95 < 1000", true, None),
+        );
+        assert!(check_abort_on_fail(&thresholds, &make_metrics(), Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn abort_ignores_non_abort_thresholds() {
+        // Breached but abort_on_fail = false → must NOT abort (the run
+        // continues and reports the failure at the end).
+        let mut thresholds = HashMap::new();
+        thresholds.insert(
+            "dur".to_string(),
+            abort_config("http_req_duration.p95 < 1000", false, None),
+        );
+        assert!(!check_abort_on_fail(&thresholds, &make_metrics(), Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn abort_respects_delay_abort_eval_grace_period() {
+        let mut thresholds = HashMap::new();
+        thresholds.insert(
+            "dur".to_string(),
+            abort_config("http_req_duration.p95 < 1000", true, Some("30s")),
+        );
+        // Inside the 30s grace period: breach must NOT abort yet.
+        assert!(!check_abort_on_fail(
+            &thresholds,
+            &make_metrics(),
+            Duration::from_secs(10)
+        ));
+        // After the grace period: breach aborts.
+        assert!(check_abort_on_fail(
+            &thresholds,
+            &make_metrics(),
+            Duration::from_secs(31)
+        ));
+    }
+
+    #[test]
+    fn abort_does_not_fire_when_metric_has_no_samples_yet() {
+        // Mid-run, the metric series may not have arrived yet (the `_opt`
+        // variant returns None). A threshold on it must NOT abort — data
+        // may simply not have been recorded in the first instant.
+        let mut thresholds = HashMap::new();
+        thresholds.insert(
+            "dur".to_string(),
+            abort_config("http_req_duration.p95 < 1000", true, None),
+        );
+        let empty = MetricsResult::default(); // no http_req_duration series
+        assert!(!check_abort_on_fail(&thresholds, &empty, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn abort_only_fires_for_actually_breached_thresholds() {
+        // p95 = 1200 < 1500 → passes → no abort even with abort_on_fail.
+        let mut thresholds = HashMap::new();
+        thresholds.insert(
+            "dur".to_string(),
+            abort_config("http_req_duration.p95 < 1500", true, None),
+        );
+        assert!(!check_abort_on_fail(&thresholds, &make_metrics(), Duration::from_secs(5)));
+    }
 }
