@@ -1,6 +1,6 @@
 use crate::error::*;
-use rquickjs::function::Func;
-use rquickjs::{Context, Coerced, FromJs, Function, Persistent, Promise, Runtime};
+use rquickjs::function::{Func, Rest};
+use rquickjs::{Context, Coerced, Ctx, FromJs, Function, Persistent, Promise, Runtime, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
@@ -66,26 +66,17 @@ impl CachedScript {
             .map_err(|e| JsError::Eval(format!("Script restore error: {}", e)))?;
         func.call::<_, rquickjs::Value>(()).map_err(|e| {
             let err_msg = format!("{}", e);
-            let adjusted =
-                adjust_error_lines(&err_msg, self.wrapper_offset, self.source_url.as_deref());
-            // Show adjusted error + source excerpt
-            let label = self.source_url.as_deref().unwrap_or("<script>");
-            // Show first N lines of source for context
-            let max_preview_lines = 20usize;
-            let source_lines: Vec<&str> = self.source.lines().collect();
-            let source_preview = if source_lines.len() > max_preview_lines {
-                format!(
-                    "{}... ({} lines total)",
-                    source_lines[..max_preview_lines].join("\n"),
-                    source_lines.len()
-                )
-            } else {
-                self.source.to_string()
-            };
-            JsError::Eval(format!(
-                "Script error ({}): {}\n--- source ---\n{}\n--------------",
-                label, adjusted, source_preview
-            ))
+            // Shared adjuster + source-excerpt formatter (backlog line 173) —
+            // the SAME formatting the async rejection path uses, so the two
+            // error surfaces can never drift.
+            // format_script_error already embeds the label — don't repeat it.
+            let formatted = JsContext::format_script_error(
+                &err_msg,
+                self.wrapper_offset,
+                self.source_url.as_deref(),
+                Some(&self.source),
+            );
+            JsError::Eval(format!("Script error: {}", formatted))
         })
     }
 }
@@ -105,7 +96,7 @@ fn adjust_error_lines(msg: &str, offset: u32, source_url: Option<&str>) -> Strin
     }
 
     // Build all known prefixes that introduce a line number.
-    let mut prefixes: Vec<&str> = vec!["<eval>:"];
+    let mut prefixes: Vec<&str> = vec!["<eval>:", "eval_script:"];
     if let Some(url) = source_url {
         prefixes.push(url); // e.g. "item_name.js" — followed by ":LINE:COL"
     }
@@ -265,27 +256,46 @@ impl JsContext {
         let ctx = Context::full(&rt)
             .map_err(|e| JsError::ContextCreation(format!("Context creation failed: {}", e)))?;
 
-        // Set up the global `console` object
+        // Set up the global `console` object. Backlog line 172: the old
+        // bridge took a strict `String` param (console.log({a:1}) threw
+        // "cannot convert"), accepted only ONE argument, and routed `log` to
+        // tracing::trace! — invisible at default levels, so users debugging
+        // scripts saw nothing. Now each method is variadic (Rest<Value>),
+        // stringifies every argument (JSON for objects/arrays, plain text for
+        // scalars), joins with a space, and `log` goes to tracing::info!.
         ctx.with(|ctx| {
             let global = ctx.globals();
             let console = rquickjs::Object::new(ctx).ok();
             if let Some(console) = console {
+                // Note: closure params are deliberately unannotated — rquickjs
+                // infers ONE unified 'js for Ctx and Rest<Value>, which the
+                // explicit `Ctx<'_>, Rest<Value<'_>>` form splits into two
+                // invariant lifetimes and fails to compile.
+                // rquickjs closure-arg convention: params are inferred with
+                // ONE unified 'js (annotating `Ctx<'_>, Rest<Value<'_>>` splits
+                // them into two invariant lifetimes and fails to compile). The
+                // struct-tie is the canonical way to name that single lifetime.
+                struct ConsoleArgs<'js>(Ctx<'js>, Rest<Value<'js>>);
+
                 let _ = console.set(
                     "log",
-                    Func::from(|msg: String| {
-                        tracing::trace!("[JS console.log] {}", msg);
+                    Func::from(|ctx, args| {
+                        let ConsoleArgs(ctx, args) = ConsoleArgs(ctx, args);
+                        tracing::info!("[JS console.log] {}", console_args_to_string(&ctx, &args.0));
                     }),
                 );
                 let _ = console.set(
                     "warn",
-                    Func::from(|msg: String| {
-                        tracing::warn!("[JS console.warn] {}", msg);
+                    Func::from(|ctx, args| {
+                        let ConsoleArgs(ctx, args) = ConsoleArgs(ctx, args);
+                        tracing::warn!("[JS console.warn] {}", console_args_to_string(&ctx, &args.0));
                     }),
                 );
                 let _ = console.set(
                     "error",
-                    Func::from(|msg: String| {
-                        tracing::error!("[JS console.error] {}", msg);
+                    Func::from(|ctx, args| {
+                        let ConsoleArgs(ctx, args) = ConsoleArgs(ctx, args);
+                        tracing::error!("[JS console.error] {}", console_args_to_string(&ctx, &args.0));
                     }),
                 );
                 let _ = global.set("console", console);
@@ -377,6 +387,9 @@ impl JsContext {
     fn finish_promise<'js>(
         ctx: &rquickjs::Ctx<'js>,
         promise: &rquickjs::Promise<'js>,
+        line_offset: u32,
+        source_url: Option<&str>,
+        source: Option<&str>,
     ) -> Result<rquickjs::Value<'js>> {
         promise.finish::<rquickjs::Value>().map_err(|e| match e {
             rquickjs::Error::Exception => {
@@ -389,7 +402,10 @@ impl JsContext {
                 let caught = ctx.catch();
                 let reason = Self::rejection_to_string(ctx, &caught)
                     .unwrap_or_else(|| "<non-string rejection reason>".to_string());
-                JsError::Eval(format!("Async script rejected: {}", reason))
+                JsError::Eval(format!(
+                    "Async script rejected: {}",
+                    Self::format_script_error(&reason, line_offset, source_url, source)
+                ))
             }
             rquickjs::Error::WouldBlock => {
                 // An infinite microtask loop trips the per-eval interrupt
@@ -401,7 +417,10 @@ impl JsContext {
                     let caught = ctx.catch();
                     let reason = Self::rejection_to_string(ctx, &caught)
                         .unwrap_or_else(|| "<non-string rejection reason>".to_string());
-                    JsError::Eval(format!("Async script interrupted: {}", reason))
+                    JsError::Eval(format!(
+                        "Async script interrupted: {}",
+                        Self::format_script_error(&reason, line_offset, source_url, source)
+                    ))
                 } else {
                     JsError::Eval(
                         "Async script: promise never resolved (blocked on an operation the runtime cannot drive, e.g. a real timer)"
@@ -411,6 +430,39 @@ impl JsContext {
             }
             other => JsError::Eval(format!("Async script error: {}", other)),
         })
+    }
+
+    /// Apply line-number adjustment and a source excerpt to a formatted
+    /// rejection/error string (backlog line 173). The cached async wrapper
+    /// prepends 2 wrapper lines, so QuickJS line numbers are +2 until
+    /// adjusted; without this, `adjust_error_lines` and the source preview
+    /// were dead code because rejection formatting skipped them entirely.
+    fn format_script_error(
+        msg: &str,
+        line_offset: u32,
+        source_url: Option<&str>,
+        source: Option<&str>,
+    ) -> String {
+        let adjusted = adjust_error_lines(msg, line_offset, source_url);
+        let Some(source) = source else {
+            return adjusted;
+        };
+        let label = source_url.unwrap_or("<script>");
+        let max_preview_lines = 20usize;
+        let source_lines: Vec<&str> = source.lines().collect();
+        let source_preview = if source_lines.len() > max_preview_lines {
+            format!(
+                "{}... ({} lines total)",
+                source_lines[..max_preview_lines].join("\n"),
+                source_lines.len()
+            )
+        } else {
+            source.to_string()
+        };
+        format!(
+            "{} ({})\n--- source ---\n{}\n--------------",
+            adjusted, label, source_preview
+        )
     }
 
     /// Convert a promise rejection reason to a readable string.
@@ -510,7 +562,7 @@ impl JsContext {
                 .map_err(|e| JsError::Eval(format!("JS eval_async error: {}", e)))?;
 
             if let Some(promise) = value.as_promise() {
-                let resolved = Self::finish_promise(&ctx, promise)?;
+                let resolved = Self::finish_promise(&ctx, promise, 0, None, None)?;
                 Self::resolved_value_to_string(&resolved, &ctx)
             } else {
                 value_to_string(&value, &ctx)
@@ -600,14 +652,17 @@ impl JsContext {
         self.reset_interrupt();
         let source = source.to_string();
 
-        // Wrap in an async IIFE so `await` is valid syntax
+        // Wrap in an async IIFE so `await` is valid syntax. Note: offset 0 is
+        // passed to finish_promise below because the wrapper is a single line
+        // (no newlines), so per-line adjustment is meaningless here; this
+        // method has no in-tree callers (runner.rs uses run_script_cached).
         let wrapped = format!("(async function __tropel_script(){{{source}}})()");
 
         self.ctx.with(move |ctx| {
             let promise: Promise = ctx
                 .eval(wrapped)
                 .map_err(|e| JsError::Eval(format!("Async script compile error: {}", e)))?;
-            Self::finish_promise(&ctx, &promise)?;
+            Self::finish_promise(&ctx, &promise, 0, None, None)?;
             Ok::<_, JsError>(())
         })?;
 
@@ -688,7 +743,13 @@ impl JsContext {
             let result = self.ctx.with(|ctx| {
                 let value = script.invoke(&ctx)?;
                 if let Some(promise) = value.as_promise() {
-                    Self::finish_promise(&ctx, promise)?;
+                    Self::finish_promise(
+                        &ctx,
+                        promise,
+                        WRAPPER_OFFSET,
+                        Some(source_url_str),
+                        Some(&source),
+                    )?;
                 }
                 Ok::<_, JsError>(true)
             });
@@ -723,7 +784,13 @@ impl JsContext {
             // Execute now before caching; drive any returned promise.
             let value = script.invoke(&ctx)?;
             if let Some(promise) = value.as_promise() {
-                Self::finish_promise(&ctx, promise)?;
+                Self::finish_promise(
+                    &ctx,
+                    promise,
+                    WRAPPER_OFFSET,
+                    Some(source_url_str),
+                    Some(&source),
+                )?;
             }
 
             Ok::<_, JsError>(script)
@@ -917,6 +984,30 @@ impl JsContext {
 }
 
 /// Convert a rquickjs Value to a String representation.
+/// Stringify console.* arguments (backlog line 172): JSON for objects and
+/// arrays (so `console.log({a:1})` prints real data instead of throwing or
+/// showing a type name), plain text for scalars, and a type name for exotic
+/// values. Multiple args are joined by the caller with a space, matching
+/// Node/Postman `console.log(a, b, c)`.
+fn console_args_to_string<'js>(ctx: &rquickjs::Ctx<'js>, args: &[rquickjs::Value<'js>]) -> String {
+    args.iter()
+        .map(|v| {
+            // Node/Postman parity: null/undefined print as their names, not "".
+            if v.is_null() {
+                return "null".to_string();
+            }
+            if v.is_undefined() {
+                return "undefined".to_string();
+            }
+            // Reuse the shared JSON-or-scalar stringifier; fall back to a
+            // type name if it errors (e.g. circular reference in stringify).
+            JsContext::resolved_value_to_string(v, ctx)
+                .unwrap_or_else(|_| format!("{:?}", v.type_of()))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn value_to_string(value: &rquickjs::Value, _ctx: &rquickjs::Ctx) -> Result<String> {
     if value.is_string() {
         value
@@ -947,6 +1038,57 @@ mod tests {
         JsContext::new(None, Some(Duration::from_secs(5)))
             .await
             .expect("context creation should succeed")
+    }
+
+    #[tokio::test]
+    async fn console_log_accepts_objects_and_multiple_args() {
+        // Regression (backlog line 172): console.log took a strict String
+        // (objects threw), dropped extra args, and logged at trace! level.
+        // Now it must accept arbitrary values, multiple args, and not throw.
+        let mut ctx = new_ctx().await;
+
+        // Object argument — previously threw "cannot convert".
+        let r = ctx
+            .eval_async("console.log({a: 1}); 'done'")
+            .await
+            .unwrap();
+        assert_eq!(r, "done");
+
+        // Multiple heterogeneous args with a trailing expression.
+        let r = ctx
+            .eval_async("console.log('x', 42, true, null); 'ok'")
+            .await
+            .unwrap();
+        assert_eq!(r, "ok");
+
+        // console.warn/error accept objects too.
+        let r = ctx
+            .eval_async("console.warn({w: 2}); console.error([1,2]); 'fine'")
+            .await
+            .unwrap();
+        assert_eq!(r, "fine");
+    }
+
+    #[tokio::test]
+    async fn console_stringifier_parity() {
+        // Backlog line 172: console_args_to_string must render objects as
+        // JSON and null/undefined as their names (Node/Postman parity), not
+        // as "" or a type-name placeholder. Drive it directly with real
+        // Values inside the context.
+        let ctx = new_ctx().await;
+        ctx.ctx.with(|c| {
+            let obj: rquickjs::Value = c.eval("({ a: 1, b: [2, 3] })").unwrap();
+            let nul: rquickjs::Value = c.eval("null").unwrap();
+            let undef: rquickjs::Value = c.eval("undefined").unwrap();
+            let num: rquickjs::Value = c.eval("42").unwrap();
+
+            let s = console_args_to_string(&c, &[obj, nul, undef, num]);
+            assert!(s.starts_with('{'), "object must stringify as JSON, got: {s}");
+            assert!(s.contains("\"a\":1") || s.contains("\"a\": 1"));
+            assert!(s.contains("null"), "null must print as 'null', got: {s}");
+            assert!(s.contains("undefined"), "undefined must print, got: {s}");
+            assert!(s.ends_with("42"), "number must print, got: {s}");
+        });
     }
 
     #[tokio::test]
@@ -1021,6 +1163,46 @@ mod tests {
         let msg = format!("{:?}", err);
         assert!(msg.contains("rejected"), "got: {}", msg);
         assert!(msg.contains("kaboom"), "got: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn run_script_cached_reports_adjusted_line_and_source() {
+        // Regression (backlog line 173): the async wrapper prepends 2 lines,
+        // so a raw QuickJS rejection reports user line N as N+2. finish_promise
+        // must adjust (via adjust_error_lines) AND include the source excerpt
+        // — previously rejection formatting skipped both, leaving the 90-line
+        // adjuster dead code.
+        let mut ctx = new_ctx().await;
+        let err = ctx
+            .run_script_cached(
+                "const a = 1;\nconst b = 2;\nthrow new Error('boom');\nconst c = 3;",
+                Some("lined.js".to_string()),
+            )
+            .await
+            .err();
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("boom"), "got: {}", msg);
+        // User's `throw` is on line 3 of the original source. The wrapper adds
+        // 2 lines, so the raw QuickJS line is 5; the report must point at the
+        // USER's line 3 (the +2 fix), never the unadjusted 5.
+        assert!(
+            msg.contains(":3:") || msg.contains(":3,") || msg.contains("line 3"),
+            "line number must be adjusted to user line 3, got: {}",
+            msg
+        );
+        assert!(
+            !msg.contains(":5:") && !msg.contains(":5,") && !msg.contains("line 5"),
+            "unadjusted wrapper line 5 must not appear, got: {}",
+            msg
+        );
+        // The source excerpt (previously dead code on the rejection path) is
+        // now included, pointing at the throw.
+        assert!(
+            msg.contains("const b = 2;") && msg.contains("throw new Error('boom');"),
+            "source excerpt must be included, got: {}",
+            msg
+        );
+        assert!(msg.contains("--- source ---"), "got: {}", msg);
     }
 
     #[tokio::test]
