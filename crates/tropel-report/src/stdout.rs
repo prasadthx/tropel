@@ -140,15 +140,19 @@ impl StdoutReporter {
         if result.checks_total > 0 {
             out.push_str("\n  Checks:\n");
             out.push_str(&format!("    Total:  {}\n", result.checks_total));
+            // One decimal place, matching the HTTP failure line above
+            // ("Failed 15 (1.5%)") — integer rounding would under-report
+            // small rates (0.2% -> 0%) and make 1996/2000 read as a
+            // contradictory "100% passed, 0% failed".
             out.push_str(&format!(
-                "    Passed: {} ({}%)\n",
+                "    Passed: {} ({:.1}%)\n",
                 result.checks_passed,
-                (result.checks_passed as f64 / result.checks_total as f64 * 100.0) as u64
+                result.checks_passed as f64 / result.checks_total as f64 * 100.0
             ));
             out.push_str(&format!(
-                "    Failed: {} ({}%)\n",
+                "    Failed: {} ({:.1}%)\n",
                 result.checks_failed,
-                (result.checks_failed as f64 / result.checks_total as f64 * 100.0) as u64
+                result.checks_failed as f64 / result.checks_total as f64 * 100.0
             ));
         }
 

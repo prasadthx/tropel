@@ -1,0 +1,61 @@
+---
+source: crates/tropel-report/tests/reporters.rs
+expression: rendered
+---
+{
+  "checks": {
+    "failed": 4,
+    "passed": 1996,
+    "total": 2000
+  },
+  "data_received": 12500000.0,
+  "data_sent": 2000000.0,
+  "errors": 0,
+  "http_reqs": 1000,
+  "metrics": {
+    "custom_counter": {
+      "count": 42,
+      "max": 1,
+      "mean": 1.0,
+      "min": 1,
+      "p50": 1,
+      "p90": 1,
+      "p95": 1,
+      "p99": 1,
+      "sum": 42.0
+    },
+    "custom_gauge": {
+      "count": 9,
+      "max": 9,
+      "mean": 5.0,
+      "min": 1,
+      "p50": 5,
+      "p90": 9,
+      "p95": 9,
+      "p99": 9,
+      "sum": 45.0
+    },
+    "http_req_duration{url=/api/a}": {
+      "count": 600,
+      "max": 800000,
+      "mean": 250000.0,
+      "min": 10000,
+      "p50": 180000,
+      "p90": 420000,
+      "p95": 620000,
+      "p99": 900000,
+      "sum": 250000000.0
+    },
+    "http_req_duration{url=/api/b}": {
+      "count": 400,
+      "max": 950000,
+      "mean": 250000.0,
+      "min": 10000,
+      "p50": 180000,
+      "p90": 420000,
+      "p95": 620000,
+      "p99": 900000,
+      "sum": 250000000.0
+    }
+  }
+}

@@ -1,0 +1,50 @@
+---
+source: crates/tropel-report/tests/reporters.rs
+expression: rendered
+---
+
+╔════════════════════════════════════════════════════════════════╗
+║                    Tropel Load Test Summary                    ║
+╠════════════════════════════════════════════════════════════════╣
+  ── Execution ─────────────────────────────────────────────
+    Iterations    1024
+    Max VUs       4
+    Dropped       2
+
+  ── HTTP requests ─────────────────────────────────────────
+    Total         1000 (33.33/s)
+    Failed        15 (1.5%)
+    Data received 12.50 MB
+    Data sent     2.00 MB
+
+  HTTP request duration:
+    avg=250.00ms  min=10ms  med=180ms  max=950ms  p(90)=420ms  p(95)=620ms  p(99)=900ms
+
+  Iteration duration:
+    avg=250.00ms  min=10ms  med=180ms  max=1100ms  p(90)=420ms  p(95)=620ms  p(99)=900ms
+
+  Checks:
+    Total:  2000
+    Passed: 1996 (99.8%)
+    Failed: 4 (0.2%)
+
+  All metrics:
+    custom_counter  [Counter]  total: 42  rate: 1.40/s
+    custom_gauge  [Gauge]  last: 7  min: 1  max: 9  avg: 5.00
+
+  Per-URL (http_req_duration):
+    /api/a  (reqs: 600)
+      avg=250.00ms  min=10ms  med=180ms  max=800ms  p(90)=420ms  p(95)=620ms  p(99)=900ms
+    /api/b  (reqs: 400)
+      avg=250.00ms  min=10ms  med=180ms  max=950ms  p(90)=420ms  p(95)=620ms  p(99)=900ms
+
+  Per-group breakdown:
+    group_duration  [group=checkout]
+          avg=250.00ms  min=10ms  med=180ms  max=700ms  p(90)=420ms  p(95)=620ms  p(99)=900ms
+
+  ── Thresholds ──────────────────────────────────────────
+    ✓ checks: 1.00 > 0.99 (PASS)
+    ✗ http_req_duration: 620000.00 < 1000.00 (FAIL)
+
+  ✗ FAIL — one or more thresholds crossed
+╚════════════════════════════════════════════════════════════════╝
