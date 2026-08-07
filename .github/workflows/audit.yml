@@ -1,0 +1,51 @@
+# Scheduled dependency audit
+#
+# Commit to: .github/workflows/audit.yml
+#
+# Why separate from ci.yml: advisories are published continuously, so a clean
+# PR today can be vulnerable next week. This re-checks on a schedule without
+# re-running the whole build matrix. Cheap (one Linux job) and free on a
+# public repo.
+
+name: Audit
+
+on:
+  schedule:
+    # Mondays 06:00 UTC.
+    - cron: "0 6 * * 1"
+  push:
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    name: cargo-deny advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+
+  outdated:
+    name: outdated dependencies (informational)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Never block on this — it's a report, not a gate.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: outdated
+      - name: Install cargo-outdated
+        run: cargo install cargo-outdated --locked
+      - run: cargo outdated --workspace --root-deps-only

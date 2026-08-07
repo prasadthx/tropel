@@ -1,0 +1,208 @@
+# Tropel CI
+#
+# Commit to: .github/workflows/ci.yml
+#
+# Public repo => GitHub Actions standard runners are free with unlimited minutes.
+#
+# Design notes:
+#  - `clippy` uses --all-targets, which the justfile's `lint` recipe omits. That
+#    means tests, benches and examples are linted too (where warnings hid before).
+#  - `test` runs on all three OSes because the codebase has platform-specific
+#    code (mach task_info on macOS, /proc on Linux, GetProcessMemoryInfo +
+#    a past LNK1140 link failure on Windows). fail-fast is off so one flaky
+#    platform doesn't mask the others.
+#  - `msrv` enforces the declared rust-version = "1.85"; nothing did before.
+#  - `smoke` is the important one: it runs the built BINARY end-to-end and
+#    asserts metrics were actually produced. Unit tests can pass while the
+#    binary silently does zero iterations and exits 0 (that exact class of bug
+#    has shipped twice). This gate is what catches it.
+#  - timeout-minutes is set on every job: the engine has known hang paths, and
+#    an unbounded run would otherwise burn a full 6h runner slot.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref instead of paying for both.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep incremental off in CI: it bloats the cache and doesn't help cold builds.
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy (-D warnings)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # --all-targets covers lib/bins/tests/benches/examples.
+      # Add --all-features once the unstable-* SDK features and the wasm tier
+      # are known to lint clean; leaving it off keeps this gate trustworthy.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+      - name: Build tests
+        run: cargo test --workspace --no-run --locked
+      - name: Run tests
+        run: cargo test --workspace -- --nocapture
+
+  msrv:
+    name: MSRV 1.85
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      # `check` not `test`: dev-dependencies may legitimately need newer Rust.
+      - run: cargo check --workspace --locked
+
+  deny:
+    name: cargo-deny (advisories, licenses, bans, sources)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+
+  smoke:
+    name: e2e smoke (binary)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: smoke
+
+      - name: Build release binary
+        run: cargo build --release --locked --bin tropel
+
+      # `inspect` parses the input and prints the resolved scenario. A regression
+      # in an adapter, the k6 import stripper, or the module resolver fails here
+      # loudly instead of silently producing a zero-iteration run.
+      - name: Inspect every example
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for f in examples/k6/*.js examples/har/*.har examples/openapi/*.yaml; do
+            echo "::group::inspect $f"
+            ./target/release/tropel inspect "$f"
+            echo "::endgroup::"
+          done
+
+      # Server + client in ONE step: GitHub Actions terminates a step's
+      # background processes when the step ends, so a server started in its own
+      # step would be dead before the later steps ran (connection refused →
+      # zero requests → false red). The trap kills the server at step end.
+      - name: Smoke — metrics produced, checks pass, threshold breach fails
+        run: |
+          set -euo pipefail
+          python3 -m http.server 8787 --bind 127.0.0.1 --directory .github/ci/www \
+            >/tmp/tropel-smoke-server.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          for i in $(seq 1 50); do
+            curl -fsS http://127.0.0.1:8787/ok.json >/dev/null 2>&1 && break
+            sleep 0.2
+          done
+          curl -fsS http://127.0.0.1:8787/ok.json >/dev/null
+
+          # THE behavioural gate. A run that "succeeds" with zero requests is the
+          # failure mode we're guarding against, so assert on the metrics, not the
+          # exit code alone.
+          ./target/release/tropel run .github/ci/smoke.js \
+            --vus 4 --duration 5s \
+            --summary-export smoke-summary.json
+          echo "::group::summary"; cat smoke-summary.json; echo "::endgroup::"
+
+          # Summary shape (tropel-engine/src/summary.rs): per-metric values live
+          # under .metrics.<key>.values (count for counter/trend/rate), run totals
+          # under .state. Assert on those exact paths — a recursive scan that
+          # picks up the metric objects would read .count on the wrapper object
+          # and always yield 0 (false red on healthy runs).
+          jq -e '(.metrics.http_reqs.values.count // 0) > 0' smoke-summary.json > /dev/null \
+            || { echo "FAIL: http_reqs is missing or zero — the run produced no requests"; exit 1; }
+          echo "ok: http_reqs > 0"
+          jq -e '(.metrics.iterations.values.count // .state.iterations // 0) > 0' smoke-summary.json > /dev/null \
+            || { echo "FAIL: iterations is missing or zero — VUs never iterated"; exit 1; }
+          echo "ok: iterations > 0"
+          jq -e '(.metrics.http_req_duration.values.count // 0) > 0' smoke-summary.json > /dev/null \
+            || { echo "FAIL: http_req_duration is missing or zero — no timed requests"; exit 1; }
+          echo "ok: http_req_duration > 0"
+
+          # Checks must have run AND none may have failed.
+          jq -e '(.state.checksPassed // 0) > 0' smoke-summary.json > /dev/null \
+            || { echo "FAIL: no checks were recorded"; exit 1; }
+          jq -e '(.state.checksFailed // 0) == 0' smoke-summary.json > /dev/null \
+            || { echo "FAIL: a check failed"; exit 1; }
+          echo "ok: checks recorded, none failed"
+
+          # The exit-code contract: a breached threshold must fail the process.
+          # If this passes with exit 0, thresholds are inert (which has happened).
+          if ./target/release/tropel run .github/ci/smoke-threshold-fail.js \
+               --vus 2 --duration 3s; then
+            echo "FAIL: impossible threshold did not fail the run (exit 0)"
+            exit 1
+          fi
+          echo "ok: breached threshold produced a non-zero exit"
+
+  # Aggregate gate — set this single check as the required status in branch
+  # protection so adding a job doesn't require editing the rule.
+  ci-ok:
+    name: CI OK
+    if: always()
+    needs: [fmt, clippy, test, msrv, deny, smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail if any dependency failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      - run: echo "all green"
