@@ -485,3 +485,141 @@ inventory::collect!(InputAdapterRegistration);
 inventory::collect!(DriverRegistration);
 inventory::collect!(OutputRegistration);
 inventory::collect!(ProtocolRegistration);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use tropel_core::TropelError;
+
+    // ── Stub impls for registration tests ──
+    struct StubAdapter;
+    impl InputAdapter for StubAdapter {
+        fn id(&self) -> &str {
+            "stub"
+        }
+        fn detect(&self, _bytes: &[u8]) -> bool {
+            false
+        }
+        fn parse(&self, _bytes: &[u8]) -> tropel_core::Result<Scenario> {
+            Err(TropelError::Other("stub".into()))
+        }
+    }
+
+    struct StubDriver;
+    #[async_trait]
+    impl Driver for StubDriver {
+        fn id(&self) -> &str {
+            "stub"
+        }
+        fn detect(&self, _bytes: &[u8]) -> bool {
+            false
+        }
+        async fn init(
+            &self,
+            _bytes: &[u8],
+            _source_path: Option<&std::path::Path>,
+            _exec: Option<&str>,
+        ) -> tropel_core::Result<Box<dyn DriverInstance>> {
+            Err(TropelError::Other("stub".into()))
+        }
+    }
+
+    struct StubProtocol;
+    #[async_trait]
+    impl Protocol for StubProtocol {
+        fn scheme(&self) -> &str {
+            "stub"
+        }
+        async fn execute(
+            &self,
+            _req: &Request,
+            _config: Option<&Value>,
+        ) -> tropel_core::Result<ProtocolOutcome> {
+            Err(TropelError::Other("stub".into()))
+        }
+    }
+
+    struct StubOutput;
+    #[async_trait]
+    impl Output for StubOutput {
+        fn name(&self) -> &str {
+            "stub"
+        }
+        async fn emit(&self, _batch: &[Sample]) -> tropel_core::Result<()> {
+            Ok(())
+        }
+        async fn flush(&self) -> tropel_core::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn stub_adapter() -> Box<dyn InputAdapter> {
+        Box::new(StubAdapter)
+    }
+    fn stub_driver() -> Box<dyn Driver> {
+        Box::new(StubDriver)
+    }
+    fn stub_protocol() -> Box<dyn Protocol> {
+        Box::new(StubProtocol)
+    }
+    fn stub_output() -> Box<dyn Output> {
+        Box::new(StubOutput)
+    }
+
+    #[test]
+    fn registration_builders_default_priority_zero() {
+        assert_eq!(ProtocolRegistration::new("grpc", stub_protocol).priority, 0);
+        assert_eq!(OutputRegistration::new("stdout", stub_output).priority, 0);
+        assert_eq!(InputAdapterRegistration::new("postman", stub_adapter).priority, 0);
+        assert_eq!(DriverRegistration::new("k6", stub_driver).priority, 0);
+    }
+
+    #[test]
+    fn with_priority_is_const_builder_pattern() {
+        let p = ProtocolRegistration::new("grpc", stub_protocol).with_priority(5);
+        assert_eq!(p.scheme, "grpc");
+        assert_eq!(p.priority, 5);
+        let a = InputAdapterRegistration::new("x", stub_adapter).with_priority(9);
+        assert_eq!(a.id, "x");
+        assert_eq!(a.priority, 9);
+    }
+
+    #[test]
+    fn vu_context_defaults_and_exec_context() {
+        let mut ctx = VuContext::new(3, 7, "scenario".into());
+        assert_eq!(ctx.vu_id, 3);
+        assert_eq!(ctx.iteration, 7);
+        assert_eq!(ctx.scenario_name, "scenario");
+        assert!(ctx.env.is_empty());
+        assert!(ctx.data_row.is_none());
+        assert!(ctx.samples.is_empty());
+        assert!(!ctx.abort_requested);
+        assert!(ctx.http_client.is_none());
+        assert!(ctx.setup_data.is_none());
+
+        ctx.set_exec_context("constant-vus".into(), 100, 4);
+        assert_eq!(ctx.executor_name, "constant-vus");
+        assert_eq!(ctx.iterations_completed, 100);
+        assert_eq!(ctx.vus_active, 4);
+    }
+
+    #[test]
+    fn vu_context_emit_sample_and_abort() {
+        let mut ctx = VuContext::new(1, 0, "s".into());
+        let mut tags = tropel_core::types::TagMap::new();
+        tags.insert("group", "::g");
+        ctx.emit_sample("custom", 1.5, tags);
+        assert_eq!(ctx.samples.len(), 1);
+        assert_eq!(ctx.samples[0].metric, "custom");
+        assert_eq!(ctx.samples[0].value, 1.5);
+        assert_eq!(ctx.samples[0].tags.get("group").map(|v| v.as_ref()), Some("::g"));
+
+        ctx.abort(Some("boom".into()));
+        assert!(ctx.abort_requested);
+        assert_eq!(ctx.abort_message.as_deref(), Some("boom"));
+        ctx.abort(None);
+        assert!(ctx.abort_requested);
+        assert_eq!(ctx.abort_message, None);
+    }
+}

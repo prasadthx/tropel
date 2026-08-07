@@ -186,3 +186,70 @@ pub type SharedPmState = Arc<Mutex<PmState>>;
 pub fn new_pm_state() -> SharedPmState {
     Arc::new(Mutex::new(PmState::new()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_test_updates_counters_and_emits_check_sample() {
+        let mut st = PmState::new();
+        st.record_test("status is 200", true);
+        st.record_test("body has id", false);
+        assert_eq!(st.assertions.total, 2);
+        assert_eq!(st.assertions.passed, 1);
+        assert_eq!(st.assertions.failed, 1);
+        assert_eq!(st.assertions.skipped, 0);
+        // Each test pushes a `checks` Rate sample tagged with the raw name.
+        assert_eq!(st.samples.len(), 2);
+        let s = &st.samples[0];
+        assert_eq!(s.metric, "checks");
+        assert_eq!(s.value, 1.0);
+        assert_eq!(s.sample_type, tropel_core::types::SampleType::Rate);
+        assert_eq!(s.tags.get("check").map(|v| v.as_ref()), Some("status is 200"));
+        let s = &st.samples[1];
+        assert_eq!(s.value, 0.0);
+        assert_eq!(s.tags.get("check").map(|v| v.as_ref()), Some("body has id"));
+    }
+
+    #[test]
+    fn record_test_tagged_carries_extra_tags() {
+        let mut st = PmState::new();
+        st.record_test_tagged(
+            "check users",
+            true,
+            HashMap::from([("group".to_string(), "::users".to_string())]),
+        );
+        let s = &st.samples[0];
+        assert_eq!(s.tags.get("check").map(|v| v.as_ref()), Some("check users"));
+        assert_eq!(s.tags.get("group").map(|v| v.as_ref()), Some("::users"));
+        assert_eq!(st.assertions.passed, 1);
+    }
+
+    #[test]
+    fn set_request_names_and_iteration_data() {
+        let mut st = PmState::new();
+        st.set_request_names(Arc::new(vec!["a".into(), "b".into()]));
+        assert_eq!(st.request_names.len(), 2);
+        assert_eq!(st.request_names[0], "a");
+        st.set_iteration_data(Some(HashMap::from([("id".into(), Value::from(7))])));
+        assert_eq!(st.iteration_data.as_ref().unwrap()["id"], 7);
+        st.set_iteration_data(None);
+        assert!(st.iteration_data.is_none());
+    }
+
+    #[test]
+    fn attach_exec_context_wires_shared_atomics() {
+        let mut st = PmState::new();
+        let active = Arc::new(AtomicU32::new(2));
+        let total = Arc::new(AtomicU64::new(5));
+        st.attach_exec_context("constant-vus".into(), active.clone(), total.clone());
+        assert_eq!(st.executor_name, "constant-vus");
+        // Reads go through the SAME Arc as the caller's — live updates visible.
+        assert_eq!(st.active_vus.as_ref().unwrap().load(std::sync::atomic::Ordering::Relaxed), 2);
+        active.store(9, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(st.active_vus.as_ref().unwrap().load(std::sync::atomic::Ordering::Relaxed), 9);
+        total.store(42, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(st.global_iterations.as_ref().unwrap().load(std::sync::atomic::Ordering::Relaxed), 42);
+    }
+}

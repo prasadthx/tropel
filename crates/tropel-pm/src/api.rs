@@ -113,13 +113,16 @@ impl PmApi {
             .unwrap_or_default()
     }
 
-    /// Get a specific response header.
+    /// Get a specific response header (case-insensitive — HTTP headers are
+    /// case-insensitive, matching Postman and the bridge_fns lookup).
     pub fn response_header(&self, key: &str) -> Option<String> {
         let state = self.state.lock().unwrap();
-        state
-            .response
-            .as_ref()
-            .and_then(|r| r.headers.get(key).cloned())
+        state.response.as_ref().and_then(|r| {
+            r.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                .map(|(_, v)| v.clone())
+        })
     }
 
     /// Get response time in milliseconds.
@@ -182,12 +185,15 @@ impl PmApi {
 
     // ── Assertion shortcuts ──
 
-    pub fn expect_true(&self, name: &str, condition: bool) {
+    pub fn expect_true(&self, name: &str, condition: bool) -> bool {
         self.test(name, condition);
+        condition
     }
 
-    pub fn expect_equal(&self, name: &str, actual: &str, expected: &str) {
-        self.test(name, actual == expected);
+    pub fn expect_equal(&self, name: &str, actual: &str, expected: &str) -> bool {
+        let passed = actual == expected;
+        self.test(name, passed);
+        passed
     }
 
     pub fn expect_status(&self, expected: u16) -> bool {
@@ -254,8 +260,11 @@ impl PmApi {
 
     /// Run a named check (records pass/fail to checks Rate metric).
     /// Returns true if the check passed.
+    ///
+    /// The recorded name is the RAW check name — no "check " prefix (k6
+    /// convention, matching [`crate::bridge::PmState::record_test_tagged`]).
     pub fn check(&self, name: &str, passed: bool) -> bool {
-        self.test(&format!("check {}", name), passed);
+        self.test(name, passed);
         passed
     }
 
@@ -270,5 +279,226 @@ impl PmApi {
             timestamp: tropel_core::clock::monotonic_wall_now(),
             sample_type: tropel_core::types::SampleType::Point,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::new_pm_state;
+    use std::time::Duration;
+
+    /// Build a `Response` fixture (mirrors the `From<&HttpResponse>` shape).
+    fn resp(code: u16, body: &str, headers: &[(&str, &str)]) -> Response {
+        Response {
+            url: "https://api.example.com/users".to_string(),
+            status_code: code,
+            status_text: if code == 200 { "OK".into() } else { "Error".into() },
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: body.as_bytes().to_vec(),
+            text_cache: std::cell::OnceCell::new(),
+            json_cache: std::cell::OnceCell::new(),
+            response_time: Duration::from_millis(42),
+            timings: None,
+            cookies: vec![tropel_core::types::Cookie {
+                name: "session".into(),
+                value: "abc123".into(),
+                domain: None,
+                path: None,
+                http_only: None,
+                secure: None,
+                same_site: None,
+                expires: None,
+            }],
+            size: body.len() as u64,
+            redirects: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn environment_set_get_unset_clear() {
+        let state = new_pm_state();
+        let api = PmApi::new(state.clone());
+        // Set/get round-trip.
+        api.environment_set("base_url", "https://example.com");
+        assert_eq!(api.environment_get("base_url").as_deref(), Some("https://example.com"));
+        // Unknown key → None.
+        assert_eq!(api.environment_get("missing"), None);
+        // Unset removes.
+        api.environment_unset("base_url");
+        assert_eq!(api.environment_get("base_url"), None);
+        // Clear wipes everything.
+        api.environment_set("a", "1");
+        api.environment_set("b", "2");
+        api.environment_clear();
+        assert!(api.environment_get("a").is_none() && api.environment_get("b").is_none());
+    }
+
+    #[test]
+    fn variables_postman_precedence_data_env_collection_globals() {
+        let state = new_pm_state();
+        let api = PmApi::new(state.clone());
+        api.variables_set("k", Value::String("from-collection".into()));
+        assert_eq!(
+            api.variables_get("k"),
+            Some(Value::String("from-collection".into()))
+        );
+        // Environment beats collection.
+        api.environment_set("k", "from-env");
+        assert_eq!(api.variables_get("k"), Some(Value::String("from-env".into())));
+        // Globals beat nothing when env present; add globals and drop env.
+        state.lock().unwrap().globals.insert("k".into(), Value::String("from-globals".into()));
+        assert_eq!(api.variables_get("k"), Some(Value::String("from-env".into())));
+        api.environment_unset("k");
+        assert_eq!(api.variables_get("k"), Some(Value::String("from-collection".into())));
+        // Iteration data beats everything (backlog line 145 precedence).
+        state
+            .lock()
+            .unwrap()
+            .set_iteration_data(Some(HashMap::from([("k".into(), Value::String("from-data".into()))])));
+        assert_eq!(api.variables_get("k"), Some(Value::String("from-data".into())));
+        // Unset removes from collection/environment/globals — but NOT the
+        // per-iteration data row (that scope is reset between iterations,
+        // not by pm.variables.unset).
+        api.variables_unset("k");
+        assert_eq!(api.variables_get("k"), Some(Value::String("from-data".into())));
+        state.lock().unwrap().set_iteration_data(None);
+        assert_eq!(api.variables_get("k"), None);
+        // Globals-fallback branch: only globals holds the key.
+        state
+            .lock()
+            .unwrap()
+            .globals
+            .insert("k".into(), Value::String("from-globals".into()));
+        assert_eq!(api.variables_get("k"), Some(Value::String("from-globals".into())));
+    }
+
+    #[test]
+    fn response_accessors_cover_whole_surface() {
+        let state = new_pm_state();
+        let api = PmApi::new(state.clone());
+        // No response yet → empty accessors.
+        assert_eq!(api.response_code(), None);
+        assert_eq!(api.response_body(), None);
+        assert_eq!(api.response_json(), None);
+        assert!(api.response_headers().is_empty());
+        assert_eq!(api.response_header("content-type"), None);
+        assert_eq!(api.response_time(), None);
+        assert!(api.response_cookies().is_empty());
+
+        state.lock().unwrap().response = Some(resp(
+            200,
+            r#"{"id":42,"name":"Ada"}"#,
+            &[("Content-Type", "application/json")],
+        ));
+        assert_eq!(api.response_code(), Some(200));
+        assert_eq!(api.response_body().as_deref(), Some(r#"{"id":42,"name":"Ada"}"#));
+        assert_eq!(api.response_json(), Some(serde_json::json!({ "id": 42, "name": "Ada" })));
+        assert_eq!(api.response_header("content-type").as_deref(), Some("application/json"));
+        assert_eq!(api.response_headers().get("Content-Type").map(String::as_str), Some("application/json"));
+        assert_eq!(api.response_time(), Some(42.0));
+        let cookies = api.response_cookies();
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].name, "session");
+        assert_eq!(api.response_get().map(|r| r.status_code), Some(200));
+    }
+
+    #[test]
+    fn test_and_check_record_assertions() {
+        let state = new_pm_state();
+        let api = PmApi::new(state.clone());
+        api.test("status is 200", true);
+        api.test("body has id", false);
+        api.check("users", true);
+        let st = state.lock().unwrap();
+        assert_eq!(st.assertions.total, 3);
+        assert_eq!(st.assertions.passed, 2);
+        assert_eq!(st.assertions.failed, 1);
+        // Every test/check emits a `checks` Rate sample.
+        let checks: Vec<_> = st
+            .samples
+            .iter()
+            .filter(|s| s.metric == "checks")
+            .collect();
+        assert_eq!(checks.len(), 3);
+        assert_eq!(checks[0].value, 1.0);
+        assert_eq!(checks[1].value, 0.0);
+        // check() records the RAW name — no "check " prefix (k6 convention).
+        assert_eq!(checks[2].tags.get("check").map(|s| s.as_ref()), Some("users"));
+    }
+
+    #[test]
+    fn expect_shortcuts_chain_into_assertions() {
+        let state = new_pm_state();
+        let api = PmApi::new(state.clone());
+        assert!(api.expect_true("truthy", true));
+        assert!(!api.expect_true("falsy", false));
+        api.expect_equal("eq", "a", "a");
+        state.lock().unwrap().response = Some(resp(201, "created ok", &[("X-Id", "9")]));
+        assert!(api.expect_status(201));
+        assert!(!api.expect_status(200));
+        assert!(api.expect_body_contains("has created", "created"));
+        assert!(api.expect_header("has xid", "x-id", "9"));
+        let st = state.lock().unwrap();
+        assert_eq!(st.assertions.total, 7);
+        assert_eq!(st.assertions.passed, 5);
+        assert_eq!(st.assertions.failed, 2);
+    }
+
+    #[test]
+    fn flow_control_next_request_is_take_once() {
+        let state = new_pm_state();
+        let api = PmApi::new(state.clone());
+        assert_eq!(api.get_next_request(), None);
+        api.set_next_request(3);
+        assert_eq!(api.get_next_request(), Some(3));
+        // take() semantics: a second read is None.
+        assert_eq!(api.get_next_request(), None);
+        api.skip_tests();
+        assert!(state.lock().unwrap().skip_tests);
+    }
+
+    #[test]
+    fn groups_nest_and_emit_group_duration() {
+        let state = new_pm_state();
+        let api = PmApi::new(state.clone());
+        api.group_start("outer");
+        api.group_start("inner");
+        assert_eq!(state.lock().unwrap().current_group.as_deref(), Some("outer::inner"));
+        api.group_end("inner", 10.0);
+        assert_eq!(state.lock().unwrap().current_group.as_deref(), Some("outer"));
+        let st = state.lock().unwrap();
+        let gd = st.samples.iter().find(|s| s.metric == "group_duration").unwrap();
+        // 10 ms → 10,000 µs Trend sample tagged with the group name.
+        assert_eq!(gd.value, 10_000.0);
+        assert_eq!(gd.tags.get("group").map(|s| s.as_ref()), Some("inner"));
+        assert_eq!(gd.tags.get("group_path").map(|s| s.as_ref()), Some("outer"));
+    }
+
+    #[test]
+    fn emit_metric_pushes_point_sample_with_tags() {
+        let state = new_pm_state();
+        let api = PmApi::new(state.clone());
+        api.emit_metric("custom_metric", 3.14, HashMap::from([("env".into(), "prod".into())]));
+        let st = state.lock().unwrap();
+        let s = st.samples.last().unwrap();
+        assert_eq!(s.metric, "custom_metric");
+        assert_eq!(s.value, 3.14);
+        assert_eq!(s.tags.get("env").map(|v| v.as_ref()), Some("prod"));
+    }
+
+    #[test]
+    fn iteration_data_accessor_reads_current_row() {
+        let state = new_pm_state();
+        let api = PmApi::new(state.clone());
+        assert_eq!(api.iteration_data_get("id"), None);
+        state
+            .lock()
+            .unwrap()
+            .set_iteration_data(Some(HashMap::from([("id".into(), Value::from(7))])));
+        assert_eq!(api.iteration_data_get("id"), Some(Value::from(7)));
     }
 }

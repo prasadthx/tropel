@@ -261,3 +261,214 @@ impl ExtensionRegistry {
         self.drivers.get(id).map(|r| (r.create)())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use serde_json::Value;
+    use tropel_core::scenario::Scenario;
+    use tropel_core::types::{Request, Sample};
+    use tropel_core::TropelError;
+
+    // ── Stubs (pure-content detection, no real parsing) ──
+    struct StubAdapter {
+        id: &'static str,
+        detect_prefix: &'static [u8],
+    }
+    impl InputAdapter for StubAdapter {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn detect(&self, bytes: &[u8]) -> bool {
+            bytes.starts_with(self.detect_prefix)
+        }
+        fn parse(&self, _bytes: &[u8]) -> tropel_core::Result<Scenario> {
+            Err(TropelError::Other("stub adapter parse not implemented".into()))
+        }
+    }
+
+    struct StubDriver {
+        id: &'static str,
+    }
+    #[async_trait]
+    impl Driver for StubDriver {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn detect(&self, bytes: &[u8]) -> bool {
+            bytes.starts_with(b"js:")
+        }
+        async fn init(
+            &self,
+            _bytes: &[u8],
+            _source_path: Option<&std::path::Path>,
+            _exec: Option<&str>,
+        ) -> tropel_core::Result<Box<dyn DriverInstance>> {
+            Err(TropelError::Other("stub driver init not implemented".into()))
+        }
+    }
+
+    struct StubProtocol {
+        scheme: &'static str,
+    }
+    #[async_trait]
+    impl Protocol for StubProtocol {
+        fn scheme(&self) -> &str {
+            self.scheme
+        }
+        async fn execute(
+            &self,
+            _req: &Request,
+            _config: Option<&Value>,
+        ) -> tropel_core::Result<ProtocolOutcome> {
+            Err(TropelError::Other("stub protocol execute not implemented".into()))
+        }
+    }
+
+    struct StubOutput {
+        id: &'static str,
+    }
+    #[async_trait]
+    impl Output for StubOutput {
+        fn name(&self) -> &str {
+            self.id
+        }
+        async fn emit(&self, _batch: &[Sample]) -> tropel_core::Result<()> {
+            Ok(())
+        }
+        async fn flush(&self) -> tropel_core::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn stub_protocol() -> Box<dyn Protocol> {
+        Box::new(StubProtocol { scheme: "grpc" })
+    }
+    fn stub_output() -> Box<dyn Output> {
+        Box::new(StubOutput { id: "stdout" })
+    }
+    fn stub_adapter() -> Box<dyn InputAdapter> {
+        Box::new(StubAdapter {
+            id: "stub",
+            detect_prefix: b"{}",
+        })
+    }
+    fn stub_driver() -> Box<dyn Driver> {
+        Box::new(StubDriver { id: "k6" })
+    }
+
+    #[test]
+    fn register_and_get_by_id_all_four_kinds() {
+        let mut reg = ExtensionRegistry::default();
+        reg.register_protocol(ProtocolRegistration::new("grpc", stub_protocol));
+        reg.register_output("stdout", OutputRegistration::new("stdout", stub_output));
+        reg.register_input_adapter("postman", InputAdapterRegistration::new("postman", stub_adapter));
+        reg.register_driver("k6", DriverRegistration::new("k6", stub_driver));
+
+        assert!(reg.get_protocol("grpc").is_some());
+        assert!(reg.get_protocol("nope").is_none());
+        assert!(reg.get_output("stdout").is_some());
+        assert!(reg.get_input_adapter("postman").is_some());
+        assert!(reg.resolve_input_by_id("postman").is_some());
+        assert!(reg.get_driver("k6").is_some());
+        assert!(reg.resolve_driver_by_id("k6").is_some());
+        assert!(reg.get_driver("nope").is_none());
+    }
+
+    #[test]
+    fn factory_registration_takes_precedence_over_adapter_registration() {
+        let mut reg = ExtensionRegistry::default();
+        reg.register_input_adapter("dup", InputAdapterRegistration::new("dup", stub_adapter));
+        reg.register_adapter_factory("dup", Arc::new(|| -> Box<dyn InputAdapter> {
+            Box::new(StubAdapter {
+                id: "factory-wins",
+                detect_prefix: b"F",
+            })
+        }));
+        // Factories are checked first (runtime config overrides static).
+        let got = reg.get_input_adapter("dup").unwrap();
+        assert_eq!(got.id(), "factory-wins");
+    }
+
+    #[test]
+    fn resolve_input_claims_by_content_prefix() {
+        let mut reg = ExtensionRegistry::default();
+        reg.register_input_adapter("json", InputAdapterRegistration::new("json", || {
+            Box::new(StubAdapter {
+                id: "json",
+                detect_prefix: b"{",
+            })
+        }));
+        reg.register_input_adapter("xml", InputAdapterRegistration::new("xml", || {
+            Box::new(StubAdapter {
+                id: "xml",
+                detect_prefix: b"<",
+            })
+        }));
+
+        assert_eq!(reg.resolve_input(b"{...}").unwrap().id(), "json");
+        assert_eq!(reg.resolve_input(b"<x/>").unwrap().id(), "xml");
+        // No adapter claims these bytes.
+        assert!(reg.resolve_input(b"plain text").is_none());
+        // Explicit ID resolution ignores detection.
+        assert_eq!(reg.resolve_input_by_id("xml").unwrap().id(), "xml");
+    }
+
+    #[test]
+    fn resolve_input_priority_wins_over_registration_order() {
+        let mut reg = ExtensionRegistry::default();
+        // Both detect `b"{` — the LOWER-priority one is registered first.
+        reg.register_input_adapter("generic", InputAdapterRegistration::new("generic", || {
+            Box::new(StubAdapter {
+                id: "generic",
+                detect_prefix: b"{",
+            })
+        }));
+        reg.register_input_adapter(
+            "specific",
+            InputAdapterRegistration::new("specific", || {
+                Box::new(StubAdapter {
+                    id: "specific",
+                    detect_prefix: b"{",
+                })
+            })
+            .with_priority(10),
+        );
+        // Highest priority wins, not first-registered.
+        assert_eq!(reg.resolve_input(b"{...}").unwrap().id(), "specific");
+    }
+
+    #[test]
+    fn resolve_driver_uses_content_detection() {
+        let mut reg = ExtensionRegistry::default();
+        reg.register_driver("k6", DriverRegistration::new("k6", stub_driver));
+        assert!(reg.resolve_driver(b"js:export default...").is_some());
+        assert!(reg.resolve_driver(b"nope").is_none());
+    }
+
+    #[test]
+    fn list_inputs_merges_factories_and_dedups() {
+        let mut reg = ExtensionRegistry::default();
+        reg.register_input_adapter("b", InputAdapterRegistration::new("b", stub_adapter));
+        reg.register_adapter_factory("a", Arc::new(stub_adapter));
+        reg.register_adapter_factory("b", Arc::new(stub_adapter)); // duplicate
+        let mut ids = reg.list_inputs();
+        ids.sort();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn instantiate_protocols_returns_scheme_keyed_map() {
+        let mut reg = ExtensionRegistry::default();
+        reg.register_protocol(ProtocolRegistration::new("grpc", stub_protocol));
+        reg.register_protocol(ProtocolRegistration::new("ws", || {
+            Box::new(StubProtocol { scheme: "ws" })
+        }));
+        let map = reg.instantiate_protocols();
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key("grpc"));
+        assert!(map.contains_key("ws"));
+        assert_eq!(map["ws"].scheme(), "ws");
+    }
+}
