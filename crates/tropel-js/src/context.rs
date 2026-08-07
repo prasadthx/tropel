@@ -206,6 +206,13 @@ pub struct JsContext {
     interrupt_deadline: Arc<AtomicU64>,
     /// Maximum execution time per script eval.
     max_execution_time: Duration,
+    /// Unhandled promise rejections recorded by the host rejection tracker
+    /// since the last drain, keyed by promise identity (backlog line 174).
+    /// QuickJS fires the tracker with `is_handled=false` when a promise is
+    /// rejected with no handler attached, and `true` when a handler is later
+    /// attached — so a promise rejected then caught is inserted then removed,
+    /// and only genuinely-unhandled rejections remain when we drain.
+    unhandled_rejections: Arc<Mutex<HashMap<u64, String>>>,
 }
 
 // Safety: each JsContext owns its own rquickjs Runtime, and the thread-per-
@@ -251,6 +258,29 @@ impl JsContext {
         rt.set_interrupt_handler(Some(Box::new(move || {
             now_nanos() > deadline.load(Ordering::Relaxed)
         })));
+
+        // Install the host promise rejection tracker (backlog line 174).
+        // Without it, a fire-and-forget `(async () => { throw ... })()` rejects
+        // with NO handler and is silently dropped — no error, no log, and the
+        // script "passes". The tracker records unhandled rejections (false)
+        // and removes them when a handler is attached later (true); the
+        // eval-family methods drain the map after pumping and fail the script
+        // if anything is still unhandled.
+        let unhandled_rejections = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let pending = unhandled_rejections.clone();
+            rt.set_host_promise_rejection_tracker(Some(Box::new(
+                move |ctx, promise, reason, is_handled| {
+                    let key = promise_identity(&promise);
+                    let mut map = pending.lock().unwrap();
+                    if is_handled {
+                        map.remove(&key);
+                    } else {
+                        map.insert(key, rejection_reason_string(&ctx, &reason));
+                    }
+                },
+            )));
+        }
 
         // Create a full-featured context
         let ctx = Context::full(&rt)
@@ -311,6 +341,7 @@ impl JsContext {
             interrupt_deadline,
             max_execution_time,
             script_cache: Mutex::new(HashMap::new()),
+            unhandled_rejections,
         })
     }
 
@@ -343,9 +374,15 @@ impl JsContext {
     ///
     /// Returns the number of times we pumped (0 means nothing was pending).
     fn pump_promise_queue(&mut self) -> Result<u32> {
+        // Backlog line 174: this used to cap at 1000 iterations and silently
+        // DROP the remaining microtasks with only a warn!. It now pumps until
+        // the queue is empty — work is never dropped. A runaway microtask
+        // loop is bounded NOT by an iteration cap but by the per-eval
+        // interrupt handler (execution-time deadline, armed before every
+        // eval-family call): `execute_pending_job` trips it and returns an
+        // error, which we propagate.
         let mut pump_count = 0u32;
-        let max_iterations = 1000; // safety limit
-        for _ in 0..max_iterations {
+        loop {
             match self.rt.execute_pending_job() {
                 Ok(true) => {
                     pump_count += 1;
@@ -360,13 +397,25 @@ impl JsContext {
                 }
             }
         }
-        if pump_count >= max_iterations {
-            tracing::warn!(
-                "Promise queue reached max pump iterations ({}), possible infinite loop",
-                max_iterations
-            );
-        }
         Ok(pump_count)
+    }
+
+    /// Drain the host rejection tracker's records and fail the script if any
+    /// promise was rejected and left with NO handler by the time the job queue
+    /// settled (backlog line 174). A rejection that a script later catches is
+    /// removed by the `is_handled=true` tracker callback before this runs, so
+    /// only genuinely-unhandled rejections surface here.
+    fn check_unhandled_rejections(&self) -> Result<()> {
+        let mut map = self.unhandled_rejections.lock().unwrap();
+        if map.is_empty() {
+            return Ok(());
+        }
+        let mut reasons: Vec<String> = map.drain().map(|(_, r)| r).collect();
+        reasons.sort();
+        reasons.dedup();
+        let msg = format!("Unhandled promise rejection(s): {}", reasons.join("; "));
+        tracing::error!("{}", msg);
+        Err(JsError::Eval(msg))
     }
 
     /// Drive a JS Promise to completion, returning its resolved value.
@@ -536,6 +585,8 @@ impl JsContext {
 
         // Pump the promise queue to resolve microtasks
         self.pump_promise_queue()?;
+        // Surface fire-and-forget rejections instead of silently passing
+        self.check_unhandled_rejections()?;
 
         Ok(result)
     }
@@ -575,6 +626,8 @@ impl JsContext {
         if pump_count > 0 {
             tracing::trace!("Resolved async script (pumped {} times)", pump_count);
         }
+        // Surface fire-and-forget rejections instead of silently passing
+        self.check_unhandled_rejections()?;
 
         Ok(result)
     }
@@ -668,6 +721,8 @@ impl JsContext {
 
         // Pump the promise queue to resolve any remaining microtasks
         self.pump_promise_queue()?;
+        // Surface fire-and-forget rejections instead of silently passing
+        self.check_unhandled_rejections()?;
 
         Ok(true)
     }
@@ -755,6 +810,8 @@ impl JsContext {
             });
             // Pump promise queue after cached script execution
             self.pump_promise_queue()?;
+            // Surface fire-and-forget rejections instead of silently passing
+            self.check_unhandled_rejections()?;
             return result;
         }
 
@@ -798,6 +855,8 @@ impl JsContext {
 
         // Pump promise queue after script compilation and execution
         self.pump_promise_queue()?;
+        // Surface fire-and-forget rejections instead of silently passing
+        self.check_unhandled_rejections()?;
 
         // Store in cache for future calls
         {
@@ -944,6 +1003,8 @@ impl JsContext {
         // Pump the promise queue to resolve any pending microtasks, matching
         // the behavior of the source `eval` path.
         self.pump_promise_queue()?;
+        // Surface fire-and-forget rejections instead of silently passing
+        self.check_unhandled_rejections()?;
         Ok(result)
     }
 
@@ -1006,6 +1067,43 @@ fn console_args_to_string<'js>(ctx: &rquickjs::Ctx<'js>, args: &[rquickjs::Value
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Stable hashable identity for a JS value (backlog line 174). Used to pair
+/// the rejection tracker's `is_handled=false`/`is_handled=true` callbacks for
+/// the SAME promise: QuickJS passes the promise object to both, and promises
+/// are objects, so the raw `JSValue` bits (union pointer + tag) are stable for
+/// the promise's lifetime. `JSValue` is a 16-byte repr(C) struct (size
+/// asserted in rquickjs-sys), so transmuting it to two `u64`s is
+/// bit-preserving and we only ever use it as a HashMap key.
+fn promise_identity(value: &rquickjs::Value) -> u64 {
+    let raw = value.as_raw();
+    let bits: [u64; 2] = unsafe { std::mem::transmute(raw) };
+    // FNV-1a mix of the 16 raw bytes.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bits {
+        h ^= b;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Lightweight stringification of a rejection reason for the host rejection
+/// tracker (backlog line 174). Prefers JS `String()` coercion (Error objects
+/// render as "Error: msg"), falls back to the plain stringifier, then a type
+/// name. Deliberately avoids the stack-preferring `rejection_to_string`
+/// (which evals a helper) because the tracker fires mid-job-processing.
+fn rejection_reason_string<'js>(ctx: &rquickjs::Ctx<'js>, reason: &rquickjs::Value<'js>) -> String {
+    if let Ok(s) = Coerced::<String>::from_js(ctx, reason.clone()) {
+        let s = s.to_string();
+        if !s.is_empty() && s != "undefined" && s != "null" {
+            return s;
+        }
+    }
+    value_to_string(reason, ctx)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("{:?}", reason.type_of()))
 }
 
 fn value_to_string(value: &rquickjs::Value, _ctx: &rquickjs::Ctx) -> Result<String> {
@@ -1267,6 +1365,62 @@ mod tests {
             msg.contains("shim-boom") || msg.contains("shim run"),
             "runtime error must surface: {}",
             msg
+        );
+    }
+
+    #[tokio::test]
+    async fn unhandled_rejection_fails_script() {
+        // Regression (backlog line 174): `(async () => { throw ... })()` with
+        // NO handler attached used to produce no error, no log, and a passing
+        // test. The host promise rejection tracker must now surface it as a
+        // script error.
+        let mut ctx = new_ctx().await;
+        let err = ctx
+            .run_script_cached(
+                "(async () => { throw new Error('boom') })()",
+                Some("unhandled.js".to_string()),
+            )
+            .await
+            .err();
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("boom"), "got: {}", msg);
+        assert!(msg.contains("Unhandled"), "got: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn rejected_then_caught_is_not_reported() {
+        // The tracker pairs unhandled (false) with handled-later (true): a
+        // promise that IS eventually caught (within the same pump cycle) must
+        // NOT fail the script — only genuinely-unhandled rejections surface.
+        let mut ctx = new_ctx().await;
+        let ok = ctx
+            .run_script_cached(
+                "const p = Promise.reject(new Error('later'));\nawait Promise.resolve();\np.catch(() => {});",
+                Some("caught.js".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(ok);
+    }
+
+    #[tokio::test]
+    async fn pump_does_not_drop_microtasks_over_1000() {
+        // Regression (backlog line 174): the pump capped at 1000 iterations
+        // and silently DROPPED the remaining microtasks with only a warn!.
+        // 2500 chained microtasks must all run to completion.
+        let mut ctx = new_ctx().await;
+        ctx.eval(
+            "globalThis.__n = 0; for (let i = 0; i < 2500; i++) \
+             Promise.resolve().then(() => { globalThis.__n++; });",
+        )
+        .await
+        .unwrap();
+        let n = ctx.get_global("__n").await.unwrap();
+        assert_eq!(
+            n.as_deref(),
+            Some("2500"),
+            "all 2500 microtasks must run, got: {:?}",
+            n
         );
     }
 }
