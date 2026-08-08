@@ -90,7 +90,7 @@ impl OtlpOutput {
                         Ok(sample) => {
                             output.buffer(sample);
                             if output.total_buffered.load(Ordering::Relaxed) >= MAX_BUFFERED_SAMPLES {
-                                if let Err(e) = output.flush().await {
+                                if let Err(e) = output.flush_buffered().await {
                                     tracing::warn!("otlp export failed: {e}");
                                 }
                             }
@@ -102,7 +102,7 @@ impl OtlpOutput {
                     },
                     _ = tick.tick() => {
                         if output.total_buffered.load(Ordering::Relaxed) > 0 {
-                            if let Err(e) = output.flush().await {
+                            if let Err(e) = output.flush_buffered().await {
                                 tracing::warn!("otlp export failed: {e}");
                             }
                         }
@@ -110,7 +110,7 @@ impl OtlpOutput {
                 }
             }
 
-            if let Err(e) = output.flush().await {
+            if let Err(e) = output.flush_buffered().await {
                 tracing::warn!("otlp final export failed: {e}");
             }
         })
@@ -129,7 +129,7 @@ impl OtlpOutput {
 
     /// Drain the buffer, build an `ExportMetricsServiceRequest` JSON payload,
     /// and POST it to `/v1/metrics`. Non-2xx responses are logged, not fatal.
-    async fn flush(&self) -> Result<()> {
+    async fn flush_buffered(&self) -> Result<()> {
         let metrics = {
             let mut guard = self.metrics.lock().unwrap();
             let taken = std::mem::take(&mut *guard);
@@ -167,15 +167,15 @@ impl Output for OtlpOutput {
         "otlp"
     }
 
-    async fn sample(&self, samples: &[Sample]) -> Result<()> {
+    async fn emit(&self, samples: &[Sample]) -> Result<()> {
         for sample in samples {
             self.buffer(sample.clone());
         }
         Ok(())
     }
 
-    async fn stop(&self) -> Result<()> {
-        self.flush().await
+    async fn flush(&self) -> Result<()> {
+        self.flush_buffered().await
     }
 }
 
@@ -474,10 +474,10 @@ mod tests {
 
         let output = OtlpOutput::new(format!("http://{addr}"));
         output
-            .sample(&[sample("http_reqs", 1.0, SampleType::Counter)])
+            .emit(&[sample("http_reqs", 1.0, SampleType::Counter)])
             .await
             .unwrap();
-        output.stop().await.unwrap();
+        output.flush().await.unwrap();
 
         let received = server.await.unwrap();
         let text = String::from_utf8(received).unwrap();

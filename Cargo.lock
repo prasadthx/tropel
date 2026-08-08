@@ -4413,6 +4413,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tropel-core",
+ "tropel-ext",
  "tropel-metrics",
 ]
 

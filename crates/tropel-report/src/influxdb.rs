@@ -129,7 +129,7 @@ impl InfluxdbOutput {
                         Ok(sample) => {
                             output.buffer(&sample);
                             if output.total_buffered.load(Ordering::Relaxed) >= MAX_BUFFERED_SAMPLES {
-                                if let Err(e) = output.flush().await {
+                                if let Err(e) = output.flush_buffered().await {
                                     tracing::warn!("influxdb send failed: {e}");
                                 }
                             }
@@ -141,7 +141,7 @@ impl InfluxdbOutput {
                     },
                     _ = tick.tick() => {
                         if output.total_buffered.load(Ordering::Relaxed) > 0 {
-                            if let Err(e) = output.flush().await {
+                            if let Err(e) = output.flush_buffered().await {
                                 tracing::warn!("influxdb send failed: {e}");
                             }
                         }
@@ -149,7 +149,7 @@ impl InfluxdbOutput {
                 }
             }
 
-            if let Err(e) = output.flush().await {
+            if let Err(e) = output.flush_buffered().await {
                 tracing::warn!("influxdb final send failed: {e}");
             }
         })
@@ -206,7 +206,7 @@ impl InfluxdbOutput {
 
     /// Drain the buffer and send to the configured transport (HTTP POST or
     /// UDP datagrams, chunked to the UDP payload cap).
-    async fn flush(&self) -> Result<()> {
+    async fn flush_buffered(&self) -> Result<()> {
         let lines = {
             let mut guard = self.buffer.lock().unwrap();
             let taken = std::mem::take(&mut *guard);
@@ -371,15 +371,15 @@ impl Output for InfluxdbOutput {
         "influxdb"
     }
 
-    async fn sample(&self, samples: &[Sample]) -> Result<()> {
+    async fn emit(&self, samples: &[Sample]) -> Result<()> {
         for sample in samples {
             self.buffer(sample);
         }
         Ok(())
     }
 
-    async fn stop(&self) -> Result<()> {
-        self.flush().await
+    async fn flush(&self) -> Result<()> {
+        self.flush_buffered().await
     }
 }
 
@@ -521,10 +521,10 @@ mod tests {
 
         let output = InfluxdbOutput::new(addr.to_string()).unwrap();
         output
-            .sample(&[sample("http_reqs", 1.0, &[("status", "200")])])
+            .emit(&[sample("http_reqs", 1.0, &[("status", "200")])])
             .await
             .unwrap();
-        output.stop().await.unwrap();
+        output.flush().await.unwrap();
 
         let mut buf = [0u8; 1024];
         let (n, _from) = receiver.recv_from(&mut buf).await.unwrap();

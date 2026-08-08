@@ -96,7 +96,7 @@ impl StatsdOutput {
                         Ok(sample) => {
                             output.buffer(&sample);
                             if output.total_buffered.load(Ordering::Relaxed) >= MAX_BUFFERED_SAMPLES {
-                                if let Err(e) = output.flush().await {
+                                if let Err(e) = output.flush_buffered().await {
                                     tracing::warn!("statsd send failed: {e}");
                                 }
                             }
@@ -108,7 +108,7 @@ impl StatsdOutput {
                     },
                     _ = tick.tick() => {
                         if output.total_buffered.load(Ordering::Relaxed) > 0 {
-                            if let Err(e) = output.flush().await {
+                            if let Err(e) = output.flush_buffered().await {
                                 tracing::warn!("statsd send failed: {e}");
                             }
                         }
@@ -116,7 +116,7 @@ impl StatsdOutput {
                 }
             }
 
-            if let Err(e) = output.flush().await {
+            if let Err(e) = output.flush_buffered().await {
                 tracing::warn!("statsd final send failed: {e}");
             }
         })
@@ -152,7 +152,7 @@ impl StatsdOutput {
     }
 
     /// Drain the buffer and send one UDP datagram (lines joined by `\n`).
-    async fn flush(&self) -> Result<()> {
+    async fn flush_buffered(&self) -> Result<()> {
         let lines = {
             let mut guard = self.buffer.lock().unwrap();
             let taken = std::mem::take(&mut *guard);
@@ -219,15 +219,15 @@ impl Output for StatsdOutput {
         "statsd"
     }
 
-    async fn sample(&self, samples: &[Sample]) -> Result<()> {
+    async fn emit(&self, samples: &[Sample]) -> Result<()> {
         for sample in samples {
             self.buffer(sample);
         }
         Ok(())
     }
 
-    async fn stop(&self) -> Result<()> {
-        self.flush().await
+    async fn flush(&self) -> Result<()> {
+        self.flush_buffered().await
     }
 }
 
@@ -306,10 +306,10 @@ mod tests {
 
         let output = StatsdOutput::new(addr.to_string()).unwrap();
         output
-            .sample(&[sample("http_reqs", 1.0, SampleType::Counter)])
+            .emit(&[sample("http_reqs", 1.0, SampleType::Counter)])
             .await
             .unwrap();
-        output.stop().await.unwrap();
+        output.flush().await.unwrap();
 
         let mut buf = [0u8; 1024];
         let (n, _from) = receiver.recv_from(&mut buf).await.unwrap();

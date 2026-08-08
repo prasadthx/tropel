@@ -68,26 +68,15 @@ impl TagPolicy {
 /// The number of seconds between each live progress update.
 const PROGRESS_INTERVAL_SECS: u64 = 2;
 
-/// A streaming output that consumes individual `Sample`s during a load test.
+/// Re-export of the single canonical streaming-output trait from the SDK.
 ///
-/// Unlike `Reporter` (which receives a final aggregated `MetricsResult`),
-/// an `Output` receives raw samples during the run, enabling live progress
-/// bars, streaming JSON/CSV files, and real-time metric forwarding.
-///
-/// Each `Output` runs as a dedicated consumer task subscribed to the
-/// metrics collector's broadcast sample stream.
-#[async_trait]
-pub trait Output: Send + Sync {
-    fn name(&self) -> &str;
-
-    /// Process a batch of individual samples during the test run.
-    async fn sample(&self, samples: &[Sample]) -> Result<()>;
-
-    /// Finalize the output — called after the test ends.
-    async fn stop(&self) -> Result<()> {
-        Ok(())
-    }
-}
+/// The report crate previously defined its own `Output` trait (with
+/// `sample`/`stop`), forcing the reference `tropel-x-prometheus` extension
+/// to alias-import (`use tropel_report::Output as _`) past the name clash
+/// with `tropel_ext::traits::Output`. Both traits were shape-identical;
+/// the duplicate is gone — report outputs implement the SDK trait directly,
+/// mapping `sample`→`emit` and `stop`→`flush`.
+pub use tropel_ext::traits::Output;
 
 /// A live progress display printed to stdout during the test run.
 ///
@@ -174,10 +163,14 @@ impl Output for StreamingStdoutOutput {
         "stdout"
     }
 
-    async fn sample(&self, _samples: &[Sample]) -> Result<()> {
+    async fn emit(&self, _samples: &[Sample]) -> Result<()> {
         // The trait is implemented for wire-compatibility but the actual
         // consumption happens via `spawn()` which runs its own consumer task.
         // This is a no-op implementation; `spawn()` handles all processing.
+        Ok(())
+    }
+
+    async fn flush(&self) -> Result<()> {
         Ok(())
     }
 }

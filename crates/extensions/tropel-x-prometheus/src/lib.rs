@@ -22,7 +22,6 @@ use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tropel_report::Output as _; // bring `sample`/`stop` into scope (anonymous, avoids the name clash with sdk::Output)
 use tropel_report::PrometheusRemoteWriteOutput;
 use tropel_sdk::{Output, OutputConfig, OutputRegistration, Result, Sample};
 
@@ -97,7 +96,7 @@ impl Output for PrometheusOutput {
     async fn emit(&self, batch: &[Sample]) -> Result<()> {
         match &self.inner {
             Some(inner) => {
-                inner.sample(batch).await?;
+                inner.emit(batch).await?;
                 // Push buffered samples periodically so the dashboard sees
                 // data during the run, not only at the final flush. The
                 // engine driver only calls `flush` on stream close; the
@@ -108,7 +107,7 @@ impl Output for PrometheusOutput {
                     last.elapsed() >= FLUSH_INTERVAL
                 };
                 if should_flush {
-                    inner.stop().await?;
+                    inner.flush().await?;
                     *self.last_flush.lock().unwrap() = Instant::now();
                 }
                 Ok(())
@@ -127,7 +126,7 @@ impl Output for PrometheusOutput {
 
     async fn flush(&self) -> Result<()> {
         match &self.inner {
-            Some(inner) => inner.stop().await,
+            Some(inner) => inner.flush().await,
             None => Ok(()),
         }
     }

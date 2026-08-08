@@ -69,7 +69,7 @@ impl JsonStreamOutput {
                         Ok(sample) => {
                             output.buffer(&sample);
                             if output.total_buffered.load(Ordering::Relaxed) >= MAX_BUFFERED_SAMPLES {
-                                if let Err(e) = output.flush() {
+                                if let Err(e) = output.flush_buffered() {
                                     tracing::warn!("json-stream write failed: {e}");
                                 }
                             }
@@ -81,7 +81,7 @@ impl JsonStreamOutput {
                     },
                     _ = tick.tick() => {
                         if output.total_buffered.load(Ordering::Relaxed) > 0 {
-                            if let Err(e) = output.flush() {
+                            if let Err(e) = output.flush_buffered() {
                                 tracing::warn!("json-stream write failed: {e}");
                             }
                         }
@@ -89,7 +89,7 @@ impl JsonStreamOutput {
                 }
             }
 
-            if let Err(e) = output.flush() {
+            if let Err(e) = output.flush_buffered() {
                 tracing::warn!("json-stream final write failed: {e}");
             }
         })
@@ -148,7 +148,7 @@ impl JsonStreamOutput {
     }
 
     /// Drain the buffer and append the lines to the file.
-    fn flush(&self) -> Result<()> {
+    fn flush_buffered(&self) -> Result<()> {
         let lines = {
             let mut guard = self.buffer.lock().unwrap();
             let taken = std::mem::take(&mut *guard);
@@ -220,15 +220,15 @@ impl Output for JsonStreamOutput {
         "json-stream"
     }
 
-    async fn sample(&self, samples: &[Sample]) -> Result<()> {
+    async fn emit(&self, samples: &[Sample]) -> Result<()> {
         for sample in samples {
             self.buffer(sample);
         }
         Ok(())
     }
 
-    async fn stop(&self) -> Result<()> {
-        self.flush()
+    async fn flush(&self) -> Result<()> {
+        self.flush_buffered()
     }
 }
 
@@ -266,16 +266,16 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            output.sample(&[sample("http_reqs", 1.0)]).await.unwrap();
+            output.emit(&[sample("http_reqs", 1.0)]).await.unwrap();
             output
-                .sample(&[sample("http_req_duration", 12.5)])
+                .emit(&[sample("http_req_duration", 12.5)])
                 .await
                 .unwrap();
             output
-                .sample(&[sample("http_req_duration", 14.0)])
+                .emit(&[sample("http_req_duration", 14.0)])
                 .await
                 .unwrap();
-            output.stop().await.unwrap();
+            output.flush().await.unwrap();
         });
 
         let content = std::fs::read_to_string(&path).unwrap();
@@ -328,7 +328,7 @@ mod tests {
     fn empty_flush_is_noop() {
         let output = JsonStreamOutput::new("/nonexistent-dir/x.ndjson");
         assert!(
-            output.flush().is_ok(),
+            output.flush_buffered().is_ok(),
             "empty flush must not touch the file"
         );
     }

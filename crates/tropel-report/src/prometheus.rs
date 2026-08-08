@@ -156,7 +156,7 @@ impl PrometheusRemoteWriteOutput {
                         Ok(sample) => {
                             output.buffer(&sample);
                             if output.total_buffered.load(Ordering::Relaxed) >= MAX_BUFFERED_SERIES {
-                                if let Err(e) = output.flush().await {
+                                if let Err(e) = output.flush_buffered().await {
                                     tracing::warn!("prometheus remote-write flush failed: {e}");
                                 }
                             }
@@ -168,7 +168,7 @@ impl PrometheusRemoteWriteOutput {
                     },
                     _ = tick.tick() => {
                         if output.total_buffered.load(Ordering::Relaxed) > 0 {
-                            if let Err(e) = output.flush().await {
+                            if let Err(e) = output.flush_buffered().await {
                                 tracing::warn!("prometheus remote-write flush failed: {e}");
                             }
                         }
@@ -177,7 +177,7 @@ impl PrometheusRemoteWriteOutput {
             }
 
             // Final flush on stream close.
-            if let Err(e) = output.flush().await {
+            if let Err(e) = output.flush_buffered().await {
                 tracing::warn!("prometheus remote-write final flush failed: {e}");
             }
         })
@@ -214,7 +214,7 @@ impl PrometheusRemoteWriteOutput {
     /// Drain the buffer, encode a snappy-compressed `WriteRequest`, and POST
     /// it to the remote-write endpoint. Non-2xx responses are logged, not
     /// fatal (the run must not fail because a dashboard is down).
-    async fn flush(&self) -> Result<()> {
+    async fn flush_buffered(&self) -> Result<()> {
         let series = {
             let mut guard = self.series.lock().unwrap();
             let taken = std::mem::take(&mut *guard);
@@ -281,15 +281,15 @@ impl Output for PrometheusRemoteWriteOutput {
         "prometheus-remote-write"
     }
 
-    async fn sample(&self, samples: &[Sample]) -> Result<()> {
+    async fn emit(&self, samples: &[Sample]) -> Result<()> {
         for sample in samples {
             self.buffer(sample);
         }
         Ok(())
     }
 
-    async fn stop(&self) -> Result<()> {
-        self.flush().await
+    async fn flush(&self) -> Result<()> {
+        self.flush_buffered().await
     }
 }
 
@@ -936,8 +936,8 @@ mod tests {
 
         let output = PrometheusRemoteWriteOutput::new(format!("http://{addr}"));
         let s = sample("http_reqs", 1.0, TagMap::new());
-        output.sample(&[s]).await.unwrap();
-        output.stop().await.unwrap();
+        output.emit(&[s]).await.unwrap();
+        output.flush().await.unwrap();
 
         let received = server.await.unwrap();
         assert!(!received.is_empty(), "server received nothing");
