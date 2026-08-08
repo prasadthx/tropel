@@ -32,7 +32,7 @@ interface tropel-types {
         raw(string),
         json(string),
         form-urlencoded(list<tuple<string, string>>),
-        binary(string),
+        binary(list<u8>),
     }
 
     record cookie {
@@ -67,11 +67,17 @@ interface tropel-types {
         headers: list<tuple<string, string>>,
         body: list<u8>,
         response-time-ms: f64,
+        size: u64,
         cookies: list<cookie>,
     }
 
+    // NOTE: WIT forbids a record containing `list<scenario-item>` of
+    // itself, so tree nesting is expressed via the flat `parent-index`
+    // field below (the canonical C-ABI JSON shape — the runtime's
+    // build_item_tree recovers the tree by grouping on it). The live
+    // C-ABI path additionally accepts a recursive nested `items` field;
+    // it is not representable in WIT and is omitted here.
     record scenario-item {
-        id: string,
         name: string,
         request: option<request>,
         prerequest: option<string>,

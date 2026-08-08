@@ -67,7 +67,7 @@
 //! | `Protocol` trait | ✅ Stable — engine dispatches by URL scheme via the registry (`instantiate_protocols`); built-ins `grpc://`/`ws://` ship through it |
 //! | `Output` trait | ✅ Wired — engine drives registered outputs from the sample stream (emit per batch, flush on close); see the `prometheus` reference extension (`unstable-output`) |
 //! | `Driver` / `DriverInstance` / `VuContext` | ✅ Stable — re-exported and used by the k6 driver (`tropel-input-k6`) |
-//! | `WASM` / `WIT` interface | ✅ Validated — see `wit/adapter.wit` in the crate root (resolves via `wit-parser`; a unit test keeps it from silently breaking). WASM plugins use the C ABI in `tropel-wasm`; the Component-Model runtime path is pending. |
+//! | `WASM` / `WIT` interface | 🔶 Resolves (parses) — `wit/adapter.wit` in the crate root is validated as a *parseable* WIT package by a `wit-parser` unit test, nothing more. It is the forward-looking Component-Model contract and intentionally lags the shipped C-ABI path; WASM plugins currently use the C ABI in `tropel-wasm`. |
 
 // ═══════════════════════════════════════════════════════════════════
 // Core types — the shared Scenario IR used by all adapters
@@ -95,8 +95,11 @@ pub use tropel_ext::traits::{
     Driver, DriverDeclaredOptions, DriverHttpClient, DriverInstance, DriverRegistration, VuContext,
 };
 
-// Protocol and Output traits are gated behind feature flags.
-// They exist in the backing crate but aren't yet wired into engine dispatch.
+// Protocol and Output traits are gated behind feature flags so a consumer
+// that only writes input adapters never pays for (or is confused by) the
+// extension traits. They ARE wired into engine dispatch — Protocol via the
+// URL-scheme registry (`instantiate_protocols`), Output from the sample
+// stream — the flag only controls whether the SDK re-exports them.
 // Enable with `tropel-sdk = { features = ["unstable-protocol"] }` etc.
 // Breaking changes to these traits only require a minor/patch bump.
 

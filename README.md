@@ -116,9 +116,9 @@ crates/
 ├── tropel-pm/            pm.* bridge + k6 shim glue
 ├── tropel-metrics/       HDR histograms, first-class metric types, thresholds
 ├── tropel-report/        Reporters + streaming outputs
-├── tropel-es/            ESM/TypeScript transpiler + bundler
+├── tropel-es/            ESM/TypeScript transpiler
 ├── tropel-sdk/           Stable public adapter/driver contract
-├── tropel-ext/           Registry, traits (InputAdapter, Driver)
+├── tropel-ext/           Registry, traits (InputAdapter, Driver, Protocol, Output)
 ├── tropel-wasm/          WASM plugin runtime (wasmtime, fuel, AOT, pooling)
 ├── tropel-build/         Custom binary builder
 ├── tropel-distributed/   Controller/agent, execution segments

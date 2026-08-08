@@ -20,11 +20,12 @@ depending on internal crate details.
 # Until 1.0.0, breaking changes bump the minor version (0.x → 0.y).
 
 # ── Features ──────────────────────────────────────────────────────
-# Unstable traits (Protocol, Output, AuthSigner) are gated behind
-# feature flags. They exist in the backing crate but aren't yet wired
-# into the engine dispatch. Gating them means the stable surface only
-# shows what actually works. Breaking changes to unstable traits only
-# require a minor version bump (pre-1.0) or a patch (post-1.0).
+# Protocol and Output are gated behind feature flags so a consumer that
+# only writes input adapters never pays for (or is confused by) the
+# extension traits. They ARE wired into engine dispatch (Protocol via
+# the URL-scheme registry, Output from the sample stream); the flag just
+# controls whether the SDK re-exports them. Breaking changes to these
+# traits only require a minor version bump (pre-1.0) or a patch (post-1.0).
 [features]
 default = []
 unstable-protocol = []
