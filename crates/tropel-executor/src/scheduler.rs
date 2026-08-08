@@ -756,7 +756,18 @@ impl VUScheduler {
                     );
                     time::sleep(step_delay).await;
                 }
-                self.set_ramp_down_target(target, current_vus);
+                // Re-arm the final surplus from the REAL active count, not
+                // the stage-START `current_vus`. The stepped phase above arms
+                // one slot per step window and VUs exit at their next loop top,
+                // so some slots may ALREADY be claimed by the time the phase
+                // ends. Re-arming the full delta (`current_vus - target`)
+                // would let every survivor claim again and overshoot below
+                // target — 6→2 where ~2 already exited → re-arms remaining=4
+                // → all 4 survivors claim → active=0 (backlog §1 P0). Arming
+                // from the live count leaves exactly `real - target` slots,
+                // so the pool settles ON target.
+                let real = self.active_vus.load(Ordering::Acquire);
+                self.set_ramp_down_target(target, real);
 
                 // Let the final surplus drain within the graceful_ramp_down
                 // window (residual VUs exit at their next loop-top claim).
@@ -1619,6 +1630,95 @@ mod tests {
 
         // A 6th VU arriving late must not exit.
         assert!(!sched.try_claim_ramp_down(10).await);
+    }
+
+    /// Backlog §1 P0 (scheduler.rs:759): the final ramp-down re-arm used the
+    /// stage-START `current_vus` even after some VUs had already claimed a
+    /// stepped slot and exited — re-arming the FULL delta so the survivors
+    /// claimed again and the pool overshot BELOW target (6→2 with 2 already
+    /// exited re-armed remaining=4 → all 4 survivors claim → active=0, and a
+    /// following HOLD slept with zero load). The re-arm now uses the LIVE
+    /// active count, so the pool settles ON target.
+    #[tokio::test]
+    async fn ramp_down_rearms_surplus_from_real_active_not_stage_start() {
+        use tropel_core::config::Stage;
+        let stages = vec![
+            Stage {
+                duration: "60ms".to_string(),
+                target: 6,
+            },
+            // Ramp down 6→2 over 80ms: 4 stepped slots. Some VUs exit during
+            // the stepped phase (fast iterations), so the final re-arm must
+            // NOT re-issue the full 4-slot delta.
+            Stage {
+                duration: "80ms".to_string(),
+                target: 2,
+            },
+            // A following HOLD at 2 must actually hold 2, not sleep empty.
+            Stage {
+                duration: "120ms".to_string(),
+                target: 2,
+            },
+        ];
+        let sched = Arc::new(VUScheduler::new(&ExecutionConfig::RampingVus {
+            stages: stages.clone(),
+            start_vus: 6,
+            graceful_ramp_down: Some("40ms".to_string()),
+            graceful_stop: Some("40ms".to_string()),
+            think_time: Default::default(),
+        }));
+
+        // Mock VU: acquire a lease, then loop at 1ms cadence claiming any
+        // ramp-down slot it sees (and exiting on stop). Fast iterations mean
+        // VUs exit DURING the stepped phase — the exact condition that used
+        // to trigger the overshoot.
+        let run_vu = |sched: Arc<VUScheduler>, _vu_id: u32| {
+            tokio::spawn(async move {
+                let _lease = VuLease::acquire(&sched);
+                loop {
+                    if sched.is_stop_requested() {
+                        return;
+                    }
+                    let active = sched.active_vus.load(Ordering::Acquire);
+                    if sched.try_claim_ramp_down(active).await {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+        };
+
+        // Drive the scheduler concurrently with a sampler of the live count.
+        let driver = {
+            let sched = sched.clone();
+            tokio::spawn(async move {
+                sched
+                    .run_ramping(6, &stages, Duration::from_millis(40), Duration::from_millis(40), &run_vu)
+                    .await;
+            })
+        };
+        // Sample for 200ms total (10 x 20ms). The run lasts ~260ms (60+80+120)
+        // plus graceful stop, so the window t=100..200ms below is comfortably
+        // inside the active hold phase — sampling past the run end would
+        // capture post-stop 0s and flake the assertion.
+        let mut samples = Vec::new();
+        for _ in 0..10 {
+            samples.push(sched.active_vus.load(Ordering::Acquire));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = driver.await;
+
+        // The pool must never settle below target=2 after the ramp-down
+        // begins (the old bug overshot to 0), and must reach 2.
+        let post_ramp: Vec<u32> = samples.iter().skip(4).copied().collect();
+        assert!(
+            post_ramp.iter().all(|&v| v >= 2),
+            "pool must not overshoot below target 2 (samples: {samples:?})"
+        );
+        assert!(
+            post_ramp.contains(&2),
+            "pool must settle at target 2 (samples: {samples:?})"
+        );
     }
 
     /// After a fully-drained ramp-down, clearing resets the target so a later
