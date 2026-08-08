@@ -34,6 +34,10 @@
 //! ;; document written by the host. Returns bytes written to `resp` (>= 0) or
 //! ;; a negative error code. Records http_req_duration / http_reqs /
 //! ;; http_req_failed / data_received / data_sent samples for the iteration.
+//! ;; Bounded per iteration: a cumulative wall-time budget (actual elapsed
+//! ;; time, [`ITERATION_HTTP_BUDGET_MS`]) and a call-count cap
+//! ;; ([`MAX_ITERATION_HTTP_CALLS`]); once exhausted, calls return -9 without
+//! ;; executing and the iteration fails when the module returns.
 //! (import "env" "http_request" (func $http_request
 //!   (param $req_ptr i32) (param $req_len i32)
 //!   (param $resp_ptr i32) (param $resp_cap i32) (result i32)))
@@ -71,7 +75,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tropel_core::types::{Body, Method, Request, Sample, SampleType, TagMap};
 use tropel_core::{Result, TropelError};
 use tropel_ext::traits::{Driver, DriverHttpClient, DriverInstance, DriverRegistration, VuContext};
@@ -93,6 +97,21 @@ const MAX_HOST_CALL_MS: f64 = 60_000.0;
 /// would otherwise sleep in repeated 60 s chunks forever (each
 /// `adapter_run_iteration` gets a fresh budget).
 const ITERATION_SLEEP_BUDGET_MS: f64 = 60_000.0;
+
+/// Per-iteration cumulative wall-time budget for `env.http_request` (ms),
+/// deducted by ACTUAL elapsed time per call. `env.sleep` already had
+/// per-call + cumulative budgets; `http_request` had only the per-call clamp
+/// (60 s), so a hostile module could spend ~20 000 calls × 60 s ≈ 14 days
+/// inside ONE iteration (fuel does not tick during host calls). Once
+/// exhausted, further requests are refused (no blocking) and the iteration
+/// fails like the sleep budget. Each iteration gets a fresh budget.
+const ITERATION_HTTP_BUDGET_MS: f64 = 60_000.0;
+
+/// Per-iteration cap on `env.http_request` CALLS. Bounds the per-call
+/// overhead (JSON parse, connection setup, thread parking) even when every
+/// call is fast enough to stay inside the wall-time budget. Exceeding it
+/// refuses further calls and fails the iteration, mirroring the sample cap.
+const MAX_ITERATION_HTTP_CALLS: usize = 4096;
 
 /// Per-iteration cap on samples a WASM driver may emit (via `env.metric_add`
 /// and the auto-recorded `http_req_*` set). Fuel buys a hostile module
@@ -134,7 +153,15 @@ const MAX_ITERATION_TAG_BYTES: usize = 8 * 1024 * 1024;
 /// The imperative WASM driver. Stateless: `init()` loads the module from the
 /// input bytes (or AOT-cached `.cwasm` when a `.wasm` source path is given)
 /// and returns a fresh per-VU [`WasmDriverInstance`].
-pub struct WasmDriver;
+///
+/// `http_budget_ms` / `http_call_cap` tighten the per-iteration HTTP
+/// wall-time / call-count limits below the const defaults (`None` uses the
+/// constants). Tests use them to force refusal without 60 s of real sleep.
+#[derive(Default)]
+pub struct WasmDriver {
+    http_budget_ms: Option<f64>,
+    http_call_cap: Option<usize>,
+}
 
 #[async_trait]
 impl Driver for WasmDriver {
@@ -246,6 +273,13 @@ impl Driver for WasmDriver {
             .get_typed_func::<(i32, i32), i32>(&mut store, "adapter_run_iteration")
             .map_err(wasm_err)?;
 
+        // Resolve the per-iteration HTTP limits (driver-level overrides win;
+        // None falls back to the const defaults). The INSTANCE carries the
+        // effective values so a `reset()` (fresh store) re-copies the same
+        // limits, and tests can tighten them at the driver level.
+        let http_budget = self.http_budget_ms.unwrap_or(ITERATION_HTTP_BUDGET_MS);
+        let http_call_cap = self.http_call_cap.unwrap_or(MAX_ITERATION_HTTP_CALLS);
+
         let malloc_fn = instance
             .get_typed_func::<i32, i32>(&mut store, "malloc")
             .ok();
@@ -264,6 +298,8 @@ impl Driver for WasmDriver {
             free_fn,
             module,
             linker,
+            http_budget,
+            http_call_cap,
         }))
     }
 }
@@ -290,6 +326,24 @@ pub struct WasmDriverState {
     /// budget. `run_iteration` fails the iteration after the module returns
     /// (the host function cannot trap — it just refuses to block).
     pub sleep_over_budget: bool,
+    /// Set when a host `env.http_request` call was refused because the
+    /// per-iteration HTTP wall-time budget ([`Self::http_budget_ms`]) was
+    /// exhausted or the call-count cap ([`MAX_ITERATION_HTTP_CALLS`]) was
+    /// hit. `run_iteration` fails the iteration after the module returns.
+    pub http_over_budget: bool,
+    /// Remaining per-iteration wall-time budget for `env.http_request` (ms).
+    /// Charged the ACTUAL elapsed time of each call (not the guest's declared
+    /// timeout); once it reaches <= 0 further requests are refused without
+    /// blocking. Reset every iteration from the instance's `http_budget`.
+    pub http_budget_ms: f64,
+    /// `env.http_request` calls made this iteration. Capped by
+    /// [`Self::http_call_cap`]. Reset every iteration.
+    pub http_call_count: usize,
+    /// Per-iteration `env.http_request` call cap, copied from the instance
+    /// every iteration (tests tighten it via the driver's `http_call_cap`
+    /// override; the `Default` value 0 is never observed because
+    /// `run_iteration` overwrites it before any host call).
+    pub http_call_cap: usize,
     /// Set when the per-iteration sample cap ([`MAX_ITERATION_SAMPLES`]) or
     /// the cumulative tag-bytes budget ([`MAX_ITERATION_TAG_BYTES`]) was
     /// hit. `run_iteration` fails the iteration after the module returns
@@ -315,6 +369,12 @@ pub struct WasmDriverInstance {
     /// recovered by re-instantiating into a fresh store (see [`Self::reset`]).
     module: Module,
     linker: Linker<WasmDriverState>,
+    /// Per-iteration cumulative HTTP wall-time budget (ms). Copied into the
+    /// store's `http_budget_ms` at the start of each iteration; kept on the
+    /// instance so tests can tighten it.
+    http_budget: f64,
+    /// Per-iteration `env.http_request` call cap. Same rationale.
+    http_call_cap: usize,
 }
 
 impl WasmDriverInstance {
@@ -380,6 +440,10 @@ impl DriverInstance for WasmDriverInstance {
             state.sleep_over_budget = false;
             state.metric_spam_exceeded = false;
             state.iteration_tag_bytes = 0;
+            state.http_budget_ms = self.http_budget;
+            state.http_call_cap = self.http_call_cap;
+            state.http_over_budget = false;
+            state.http_call_count = 0;
         }
 
         // Reset the per-call instruction budget (fuel is consumed per call;
@@ -471,6 +535,7 @@ impl DriverInstance for WasmDriverInstance {
             let state = self.store.data_mut();
             let over_budget = state.sleep_over_budget;
             let spam = state.metric_spam_exceeded;
+            let http_over = state.http_over_budget;
             ctx.samples.append(&mut state.samples);
 
             // A host sleep that refused to block (budget exhausted) fails the
@@ -489,6 +554,16 @@ impl DriverInstance for WasmDriverInstance {
             if spam {
                 return Err(TropelError::Other(
                     "WASM driver iteration exceeded its per-iteration sample cap".into(),
+                ));
+            }
+            // The HTTP wall-time / call-count budgets are the ONLY bound on
+            // `env.http_request` — fuel does not tick during host calls, and
+            // without them a hostile module could spend ~14 days in one
+            // iteration. Once refused, the iteration fails like the sleep
+            // budget (the guest returned normally; no reset needed).
+            if http_over {
+                return Err(TropelError::Other(
+                    "WASM driver iteration exceeded its per-iteration HTTP budget".into(),
                 ));
             }
         }
@@ -591,6 +666,22 @@ fn http_request_host(
     resp_ptr: i32,
     resp_cap: i32,
 ) -> i32 {
+    // Fast-fail a doomed iteration BEFORE paying the per-call path: once the
+    // sample/tag caps or the HTTP budgets trip, keep refusing cheaply. The
+    // call-count cap + cumulative wall-time budget are the ONLY bound on
+    // `env.http_request` — fuel does not tick during host calls, and each
+    // call could otherwise block up to MAX_HOST_CALL_MS (60 s) with no
+    // cumulative limit (backlog line 110).
+    {
+        let state = caller.data_mut();
+        if state.metric_spam_exceeded {
+            return -9; // iteration already over the sample/tag caps
+        }
+        if state.http_budget_ms <= 0.0 || state.http_call_count >= state.http_call_cap {
+            state.http_over_budget = true;
+            return -9;
+        }
+    }
     let memory = match caller.get_export("memory") {
         Some(Extern::Memory(m)) => m,
         _ => return -1,
@@ -630,10 +721,21 @@ fn http_request_host(
     // original stays alive for sample-tag construction below.
     let req_for_io = req.clone();
     let client_for_io = http_client.clone();
+    let started = Instant::now();
     let result =
         tropel_http::blocking::execute_blocking(
             async move { client_for_io.execute(&req_for_io).await },
         );
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    // Charge the ACTUAL wall time to the cumulative budget (a call that
+    // overruns its declared timeout still counts against it), and count the
+    // call. Charging actual elapsed — not the guest's declared timeout —
+    // keeps fast legit requests cheap while still bounding total wall time.
+    {
+        let state = caller.data_mut();
+        state.http_call_count += 1;
+        state.http_budget_ms = (state.http_budget_ms - elapsed_ms).max(0.0);
+    }
     let resp = match result {
         Ok(r) => r,
         Err(e) => {
@@ -887,7 +989,7 @@ fn read_mem_string(
 // Registration — compile-time discovery via inventory
 // ══════════════════════════════════════════════════════════════════
 
-inventory::submit!(DriverRegistration::new("wasm", || Box::new(WasmDriver)));
+inventory::submit!(DriverRegistration::new("wasm", || Box::new(WasmDriver::default())));
 
 // ══════════════════════════════════════════════════════════════════
 // Tests
@@ -1052,7 +1154,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_detect() {
-        let driver = WasmDriver;
+        let driver = WasmDriver::default();
         assert!(driver.detect(b"\0asm\x01\x00\x00\x00"));
         assert!(driver.detect(b"(module"));
         assert!(!driver.detect(b"export default function() {}"));
@@ -1100,7 +1202,7 @@ mod tests {
         // must be rejected as a driver with a clear error. The module is VALID
         // wasm — only the export is missing — so the rejection genuinely
         // exercises the export check, not a parse failure.
-        let result = WasmDriver
+        let result = WasmDriver::default()
             .init(DECLARATIVE_ONLY_WAT.as_bytes(), None, None)
             .await;
         let msg = match result {
@@ -1123,7 +1225,7 @@ mod tests {
         // `vu_loop.rs` swallowed the error (the summary reported the requested
         // count). The pool now holds 4096 instances; 32 concurrent driver
         // instances must all start.
-        let driver = WasmDriver;
+        let driver = WasmDriver::default();
         let mut instances: Vec<Box<dyn DriverInstance>> = Vec::new();
         for _ in 0..32 {
             let inst = driver
@@ -1144,7 +1246,7 @@ mod tests {
         // run, surfacing as a generic "WASM memory write failed"). The module
         // here emits a marker metric from its free; the host must invoke free
         // after run_iteration so the marker lands in ctx.samples.
-        let driver = WasmDriver;
+        let driver = WasmDriver::default();
         let mut inst = driver
             .init(FREE_MARKER_WAT.as_bytes(), None, None)
             .await
@@ -1251,7 +1353,7 @@ mod tests {
         // on that poisoned heap. The instance must now re-instantiate into a
         // fresh store: the trapped iteration surfaces the trap and emits NO
         // free marker, and the next iteration runs on pristine memory.
-        let driver = WasmDriver;
+        let driver = WasmDriver::default();
         let mut inst = driver
             .init(TRAP_RESET_WAT.as_bytes(), None, None)
             .await
@@ -1321,7 +1423,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_iteration_http_and_metric() {
-        let driver = WasmDriver;
+        let driver = WasmDriver::default();
         let mut inst = driver
             .init(DRIVER_WAT.as_bytes(), None, None)
             .await
@@ -1377,7 +1479,7 @@ mod tests {
     async fn test_infinite_loop_traps_via_fuel() {
         // An infinite adapter_run_iteration must be interrupted by the fuel
         // budget rather than hang the VU.
-        let driver = WasmDriver;
+        let driver = WasmDriver::default();
         let mut inst = driver
             .init(LOOP_DRIVER_WAT.as_bytes(), None, None)
             .await
@@ -1399,7 +1501,7 @@ mod tests {
         // years) and hung the run — fuel doesn't tick during host calls, so
         // the instruction budget never applied. A sleep that would exceed the
         // per-iteration budget must trap IMMEDIATELY (no actual sleeping).
-        let driver = WasmDriver;
+        let driver = WasmDriver::default();
         let mut inst = driver
             .init(SLEEP_DRIVER_WAT.as_bytes(), None, None)
             .await
@@ -1420,10 +1522,112 @@ mod tests {
         );
     }
 
+    // Makes TWO http_request calls and ignores the results (returns 0 either
+    // way) — so the host's budget enforcement is what fails the iteration,
+    // not the guest's return-code handling.
+    const TWO_HTTP_CALLS_WAT: &str = r#"
+(module
+  (import "env" "http_request" (func $http_request (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 64 256)
+  (data (i32.const 4096) "{\"url\":\"http://example.com/\",\"method\":\"GET\"}")
+  (func (export "adapter_run_iteration") (param $in i32) (param $in_len i32) (result i32)
+    (drop (call $http_request (i32.const 4096) (i32.const 44) (i32.const 12288) (i32.const 1024)))
+    (drop (call $http_request (i32.const 4096) (i32.const 44) (i32.const 12288) (i32.const 1024)))
+    (i32.const 0))
+)
+"#;
+
+    #[tokio::test]
+    async fn test_http_within_budget_succeeds() {
+        // Two fast calls against the default budgets must succeed (the
+        // cumulative wall-time budget is charged ACTUAL elapsed time, so
+        // fast legit requests stay cheap).
+        let driver = WasmDriver::default();
+        let mut inst = driver
+            .init(TWO_HTTP_CALLS_WAT.as_bytes(), None, None)
+            .await
+            .expect("driver init must succeed");
+
+        let mut ctx = VuContext::new(1, 0, "default".into());
+        ctx.http_client = Some(Arc::new(StubClient));
+        inst.run_iteration(&mut ctx)
+            .await
+            .expect("two fast http_request calls within budget must succeed");
+        let reqs = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "http_reqs")
+            .count();
+        assert_eq!(reqs, 2, "both calls must record http_reqs samples");
+    }
+
+    #[tokio::test]
+    async fn test_http_call_cap_fails_iteration() {
+        // P1 regression: `env.http_request` had only a per-call 60 s clamp —
+        // no call count, no cumulative budget — so a hostile module could
+        // spend ~20 000 × 60 s ≈ 14 days in ONE iteration. Tightening the
+        // call cap to 1 must refuse the second call (-9), set the over-budget
+        // flag, and fail the iteration when the module returns.
+        let driver = WasmDriver {
+            http_call_cap: Some(1),
+            ..Default::default()
+        };
+        let mut inst = driver
+            .init(TWO_HTTP_CALLS_WAT.as_bytes(), None, None)
+            .await
+            .expect("driver init must succeed");
+
+        let mut ctx = VuContext::new(1, 0, "default".into());
+        ctx.http_client = Some(Arc::new(StubClient));
+        let err = match inst.run_iteration(&mut ctx).await {
+            Err(e) => e,
+            Ok(()) => panic!("the second http_request call must trip the call cap"),
+        };
+        assert!(
+            format!("{}", err).contains("HTTP budget"),
+            "error should mention the HTTP budget, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_budget_exhaustion_refuses_calls() {
+        // The cumulative wall-time budget exhausted (0 ms left) must refuse
+        // the call BEFORE it executes — the first call itself returns -9 and
+        // the iteration fails.
+        let driver = WasmDriver {
+            http_budget_ms: Some(0.0),
+            ..Default::default()
+        };
+        let mut inst = driver
+            .init(TWO_HTTP_CALLS_WAT.as_bytes(), None, None)
+            .await
+            .expect("driver init must succeed");
+
+        let mut ctx = VuContext::new(1, 0, "default".into());
+        ctx.http_client = Some(Arc::new(StubClient));
+        let err = match inst.run_iteration(&mut ctx).await {
+            Err(e) => e,
+            Ok(()) => panic!("a zero HTTP budget must refuse http_request calls"),
+        };
+        assert!(
+            format!("{}", err).contains("HTTP budget"),
+            "error should mention the HTTP budget, got: {}",
+            err
+        );
+        // Refused calls record NO samples.
+        let reqs = ctx
+            .samples
+            .iter()
+            .filter(|s| s.metric == "http_reqs")
+            .count();
+        assert_eq!(reqs, 0, "refused calls must not record http_reqs");
+    }
+
     #[tokio::test]
     async fn test_sleep_within_budget_succeeds() {
         // A legitimate small sleep must still work.
-        let driver = WasmDriver;
+        let driver = WasmDriver::default();
         let mut inst = driver
             .init(SLEEP_OK_DRIVER_WAT.as_bytes(), None, None)
             .await
@@ -1446,7 +1650,7 @@ mod tests {
         // per iteration (fuel-bounded), growing state.samples toward
         // multi-GB and flooding the metrics pipeline. The per-iteration
         // sample cap must bound the buffer AND fail the iteration.
-        let driver = WasmDriver;
+        let driver = WasmDriver::default();
         let mut inst = driver
             .init(SPAM_DRIVER_WAT.as_bytes(), None, None)
             .await
@@ -1480,7 +1684,7 @@ mod tests {
         // 100k capped samples x 64 KiB would be ~6.4 GB per VU. The
         // cumulative per-iteration tag-bytes budget must trip (~2048 samples
         // of 4 KiB) and fail the iteration.
-        let driver = WasmDriver;
+        let driver = WasmDriver::default();
         let mut inst = driver
             .init(tag_spam_driver_wat().as_bytes(), None, None)
             .await
@@ -1515,7 +1719,7 @@ mod tests {
         // discards metrics). The host must clamp to the module's memory size
         // (engine-capped at 16 MiB), fail the read, and return a negative
         // error code instead.
-        let driver = WasmDriver;
+        let driver = WasmDriver::default();
         let mut inst = driver
             .init(HOSTILE_LEN_DRIVER_WAT.as_bytes(), None, None)
             .await

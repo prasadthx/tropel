@@ -32,7 +32,7 @@ pub fn link_builtins() -> usize {
         // survives dead-stripping (tropel-wasm is also linked for
         // discover_plugins, but the DriverRegistration static must be pulled
         // into the binary for `tropel run plugin.wasm` to resolve).
-        Box::new(tropel_wasm::driver::WasmDriver),
+        Box::new(tropel_wasm::driver::WasmDriver::default()),
     ];
     // Force-link the protocol extensions so their `inventory::submit!`
     // registrations survive dead-stripping — this is what makes `grpc://` /
