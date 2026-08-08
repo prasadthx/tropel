@@ -408,11 +408,14 @@ fn metric_base_name(key: &str) -> &str {
 }
 
 /// Get a metric value for a tag-scoped threshold by searching the metrics list.
-/// Looks for entries whose BASE name equals the metric name and that contain
-/// all the specified tag key=value pairs.
+/// Looks for entries whose BASE name equals the metric name and that carry
+/// all the specified tag key=value pairs (matched STRUCTURALLY against each
+/// series' parsed `tags`, not against the rendered key string — the collector
+/// joins all tags into one brace group `http_req_duration{status=200,method=GET}`,
+/// so the old `{status=200}` substring never matched).
 ///
-/// When MULTIPLE entries match (e.g. `http_req_duration{status=200}{method=GET}`
-/// and `http_req_duration{status=200}{method=POST}` both match `{status=200}`),
+/// When MULTIPLE entries match (e.g. `http_req_duration{status=200,method=GET}`
+/// and `http_req_duration{status=200,method=POST}` both match `{status=200}`),
 /// the function aggregates:
 /// - **Percentiles** (p50/p90/p95/p99): returns the WORST (highest) value
 /// - **Avg/mean**: returns the WORST (highest) value across matches
@@ -438,12 +441,15 @@ fn get_tag_scoped_metric_value(
         if metric_base_name(&m.key) != metric_name {
             continue;
         }
-        // Check if all tag filters are present in the key string
-        // The key format is like "http_req_duration{status=200}{method=GET}"
-        let all_tags_match = tag_filters.iter().all(|(key, val)| {
-            let pattern = format!("{{{}={}}}", key, val);
-            m.key.contains(&pattern)
-        });
+        // Match structurally against the parsed tag pairs — NOT the rendered
+        // key. The collector emits ONE comma-joined brace group
+        // (`{status=200,method=GET}`), so a substring like `{status=200}` can
+        // never match; the k6-copied `http_req_duration{status:200}` threshold
+        // therefore reported actual = 0.00 on a healthy run. `tags` is the
+        // authoritative (key, value) source (backlog §1 P0).
+        let all_tags_match = tag_filters
+            .iter()
+            .all(|(key, val)| m.tags.iter().any(|(k, v)| k == key && v == val));
         if !all_tags_match {
             continue;
         }
@@ -1566,6 +1572,55 @@ mod tests {
             "must match only the login{{status=200}} series (count 2)"
         );
         assert_eq!(actual, 2.0);
+    }
+
+    #[test]
+    fn test_tag_scoped_matches_real_comma_joined_key() {
+        // Regression (backlog §1): the collector renders ONE comma-joined tag
+        // group (`http_req_duration{status=200,method=GET}`), but the old
+        // matcher substring-matched `{status=200}` — which can never appear
+        // because the closing brace follows the LAST tag. The most-copied k6
+        // threshold `http_req_duration{status:200}` reported actual = 0.00 on
+        // a healthy run. Matching is now structural against the parsed tags.
+        let mut metrics = MetricsResult::default();
+        metrics.metrics.push(MetricSummary {
+            key: "http_req_duration{status=200,method=GET}".into(),
+            tags: vec![
+                ("status".into(), "200".into()),
+                ("method".into(), "GET".into()),
+            ],
+            metric_type: MetricType::Trend,
+            count: 80,
+            sum: 32000.0,
+            mean: 400.0,
+            min: 50,
+            max: 1500,
+            p50: 350,
+            p90: 700,
+            p95: 900,
+            p99: 1400,
+            last: 0.0,
+            rate: 0.0,
+            histogram: None,
+        });
+        // The k6-copied form, with the `:` tag separator and a single filter.
+        let (passed, actual, _) =
+            evaluate_single_threshold("http_req_duration{status:200}.p95 < 1000", &metrics);
+        assert!(passed, "status=200 filter must match the comma-joined key");
+        assert_eq!(actual, 900.0);
+
+        // A second filter on the same key must also match.
+        let (passed, actual, _) = evaluate_single_threshold(
+            "http_req_duration{status=200,method=GET}.p95 < 1000",
+            &metrics,
+        );
+        assert!(passed, "both filters must match");
+        assert_eq!(actual, 900.0);
+
+        // A filter the key does NOT carry must not match.
+        let (passed, _, _) =
+            evaluate_single_threshold("http_req_duration{status=404}.p95 < 1000", &metrics);
+        assert!(!passed, "status=404 must not match the status=200 series");
     }
 
     #[test]
