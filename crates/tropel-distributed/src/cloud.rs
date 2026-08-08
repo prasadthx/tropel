@@ -358,7 +358,8 @@ mod tests {
                     // and reusing it on a fast host (Linux/macOS CI) races the
                     // close, causing a spurious transport error that drops a
                     // sample and flakes the merge assertions.
-                    let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+                    let resp =
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
                     let _ = sock.write_all(resp.as_bytes()).await;
                 });
             }
