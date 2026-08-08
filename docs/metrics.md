@@ -35,6 +35,10 @@ tropel run c.json --threshold "http_req_duration p95 < 500" \
                   --threshold "checks rate > 0.99"
 ```
 
+**All duration threshold values are in MILLISECONDS** (k6's native unit —
+backlog §0). `http_req_duration p95 < 500` means p95 < 500 ms, matching how
+the same threshold behaves inside a k6 script.
+
 - Metric-only expressions (`http_req_duration p95 < 500`) and tag-scoped
   expressions (`http_req_duration{status:200} p95 < 500`).
 - **k6-compatible abort semantics**: thresholds are evaluated during the run;

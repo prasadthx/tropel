@@ -533,7 +533,7 @@ impl Protocol for GrpcProtocol {
         let samples = vec![
             Sample {
                 metric: "grpc_req_duration".into(),
-                value: duration.as_micros() as f64,
+                value: duration.as_secs_f64() * 1000.0,
                 tags: tags.clone(),
                 timestamp: now,
                 sample_type: SampleType::Trend,

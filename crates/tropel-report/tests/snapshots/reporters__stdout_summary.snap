@@ -44,7 +44,7 @@ expression: rendered
 
   ── Thresholds ──────────────────────────────────────────
     ✓ checks: 1.00 > 0.99 (PASS)
-    ✗ http_req_duration: 620000.00 < 1000.00 (FAIL)
+    ✗ http_req_duration: 620.00 < 500.00 (FAIL)
 
   ✗ FAIL — one or more thresholds crossed
 ╚════════════════════════════════════════════════════════════════╝

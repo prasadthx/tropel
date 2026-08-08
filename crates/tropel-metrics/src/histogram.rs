@@ -78,8 +78,8 @@ impl LatencyHistogram {
         }
     }
 
-    /// Create a new histogram with a custom high bound in microseconds
-    /// (1 μs low bound). `None` (or an unusable ceiling) selects the
+    /// Create a new histogram with a custom high bound in milliseconds
+    /// (1 ms low bound). `None` (or an unusable ceiling) selects the
     /// auto-resizing variant — a garbage ceiling must not panic inside the
     /// aggregator task on the first recorded sample.
     ///
@@ -87,29 +87,29 @@ impl LatencyHistogram {
     /// `high >= 2`), so ceilings of 0 or 1 fall back to auto-resize. Very
     /// large `high` values are safe: with low=1 the internal magnitude sum
     /// is always < 63, so the constructor never rejects them.
-    pub fn with_max(max_micros: Option<u64>) -> Self {
-        match max_micros {
+    pub fn with_max(max_ms: Option<u64>) -> Self {
+        match max_ms {
             Some(high) if high >= 2 => Self::with_bounds(1, high),
             _ => Self::new(),
         }
     }
 
-    /// Record a duration value.
+    /// Record a duration value (in milliseconds).
     pub fn record(&mut self, duration: Duration) {
-        let micros = duration.as_micros() as u64;
-        self.inner.record(micros.max(1)).ok();
+        let ms = duration.as_millis() as u64;
+        self.inner.record(ms.max(1)).ok();
     }
 
-    /// Record a value in microseconds.
+    /// Record a value in milliseconds.
     ///
-    /// Values are clamped to the histogram's lowest trackable value (1 µs)
+    /// Values are clamped to the histogram's lowest trackable value (1 ms)
     /// BEFORE recording: hdrhistogram rejects 0 (returns `RecordError`), and
     /// the caller's `.ok()` would silently drop it — recreating the
     /// population-mismatch bug (zeros excluded from percentiles while still
     /// counted in `count`/`sum`). Clamping keeps zero samples in the
     /// distribution, so `min ≤ avg` always holds.
-    pub fn record_micros(&mut self, micros: u64) {
-        self.inner.record(micros.max(1)).ok();
+    pub fn record_ms(&mut self, ms: u64) {
+        self.inner.record(ms.max(1)).ok();
     }
 
     /// Get the total count of recorded values.
@@ -117,42 +117,42 @@ impl LatencyHistogram {
         self.inner.len()
     }
 
-    /// Get the minimum value (in microseconds).
+    /// Get the minimum value (in milliseconds).
     pub fn min(&self) -> u64 {
         self.inner.min()
     }
 
-    /// Get the maximum value (in microseconds).
+    /// Get the maximum value (in milliseconds).
     pub fn max(&self) -> u64 {
         self.inner.max()
     }
 
-    /// Get the mean value (in microseconds).
+    /// Get the mean value (in milliseconds).
     pub fn mean(&self) -> f64 {
         self.inner.mean()
     }
 
-    /// Get a percentile value (in microseconds).
+    /// Get a percentile value (in milliseconds).
     pub fn percentile(&self, p: f64) -> u64 {
         self.inner.value_at_percentile(p)
     }
 
-    /// Get the p50 (median) in microseconds.
+    /// Get the p50 (median) in milliseconds.
     pub fn p50(&self) -> u64 {
         self.percentile(50.0)
     }
 
-    /// Get the p90 in microseconds.
+    /// Get the p90 in milliseconds.
     pub fn p90(&self) -> u64 {
         self.percentile(90.0)
     }
 
-    /// Get the p95 in microseconds.
+    /// Get the p95 in milliseconds.
     pub fn p95(&self) -> u64 {
         self.percentile(95.0)
     }
 
-    /// Get the p99 in microseconds.
+    /// Get the p99 in milliseconds.
     pub fn p99(&self) -> u64 {
         self.percentile(99.0)
     }
@@ -262,7 +262,7 @@ mod tests {
     fn v2_roundtrip_preserves_exact_statistics() {
         let mut h = LatencyHistogram::new();
         for ms in [1u64, 2, 3, 4, 5, 50, 100, 250] {
-            h.record_micros(ms * 1000);
+            h.record_ms(ms);
         }
         let bytes = h.to_bytes();
         assert!(!bytes.is_empty());
@@ -288,14 +288,14 @@ mod tests {
     fn percentiles_track_ground_truth() {
         // Backlog §6 P1: the old tests were self-consistency only (h == h2,
         // merged == direct) — a p50() returning the mean would pass all of
-        // them. Record 1..=1000 µs (mean = 500.5) and assert each percentile
+        // them. Record 1..=1000 ms (mean = 500.5) and assert each percentile
         // tracks its own ground truth, NOT the mean.
         let mut h = LatencyHistogram::new();
         for v in 1..=1000u64 {
-            h.record_micros(v);
+            h.record_ms(v);
         }
         // hdr-histogram returns the upper edge of the bucket containing the
-        // requested percentile, so allow ±3 µs of quantization tolerance. The
+        // requested percentile, so allow ±3 ms of quantization tolerance. The
         // point is p50 ≈ 500 while p90 ≈ 900 — a mean-returning p50 would
         // give ~500.5 for ALL of them.
         let approx = |got: u64, want: u64| (got as i64 - want as i64).abs() <= 3;
@@ -321,19 +321,19 @@ mod tests {
         // whose top is 5,001,215 µs with sigfig 3) — assert the sample was
         // recorded, not the exact bucket edge.
         let mut h = LatencyHistogram::with_bounds(0, 0);
-        h.record_micros(5_000_000); // 5 s — above any fixed tiny ceiling
+        h.record_ms(5_000); // 5 s — above any fixed tiny ceiling
         assert_eq!(h.count(), 1, "the sample must not be dropped");
         assert!(
-            h.max() >= 5_000_000,
+            h.max() >= 5_000,
             "max={} must cover the recorded value",
             h.max()
         );
 
         let mut h2 = LatencyHistogram::with_bounds(1, 1); // high < 2*low
-        h2.record_micros(1_000);
+        h2.record_ms(1);
         assert_eq!(h2.count(), 1);
         assert!(
-            h2.max() >= 1_000,
+            h2.max() >= 1,
             "max={} must cover the recorded value",
             h2.max()
         );
@@ -343,10 +343,10 @@ mod tests {
     fn merge_is_exact_sum_of_buckets() {
         let mut a = LatencyHistogram::new();
         let mut b = LatencyHistogram::new();
-        a.record_micros(1_000);
-        a.record_micros(2_000);
-        b.record_micros(50_000);
-        b.record_micros(100_000);
+        a.record_ms(1);
+        a.record_ms(2);
+        b.record_ms(50);
+        b.record_ms(100);
 
         // Serialize, deserialize, merge — must equal recording all four.
         let a2 = LatencyHistogram::from_bytes(&a.to_bytes()).unwrap();
@@ -355,10 +355,10 @@ mod tests {
         merged.merge(&b2);
 
         let mut direct = LatencyHistogram::new();
-        direct.record_micros(1_000);
-        direct.record_micros(2_000);
-        direct.record_micros(50_000);
-        direct.record_micros(100_000);
+        direct.record_ms(1);
+        direct.record_ms(2);
+        direct.record_ms(50);
+        direct.record_ms(100);
 
         assert_eq!(merged.count(), 4);
         assert_eq!(merged.count(), direct.count());

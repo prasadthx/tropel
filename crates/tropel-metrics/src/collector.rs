@@ -134,7 +134,7 @@ pub struct MetricSet {
     pub histogram: Option<LatencyHistogram>,
     /// Histogram ceiling captured at creation; used when the histogram is
     /// lazily allocated on the first Trend sample.
-    histogram_max_micros: Option<u64>,
+    histogram_max_ms: Option<u64>,
     /// For Counter/Rate: event count; for Gauge/Trend: sample count.
     pub count: f64,
     /// Sum of values (for mean calculation or rate numerator).
@@ -148,11 +148,11 @@ pub struct MetricSet {
 }
 
 impl MetricSet {
-    fn new(metric_type: MetricType, histogram_max_micros: Option<u64>) -> Self {
+    fn new(metric_type: MetricType, histogram_max_ms: Option<u64>) -> Self {
         Self {
             metric_type,
             histogram: None,
-            histogram_max_micros,
+            histogram_max_ms,
             count: 0.0,
             sum: 0.0,
             min: f64::MAX,
@@ -210,8 +210,8 @@ impl MetricSet {
                 // µs values ≥ 0.5 in the distribution.
                 let h = self
                     .histogram
-                    .get_or_insert_with(|| LatencyHistogram::with_max(self.histogram_max_micros));
-                h.record_micros(value.max(0.0).round() as u64);
+                    .get_or_insert_with(|| LatencyHistogram::with_max(self.histogram_max_ms));
+                h.record_ms(value.max(0.0).round() as u64);
                 self.count += 1.0;
                 self.sum += value;
             }
@@ -233,7 +233,7 @@ impl MetricSet {
     /// histograms bucket-exact, Gauge folds min/max/last). Used to rebuild
     /// the incremental merged accumulators after snapshot absorption.
     fn merge_from(&mut self, other: &MetricSet) {
-        let hmax = self.histogram_max_micros;
+        let hmax = self.histogram_max_ms;
         self.count += other.count;
         self.sum += other.sum;
         if self.metric_type == MetricType::Trend {
@@ -294,7 +294,7 @@ enum MetricsEvent {
         effective_thresholds:
             std::collections::HashMap<String, tropel_core::config::ThresholdConfig>,
     },
-    /// Set the latency histogram ceiling (microseconds) before any samples
+    /// Set the latency histogram ceiling (milliseconds) before any samples
     /// are recorded. `None` = auto-resize (no ceiling).
     SetHistogramMax(Option<u64>),
 }
@@ -395,13 +395,13 @@ impl MetricsCollector {
         }
     }
 
-    /// Set the latency histogram ceiling (microseconds) before samples are
+    /// Set the latency histogram ceiling (milliseconds) before samples are
     /// recorded. `None` selects auto-resize (no ceiling). Best-effort.
-    pub async fn set_histogram_max(&self, max_micros: Option<u64>) {
+    pub async fn set_histogram_max(&self, max_ms: Option<u64>) {
         self.ensure_aggregator();
         let _ = self
             .tx
-            .send(MetricsEvent::SetHistogramMax(max_micros))
+            .send(MetricsEvent::SetHistogramMax(max_ms))
             .await;
     }
 
@@ -565,8 +565,8 @@ struct Aggregator {
     summary_trend_stats: Vec<String>,
     /// Effective threshold set (job + script-declared) for reporting.
     effective_thresholds: std::collections::HashMap<String, tropel_core::config::ThresholdConfig>,
-    /// Latency histogram ceiling in microseconds (None = auto-resize).
-    histogram_max_micros: Option<u64>,
+    /// Latency histogram ceiling in milliseconds (None = auto-resize).
+    histogram_max_ms: Option<u64>,
     /// Whether any configured threshold/summary stat needs EXACT non-tracked
     /// percentiles. Computed once when the summary config arrives (and in
     /// [`merge_snapshots`]) so it stays stable across the many `results()`
@@ -600,7 +600,7 @@ impl Aggregator {
             totals: HashMap::new(),
             summary_trend_stats: k6_default_trend_stats(),
             effective_thresholds: std::collections::HashMap::new(),
-            histogram_max_micros: None,
+            histogram_max_ms: None,
             retain_histograms: false,
             max_series: MAX_SERIES,
             merged_http_dur: None,
@@ -644,7 +644,7 @@ impl Aggregator {
                     agg.effective_thresholds = effective_thresholds;
                 }
                 MetricsEvent::SetHistogramMax(max) => {
-                    agg.histogram_max_micros = max;
+                    agg.histogram_max_ms = max;
                 }
             }
         }
@@ -691,7 +691,7 @@ impl Aggregator {
         let metric_set = self
             .data
             .entry(key)
-            .or_insert_with(|| MetricSet::new(metric_type, self.histogram_max_micros));
+            .or_insert_with(|| MetricSet::new(metric_type, self.histogram_max_ms));
         metric_set.record(sample.value, &sample.sample_type);
 
         // Maintain the incremental merged accumulators (headline http_req_
@@ -700,7 +700,7 @@ impl Aggregator {
         // stats instead of re-cloning and re-merging every full histogram per
         // series per tick (the O(N)-per-2s cost that filled the bounded
         // channel and blocked `record_batch().await`).
-        let hmax = self.histogram_max_micros;
+        let hmax = self.histogram_max_ms;
         if sample.metric.as_ref() == "http_req_duration" {
             let merged = self
                 .merged_http_dur
@@ -1200,7 +1200,7 @@ impl Aggregator {
                             existing
                                 .histogram
                                 .get_or_insert_with(|| {
-                                    LatencyHistogram::with_max(existing.histogram_max_micros)
+                                    LatencyHistogram::with_max(existing.histogram_max_ms)
                                 })
                                 .merge(h);
                         }
@@ -1219,7 +1219,7 @@ impl Aggregator {
                     v.insert(MetricSet {
                         metric_type: s.metric_type,
                         histogram,
-                        histogram_max_micros: self.histogram_max_micros,
+                        histogram_max_ms: self.histogram_max_ms,
                         count: s.count,
                         sum: s.sum,
                         min: s.min,
@@ -1252,7 +1252,7 @@ impl Aggregator {
         self.merged_iter_dur = None;
         self.merged_per_url.clear();
         self.merged_per_group.clear();
-        let hmax = self.histogram_max_micros;
+        let hmax = self.histogram_max_ms;
         for (key, set) in &self.data {
             if key.metric.as_ref() == "http_req_duration" {
                 let merged = self

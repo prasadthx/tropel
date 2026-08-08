@@ -5,5 +5,5 @@ expression: rendered
 key,count,sum,mean,min,max,p50,p90,p95,p99
 custom_counter,42,42,1.00,1,1,1,1,1,1
 custom_gauge,9,45,5.00,1,9,5,9,9,9
-http_req_duration{url=/api/a},600,250000000,250000.00,10000,800000,180000,420000,620000,900000
-http_req_duration{url=/api/b},400,250000000,250000.00,10000,950000,180000,420000,620000,900000
+http_req_duration{url=/api/a},600,250000,250.00,10,800,180,420,620,900
+http_req_duration{url=/api/b},400,250000,250.00,10,950,180,420,620,900

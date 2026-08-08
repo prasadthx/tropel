@@ -48,20 +48,34 @@ pub(crate) fn build_summary_data(
                 "default",
                 json!({ "rate": m.rate, "count": m.count }),
             ),
-            MetricType::Trend => (
-                "trend",
-                "time",
-                json!({
-                    "avg": m.mean,
-                    "min": m.min,
-                    "med": m.p50,
-                    "max": m.max,
-                    "p(90)": m.p90,
-                    "p(95)": m.p95,
-                    "p(99)": m.p99,
-                    "count": m.count,
-                }),
-            ),
+            MetricType::Trend => {
+                // Values are already in ms end-to-end (backlog §0); k6's
+                // `contains` is `"time"` only for duration metrics — a custom
+                // byte-count Trend must NOT be labelled time (the old code
+                // hardcoded "time" for every Trend). The classification
+                // delegates to tropel-metrics (single source of truth shared
+                // with json-stream/stdout) so outputs never disagree.
+                let base = m.key.split('{').next().unwrap_or(&m.key);
+                let contains = if tropel_metrics::time_metrics::is_time_metric(base) {
+                    "time"
+                } else {
+                    "default"
+                };
+                (
+                    "trend",
+                    contains,
+                    json!({
+                        "avg": m.mean,
+                        "min": m.min,
+                        "med": m.p50,
+                        "max": m.max,
+                        "p(90)": m.p90,
+                        "p(95)": m.p95,
+                        "p(99)": m.p99,
+                        "count": m.count,
+                    }),
+                )
+            }
         };
         metrics.insert(
             m.key.clone(),

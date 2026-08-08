@@ -227,7 +227,7 @@ impl Protocol for WebSocketProtocol {
         let samples = vec![
             Sample {
                 metric: "ws_connecting".into(),
-                value: connecting.as_micros() as f64,
+                value: connecting.as_secs_f64() * 1000.0,
                 tags: tags.clone(),
                 timestamp: now,
                 sample_type: SampleType::Trend,
@@ -269,7 +269,7 @@ impl Protocol for WebSocketProtocol {
             },
             Sample {
                 metric: "ws_req_duration".into(),
-                value: duration.as_micros() as f64,
+                value: duration.as_secs_f64() * 1000.0,
                 tags: tags.clone(),
                 timestamp: now,
                 sample_type: SampleType::Trend,

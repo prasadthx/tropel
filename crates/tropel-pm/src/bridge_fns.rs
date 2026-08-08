@@ -925,8 +925,9 @@ impl PmBridge {
                         Some(st.group_stack.join("::"))
                     };
 
-                    // Emit group_duration sample (Trend) in microseconds
-                    let duration_micros = (duration_ms * 1000.0) as u64;
+                    // Emit group_duration sample (Trend) in ms — the public
+                    // unit end-to-end (backlog §0). The JS side already
+                    // measures in ms, so no µs conversion here.
                     let mut tags = tropel_core::types::TagMap::new();
                     tags.insert("group", name.clone());
                     if let Some(ref path) = st.current_group {
@@ -934,7 +935,7 @@ impl PmBridge {
                     }
                     st.samples.push(tropel_core::types::Sample {
                         metric: "group_duration".into(),
-                        value: duration_micros as f64,
+                        value: duration_ms,
                         tags: Arc::new(tags),
                         timestamp: tropel_core::clock::monotonic_wall_now(),
                         sample_type: tropel_core::types::SampleType::Trend,

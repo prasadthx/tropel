@@ -201,7 +201,7 @@ async fn run_vu_loop(
             });
             iter_samples.push(Sample {
                 metric: "iteration_duration".into(),
-                value: iter_dur.as_micros() as f64,
+                value: iter_dur.as_secs_f64() * 1000.0,
                 tags: empty_tags,
                 timestamp: now,
                 sample_type: tropel_core::types::SampleType::Trend,

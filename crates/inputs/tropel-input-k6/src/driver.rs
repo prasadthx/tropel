@@ -810,7 +810,7 @@ fn push_http_samples_for(
     let mut v = sink.lock().unwrap();
     v.push(Sample {
         metric: "http_req_duration".into(),
-        value: duration.as_micros() as f64,
+        value: duration.as_secs_f64() * 1000.0,
         tags: tags.clone(),
         timestamp: now,
         sample_type: SampleType::Trend,
@@ -834,7 +834,7 @@ fn push_http_samples_for(
         for (name, dur) in &sub {
             v.push(Sample {
                 metric: (*name).into(),
-                value: dur.as_micros() as f64,
+                value: dur.as_secs_f64() * 1000.0,
                 tags: tags.clone(),
                 timestamp: now,
                 sample_type: SampleType::Trend,
@@ -1831,7 +1831,7 @@ impl K6DriverInstance {
                     tags.insert("group", name);
                     v.push(Sample {
                         metric: "group_duration".into(),
-                        value: duration_ms * 1000.0, // μs, consistent with other Trends
+                        value: duration_ms, // ms — the public unit (k6 semantics)
                         tags: Arc::new(tags),
                         timestamp: tropel_core::clock::monotonic_wall_now(),
                         sample_type: SampleType::Trend,
@@ -2231,7 +2231,7 @@ impl K6DriverInstance {
                         let mut v = sink_finish.lock().unwrap();
                         v.push(Sample {
                             metric: "ws_connecting".into(),
-                            value: session.connecting.as_micros() as f64,
+                            value: session.connecting.as_secs_f64() * 1000.0,
                             tags: tags.clone(),
                             timestamp: now,
                             sample_type: SampleType::Trend,
@@ -2273,7 +2273,7 @@ impl K6DriverInstance {
                         });
                         v.push(Sample {
                             metric: "ws_req_duration".into(),
-                            value: duration.as_micros() as f64,
+                            value: duration.as_secs_f64() * 1000.0,
                             tags: tags.clone(),
                             timestamp: now,
                             sample_type: SampleType::Trend,
@@ -4755,17 +4755,16 @@ mod tests {
             .iter()
             .find(|s| s.metric == "http_req_waiting")
             .unwrap();
-        assert_eq!(
-            waiting.value, 4000.0,
-            "waiting must carry the microsecond TTFB"
-        );
+        // Values are milliseconds end-to-end (backlog §0): 4000 µs → 4.0 ms,
+        // 100 µs → 0.1 ms.
+        assert_eq!(waiting.value, 4.0, "waiting must carry the TTFB in ms");
         let blocked = samples
             .iter()
             .find(|s| s.metric == "http_req_blocked")
             .unwrap();
         assert_eq!(
-            blocked.value, 100.0,
-            "blocked must carry the microsecond pool-wait"
+            blocked.value, 0.1,
+            "blocked must carry the pool-wait in ms"
         );
         assert_eq!(samples.len(), 12, "5 base + 7 sub-timing samples");
     }

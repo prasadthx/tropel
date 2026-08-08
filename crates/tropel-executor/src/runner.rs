@@ -473,7 +473,7 @@ impl VURunner {
                                     // http_req_duration (Trend) — this hop's own time
                                     result.samples.push(Sample {
                                         metric: "http_req_duration".into(),
-                                        value: resp.response_time.as_micros() as f64,
+                                        value: resp.response_time.as_secs_f64() * 1000.0,
                                         tags: tags.clone(),
                                         timestamp: now,
                                         sample_type: SampleType::Trend,
@@ -547,7 +547,7 @@ impl VURunner {
                                         for (metric_name, dur) in &sub_timing_metrics {
                                             result.samples.push(Sample {
                                                 metric: (*metric_name).into(),
-                                                value: dur.as_micros() as f64,
+                                                value: dur.as_secs_f64() * 1000.0,
                                                 tags: sub_tags.clone(),
                                                 timestamp: now,
                                                 sample_type: SampleType::Trend,

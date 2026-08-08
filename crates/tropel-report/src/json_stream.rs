@@ -194,24 +194,11 @@ fn k6_timestamp(t: std::time::SystemTime) -> String {
 
 /// True for metrics k6 marks `contains: "time"` (rendered in ms). Duration
 /// trends carry duration suffixes/prefixes; everything else is `default`.
-/// Custom metrics explicitly declared as time metrics (`new Trend(name, true)`
-/// — backlog line 154) are consulted via the tropel-metrics registry too, so
-/// a custom `my_timer` renders in ms even though its name has no time suffix.
+/// Delegates to the tropel-metrics registry+heuristic — the SINGLE source of
+/// truth (backlog §0) — so json-stream, stdout, and handleSummary always
+/// agree on which metrics are time metrics.
 pub(crate) fn is_time_metric(metric: &str) -> bool {
-    if tropel_metrics::time_metrics::is_time_metric(metric) {
-        return true;
-    }
-    metric.ends_with("duration")
-        || metric.ends_with("_time")
-        || metric.ends_with("_waiting")
-        || metric.ends_with("_receiving")
-        || metric.ends_with("_sending")
-        || metric.ends_with("_connecting")
-        || metric.ends_with("_blocked")
-        || metric.ends_with("_tls_handshaking")
-        || metric.ends_with("_lookup")
-        || metric.contains("ttfb")
-        || metric.contains("latency")
+    tropel_metrics::time_metrics::is_time_metric(metric)
 }
 
 #[async_trait]

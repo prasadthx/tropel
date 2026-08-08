@@ -448,11 +448,13 @@ impl Response {
 
 /// Request sub-timings, matching k6's http_req_* breakdown.
 ///
-/// All durations are wall-clock microseconds measured from the start of the
-/// HTTP request (`execute()`). `blocked`, `dns`, and `connecting` are filled
-/// from real connector instrumentation (reqwest's `dns_resolver` and
-/// `connector_layer` hooks — see `tropel-http::subtimings`); they are ZERO
-/// when a pooled keep-alive connection is reused (no connection work).
+/// All durations are wall-clock, measured from the start of the HTTP request
+/// (`execute()`). Metric samples derived from these are emitted in
+/// MILLISECONDS — the public unit end-to-end (backlog §0). `blocked`, `dns`,
+/// and `connecting` are filled from real connector instrumentation (reqwest's
+/// `dns_resolver` and `connector_layer` hooks — see `tropel-http::subtimings`);
+/// they are ZERO when a pooled keep-alive connection is reused (no connection
+/// work).
 ///
 /// The measurable phases:
 /// - **blocked**: request start until connection attempt begins (pool wait)

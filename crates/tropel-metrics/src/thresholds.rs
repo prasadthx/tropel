@@ -787,15 +787,15 @@ mod tests {
     // ── Arbitrary-percentile tests ──
 
     /// Build a MetricsResult whose http_req_duration carries a real retained
-    /// histogram with values 100..=1000 µs (10 samples, mean 550 µs).
-    /// p75 ≈ 775-800 µs — far above the mean — so a `.p75 < 600` threshold
+    /// histogram with values 100..=1000 ms (10 samples, mean 550 ms).
+    /// p75 ≈ 775-800 ms — far above the mean — so a `.p75 < 600` threshold
     /// MUST fail. Before the histogram was retained, any non-{p50,p90,p95,p99}
     /// stat silently fell back to the mean (550) → false PASS.
     fn make_histogram_metrics() -> MetricsResult {
         use crate::histogram::LatencyHistogram;
         let mut h = LatencyHistogram::new();
         for i in 1..=10u64 {
-            h.record_micros(i * 100);
+            h.record_ms(i * 100);
         }
         MetricsResult {
             http_req_duration: Some(MetricSummary {
@@ -870,7 +870,7 @@ mod tests {
         use crate::histogram::LatencyHistogram;
         let mut h = LatencyHistogram::new();
         for i in 1..=10u64 {
-            h.record_micros(i * 100);
+            h.record_ms(i * 100);
         }
         let mut m = MetricsResult::default();
         m.metrics.push(MetricSummary {
@@ -906,7 +906,7 @@ mod tests {
         use crate::histogram::LatencyHistogram;
         let mut h = LatencyHistogram::new();
         for i in 1..=10u64 {
-            h.record_micros(i * 100);
+            h.record_ms(i * 100);
         }
         let mut metrics = MetricsResult::default();
         metrics.metrics.push(MetricSummary {

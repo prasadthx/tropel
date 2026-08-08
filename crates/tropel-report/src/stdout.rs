@@ -11,10 +11,11 @@ impl StdoutReporter {
     /// Render a Trend metric using the configured `summaryTrendStats` list,
     /// appending to `out` (single trailing newline).
     ///
-    /// Time-based trends (k6 `contains: "time"`) render in `ms` (values are
-    /// microseconds internally); non-duration trends (byte counts, custom
-    /// metrics, `contains: "default"`) render raw — the old code stamped
-    /// `ms` on every trend, mislabeling non-duration metrics.
+    /// All durations are stored in MILLISECONDS end-to-end (backlog §0), so
+    /// time-based trends (k6 `contains: "time"`) render their value with an
+    /// `ms` suffix and NO scaling; non-duration trends (byte counts, custom
+    /// metrics, `contains: "default"`) render raw with no suffix. The old
+    /// name-heuristic `/1000` is gone — values are already in the public unit.
     fn render_trend(out: &mut String, line: &str, m: &MetricSummary, stats: &[String]) {
         let base = m.key.split('{').next().unwrap_or(&m.key);
         let is_time = crate::json_stream::is_time_metric(base);
@@ -24,33 +25,16 @@ impl StdoutReporter {
         for stat in stats {
             if let Some(v) = trend_stat_value(stat, m) {
                 match stat.trim() {
-                    s if s.starts_with("p(") => parts.push(format!(
-                        "{}={:.0}{unit}",
-                        stat.trim(),
-                        if is_time { v / 1000.0 } else { v }
-                    )),
-                    "avg" | "mean" => parts.push(format!(
-                        "avg={:.2}{unit}",
-                        if is_time { v / 1000.0 } else { v }
-                    )),
-                    "min" => parts.push(format!(
-                        "min={:.0}{unit}",
-                        if is_time { v / 1000.0 } else { v }
-                    )),
-                    "max" => parts.push(format!(
-                        "max={:.0}{unit}",
-                        if is_time { v / 1000.0 } else { v }
-                    )),
+                    s if s.starts_with("p(") => {
+                        parts.push(format!("{}={:.0}{unit}", stat.trim(), v))
+                    }
+                    "avg" | "mean" => parts.push(format!("avg={:.2}{unit}", v)),
+                    "min" => parts.push(format!("min={:.0}{unit}", v)),
+                    "max" => parts.push(format!("max={:.0}{unit}", v)),
                     "count" => parts.push(format!("count={:.0}", v)),
-                    "sum" => parts.push(format!(
-                        "sum={:.2}{unit}",
-                        if is_time { v / 1000.0 } else { v }
-                    )),
+                    "sum" => parts.push(format!("sum={:.2}{unit}", v)),
                     "rate" => parts.push(format!("rate={:.4}", v)),
-                    "med" | "median" => parts.push(format!(
-                        "med={:.0}{unit}",
-                        if is_time { v / 1000.0 } else { v }
-                    )),
+                    "med" | "median" => parts.push(format!("med={:.0}{unit}", v)),
                     _ => parts.push(format!("{}={:.2}", stat.trim(), v)),
                 }
             }
@@ -369,19 +353,19 @@ mod tests {
             run_duration: Duration::from_secs(10),
             http_req_duration: Some(trend(
                 "http_req_duration",
-                134_890.0,
-                150_040,
-                268_230,
-                272_420,
-                337_910,
+                134.89,
+                150,
+                268,
+                272,
+                338,
             )),
             iteration_duration: Some(trend(
                 "iteration_duration",
-                294_580.0,
-                262_280,
-                278_660,
-                321_420,
-                1_150_000,
+                294.58,
+                262,
+                279,
+                321,
+                1_150,
             )),
             summary_trend_stats: vec![],
             effective_thresholds: HashMap::new(),
@@ -407,11 +391,11 @@ mod tests {
         let mut out = String::new();
         let m = trend(
             "http_req_duration",
-            134_890.0,
-            150_040,
-            268_230,
-            272_420,
-            337_910,
+            134.89,
+            150,
+            268,
+            272,
+            338,
         );
         let stats = vec![
             "avg".to_string(),
@@ -421,7 +405,8 @@ mod tests {
             "p(90)".to_string(),
         ];
         StdoutReporter::render_trend(&mut out, "", &m, &stats);
-        // μs → ms: avg=134.89ms, med=150ms, p(90)=268ms.
+        // Values are ms end-to-end (backlog §0): avg=134.89ms, med=150ms,
+        // p(90)=268ms — no /1000 anywhere.
         assert!(out.contains("avg=134.89ms"), "{out}");
         assert!(out.contains("med=150ms"), "{out}");
         assert!(out.contains("p(90)=268ms"), "{out}");
@@ -481,19 +466,19 @@ mod tests {
         let mut r = result_with();
         let mut a = trend(
             "http_req_duration{url=/a}",
-            100_000.0,
-            100_000,
-            150_000,
-            160_000,
-            200_000,
+            100.0,
+            100,
+            150,
+            160,
+            200,
         );
         let mut b = trend(
             "http_req_duration{url=/b}",
-            200_000.0,
-            200_000,
-            250_000,
-            260_000,
-            300_000,
+            200.0,
+            200,
+            250,
+            260,
+            300,
         );
         a.tags = vec![("url".to_string(), "/a".to_string())];
         b.tags = vec![("url".to_string(), "/b".to_string())];

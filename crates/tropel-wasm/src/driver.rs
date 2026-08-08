@@ -666,7 +666,7 @@ fn http_request_host(
                 caller.data_mut(),
                 Sample {
                     metric: "http_req_duration".into(),
-                    value: hop.response_time.as_micros() as f64,
+                    value: hop.response_time.as_secs_f64() * 1000.0,
                     tags: tags.clone(),
                     timestamp: now,
                     sample_type: SampleType::Trend,

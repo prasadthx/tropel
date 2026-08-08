@@ -244,9 +244,10 @@ impl LiveState {
             }
             "http_req_duration" => {
                 self.rolling_count += 1;
-                let val_ms = sample.value / 1000.0; // μs → ms
-                if val_ms > self.rolling_max {
-                    self.rolling_max = val_ms;
+                // Values are milliseconds end-to-end (backlog §0) — no µs→ms
+                // scaling needed here.
+                if sample.value > self.rolling_max {
+                    self.rolling_max = sample.value;
                 }
                 self.rolling_p95.push_back(sample.value as u64);
                 if self.rolling_p95.len() > 5000 {
@@ -264,7 +265,8 @@ impl LiveState {
         let mut sorted: Vec<u64> = self.rolling_p95.iter().copied().collect();
         sorted.sort_unstable();
         let idx = (sorted.len() as f64 * 0.95) as usize;
-        sorted.get(idx).copied().unwrap_or(0) as f64 / 1000.0
+        // Samples are already in ms (backlog §0).
+        sorted.get(idx).copied().unwrap_or(0) as f64
     }
 
     /// Render the progress block as two lines (k6-style).
@@ -457,19 +459,19 @@ mod tests {
     #[test]
     fn live_state_rolling_p95_and_max_bounded_window() {
         let mut state = LiveState::new(None);
-        // Feed durations in μs: 0..=6000 (6001 samples) → window capped at
-        // 5000 so the OLDEST (smallest) samples are evicted.
+        // Feed durations in ms (backlog §0): 0..=6000 (6001 samples) → window
+        // capped at 5000 so the OLDEST (smallest) samples are evicted.
         for i in 0..6001u64 {
             state.record(&sample("http_req_duration", i as f64, TagMap::new()));
         }
         assert_eq!(state.rolling_p95.len(), 5000, "window capped at 5000");
         assert_eq!(state.rolling_count, 6001);
-        // rolling_max is stored in MS (μs / 1000) — 6000 μs → 6.0 ms.
-        assert_eq!(state.rolling_max, 6.0);
+        // Values are ms end-to-end — rolling_max stores them as-is.
+        assert_eq!(state.rolling_max, 6000.0);
         // Sorted window is 1001..=6000; p95 index = floor(5000*0.95) = 4750
-        // → value 1001+4750 = 5751 μs → 5.751 ms.
+        // → value 1001+4750 = 5751 ms.
         let p95 = state.compute_p95();
-        assert!((p95 - 5.751).abs() < 1e-9, "p95 = {p95}");
+        assert!((p95 - 5751.0).abs() < 1e-9, "p95 = {p95}");
     }
 
     #[test]

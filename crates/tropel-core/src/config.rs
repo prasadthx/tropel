@@ -612,12 +612,12 @@ pub struct HttpConfig {
     /// k6 always follows redirects; this flag lets Tropel opt out.
     #[serde(default)]
     pub no_redirects: bool,
-    /// Optional fixed ceiling for the latency histogram, in MICROseconds.
+    /// Optional fixed ceiling for the latency histogram, in MILLISECONDS.
     /// `None` (default) uses hdrhistogram auto-resize — no ceiling, so very
     /// slow requests are recorded exactly instead of being clipped at 60 s.
     /// Set this to bound memory for runs with pathological outliers.
-    #[serde(default, alias = "histogramMaxMicros")]
-    pub histogram_max_micros: Option<u64>,
+    #[serde(default, alias = "histogramMaxMs")]
+    pub histogram_max_ms: Option<u64>,
     /// DNS cache TTL (k6 `dns.ttl`), e.g. `"5m"`, `"inf"`. `None` (default)
     /// disables caching — every request resolves. `"0"` also disables it.
     #[serde(default, alias = "dnsTtl")]
@@ -690,7 +690,7 @@ impl Default for HttpConfig {
             max_redirects: 10,
             no_redirects: false,
             discard_response_bodies: false,
-            histogram_max_micros: None,
+            histogram_max_ms: None,
             dns_ttl: None,
             dns_select: None,
             dns_policy: None,

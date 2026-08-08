@@ -35,10 +35,29 @@ pub mod time_metrics {
             .insert(name.to_string());
     }
 
-    /// Whether the metric was explicitly declared as a time metric.
+    /// Whether a metric is a TIME metric (rendered/compared in ms): either
+    /// explicitly declared via [`register`] (k6 `new Trend(name, true)`) or
+    /// matches k6's name conventions for duration metrics. This is the SINGLE
+    /// source of truth — json-stream's `contains` stamp, stdout's ms suffix,
+    /// and handleSummary's `contains` field all delegate here so the
+    /// classification can never drift between outputs (backlog §0).
     pub fn is_time_metric(name: &str) -> bool {
-        TIME_METRICS
+        if TIME_METRICS
             .get()
             .is_some_and(|m| m.lock().unwrap().contains(name))
+        {
+            return true;
+        }
+        name.ends_with("duration")
+            || name.ends_with("_time")
+            || name.ends_with("_waiting")
+            || name.ends_with("_receiving")
+            || name.ends_with("_sending")
+            || name.ends_with("_connecting")
+            || name.ends_with("_blocked")
+            || name.ends_with("_tls_handshaking")
+            || name.ends_with("_lookup")
+            || name.contains("ttfb")
+            || name.contains("latency")
     }
 }

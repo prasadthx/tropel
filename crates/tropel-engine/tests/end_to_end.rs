@@ -218,14 +218,14 @@ async fn end_to_end_two_vu_with_header_check_and_threshold() -> Result<()> {
     let (srv, peak) = start_echo_server(seen.clone()).await;
     let coll = write_collection(&format!("http://{srv}"), "two-vu");
 
-    // Threshold on http_req_duration (samples are MICROSECONDS): a generous
+    // Threshold on http_req_duration (samples are MILLISECONDS): a generous
     // 5 s ceiling that still reflects REAL latency — a hardcoded pass or an
     // empty series (actual = 0) must fail the "> 0 real samples" asserts.
     let mut thresholds = HashMap::new();
     thresholds.insert(
         "http_req_duration".to_string(),
         ThresholdConfig {
-            expression: "http_req_duration.p95 < 5000000".to_string(),
+            expression: "http_req_duration.p95 < 5000".to_string(),
             abort_on_fail: false,
             delay_abort_eval: None,
         },

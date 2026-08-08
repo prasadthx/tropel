@@ -22,14 +22,16 @@ fn fixture() -> MetricsResult {
             .collect(),
         metric_type: MetricType::Trend,
         count,
-        sum: 250_000_000.0,
-        mean: 250_000.0,
-        min: 10_000,
+        // Durations are MILLISECONDS end-to-end (backlog §0): 250.0 ms mean,
+        // 10 ms min, p50=180 ms, p90=420 ms, p95=620 ms, p99=900 ms.
+        sum: 250_000.0,
+        mean: 250.0,
+        min: 10,
         max,
-        p50: 180_000,
-        p90: 420_000,
-        p95: 620_000,
-        p99: 900_000,
+        p50: 180,
+        p90: 420,
+        p95: 620,
+        p99: 900,
         last: 0.0,
         rate: 0.0,
         histogram: None,
@@ -51,8 +53,11 @@ fn fixture() -> MetricsResult {
         effective_thresholds: HashMap::from([
             (
                 "http_req_duration".to_string(),
+                // p95=620 ms in the fixture — a < 500 ms threshold must FAIL
+                // (the old µs fixture needed a 1000×-inflated bound to fail;
+                // with ms values the bound is expressed in the same unit).
                 ThresholdConfig {
-                    expression: "http_req_duration.p95 < 1000".to_string(),
+                    expression: "http_req_duration.p95 < 500".to_string(),
                     abort_on_fail: false,
                     delay_abort_eval: None,
                 },
@@ -66,8 +71,8 @@ fn fixture() -> MetricsResult {
                 },
             ),
         ]),
-        http_req_duration: Some(trend("http_req_duration", vec![], 1_000, 950_000)),
-        iteration_duration: Some(trend("iteration_duration", vec![], 1_024, 1_100_000)),
+        http_req_duration: Some(trend("http_req_duration", vec![], 1_000, 950)),
+        iteration_duration: Some(trend("iteration_duration", vec![], 1_024, 1_100)),
         metrics: vec![
             MetricSummary {
                 key: "custom_counter".to_string(),
@@ -109,13 +114,13 @@ fn fixture() -> MetricsResult {
                 "http_req_duration{url=/api/a}",
                 vec![("url", "/api/a")],
                 600,
-                800_000,
+                800,
             ),
             trend(
                 "http_req_duration{url=/api/b}",
                 vec![("url", "/api/b")],
                 400,
-                950_000,
+                950,
             ),
         ],
         // Per-group breakdown — the collector merges group-tagged series
@@ -125,7 +130,7 @@ fn fixture() -> MetricsResult {
             "group_duration{group=checkout}",
             vec![("group", "checkout")],
             500,
-            700_000,
+            700,
         )],
         // Wall-clock run duration — backs k6-style per-second rates
         // (`http_reqs: 1000 33.33/s`) in the stdout summary (backlog 154).

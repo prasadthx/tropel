@@ -261,7 +261,7 @@ async fn k6_script_records_requests_checks_and_real_latency() -> Result<()> {
     thresholds.insert(
         "http_req_duration".to_string(),
         ThresholdConfig {
-            expression: "http_req_duration.p95 < 5000000".to_string(),
+            expression: "http_req_duration.p95 < 5000".to_string(),
             abort_on_fail: false,
             delay_abort_eval: None,
         },

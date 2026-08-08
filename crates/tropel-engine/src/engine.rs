@@ -56,7 +56,7 @@ impl Engine {
         // Latency histogram ceiling (None = auto-resize, no clipping). Applied
         // before any samples are recorded so every MetricSet uses it.
         metrics
-            .set_histogram_max(config.http.histogram_max_micros)
+            .set_histogram_max(config.http.histogram_max_ms)
             .await;
 
         let num_workers = std::thread::available_parallelism()
