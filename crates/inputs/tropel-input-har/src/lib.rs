@@ -305,7 +305,23 @@ fn har_entry_to_item(entry: HarEntry, index: usize) -> Result<ScenarioItem> {
 
     let item_name = generate_item_name(&url, index);
 
-    let headers = merge_headers(entry.request.headers.into_iter().map(|h| (h.name, h.value)));
+    // Chrome records HTTP/2 traffic with pseudo-headers (`:method`,
+    // `:authority`, `:scheme`, `:path`) that are NOT valid HTTP/1.1 header
+    // names — `HeaderName::try_from` rejects the leading `:`, so replaying
+    // them verbatim made EVERY request from a modern Chrome HAR fail at
+    // builder time, before a byte left the process (P0). Also strip the
+    // replayed `Content-Length` (the client computes it from the actual
+    // body; a stale recorded value would abort or corrupt the request) and
+    // `Accept-Encoding` (the client negotiates its own, and a replayed
+    // `br`/`zstd` the client can't decode would come back undecodable).
+    let headers = merge_headers(
+        entry
+            .request
+            .headers
+            .into_iter()
+            .map(|h| (h.name, h.value))
+            .filter(|(name, _)| should_replay_header(name)),
+    );
 
     // The recorded URL already carries the query string. Populating
     // query_params as well would make the HTTP layer re-append it
@@ -429,6 +445,20 @@ fn merge_pairs<I: Iterator<Item = (String, String)>>(pairs: I) -> HashMap<String
         }
     }
     map
+}
+
+/// Should a recorded HAR request header be replayed on the wire?
+///
+/// Returns false for HTTP/2 pseudo-headers (`:method`, `:authority`,
+/// `:scheme`, `:path` — Chrome HARs record them; they're not valid HTTP/1.1
+/// header names and `HeaderName::try_from` rejects the `:`), and for
+/// `Content-Length` / `Accept-Encoding`, which the HTTP client manages
+/// itself. Everything else is replayed as recorded.
+fn should_replay_header(name: &str) -> bool {
+    if name.starts_with(':') {
+        return false;
+    }
+    !name.eq_ignore_ascii_case("content-length") && !name.eq_ignore_ascii_case("accept-encoding")
 }
 
 /// Combine duplicate header lines into one value per name.
@@ -948,6 +978,74 @@ mod tests {
             .collect();
         assert!(urls.contains(&"https://app.example.com/"));
         assert!(urls.contains(&"https://api.example.com/orders"));
+    }
+
+    #[test]
+    fn test_pseudo_headers_and_replayed_transport_headers_stripped() {
+        // P0 (backlog): Chrome records HTTP/2 traffic with pseudo-headers
+        // (`:method`, `:authority`, `:scheme`, `:path`) in the header list.
+        // They're not valid HTTP/1.1 header names — HeaderName::try_from
+        // rejects the leading `:` — so replaying them verbatim made EVERY
+        // request from a modern Chrome HAR fail at builder time, before a
+        // byte left the process. Replayed Content-Length / Accept-Encoding
+        // are also stripped (the client manages both itself).
+        let adapter = HarInputAdapter;
+        let data = br#"{
+            "log": {
+                "version": "1.2",
+                "entries": [
+                    {
+                        "request": {
+                            "method": "GET",
+                            "url": "https://api.example.com/users",
+                            "headers": [
+                                {"name": ":method", "value": "GET"},
+                                {"name": ":authority", "value": "api.example.com"},
+                                {"name": ":scheme", "value": "https"},
+                                {"name": ":path", "value": "/users"},
+                                {"name": "Content-Length", "value": "12345"},
+                                {"name": "accept-encoding", "value": "gzip, deflate, br"},
+                                {"name": "Authorization", "value": "Bearer tok"},
+                                {"name": "X-Trace", "value": "abc"}
+                            ],
+                            "queryString": []
+                        },
+                        "response": {"status": 200, "statusText": "OK"}
+                    }
+                ]
+            }
+        }"#;
+
+        let scenario = adapter.parse(data).unwrap();
+        let req = scenario.items[0].request.as_ref().unwrap();
+
+        // Pseudo-headers must NOT survive into Request.headers.
+        assert!(
+            req.headers.keys().all(|k| !k.starts_with(':')),
+            "pseudo-headers must be stripped, got {:?}",
+            req.headers.keys()
+        );
+        // Content-Length / Accept-Encoding stripped case-insensitively.
+        assert!(
+            !req
+                .headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("content-length")),
+            "Content-Length must be stripped"
+        );
+        assert!(
+            !req
+                .headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("accept-encoding")),
+            "Accept-Encoding must be stripped"
+        );
+        // Real headers survive.
+        assert_eq!(
+            req.headers.get("Authorization").map(String::as_str),
+            Some("Bearer tok")
+        );
+        assert_eq!(req.headers.get("X-Trace").map(String::as_str), Some("abc"));
     }
 
     #[test]
