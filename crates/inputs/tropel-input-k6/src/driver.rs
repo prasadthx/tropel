@@ -4194,22 +4194,86 @@ mod tests {
             )
             .expect("script should eval");
 
-            assert_eq!(ctx.eval::<String, _>("__pm_true_ok").unwrap(), "ok", "pm true passes");
-            assert_eq!(ctx.eval::<String, _>("__pm_exist_ok").unwrap(), "ok", "pm exist passes");
-            assert_eq!(ctx.eval::<String, _>("__pm_empty_ok").unwrap(), "ok", "pm empty passes");
-            assert_eq!(ctx.eval::<String, _>("__pm_ok_fail").unwrap(), "threw", "pm false.to.be.true must throw");
-            assert_eq!(ctx.eval::<String, _>("__pm_null_exist_fail").unwrap(), "threw", "pm null.to.exist must throw");
-            assert_eq!(ctx.eval::<String, _>("__pm_unknown_prop").unwrap(), "threw", "pm unknown assertion prop must throw");
-            assert_eq!(ctx.eval::<String, _>("__pm_not_true_fail").unwrap(), "threw", "pm true.not.to.be.true must throw");
-            assert_eq!(ctx.eval::<String, _>("__pm_not_true_ok").unwrap(), "ok", "pm false.not.to.be.true passes");
-            assert_eq!(ctx.eval::<String, _>("__pm_not_exist_fail").unwrap(), "threw", "pm 1.not.to.exist must throw (1 exists)");
-            assert_eq!(ctx.eval::<String, _>("__chai_empty_ok").unwrap(), "ok", "chai empty passes");
-            assert_eq!(ctx.eval::<String, _>("__chai_nan_ok").unwrap(), "ok", "chai NaN passes");
-            assert_eq!(ctx.eval::<String, _>("__chai_exist_fail").unwrap(), "threw", "chai null.to.exist must throw");
-            assert_eq!(ctx.eval::<String, _>("__chai_finite_fail").unwrap(), "threw", "chai Infinity.to.be.finite must throw");
-            assert_eq!(ctx.eval::<String, _>("__chai_unknown_prop").unwrap(), "threw", "chai unknown assertion prop must throw");
-            assert_eq!(ctx.eval::<String, _>("__chai_inspect_ok").unwrap(), "ok", "chai JSON.stringify must not throw (allowlist)");
-            assert_eq!(ctx.eval::<String, _>("__chai_true_fail").unwrap(), "threw", "chai false.to.be.true must throw");
+            assert_eq!(
+                ctx.eval::<String, _>("__pm_true_ok").unwrap(),
+                "ok",
+                "pm true passes"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__pm_exist_ok").unwrap(),
+                "ok",
+                "pm exist passes"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__pm_empty_ok").unwrap(),
+                "ok",
+                "pm empty passes"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__pm_ok_fail").unwrap(),
+                "threw",
+                "pm false.to.be.true must throw"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__pm_null_exist_fail").unwrap(),
+                "threw",
+                "pm null.to.exist must throw"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__pm_unknown_prop").unwrap(),
+                "threw",
+                "pm unknown assertion prop must throw"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__pm_not_true_fail").unwrap(),
+                "threw",
+                "pm true.not.to.be.true must throw"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__pm_not_true_ok").unwrap(),
+                "ok",
+                "pm false.not.to.be.true passes"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__pm_not_exist_fail").unwrap(),
+                "threw",
+                "pm 1.not.to.exist must throw (1 exists)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__chai_empty_ok").unwrap(),
+                "ok",
+                "chai empty passes"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__chai_nan_ok").unwrap(),
+                "ok",
+                "chai NaN passes"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__chai_exist_fail").unwrap(),
+                "threw",
+                "chai null.to.exist must throw"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__chai_finite_fail").unwrap(),
+                "threw",
+                "chai Infinity.to.be.finite must throw"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__chai_unknown_prop").unwrap(),
+                "threw",
+                "chai unknown assertion prop must throw"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__chai_inspect_ok").unwrap(),
+                "ok",
+                "chai JSON.stringify must not throw (allowlist)"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("__chai_true_fail").unwrap(),
+                "threw",
+                "chai false.to.be.true must throw"
+            );
         });
     }
 

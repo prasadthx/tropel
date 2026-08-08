@@ -1693,7 +1693,13 @@ mod tests {
             let sched = sched.clone();
             tokio::spawn(async move {
                 sched
-                    .run_ramping(6, &stages, Duration::from_millis(40), Duration::from_millis(40), &run_vu)
+                    .run_ramping(
+                        6,
+                        &stages,
+                        Duration::from_millis(40),
+                        Duration::from_millis(40),
+                        &run_vu,
+                    )
                     .await;
             })
         };
