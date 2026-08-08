@@ -697,8 +697,13 @@ mod tests {
         let inner = &folder.items[0];
 
         // Prerequest: ALL three levels concatenated, outer→inner.
-        let pre = inner.prerequest.as_ref().expect("leaf must carry prerequest");
-        let c = pre.find("COLLECTION_PREREQUEST").expect("collection script folded");
+        let pre = inner
+            .prerequest
+            .as_ref()
+            .expect("leaf must carry prerequest");
+        let c = pre
+            .find("COLLECTION_PREREQUEST")
+            .expect("collection script folded");
         let f = pre.find("FOLDER_PREREQUEST").expect("folder script folded");
         let i = pre.find("INNER_PREREQUEST").expect("request script kept");
         assert!(c < f && f < i, "prerequest must be outer→inner, got: {pre}");
@@ -735,9 +740,14 @@ mod tests {
             .prerequest
             .as_ref()
             .expect("leaf must carry prerequest");
-        let c = pre.find("COLL_PRE").expect("collection script must be inherited");
+        let c = pre
+            .find("COLL_PRE")
+            .expect("collection script must be inherited");
         let r = pre.find("REQ_PRE").expect("request script must be present");
-        assert!(c < r, "inherited script must run before the request's own: {pre}");
+        assert!(
+            c < r,
+            "inherited script must run before the request's own: {pre}"
+        );
     }
 
     #[test]

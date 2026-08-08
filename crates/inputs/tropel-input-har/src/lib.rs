@@ -1027,15 +1027,13 @@ mod tests {
         );
         // Content-Length / Accept-Encoding stripped case-insensitively.
         assert!(
-            !req
-                .headers
+            !req.headers
                 .keys()
                 .any(|k| k.eq_ignore_ascii_case("content-length")),
             "Content-Length must be stripped"
         );
         assert!(
-            !req
-                .headers
+            !req.headers
                 .keys()
                 .any(|k| k.eq_ignore_ascii_case("accept-encoding")),
             "Accept-Encoding must be stripped"

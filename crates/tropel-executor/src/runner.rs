@@ -1175,8 +1175,14 @@ mod tests {
             Arc::new(execution_items.iter().map(|i| i.name.clone()).collect());
         let client = HttpClient::new(&tropel_core::config::HttpConfig::default())
             .expect("http client should construct");
-        let mut runner =
-            VURunner::new(scenario, execution_items, names, client, 0, "folder-scripts".into());
+        let mut runner = VURunner::new(
+            scenario,
+            execution_items,
+            names,
+            client,
+            0,
+            "folder-scripts".into(),
+        );
 
         let mut js_ctx = Box::new(
             JsContext::new(None, None)

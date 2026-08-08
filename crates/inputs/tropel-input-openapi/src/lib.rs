@@ -2066,7 +2066,10 @@ components:
         let scenario = adapter.parse(data).unwrap();
         assert_eq!(scenario.items.len(), 1);
         let req = scenario.items[0].request.as_ref().unwrap();
-        let body = req.body.as_ref().expect("recursive body schema must generate a body");
+        let body = req
+            .body
+            .as_ref()
+            .expect("recursive body schema must generate a body");
         let json = match body {
             Body::Json(v) => v.to_string(),
             other => panic!("expected Json body, got {:?}", other),
@@ -2175,7 +2178,10 @@ components:
             json.contains("\"depth\":1"),
             "A→B→C chain must inline fully, got: {json}"
         );
-        assert!(json.contains("\"c\":"), "B must be inlined inside A, got: {json}");
+        assert!(
+            json.contains("\"c\":"),
+            "B must be inlined inside A, got: {json}"
+        );
     }
 
     #[test]

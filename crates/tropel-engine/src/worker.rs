@@ -114,7 +114,9 @@ impl VUWorkerPool {
         assert!(count > 0, "VUWorkerPool requires at least 1 worker");
 
         let workers = (0..count).map(Self::make_worker).collect();
-        let busy = (0..count).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        let busy = (0..count)
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect();
         Self {
             workers: Mutex::new(workers),
             busy: Mutex::new(busy),
@@ -427,18 +429,32 @@ mod tests {
         for vu_id in 0..2000u32 {
             let h = pool.spawn_vu(vu_id, async {});
             assert!(h.await.is_ok());
-            assert_eq!(pool.worker_count(), 2, "sequential VU {vu_id} grew the pool");
+            assert_eq!(
+                pool.worker_count(),
+                2,
+                "sequential VU {vu_id} grew the pool"
+            );
         }
 
         // Concurrent VUs DO grow it: 3 simultaneously-live VUs on a 2-worker
         // pool must grow to 3 workers, then free slots back when they finish.
         let (a, b, c) = tokio::join!(
-            pool.spawn_vu(0, async { std::thread::sleep(std::time::Duration::from_millis(50)); }),
-            pool.spawn_vu(1, async { std::thread::sleep(std::time::Duration::from_millis(50)); }),
-            pool.spawn_vu(2, async { std::thread::sleep(std::time::Duration::from_millis(50)); }),
+            pool.spawn_vu(0, async {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }),
+            pool.spawn_vu(1, async {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }),
+            pool.spawn_vu(2, async {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }),
         );
         assert!(a.is_ok() && b.is_ok() && c.is_ok());
-        assert_eq!(pool.worker_count(), 3, "3 concurrent VUs must grow the pool to 3");
+        assert_eq!(
+            pool.worker_count(),
+            3,
+            "3 concurrent VUs must grow the pool to 3"
+        );
 
         // After they finish, the 3rd worker slot is idle again but the pool
         // never shrinks below the peak — a later sequential VU reuses it.
