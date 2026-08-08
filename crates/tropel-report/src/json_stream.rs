@@ -1,15 +1,19 @@
 //! # JSON-stream streaming output
 //!
 //! Appends every sample as NDJSON to a file while the run is in progress —
-//! the k6 `--out json=file` equivalent, emitting **k6-compatible records**:
+//! the k6 `--out json=file` equivalent, emitting **byte-compatible k6
+//! records**:
 //!
-//! - a `Metric` definition record (`{"type":"Metric","data":{...}}`) the
-//!   first time each metric is seen, carrying the k6 metric type
-//!   (`counter`/`gauge`/`rate`/`trend`), `contains` (`time` for duration
-//!   metrics, else `default`), and the metric name;
-//! - a `Point` record (`{"type":"Point","data":{...}}`) per sample with
-//!   RFC 3339 (nanosecond) `time`, the `measurement`, `tags`, and the value
-//!   under `fields.value` — exactly the schema k6's JSON output emits.
+//! - a `Metric` definition record (`{"type":"Metric","data":{"name",
+//!   "type","contains","thresholds","submetrics"}}`) the first time each
+//!   metric is seen, carrying the k6 metric type
+//!   (`counter`/`gauge`/`rate`/`trend`) and `contains` (`time` for duration
+//!   metrics, else `default`);
+//! - a `Point` record (`{"type":"Point","data":{"time","metric","tags",
+//!   "value"}}`) per sample with RFC 3339 (nanosecond) `time`, the metric
+//!   name under **`metric`**, `tags`, and the value under **`value`** — k6's
+//!   exact Point schema (not the InfluxDB point shape, which puts the name
+//!   under `measurement` and the value under `fields.value`).
 //!
 //! Lines are buffered and written every `FLUSH_INTERVAL` (or when the
 //! buffer exceeds `MAX_BUFFERED_SAMPLES`), with a final drain on stream
@@ -108,23 +112,22 @@ impl JsonStreamOutput {
             !seen.insert(metric_name.to_string())
         };
         if !seen {
-            // k6 Metric definition record — emitted once per metric.
+            // k6 Metric definition record — emitted once per metric, exactly
+            // the keys k6's JSON output emits (name, type, contains,
+            // thresholds, submetrics). The old record carried InfluxDB-ish
+            // extras (tainted/time/tags/samples) k6 never emits.
             let def = serde_json::json!({
                 "type": "Metric",
                 "data": {
+                    "name": metric_name,
                     "type": k6_metric_type(&sample.sample_type),
                     "contains": if is_time_metric(&metric_name) {
                         "time"
                     } else {
                         "default"
                     },
-                    "tainted": null,
                     "thresholds": [],
                     "submetrics": null,
-                    "time": k6_timestamp(sample.timestamp),
-                    "name": metric_name,
-                    "tags": null,
-                    "samples": [],
                 },
             })
             .to_string();
@@ -132,14 +135,18 @@ impl JsonStreamOutput {
             self.total_buffered.fetch_add(1, Ordering::Relaxed);
         }
 
-        // k6 Point record — one per sample.
+        // k6 Point record — one per sample. k6's schema puts the metric
+        // name under `metric` and the value directly under `value` (NOT the
+        // InfluxDB `measurement` / `fields.value` shape) — every jq
+        // `.data.value` pipeline, k6-reporter, and Grafana JSON ingest
+        // depends on this exact layout (backlog line 97).
         let point = serde_json::json!({
             "type": "Point",
             "data": {
                 "time": k6_timestamp(sample.timestamp),
-                "measurement": sample.metric,
+                "metric": sample.metric,
                 "tags": sample.tags,
-                "fields": {"value": sample.value},
+                "value": sample.value,
             },
         })
         .to_string();
@@ -287,7 +294,9 @@ mod tests {
                     let data = &v["data"];
                     let name = data["name"].as_str().unwrap();
                     assert!(data["type"].is_string());
-                    assert!(data["time"].is_string(), "RFC3339 time");
+                    // k6's Metric record carries NO timestamp — RFC 3339
+                    // time lives only on Point records.
+                    assert!(data.get("time").is_none(), "Metric def has no time");
                     if name == "http_req_duration" {
                         assert_eq!(data["contains"], "time");
                     } else {
@@ -297,11 +306,15 @@ mod tests {
                 "Point" => {
                     points += 1;
                     let data = &v["data"];
-                    assert!(data["measurement"].is_string());
+                    // k6 Point schema: `metric` + top-level `value`, never the
+                    // InfluxDB `measurement` / `fields.value` shape.
+                    assert!(data["metric"].is_string());
                     assert!(data["time"].is_string());
-                    assert!(data["fields"]["value"].is_number());
+                    assert!(data["value"].is_number());
+                    assert!(data.get("measurement").is_none(), "no InfluxDB measurement key");
+                    assert!(data.get("fields").is_none(), "no InfluxDB fields wrapper");
                     assert!(data["tags"]["status"] == "200");
-                    if data["measurement"] == "http_req_duration" {
+                    if data["metric"] == "http_req_duration" {
                         duration_points += 1;
                     }
                 }
@@ -311,6 +324,65 @@ mod tests {
         assert_eq!(metric_defs, 2);
         assert_eq!(points, 3);
         assert_eq!(duration_points, 2, "no duplicate Metric def per metric");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regression (backlog line 97): the Point record must match k6's
+    /// `--out json` schema — metric name under `metric`, value directly under
+    /// `value`, RFC 3339 `time`, `tags` — so `jq '.data.value'` pipelines and
+    /// k6/Grafana JSON ingests read real numbers instead of null.
+    #[test]
+    fn point_record_matches_k6_schema() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "tropel-json-stream-{}-schema.ndjson",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let output = JsonStreamOutput::new(path.to_string_lossy().to_string());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            output.emit(&[sample("http_req_duration", 12.5)]).await.unwrap();
+            output.flush().await.unwrap();
+        });
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "Metric def + Point: {content}");
+
+        let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v["type"], "Metric");
+        // Exactly k6's Metric keys — no InfluxDB-ish extras. Order-independent
+        // (serde_json Map is a BTreeMap by default but may be an IndexMap
+        // under preserve_order).
+        let mut keys: Vec<&str> = v["data"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        keys.sort_unstable();
+        let mut expected = vec!["contains", "name", "submetrics", "thresholds", "type"];
+        expected.sort_unstable();
+        assert_eq!(keys, expected);
+        assert_eq!(v["data"]["name"], "http_req_duration");
+        assert_eq!(v["data"]["type"], "trend");
+        assert_eq!(v["data"]["contains"], "time");
+
+        let v: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(v["type"], "Point");
+        let data = &v["data"];
+        assert_eq!(data["metric"], "http_req_duration");
+        assert_eq!(data["value"], 12.5);
+        assert!(data["time"].as_str().unwrap().ends_with('Z'), "RFC 3339 UTC");
+        assert_eq!(data["tags"]["status"], "200");
+        // The InfluxDB shape must be gone — this is what every consumer reads.
+        assert!(data.get("measurement").is_none());
+        assert!(data.get("fields").is_none());
         let _ = std::fs::remove_file(&path);
     }
 
