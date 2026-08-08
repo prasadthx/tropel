@@ -321,10 +321,13 @@ inventory::submit!(DriverRegistration::new("k6", || Box::new(K6Driver)).with_pri
 // building / element serialization, and concurrent readers never collide
 // (the old `Mutex` serialized every VU thread on every element read — the
 // one place all VUs collided). Writers clone the small map and swap it in.
-static SHARED_ARRAY_CACHE: OnceLock<RwLock<Arc<HashMap<String, Arc<Vec<serde_json::Value>>>>>> =
-    OnceLock::new();
+/// name -> frozen element rows. `Arc<Vec<...>>` lets readers grab a cheap
+/// refcount bump; writers clone the small map and swap it in.
+type SharedArrayCache = RwLock<Arc<HashMap<String, Arc<Vec<serde_json::Value>>>>>;
 
-fn shared_array_cache() -> &'static RwLock<Arc<HashMap<String, Arc<Vec<serde_json::Value>>>>> {
+static SHARED_ARRAY_CACHE: OnceLock<SharedArrayCache> = OnceLock::new();
+
+fn shared_array_cache() -> &'static SharedArrayCache {
     SHARED_ARRAY_CACHE.get_or_init(|| RwLock::new(Arc::new(HashMap::new())))
 }
 
@@ -720,6 +723,7 @@ fn http_tags_for(
 /// Mirrors the declarative runner's tag set and k6's default success
 /// semantics: a request is failed unless its status is in 2xx–3xx. `sent`
 /// is the request-body byte count (for `data_sent`).
+#[allow(clippy::too_many_arguments)] // 10 fields mirror the k6 http_req_* tag/attr set
 fn push_http_samples(
     sink: &Mutex<Vec<Sample>>,
     req: &Request,
@@ -778,6 +782,7 @@ fn push_redirect_hops(
 
 /// Implementation of [`push_http_samples`] with an explicit URL/method so
 /// redirect hops (different URL, same method) reuse the same emitter.
+#[allow(clippy::too_many_arguments)] // redirect-hop variant of push_http_samples (same field set + scenario)
 fn push_http_samples_for(
     sink: &Mutex<Vec<Sample>>,
     url: &str,
@@ -1069,6 +1074,7 @@ impl DriverInstance for K6DriverInstance {
 /// `error_code` (0 on success, 1xxx series on transport failure), and for
 /// `responseType: "binary"` the body is a native JS ArrayBuffer instead of a
 /// UTF-8 string (binary payloads are no longer silently destroyed).
+#[allow(clippy::too_many_arguments)] // response object fields mirror k6's Response shape
 fn build_k6_response_object<'js>(
     ctx: &rquickjs::Ctx<'js>,
     code: u16,

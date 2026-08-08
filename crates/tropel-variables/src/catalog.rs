@@ -112,7 +112,7 @@ impl DynamicCatalog {
         // {{$randomString[:length]}}
         if result.contains("{{$randomString") {
             let re = cached_re!(RE_RANDOM_STRING, r"\{\{\$randomString(?::(\d+))?\}\}");
-            result = self.replace_with_func(&result, &re, |caps| {
+            result = self.replace_with_func(&result, re, |caps| {
                 let len = capped_len(caps.get(1).map(|m| m.as_str()), 10);
                 random_string(
                     &mut rng,
@@ -128,7 +128,7 @@ impl DynamicCatalog {
                 RE_RANDOM_ALPHABETIC,
                 r"\{\{\$randomAlphabetic(?::(\d+))?\}\}"
             );
-            result = self.replace_with_func(&result, &re, |caps| {
+            result = self.replace_with_func(&result, re, |caps| {
                 let len = capped_len(caps.get(1).map(|m| m.as_str()), 10);
                 random_string(
                     &mut rng,
@@ -144,7 +144,7 @@ impl DynamicCatalog {
                 RE_RANDOM_ALPHANUMERIC,
                 r"\{\{\$randomAlphanumeric(?::(\d+))?\}\}"
             );
-            result = self.replace_with_func(&result, &re, |caps| {
+            result = self.replace_with_func(&result, re, |caps| {
                 let len = capped_len(caps.get(1).map(|m| m.as_str()), 10);
                 random_string(
                     &mut rng,
@@ -157,13 +157,13 @@ impl DynamicCatalog {
         // {{$randomBoolean}} — fresh random bool per occurrence
         if result.contains("{{$randomBoolean}}") {
             let re = cached_re!(RE_RANDOM_BOOLEAN, r"\{\{\$randomBoolean\}\}");
-            result = self.replace_with_func(&result, &re, |_| rng.random_bool(0.5).to_string());
+            result = self.replace_with_func(&result, re, |_| rng.random_bool(0.5).to_string());
         }
 
         // {{$randomHex[:length]}}
         if result.contains("{{$randomHex") {
             let re = cached_re!(RE_RANDOM_HEX, r"\{\{\$randomHex(?::(\d+))?\}\}");
-            result = self.replace_with_func(&result, &re, |caps| {
+            result = self.replace_with_func(&result, re, |caps| {
                 let len = capped_len(caps.get(1).map(|m| m.as_str()), 8);
                 random_string(&mut rng, len, "0123456789abcdef")
             });
@@ -172,66 +172,66 @@ impl DynamicCatalog {
         // {{$randomEmail}} — fresh email per occurrence
         if result.contains("{{$randomEmail}}") {
             let re = cached_re!(RE_RANDOM_EMAIL, r"\{\{\$randomEmail\}\}");
-            result = self.replace_with_func(&result, &re, |_| random_email(&mut rng));
+            result = self.replace_with_func(&result, re, |_| random_email(&mut rng));
         }
 
         // {{$randomPhone}} / {{$randomPhoneNumber}}
         if result.contains("{{$randomPhone") {
             let re = cached_re!(RE_RANDOM_PHONE, r"\{\{\$randomPhone(?:Number)?\}\}");
-            result = self.replace_with_func(&result, &re, |_| random_phone_number(&mut rng));
+            result = self.replace_with_func(&result, re, |_| random_phone_number(&mut rng));
         }
 
         // {{$randomCompany}} / {{$randomCompanyName}}
         if result.contains("{{$randomCompany") {
             let re = cached_re!(RE_RANDOM_COMPANY, r"\{\{\$randomCompany(?:Name)?\}\}");
-            result = self.replace_with_func(&result, &re, |_| random_company_name(&mut rng));
+            result = self.replace_with_func(&result, re, |_| random_company_name(&mut rng));
         }
 
         // {{$randomLorem}} — one paragraph of lorem-style text
         if result.contains("{{$randomLorem}}") {
             let re = cached_re!(RE_RANDOM_LOREM, r"\{\{\$randomLorem\}\}");
-            result = self.replace_with_func(&result, &re, |_| random_lorem_paragraph(&mut rng));
+            result = self.replace_with_func(&result, re, |_| random_lorem_paragraph(&mut rng));
         }
 
         // {{$randomSentence}} / {{$randomWords[:count]}} / {{$randomWord}}
         if result.contains("{{$randomSentence}}") {
             let re = cached_re!(RE_RANDOM_SENTENCE, r"\{\{\$randomSentence\}\}");
-            result = self.replace_with_func(&result, &re, |_| random_sentence(&mut rng));
+            result = self.replace_with_func(&result, re, |_| random_sentence(&mut rng));
         }
         if result.contains("{{$randomWords") {
             let re = cached_re!(RE_RANDOM_WORDS, r"\{\{\$randomWords(?::(\d+))?\}\}");
-            result = self.replace_with_func(&result, &re, |caps| {
+            result = self.replace_with_func(&result, re, |caps| {
                 let count = capped_len(caps.get(1).map(|m| m.as_str()), 5);
                 random_words(&mut rng, count)
             });
         }
         if result.contains("{{$randomWord}}") {
             let re = cached_re!(RE_RANDOM_WORD, r"\{\{\$randomWord\}\}");
-            result = self.replace_with_func(&result, &re, |_| random_word(&mut rng));
+            result = self.replace_with_func(&result, re, |_| random_word(&mut rng));
         }
 
         // {{$randomDate}} / {{$randomDatePast}} / {{$randomDateFuture}} / {{$randomTime}}
         if result.contains("{{$randomDatePast}}") {
             let re = cached_re!(RE_RANDOM_DATE_PAST, r"\{\{\$randomDatePast\}\}");
-            result = self.replace_with_func(&result, &re, |_| random_date_past(&mut rng));
+            result = self.replace_with_func(&result, re, |_| random_date_past(&mut rng));
         }
         if result.contains("{{$randomDateFuture}}") {
             let re = cached_re!(RE_RANDOM_DATE_FUTURE, r"\{\{\$randomDateFuture\}\}");
-            result = self.replace_with_func(&result, &re, |_| random_date_future(&mut rng));
+            result = self.replace_with_func(&result, re, |_| random_date_future(&mut rng));
         }
         if result.contains("{{$randomDate}}") {
             let re = cached_re!(RE_RANDOM_DATE, r"\{\{\$randomDate\}\}");
-            result = self.replace_with_func(&result, &re, |_| random_date(&mut rng));
+            result = self.replace_with_func(&result, re, |_| random_date(&mut rng));
         }
         if result.contains("{{$randomTime}}") {
             let re = cached_re!(RE_RANDOM_TIME, r"\{\{\$randomTime\}\}");
-            result = self.replace_with_func(&result, &re, |_| random_time(&mut rng));
+            result = self.replace_with_func(&result, re, |_| random_time(&mut rng));
         }
 
         // {{$randomIP}} — fresh IP per occurrence
         if result.contains("{{$randomIP}}") {
             let re = cached_re!(RE_RANDOM_IP, r"\{\{\$randomIP\}\}");
-            result = self.replace_with_func(&result, &re, |_| {
+            result = self.replace_with_func(&result, re, |_| {
                 format!(
                     "{}.{}.{}.{}",
                     rng.random_range(1..255u32),
@@ -247,45 +247,45 @@ impl DynamicCatalog {
         // {{$randomName}}, {{$randomColor}}, {{$randomMAC}}
         if result.contains("{{$randomCity}}") {
             let re = cached_re!(RE_RANDOM_CITY, r"\{\{\$randomCity\}\}");
-            result = self.replace_with_func(&result, &re, |_| random_city(&mut rng));
+            result = self.replace_with_func(&result, re, |_| random_city(&mut rng));
         }
         if result.contains("{{$randomCountry}}") {
             let re = cached_re!(RE_RANDOM_COUNTRY, r"\{\{\$randomCountry\}\}");
-            result = self.replace_with_func(&result, &re, |_| random_country(&mut rng));
+            result = self.replace_with_func(&result, re, |_| random_country(&mut rng));
         }
         if result.contains("{{$randomStreet}}") {
             let re = cached_re!(RE_RANDOM_STREET, r"\{\{\$randomStreet\}\}");
-            result = self.replace_with_func(&result, &re, |_| random_street(&mut rng));
+            result = self.replace_with_func(&result, re, |_| random_street(&mut rng));
         }
         if result.contains("{{$randomPostcode}}") {
             let re = cached_re!(RE_RANDOM_POSTCODE, r"\{\{\$randomPostcode\}\}");
-            result = self.replace_with_func(&result, &re, |_| random_postcode(&mut rng));
+            result = self.replace_with_func(&result, re, |_| random_postcode(&mut rng));
         }
         if result.contains("{{$randomName}}") {
             // Note: {{$randomName}} is the base pattern; longer forms like
             // {{$randomNameFullName}} are handled later with more specific regexes.
             let re = cached_re!(RE_RANDOM_NAME, r"\{\{\$randomName\}\}");
-            result = self.replace_with_func(&result, &re, |_| random_full_name(&mut rng));
+            result = self.replace_with_func(&result, re, |_| random_full_name(&mut rng));
         }
         if result.contains("{{$randomNameFullName}}") {
             let re = cached_re!(RE_RANDOM_NAME_FULL, r"\{\{\$randomNameFullName\}\}");
-            result = self.replace_with_func(&result, &re, |_| random_full_name(&mut rng));
+            result = self.replace_with_func(&result, re, |_| random_full_name(&mut rng));
         }
         if result.contains("{{$randomNameFirstName}}") {
             let re = cached_re!(RE_RANDOM_NAME_FIRST, r"\{\{\$randomNameFirstName\}\}");
-            result = self.replace_with_func(&result, &re, |_| random_first_name(&mut rng));
+            result = self.replace_with_func(&result, re, |_| random_first_name(&mut rng));
         }
         if result.contains("{{$randomNameLastName}}") {
             let re = cached_re!(RE_RANDOM_NAME_LAST, r"\{\{\$randomNameLastName\}\}");
-            result = self.replace_with_func(&result, &re, |_| random_last_name(&mut rng));
+            result = self.replace_with_func(&result, re, |_| random_last_name(&mut rng));
         }
         if result.contains("{{$randomColor}}") {
             let re = cached_re!(RE_RANDOM_COLOR, r"\{\{\$randomColor\}\}");
-            result = self.replace_with_func(&result, &re, |_| random_color(&mut rng));
+            result = self.replace_with_func(&result, re, |_| random_color(&mut rng));
         }
         if result.contains("{{$randomMAC}}") {
             let re = cached_re!(RE_RANDOM_MAC, r"\{\{\$randomMAC\}\}");
-            result = self.replace_with_func(&result, &re, |_| {
+            result = self.replace_with_func(&result, re, |_| {
                 let hex = random_string(&mut rng, 12, "0123456789abcdef");
                 hex.chars()
                     .collect::<Vec<_>>()
@@ -299,7 +299,7 @@ impl DynamicCatalog {
         // {{$randomPassword[:length]}}
         if result.contains("{{$randomPassword") {
             let re = cached_re!(RE_RANDOM_PASSWORD, r"\{\{\$randomPassword(?::(\d+))?\}\}");
-            result = self.replace_with_func(&result, &re, |caps| {
+            result = self.replace_with_func(&result, re, |caps| {
                 let len = capped_len(caps.get(1).map(|m| m.as_str()), 12);
                 random_string(
                     &mut rng,

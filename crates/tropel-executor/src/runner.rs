@@ -918,7 +918,7 @@ mod tests {
             assertions: vec![],
             items: vec![],
         };
-        let flat = flatten_execution_items(&vec![leaf("a"), inert, leaf("b")]);
+        let flat = flatten_execution_items(&[leaf("a"), inert, leaf("b")]);
         let names: Vec<&str> = flat.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b"]);
     }

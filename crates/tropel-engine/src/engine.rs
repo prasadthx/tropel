@@ -255,21 +255,19 @@ impl Engine {
             // running (the bar then just stays at 100% elapsed-only).
             if let Some(scs) = &declared_scenarios {
                 scs.values()
-                    .map(|sc| {
+                    .filter_map(|sc| {
                         let start = parse_duration_str(&sc.start_time).unwrap_or(Duration::ZERO);
                         consider(&sc.execution, start)
                     })
-                    .flatten()
                     .max()
             } else if !config.scenarios.is_empty() {
                 config
                     .scenarios
                     .values()
-                    .map(|sc| {
+                    .filter_map(|sc| {
                         let start = parse_duration_str(&sc.start_time).unwrap_or(Duration::ZERO);
                         consider(&sc.execution, start)
                     })
-                    .flatten()
                     .max()
             } else {
                 consider(
@@ -533,6 +531,11 @@ impl Engine {
                             registry_sc,
                             control_port,
                             rps_limiter_sc,
+                            // Backlog line 230: the driver path now gets the
+                            // same registry-instantiated protocol map as the
+                            // declarative path (clone — the Scenario arm
+                            // moves the original).
+                            protocols.clone(),
                         )
                         .await
                     }

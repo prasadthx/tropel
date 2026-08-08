@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tropel_core::config::{ExecutionConfig, OutputConfig, ScenarioConfig, ThresholdConfig};
 use tropel_core::scenario::Scenario;
 use tropel_core::types::{Request, Response, Sample};
@@ -107,6 +108,13 @@ pub struct VuContext {
     /// declares no `setup` export — the driver passes `undefined`, matching
     /// k6.
     pub setup_data: Option<String>,
+    /// Registered protocols keyed by URL scheme (e.g. `grpc`, `ws`, or any
+    /// third-party scheme). The engine instantiates the registry's protocols
+    /// once per scenario and threads the map into every VU's context, so a
+    /// driver (k6, WASM, or a third-party one) can dispatch non-HTTP URLs
+    /// through the same scheme lookup the declarative runner uses. Empty for
+    /// the declarative path, which keeps protocols on `VURunner` instead.
+    pub protocols: Arc<HashMap<String, Arc<dyn Protocol>>>,
 }
 
 impl VuContext {
@@ -125,6 +133,7 @@ impl VuContext {
             abort_message: None,
             http_client: None,
             setup_data: None,
+            protocols: Arc::new(HashMap::new()),
         }
     }
 
@@ -597,6 +606,7 @@ mod tests {
         assert!(!ctx.abort_requested);
         assert!(ctx.http_client.is_none());
         assert!(ctx.setup_data.is_none());
+        assert!(ctx.protocols.is_empty());
 
         ctx.set_exec_context("constant-vus".into(), 100, 4);
         assert_eq!(ctx.executor_name, "constant-vus");
@@ -613,7 +623,7 @@ mod tests {
         assert_eq!(ctx.samples.len(), 1);
         assert_eq!(ctx.samples[0].metric, "custom");
         assert_eq!(ctx.samples[0].value, 1.5);
-        assert_eq!(ctx.samples[0].tags.get("group").map(|v| v.as_ref()), Some("::g"));
+        assert_eq!(ctx.samples[0].tags.get("group"), Some("::g"));
 
         ctx.abort(Some("boom".into()));
         assert!(ctx.abort_requested);

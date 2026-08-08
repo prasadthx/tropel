@@ -109,7 +109,7 @@ fn transpile_typescript(
     {
         return Err(anyhow::anyhow!(
             "TypeScript parse error: {}",
-            format_diagnostics(&[err.clone()])
+            format_diagnostics(std::slice::from_ref(err))
         ));
     }
     for d in &parser_return.errors {
@@ -134,7 +134,7 @@ fn transpile_typescript(
     {
         return Err(anyhow::anyhow!(
             "TypeScript transform error: {}",
-            format_diagnostics(&[err.clone()])
+            format_diagnostics(std::slice::from_ref(err))
         ));
     }
     for d in &transform_return.errors {

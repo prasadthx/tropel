@@ -206,10 +206,10 @@ mod tests {
         assert_eq!(s.metric, "checks");
         assert_eq!(s.value, 1.0);
         assert_eq!(s.sample_type, tropel_core::types::SampleType::Rate);
-        assert_eq!(s.tags.get("check").map(|v| v.as_ref()), Some("status is 200"));
+        assert_eq!(s.tags.get("check"), Some("status is 200"));
         let s = &st.samples[1];
         assert_eq!(s.value, 0.0);
-        assert_eq!(s.tags.get("check").map(|v| v.as_ref()), Some("body has id"));
+        assert_eq!(s.tags.get("check"), Some("body has id"));
     }
 
     #[test]
@@ -221,8 +221,8 @@ mod tests {
             HashMap::from([("group".to_string(), "::users".to_string())]),
         );
         let s = &st.samples[0];
-        assert_eq!(s.tags.get("check").map(|v| v.as_ref()), Some("check users"));
-        assert_eq!(s.tags.get("group").map(|v| v.as_ref()), Some("::users"));
+        assert_eq!(s.tags.get("check"), Some("check users"));
+        assert_eq!(s.tags.get("group"), Some("::users"));
         assert_eq!(st.assertions.passed, 1);
     }
 

@@ -874,6 +874,7 @@ impl AuthSigner for DigestAuth {
 /// `H(H(A1):nonce:nc:cnonce:auth:H(A2))`; any other combination falls back
 /// to the no-qop form `H(H(A1):nonce:H(A2))` (with `-sess` folding the
 /// nonce+cnonce into HA1 first).
+#[allow(clippy::too_many_arguments)] // all 8 params are RFC-specified digest inputs
 fn digest_response_value(
     base_ha1: &str,
     is_sess: bool,

@@ -974,7 +974,7 @@ impl JsContext {
         self.reset_interrupt();
         let bytes = bytecode.to_vec();
 
-        let result = self.ctx.with(|ctx| {
+        self.ctx.with(|ctx| {
             let raw = ctx.as_raw().as_ptr();
             let val = unsafe {
                 rquickjs::qjs::JS_ReadObject(
@@ -1022,7 +1022,7 @@ impl JsContext {
         self.pump_promise_queue()?;
         // Surface fire-and-forget rejections instead of silently passing
         self.check_unhandled_rejections()?;
-        Ok(result)
+        Ok(())
     }
 
     /// Get the context ID.

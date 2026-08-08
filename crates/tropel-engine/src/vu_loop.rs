@@ -119,6 +119,10 @@ struct DriverVuSource {
     /// every VU's `VuContext.setup_data` so `export default function (data)`
     /// receives it (k6 lifecycle). `None` when the script declares no setup.
     setup_data: Option<String>,
+    /// Registered protocols keyed by URL scheme (backlog line 230) — the
+    /// driver-path twin of `VURunner.protocols`, so imperative scripts can
+    /// reach third-party protocols, not just the declarative runner.
+    protocols: Arc<HashMap<String, Arc<dyn Protocol>>>,
 }
 
 #[async_trait]
@@ -141,6 +145,7 @@ impl VuIterationSource for DriverVuSource {
         ctx.data_row = data_row;
         ctx.http_client = Some(self.http_client.clone());
         ctx.setup_data = self.setup_data.clone();
+        ctx.protocols = self.protocols.clone();
         ctx.set_exec_context(
             self.executor_name.clone(),
             self.sched.total_iterations().await,
@@ -767,6 +772,13 @@ pub(crate) async fn run_driver_vus(
     registry: Arc<ExtensionRegistry>,
     control_port: Option<u16>,
     rps_limiter: Option<Arc<tropel_http::RpsLimiter>>,
+    // Protocols instantiated from the registry ONCE per scenario (backlog
+    // line 230): run_driver_vus used to take NO protocols map, so a k6 or
+    // WASM script could never reach a third-party protocol — only the
+    // declarative path got the registry-driven scheme dispatch. Thread the
+    // shared map into every VU's VuContext so drivers dispatch non-HTTP
+    // schemes through the same lookup the declarative runner uses.
+    protocols: Arc<HashMap<String, Arc<dyn Protocol>>>,
 ) -> (u32, u64) {
     let driver_id = driver.id().to_string();
     let input_bytes = match std::fs::read(input_path) {
@@ -785,6 +797,7 @@ pub(crate) async fn run_driver_vus(
     let sc_exec_c = sc_exec.clone();
     let pool_c = pool.clone();
     let sc_name_c = sc_name.clone();
+    let protocols_c = protocols.clone();
 
     // Build ONE HttpClient per scenario and share it (Arc) across every VU
     // (same rationale as run_scenario_vus): the two reqwest::Clients inside
@@ -844,6 +857,7 @@ pub(crate) async fn run_driver_vus(
             // closure must not be moved out of — same pattern as every other
             // capture above).
             let setup_data_vu = setup_data_c.clone();
+            let protocols_vu = protocols_c.clone();
 
             // 1-VU-per-task: pin this VU to its own dedicated worker thread (see
             // run_scenario_vus for the rationale — blocking sleep() must never
@@ -908,6 +922,7 @@ pub(crate) async fn run_driver_vus(
                     env: shared.vu_env.clone(),
                     env_attached: false,
                     setup_data: setup_data_vu,
+                    protocols: protocols_vu,
                 };
                 run_vu_loop(sched, &shared, vu_id, &mut source).await;
             });
@@ -1103,3 +1118,98 @@ async fn apply_think_time(config: &ThinkTimeConfig, iter_duration: Option<Durati
 }
 
 // ── JS context creation ──
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Stub protocol whose presence in the context proves the driver path
+    /// received the registry's protocol map (backlog line 230).
+    struct StubProtocol;
+    #[async_trait]
+    impl Protocol for StubProtocol {
+        fn scheme(&self) -> &str {
+            "stub"
+        }
+        async fn execute(
+            &self,
+            _req: &Request,
+            _config: Option<&serde_json::Value>,
+        ) -> Result<tropel_ext::traits::ProtocolOutcome> {
+            Ok(tropel_ext::traits::ProtocolOutcome {
+                samples: vec![],
+                response: None,
+            })
+        }
+    }
+
+    /// Stub driver instance that records whether the VuContext it was handed
+    /// carried the protocols map (backlog line 230).
+    struct RecordingInstance {
+        saw_protocols: Arc<AtomicBool>,
+    }
+    #[async_trait]
+    impl DriverInstance for RecordingInstance {
+        async fn run_iteration(&mut self, ctx: &mut VuContext) -> Result<()> {
+            // Check the SPECIFIC scheme, not just non-empty: a wrong-but-
+            // populated map would slip past a `!is_empty()` assertion.
+            self.saw_protocols.store(
+                ctx.protocols.get("stub").is_some(),
+                Ordering::SeqCst,
+            );
+            Ok(())
+        }
+    }
+
+    struct StubHttpClient;
+    #[async_trait]
+    impl DriverHttpClient for StubHttpClient {
+        async fn execute(&self, _req: &Request) -> Result<Response> {
+            Err(tropel_core::TropelError::Other("stub".into()))
+        }
+    }
+
+    /// Backlog line 230: `run_driver_vus` used to take NO `protocols`
+    /// argument, so a k6/WASM/third-party driver could never reach a
+    /// registered protocol — only the declarative runner got the registry's
+    /// scheme dispatch. The engine now threads the protocol map into every
+    /// driver VU's `VuContext`; this pins that wiring at the `DriverVuSource`
+    /// level (no full engine run needed).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn driver_source_threads_protocols_into_vu_context() {
+        let mut protocols: HashMap<String, Arc<dyn Protocol>> = HashMap::new();
+        protocols.insert("stub".to_string(), Arc::new(StubProtocol));
+        let protocols = Arc::new(protocols);
+
+        let saw = Arc::new(AtomicBool::new(false));
+        let sched = Arc::new(VUScheduler::new(&ExecutionConfig::ConstantVus {
+            vus: 1,
+            duration: "1s".to_string(),
+            graceful_stop: None,
+            think_time: ThinkTimeConfig::default(),
+        }));
+
+        let mut source = DriverVuSource {
+            instance: Box::new(RecordingInstance {
+                saw_protocols: saw.clone(),
+            }),
+            http_client: Arc::new(StubHttpClient),
+            executor_name: "constant-vus".to_string(),
+            driver_id: "stub".to_string(),
+            vu_id: 0,
+            sc_name: "scenario".to_string(),
+            sched,
+            env: HashMap::new(),
+            env_attached: false,
+            setup_data: None,
+            protocols,
+        };
+
+        source.run_iteration(0, None, &HashMap::new()).await;
+        assert!(
+            saw.load(Ordering::SeqCst),
+            "driver VuContext must receive the registry's protocol map (scheme 'stub')"
+        );
+    }
+}

@@ -243,8 +243,8 @@ mod tests {
         let cores = std::thread::available_parallelism()
             .map(|c| c.get())
             .unwrap_or(4);
-        assert!(n >= 2 && n <= 256, "default out of range: {n}");
-        assert!(n <= cores.max(2).min(256));
+        assert!((2..=256).contains(&n), "default out of range: {n}");
+        assert!(n <= cores.clamp(2, 256));
     }
 
     #[tokio::test]
