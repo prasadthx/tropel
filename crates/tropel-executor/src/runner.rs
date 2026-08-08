@@ -804,7 +804,6 @@ mod tests {
 
     fn leaf(name: &str) -> ScenarioItem {
         ScenarioItem {
-            id: name.to_string(),
             name: name.to_string(),
             request: Some(tropel_core::types::Request {
                 url: format!("http://example.com/{name}"),
@@ -827,7 +826,6 @@ mod tests {
 
     fn folder(name: &str, items: Vec<ScenarioItem>) -> ScenarioItem {
         ScenarioItem {
-            id: name.to_string(),
             name: name.to_string(),
             request: None,
             prerequest: None,
@@ -910,7 +908,6 @@ mod tests {
         // A leaf with no request and no scripts is not executable; it must
         // not appear in the run order.
         let inert = ScenarioItem {
-            id: "inert".into(),
             name: "inert".into(),
             request: None,
             prerequest: None,
@@ -1044,7 +1041,6 @@ mod tests {
             // forever. Both items are script-only — no network traffic.
             items: vec![
                 ScenarioItem {
-                    id: "self".into(),
                     name: "self".into(),
                     request: None,
                     prerequest: Some("postman.setNextRequest('self');".into()),
@@ -1053,7 +1049,6 @@ mod tests {
                     items: vec![],
                 },
                 ScenarioItem {
-                    id: "after".into(),
                     name: "after".into(),
                     request: None,
                     prerequest: Some("// inert".into()),

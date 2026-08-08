@@ -80,12 +80,6 @@ pub fn json_stringify(value: &Value) -> Result<String> {
         .map_err(|e| tropel_core::TropelError::Parse(format!("JSON stringify error: {}", e)))
 }
 
-/// Pretty-print JSON.
-pub fn json_stringify_pretty(value: &Value) -> Result<String> {
-    serde_json::to_string_pretty(value)
-        .map_err(|e| tropel_core::TropelError::Parse(format!("JSON stringify error: {}", e)))
-}
-
 /// Extract a value from a JSON document using a dot-path.
 pub fn json_get<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
     let parts: Vec<&str> = path.split('.').collect();

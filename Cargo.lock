@@ -4244,7 +4244,6 @@ dependencies = [
  "tower",
  "tracing",
  "tropel-core",
- "tropel-ext",
  "tropel-metrics",
  "url",
 ]
@@ -4487,7 +4486,6 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tower",
- "tropel-core",
  "tropel-sdk",
  "url",
 ]

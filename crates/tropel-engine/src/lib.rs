@@ -11,6 +11,6 @@ pub mod input;
 pub mod js_bootstrap;
 pub mod outputs;
 pub mod summary;
-pub mod vu_loop;
+mod vu_loop;
 pub mod worker;
 pub use engine::*;

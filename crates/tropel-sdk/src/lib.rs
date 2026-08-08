@@ -160,7 +160,6 @@ mod tests {
                 schema: None,
             },
             items: vec![ScenarioItem {
-                id: "item-1".into(),
                 name: "GET /api".into(),
                 request: Some(Request {
                     url: "https://example.com/api".into(),

@@ -405,7 +405,6 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
     let global_security = doc.security.clone();
 
     let mut items: Vec<ScenarioItem> = Vec::new();
-    let mut index = 0usize;
 
     // Sort paths for deterministic output
     let mut path_keys: Vec<&String> = doc.paths.keys().collect();
@@ -499,7 +498,6 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
             })?;
 
             items.push(ScenarioItem {
-                id: format!("openapi-item-{}", index),
                 name: item_name,
                 request: Some(Request {
                     url: resolved_url,
@@ -518,8 +516,6 @@ fn parse_typed(doc: OasDoc) -> Result<Scenario> {
                 assertions: vec![],
                 items: vec![],
             });
-
-            index += 1;
         }
     }
 

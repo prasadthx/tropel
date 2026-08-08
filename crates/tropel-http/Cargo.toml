@@ -9,7 +9,6 @@ rust-version.workspace = true
 [dependencies]
 tropel-core.workspace = true
 tropel-metrics.workspace = true
-tropel-ext.workspace = true
 reqwest.workspace = true
 tower.workspace = true
 serde.workspace = true

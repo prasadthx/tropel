@@ -18,12 +18,6 @@ pub fn parse_collection_str(s: &str) -> Result<Collection> {
     Ok(collection)
 }
 
-/// Read and parse a Collection from a file path.
-pub fn parse_collection_file(path: &str) -> Result<Collection> {
-    let content = std::fs::read_to_string(path)?;
-    parse_collection_str(&content)
-}
-
 /// Validate the collection structure.
 fn validate_collection(collection: &Collection) -> Result<()> {
     if collection.info.name.is_empty() {
@@ -99,14 +93,12 @@ fn convert_items(
     inherited_auth: Option<&CollectionAuth>,
 ) -> Vec<ScenarioItem> {
     let mut result = Vec::new();
-    let mut index = 0usize;
 
     for item in items {
         match item {
             CollectionItem::Request(req) => {
-                let scenario_item = convert_request_item(req, parent_events, inherited_auth, index);
+                let scenario_item = convert_request_item(req, parent_events, inherited_auth);
                 result.push(scenario_item);
-                index += 1;
             }
             CollectionItem::Folder(folder) => {
                 // Folder-level auth overrides the inherited (collection/parent)
@@ -119,7 +111,6 @@ fn convert_items(
                     None => inherited_auth,
                 };
                 let scenario_item = ScenarioItem {
-                    id: format!("folder_{}", index),
                     name: folder.name.clone(),
                     request: None,
                     prerequest: find_prerequest_script(&folder.event),
@@ -128,7 +119,6 @@ fn convert_items(
                     items: convert_items(&folder.item, &folder.event, folder_auth),
                 };
                 result.push(scenario_item);
-                index += 1;
             }
         }
     }
@@ -140,7 +130,6 @@ fn convert_request_item(
     req: &RequestItem,
     parent_events: &[Event],
     inherited_auth: Option<&CollectionAuth>,
-    index: usize,
 ) -> ScenarioItem {
     // v2.1 schema location for request-level auth is `item.request.auth`
     // (RequestDetail.auth) — `item.auth` is a position the schema doesn't
@@ -155,7 +144,6 @@ fn convert_request_item(
     };
 
     ScenarioItem {
-        id: format!("req_{}", index),
         name: req.name.clone(),
         request: Some(request),
         prerequest: find_prerequest_script(events),

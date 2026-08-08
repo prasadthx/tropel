@@ -1117,8 +1117,6 @@ async fn apply_think_time(config: &ThinkTimeConfig, iter_duration: Option<Durati
     }
 }
 
-// ── JS context creation ──
-
 #[cfg(test)]
 mod tests {
     use super::*;

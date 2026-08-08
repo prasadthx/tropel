@@ -101,7 +101,6 @@ fn build_scenario_from_source(js_code: &str, name: &str) -> Result<Scenario> {
             schema: None,
         },
         items: vec![ScenarioItem {
-            id: format!("k6-script-{}", name),
             name: name.to_string(),
             request: None,
             prerequest: None,

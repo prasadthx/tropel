@@ -28,7 +28,6 @@ pub struct ScenarioInfo {
 /// An item in a scenario — either a single request or a folder of items.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScenarioItem {
-    pub id: String,
     pub name: String,
     pub request: Option<Request>,
     /// Pre-request script (JS code).

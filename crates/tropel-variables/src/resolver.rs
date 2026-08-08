@@ -126,11 +126,6 @@ impl VariableResolver {
         format!("{{{{{}}}}}", var_name)
     }
 
-    /// Resolve all {{variable}} references in request headers, URL, body, etc.
-    pub fn resolve_request(&self, input: &str, scope: &VariableScope) -> String {
-        self.resolve(input, scope)
-    }
-
     /// Resolve an entire string — including nested variable references.
     /// Multiple passes to handle {{var1_{{var2}}}} style nesting.
     pub fn resolve_deep(&self, input: &str, scope: &VariableScope, max_passes: usize) -> String {

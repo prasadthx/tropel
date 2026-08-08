@@ -4,11 +4,9 @@
 //! context at bootstrap. These provide Rust execution for crypto, hashing,
 //! encoding, JSON, and assertions that scripts use.
 
-pub mod assert;
 pub mod crypto;
 pub mod encoding;
 pub mod r#fn;
-pub mod hash;
 pub mod json;
 
 use tropel_core::Result;
@@ -26,9 +24,7 @@ pub trait NativeModule {
 pub async fn install_all(ctx: &mut JsContext) -> Result<()> {
     let modules: Vec<Box<dyn NativeModule>> = vec![
         Box::new(crypto::CryptoModule),
-        Box::new(hash::HashModule),
         Box::new(encoding::EncodingModule),
-        Box::new(assert::AssertModule),
         Box::new(json::JsonModule),
         Box::new(r#fn::ExtraFunctionsModule),
     ];
@@ -81,8 +77,6 @@ mod tests {
             "__tropel_native_aes_cbc_decrypt",
             "__tropel_native_random_bytes",
             "__tropel_native_evp_bytes_to_key",
-            // ── Hash (hash.rs) ──
-            "__tropel_native_hash_uuid",
             // ── Encoding (encoding.rs) ──
             "__tropel_native_base64_encode",
             "__tropel_native_base64_decode",
@@ -92,16 +86,6 @@ mod tests {
             "__tropel_native_hex_decode",
             "__tropel_native_url_encode",
             "__tropel_native_url_decode",
-            // ── Assert (assert.rs) ──
-            "__tropel_native_deep_equal",
-            "__tropel_native_is_string",
-            "__tropel_native_is_number",
-            "__tropel_native_is_array",
-            "__tropel_native_is_object",
-            "__tropel_native_is_null",
-            "__tropel_native_is_boolean",
-            "__tropel_native_length",
-            "__tropel_native_matches",
             // ── JSON (json.rs) ──
             "__tropel_native_json_parse",
             "__tropel_native_json_stringify",
