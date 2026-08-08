@@ -1,8 +1,8 @@
 //! Blocking HTTP execution for host functions (pm.sendRequest, k6 http.*).
 //!
-//! The constraint: VUs run on current-thread runtimes that multiplex many VUs
-//! (thread-per-core). From inside QuickJS `ctx.with` you must call HTTP
-//! **synchronously** and return the result to JS. You therefore **cannot**:
+//! The constraint: host functions are invoked from inside QuickJS `ctx.with`,
+//! so they must call HTTP **synchronously** and return the result to JS. You
+//! therefore **cannot**:
 //! - `Runtime::block_on(...)` (any runtime) — panics, the caller thread is
 //!   already in a runtime;
 //! - `futures::executor::block_on(reqwest_fut)` — deadlocks, the future needs

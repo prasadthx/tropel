@@ -306,8 +306,9 @@ enum MetricsEvent {
 /// `record_batch()` sends samples into a bounded MPSC channel (`MAX_PENDING_SAMPLES`).
 /// When the channel is full, `send().await` blocks, applying backpressure to the
 /// producing VU — preventing unbounded queue growth that could OOM the process.
-/// The `tokio::select!` in the VU run loop ensures the stop signal is still
-/// checked while waiting, so shutdown is not blocked.
+/// The blocking send is bounded by `MAX_PENDING_SAMPLES`, and shutdown is not
+/// stalled: once the aggregator task exits, the channel closes and the send
+/// returns `Err`, which the caller drops (acceptable during teardown).
 ///
 /// A single background aggregator task processes the samples sequentially,
 /// updating an internal `IndexMap<MetricKey, MetricSet>`.
@@ -461,8 +462,9 @@ impl MetricsCollector {
     ///
     /// Sends samples into the bounded MPSC channel. If the channel is full,
     /// `send().await` blocks, applying backpressure to the producing VU.
-    /// The caller's `tokio::select!` ensures stop signals are still checked
-    /// while waiting, so shutdown is not blocked.
+    /// The blocking send is bounded by `MAX_PENDING_SAMPLES`; shutdown is not
+    /// stalled because the aggregator's exit closes the channel, making the
+    /// send return `Err` immediately (dropped below).
     ///
     /// If the aggregator has shut down (channel closed), the send silently
     /// drops the samples — acceptable during test teardown.
