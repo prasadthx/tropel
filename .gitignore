@@ -31,6 +31,8 @@ $RECYCLE.BIN/
 # ── Tropel output / reports ───────────────────────────────────
 *.csv
 *.json
+# The e2e smoke fixture is committed despite the *.json rule above.
+!.github/ci/www/ok.json
 !examples/collections/
 results/
 output/

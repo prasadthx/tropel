@@ -12,10 +12,11 @@
 #    a past LNK1140 link failure on Windows). fail-fast is off so one flaky
 #    platform doesn't mask the others.
 #  - `msrv` enforces the declared rust-version = "1.85"; nothing did before.
-#  - `smoke` is the important one: it runs the built BINARY end-to-end and
-#    asserts metrics were actually produced. Unit tests can pass while the
-#    binary silently does zero iterations and exits 0 (that exact class of bug
-#    has shipped twice). This gate is what catches it.
+#  - `smoke` is the important one: it runs the built BINARY end-to-end against
+#    the repo's example samples (k6, postman, openapi, har) and asserts metrics
+#    were actually produced. Unit tests can pass while the binary silently does
+#    zero iterations and exits 0 (that exact class of bug has shipped twice).
+#    This gate is what catches it.
 #  - timeout-minutes is set on every job: the engine has known hang paths, and
 #    an unbounded run would otherwise burn a full 6h runner slot.
 
@@ -115,7 +116,7 @@ jobs:
           rust-version: 1.85.0
 
   smoke:
-    name: e2e smoke (binary)
+    name: "e2e smoke (samples: k6, postman, openapi, har)"
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -135,7 +136,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          for f in examples/k6/*.js examples/har/*.har examples/openapi/*.yaml; do
+          for f in examples/k6/*.js examples/har/*.har examples/openapi/*.yaml examples/collections/*.json; do
             echo "::group::inspect $f"
             ./target/release/tropel inspect "$f"
             echo "::endgroup::"
@@ -145,7 +146,10 @@ jobs:
       # background processes when the step ends, so a server started in its own
       # step would be dead before the later steps ran (connection refused →
       # zero requests → false red). The trap kills the server at step end.
-      - name: Smoke — metrics produced, checks pass, threshold breach fails
+      # The local server only feeds the threshold negative-control below; the
+      # sample e2e runs target the public demo APIs the samples are written for
+      # (test.k6.io, jsonplaceholder.typicode.com, postman-echo.com).
+      - name: Smoke — samples e2e (k6, postman, openapi, har) + threshold breach
         run: |
           set -euo pipefail
           python3 -m http.server 8787 --bind 127.0.0.1 --directory .github/ci/www \
@@ -158,39 +162,83 @@ jobs:
           done
           curl -fsS http://127.0.0.1:8787/ok.json >/dev/null
 
+          T=./target/release/tropel
+
           # THE behavioural gate. A run that "succeeds" with zero requests is the
           # failure mode we're guarding against, so assert on the metrics, not the
-          # exit code alone.
-          ./target/release/tropel run .github/ci/smoke.js \
-            --vus 4 --duration 5s \
-            --summary-export smoke-summary.json
-          echo "::group::summary"; cat smoke-summary.json; echo "::endgroup::"
+          # exit code alone. Summary shape (verified against real exports in
+          # tropel-engine/src/summary.rs): totals live under .state (http_reqs,
+          # iterations, checks*); .metrics is keyed PER-URL with tags, so timed
+          # requests are asserted by summing the tagged http_req_duration series.
+          assert_run() {  # $1 = summary file, $2 = label
+            jq -e '(.state.http_reqs // 0) > 0' "$1" >/dev/null \
+              || { echo "FAIL: $2 produced no requests"; exit 1; }
+            echo "ok: $2 http_reqs > 0"
+            jq -e '(.state.iterations // 0) > 0' "$1" >/dev/null \
+              || { echo "FAIL: $2 produced no iterations"; exit 1; }
+            echo "ok: $2 iterations > 0"
+            jq -e '([.metrics | to_entries[] | select(.key | startswith("http_req_duration")) | .value.values.count] | add // 0) > 0' "$1" >/dev/null \
+              || { echo "FAIL: $2 recorded no timed requests"; exit 1; }
+            echo "ok: $2 http_req_duration > 0"
+          }
 
-          # Summary shape (tropel-engine/src/summary.rs): per-metric values live
-          # under .metrics.<key>.values (count for counter/trend/rate), run totals
-          # under .state. Assert on those exact paths — a recursive scan that
-          # picks up the metric objects would read .count on the wrapper object
-          # and always yield 0 (false red on healthy runs).
-          jq -e '(.metrics.http_reqs.values.count // 0) > 0' smoke-summary.json > /dev/null \
-            || { echo "FAIL: http_reqs is missing or zero — the run produced no requests"; exit 1; }
-          echo "ok: http_reqs > 0"
-          jq -e '(.metrics.iterations.values.count // .state.iterations // 0) > 0' smoke-summary.json > /dev/null \
-            || { echo "FAIL: iterations is missing or zero — VUs never iterated"; exit 1; }
-          echo "ok: iterations > 0"
-          jq -e '(.metrics.http_req_duration.values.count // 0) > 0' smoke-summary.json > /dev/null \
-            || { echo "FAIL: http_req_duration is missing or zero — no timed requests"; exit 1; }
-          echo "ok: http_req_duration > 0"
+          echo "::group::k6 (k6_sample_basic)"
+          $T run examples/k6/k6_sample_basic.js --vus 2 --duration 5s \
+            --summary-export /tmp/sum-k6.json
+          echo "::endgroup::"
+          assert_run /tmp/sum-k6.json "k6"
 
-          # Checks must have run AND none may have failed.
-          jq -e '(.state.checksPassed // 0) > 0' smoke-summary.json > /dev/null \
-            || { echo "FAIL: no checks were recorded"; exit 1; }
-          jq -e '(.state.checksFailed // 0) == 0' smoke-summary.json > /dev/null \
-            || { echo "FAIL: a check failed"; exit 1; }
-          echo "ok: checks recorded, none failed"
+          echo "::group::postman (simple-api)"
+          $T run examples/collections/simple-api.json --vus 1 --duration 5s \
+            --summary-export /tmp/sum-postman.json
+          echo "::endgroup::"
+          assert_run /tmp/sum-postman.json "postman"
+          # Postman test scripts must have run and none may have failed.
+          jq -e '(.state.checksPassed // 0) > 0' /tmp/sum-postman.json >/dev/null \
+            || { echo "FAIL: postman recorded no passed checks"; exit 1; }
+          jq -e '(.state.checksFailed // 0) == 0' /tmp/sum-postman.json >/dev/null \
+            || { echo "FAIL: a postman check failed"; exit 1; }
+          echo "ok: postman checks recorded, none failed"
+
+          echo "::group::openapi (working_api)"
+          $T run examples/openapi/working_api.yaml --vus 1 --duration 5s \
+            --summary-export /tmp/sum-openapi.json
+          echo "::endgroup::"
+          assert_run /tmp/sum-openapi.json "openapi"
+
+          echo "::group::har (01_get_posts)"
+          $T run examples/har/01_get_posts.har --vus 1 --duration 5s \
+            --summary-export /tmp/sum-har.json
+          echo "::endgroup::"
+          assert_run /tmp/sum-har.json "har"
+
+          # Informational, NOT gated on exit code: these two samples declare
+          # thresholds tuned for ideal latency (p(95)<500ms, fail rate <1%) that
+          # shared CI runners cannot reliably meet against public hosts, and
+          # their stages/scenarios must not be overridden with CLI duration
+          # (double config yields runaway script executions — a 3s override
+          # produced 25k failed execs with 0 requests). Metrics are still gated.
+          echo "::group::k6 thresholds (informational)"
+          set +e
+          $T run examples/k6/k6_sample_thresholds.js --summary-export /tmp/sum-k6-thr.json
+          echo "::endgroup::"
+          set -e
+          jq -e '(.state.http_reqs // 0) > 0' /tmp/sum-k6-thr.json >/dev/null \
+            || { echo "FAIL: k6 thresholds sample produced no requests"; exit 1; }
+          echo "ok: k6 thresholds (informational) produced requests"
+
+          echo "::group::k6 scenarios (informational)"
+          set +e
+          $T run examples/k6/k6_sample_scenarios.js --summary-export /tmp/sum-k6-scn.json
+          echo "::endgroup::"
+          set -e
+          jq -e '(.state.http_reqs // 0) > 0' /tmp/sum-k6-scn.json >/dev/null \
+            || { echo "FAIL: k6 scenarios sample produced no requests"; exit 1; }
+          echo "ok: k6 scenarios (informational) produced requests"
 
           # The exit-code contract: a breached threshold must fail the process.
           # If this passes with exit 0, thresholds are inert (which has happened).
-          if ./target/release/tropel run .github/ci/smoke-threshold-fail.js \
+          if $T run .github/ci/smoke-threshold-fail.js \
                --vus 2 --duration 3s; then
             echo "FAIL: impossible threshold did not fail the run (exit 0)"
             exit 1
