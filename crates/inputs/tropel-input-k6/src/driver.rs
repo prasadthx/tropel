@@ -4762,10 +4762,7 @@ mod tests {
             .iter()
             .find(|s| s.metric == "http_req_blocked")
             .unwrap();
-        assert_eq!(
-            blocked.value, 0.1,
-            "blocked must carry the pool-wait in ms"
-        );
+        assert_eq!(blocked.value, 0.1, "blocked must carry the pool-wait in ms");
         assert_eq!(samples.len(), 12, "5 base + 7 sub-timing samples");
     }
 

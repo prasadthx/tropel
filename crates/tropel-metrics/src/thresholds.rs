@@ -86,9 +86,48 @@ pub fn validate_thresholds(thresholds: &HashMap<String, ThresholdConfig>) -> Res
                     name, parts[2]
                 ));
             }
+            // Backlog §1: an unknown/typo'd STAT must also abort at startup —
+            // the old resolver never validated it and silently gated on the
+            // mean, so `http_req_duration.p95th < 500` passed on a 1200 ms
+            // p95. Checked here alongside the operator/RHS, like k6.
+            let (_, _, stat) = parse_metric_ref(parts[0]);
+            if let Some(s) = stat {
+                if !is_known_stat(s) {
+                    return Err(format!(
+                        "threshold '{}': unknown statistic '{}' in clause '{}' of '{}'",
+                        name, s, clause, expr
+                    ));
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// The complete set of statistics the threshold resolver understands. Used
+/// by [`validate_thresholds`] so a typo'd stat (e.g. `p95th`) aborts the run
+/// at startup instead of silently gating on the mean at the end.
+fn is_known_stat(stat: &str) -> bool {
+    matches!(
+        stat,
+        "avg"
+            | "min"
+            | "max"
+            | "p50"
+            | "median"
+            | "med"
+            | "p90"
+            | "p95"
+            | "p99"
+            | "count"
+            | "rate"
+            | "sum"
+            | "last"
+            | "value"
+            | "passed"
+            | "failed"
+            | "pass_rate"
+    ) || parse_percentile(stat).is_some()
 }
 
 /// Split a (possibly compound) threshold expression into its individual
@@ -415,6 +454,19 @@ fn get_tag_scoped_metric_value(
         return None;
     }
 
+    // Backlog §1: percentile/min/max stats on a Counter are meaningless — the
+    // accumulated value would masquerade as every percentile, so `errors.p95`
+    // (or any custom counter like `data_received.p95`) must FAIL CLOSED, not
+    // resolve to the counter's 1.0 bucket and pass a `> 0.5` gate.
+    let all_counter = matched.iter().all(|m| m.metric_type == MetricType::Counter);
+    let percentile_stat = matches!(
+        stat,
+        Some("min" | "max" | "p50" | "median" | "med" | "p90" | "p95" | "p99")
+    ) || stat.is_some_and(|s| parse_percentile(s).is_some());
+    if all_counter && percentile_stat {
+        return None;
+    }
+
     // Aggregate all matching entries
     Some(match stat {
         Some("avg") => {
@@ -450,19 +502,41 @@ fn get_tag_scoped_metric_value(
         }
         Some("count") => matched.iter().map(|m| m.count as f64).sum(),
         Some("rate") => {
-            let total_sum: f64 = matched.iter().map(|m| m.sum).sum();
-            let total_count: f64 = matched.iter().map(|m| m.count as f64).sum();
-            if total_count > 0.0 {
-                total_sum / total_count
+            if matched.iter().all(|m| m.metric_type == MetricType::Counter) {
+                counter_rate(metrics, &matched)
             } else {
-                0.0
+                let total_sum: f64 = matched.iter().map(|m| m.sum).sum();
+                let total_count: f64 = matched.iter().map(|m| m.count as f64).sum();
+                if total_count > 0.0 {
+                    total_sum / total_count
+                } else {
+                    0.0
+                }
             }
         }
         Some("sum") => matched.iter().map(|m| m.sum).sum(),
-        Some("last") => matched.last().map(|m| m.last).unwrap_or(0.0),
-        // Default (no stat or unknown stat) — return WORST mean
-        _ => matched.iter().map(|m| m.mean).fold(0.0_f64, f64::max),
+        // k6's `value` stat on a trend = the most recent sample.
+        Some("value") | Some("last") => matched.last().map(|m| m.last).unwrap_or(0.0),
+        // Bare metric (no stat) → WORST mean across matches (documented
+        // default). Backlog §1: an UNKNOWN/typo'd stat must FAIL CLOSED,
+        // not silently gate on the mean like the old `_ =>` arm.
+        None => matched.iter().map(|m| m.mean).fold(0.0_f64, f64::max),
+        Some(_) => return None,
     })
+}
+
+/// Per-second rate for all-Counter matched series: the accumulated total
+/// across series divided by the run duration (k6 counter `rate` semantics).
+/// `count` IS the accumulated value on a counter, so sum/count would
+/// degenerate to 1.0 — this is the real per-second number.
+fn counter_rate(metrics: &MetricsResult, matched: &[&MetricSummary]) -> f64 {
+    let total: f64 = matched.iter().map(|m| m.count as f64).sum();
+    let secs = metrics.run_duration.as_secs_f64();
+    if secs > 0.0 {
+        total / secs
+    } else {
+        0.0
+    }
 }
 
 /// Aggregate a statistic across ALL series in `metrics.metrics` whose BASE
@@ -478,6 +552,17 @@ fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
         .filter(|m| metric_base_name(&m.key) == name)
         .collect();
     if matched.is_empty() {
+        return None;
+    }
+    // Backlog §1: percentile/min/max stats on a Counter are meaningless — fail
+    // closed, mirroring the tag-scoped path (a custom counter's p95 bucket is
+    // 1.0 and must not pass a `> 0.5` gate).
+    let all_counter = matched.iter().all(|m| m.metric_type == MetricType::Counter);
+    let percentile_stat = matches!(
+        stat,
+        Some("min" | "max" | "p50" | "median" | "med" | "p90" | "p95" | "p99")
+    ) || stat.is_some_and(|s| parse_percentile(s).is_some());
+    if all_counter && percentile_stat {
         return None;
     }
     Some(match stat {
@@ -506,10 +591,11 @@ fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
         Some("rate") => {
             if matched.iter().all(|m| m.metric_type == MetricType::Counter) {
                 // Counter `count` IS the accumulated value (k6 semantics), so
-                // sum/count would degenerate to 1.0. There is no per-event
-                // rate for a merged counter — fall back to the per-series
-                // mean (worst across matches, mirroring the default arm).
-                matched.iter().map(|m| m.mean).fold(0.0_f64, f64::max)
+                // sum/count would degenerate to 1.0. The per-second rate is
+                // the accumulated total across series / run duration — the
+                // backlog's `data_received: ['rate>1000000']` case, which the
+                // old per-series-mean fallback made permanently red.
+                counter_rate(metrics, &matched)
             } else {
                 let total_sum: f64 = matched.iter().map(|m| m.sum).sum();
                 let total_count: f64 = matched.iter().map(|m| m.count as f64).sum();
@@ -525,8 +611,8 @@ fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
         Some("avg") => {
             if matched.iter().all(|m| m.metric_type == MetricType::Counter) {
                 // Counter: count == accumulated value, so sum/count is always
-                // 1.0 — use the preserved per-series mean instead.
-                matched.iter().map(|m| m.mean).fold(0.0_f64, f64::max)
+                // 1.0 — avg on a counter IS the per-second rate (k6).
+                counter_rate(metrics, &matched)
             } else {
                 let total_sum: f64 = matched.iter().map(|m| m.sum).sum();
                 let total_count: f64 = matched.iter().map(|m| m.count as f64).sum();
@@ -537,8 +623,11 @@ fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
                 }
             }
         }
-        // Default (no stat or unknown stat) — worst mean across matches.
-        _ => matched.iter().map(|m| m.mean).fold(0.0_f64, f64::max),
+        // Bare metric (no stat) → worst mean across matches.
+        None => matched.iter().map(|m| m.mean).fold(0.0_f64, f64::max),
+        // Backlog §1: an UNKNOWN/typo'd stat must FAIL CLOSED, not silently
+        // gate on the mean like the old `_ =>` arm.
+        Some(_) => return None,
     })
 }
 
@@ -548,7 +637,25 @@ fn aggregate_series(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
 /// measured 0.0.
 fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> Option<f64> {
     match name {
-        "http_reqs" => Some(metrics.http_reqs as f64),
+        "http_reqs" => {
+            // Backlog §1: the OLD code discarded the stat entirely —
+            // `http_reqs: ['rate>100']` evaluated 5000 > 100 and PASSED where
+            // k6 fails (83 req/s on a 60 s / 5000-request run). The per-second
+            // rate is now real (count / run_duration); `avg` on a counter is
+            // the same per-second rate (k6 semantics); any other stat
+            // (percentiles, min/max) is meaningless on a Counter and FAILS
+            // CLOSED instead of reading the summary's hardcoded zeros.
+            let secs = metrics.run_duration.as_secs_f64();
+            match stat {
+                Some("rate") | Some("avg") => Some(if secs > 0.0 {
+                    metrics.http_reqs as f64 / secs
+                } else {
+                    0.0
+                }),
+                Some("count") | None => Some(metrics.http_reqs as f64),
+                _ => None,
+            }
+        }
         "errors" => {
             // Per-tag series (errors{url=…}) may exist; aggregate per stat
             // across them (k6 merges tagged sub-series for the unscoped
@@ -559,7 +666,16 @@ fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
             if let Some(v) = stat.and_then(|_| aggregate_series(metrics, "errors", stat)) {
                 Some(v)
             } else {
-                Some(metrics.errors as f64)
+                let secs = metrics.run_duration.as_secs_f64();
+                match stat {
+                    Some("rate") | Some("avg") => Some(if secs > 0.0 {
+                        metrics.errors as f64 / secs
+                    } else {
+                        0.0
+                    }),
+                    None | Some("count") => Some(metrics.errors as f64),
+                    _ => None,
+                }
             }
         }
         // NOTE: `parse_metric_ref` strips the stat at the last dot, so a
@@ -579,32 +695,44 @@ fn get_metric_value(metrics: &MetricsResult, name: &str, stat: Option<&str>) -> 
                     0.0
                 }
             }
-            _ => metrics.checks_total as f64,
+            // Bare metric or `count` → total checks run.
+            None | Some("count") => metrics.checks_total as f64,
+            // Backlog §1: an unknown stat on checks (e.g. `checks.bogus`) must
+            // fail closed, not resolve to the total like the old `_` arm.
+            Some(_) => return None,
         }),
-        "http_req_duration" => metrics.http_req_duration.as_ref().map(|d| {
+        "http_req_duration" => metrics.http_req_duration.as_ref().and_then(|d| {
             match stat {
-                Some("avg") => d.mean,
-                Some("min") => d.min as f64,
-                Some("max") => d.max as f64,
-                Some("p50") | Some("median") | Some("med") => d.p50 as f64,
-                Some("p90") => d.p90 as f64,
-                Some("p95") => d.p95 as f64,
-                Some("p99") => d.p99 as f64,
-                Some("count") => d.count as f64,
+                Some("avg") => Some(d.mean),
+                Some("min") => Some(d.min as f64),
+                Some("max") => Some(d.max as f64),
+                Some("p50") | Some("median") | Some("med") => Some(d.p50 as f64),
+                Some("p90") => Some(d.p90 as f64),
+                Some("p95") => Some(d.p95 as f64),
+                Some("p99") => Some(d.p99 as f64),
+                Some("count") => Some(d.count as f64),
+                // k6's `value` stat on a trend = the most recent sample.
+                Some("value") | Some("last") => Some(d.last),
+                Some("sum") => Some(d.sum),
                 // Rate = sum/count (mirrors the custom-metric loop).
                 Some("rate") => {
                     if d.count > 0 {
-                        d.sum / d.count as f64
+                        Some(d.sum / d.count as f64)
                     } else {
-                        0.0
+                        Some(0.0)
                     }
                 }
                 // Any other pNN / p(NN) percentile — exact from the
                 // retained histogram (not the mean, not a bucket guess).
                 Some(s) if parse_percentile(s).is_some() => {
-                    percentile_value(d, parse_percentile(s).expect("guarded"))
+                    Some(percentile_value(d, parse_percentile(s).expect("guarded")))
                 }
-                _ => d.mean, // default to mean if no stat specified
+                // No stat → mean (documented default for a bare metric).
+                None => Some(d.mean),
+                // Backlog §1: an UNKNOWN/typo'd stat (e.g. `p95th`) must FAIL
+                // CLOSED — the old `_ => d.mean` silently gated on the mean,
+                // passing `http_req_duration.p95th < 500000` on a 1200 ms p95.
+                Some(_) => None,
             }
         }),
         _ => {
@@ -782,6 +910,196 @@ mod tests {
         let metrics = make_metrics();
         let result = evaluate_single_threshold("checks.pass_rate > 0.8", &metrics);
         assert!(result.0, "pass rate 0.9 should be > 0.8");
+    }
+
+    // ── Backlog §1: stat resolver fails CLOSED, Counter rate is real ──
+
+    #[test]
+    fn counter_rate_is_per_second_not_raw_count() {
+        // `http_reqs: ['rate>100']` on a 100-request run lasting 0.5 s →
+        // 200 req/s. The OLD code discarded the stat and compared the raw
+        // count (100 > 100 = false… barely); on a 60 s / 5000-request run it
+        // compared 5000 > 100 and PASSED where k6 (83 req/s) fails.
+        let mut metrics = make_metrics();
+        metrics.run_duration = Duration::from_millis(500);
+        let result = evaluate_single_threshold("http_reqs.rate > 100", &metrics);
+        assert!(result.0, "200 req/s should be > 100");
+        assert_eq!(result.1, 200.0);
+
+        let result = evaluate_single_threshold("http_reqs.rate > 500", &metrics);
+        assert!(!result.0, "200 req/s should NOT be > 500");
+
+        // avg on a Counter is the same per-second rate (k6 semantics).
+        let result = evaluate_single_threshold("http_reqs.avg < 500", &metrics);
+        assert!(result.0, "200 req/s should be < 500");
+    }
+
+    #[test]
+    fn counter_percentile_stat_fails_closed() {
+        // Percentiles on a Counter are meaningless — must FAIL, not read a
+        // hardcoded zero / summary placeholder.
+        let metrics = make_metrics();
+        let result = evaluate_single_threshold("http_reqs.p95 < 1", &metrics);
+        assert!(!result.0, "p95 on a Counter must fail closed");
+    }
+
+    #[test]
+    fn unknown_trend_stat_fails_closed() {
+        // `http_req_duration.p95th` (typo): mean = 500, p95 = 1200. The OLD
+        // `_ => d.mean` arm gated on the mean (500 < 900 → PASS); a threshold
+        // between the two proves the value is not the mean.
+        let metrics = make_metrics();
+        let result = evaluate_single_threshold("http_req_duration.p95th < 900", &metrics);
+        assert!(
+            !result.0,
+            "unknown stat p95th must fail closed, not gate on the mean (500 < 900 would pass)"
+        );
+    }
+
+    #[test]
+    fn unknown_custom_metric_stat_fails_closed() {
+        // Custom-metric path (aggregate_series): an unknown stat must fail
+        // closed there too — the OLD `_ =>` arm returned worst mean.
+        let mut metrics = make_metrics();
+        metrics.metrics.push(MetricSummary {
+            key: "data_received".into(),
+            tags: vec![],
+            metric_type: MetricType::Counter,
+            count: 1500,
+            sum: 1500.0,
+            mean: 1.0,
+            min: 1,
+            max: 1,
+            p50: 1,
+            p90: 1,
+            p95: 1,
+            p99: 1,
+            last: 1.0,
+            rate: 0.0,
+            histogram: None,
+        });
+        let result = evaluate_single_threshold("data_received.bogus > 0", &metrics);
+        assert!(
+            !result.0,
+            "unknown stat on a custom metric must fail closed"
+        );
+
+        // Sanity: a VALID stat still resolves.
+        let result = evaluate_single_threshold("data_received.count > 1000", &metrics);
+        assert!(result.0, "count 1500 should be > 1000");
+    }
+
+    #[test]
+    fn counter_rate_via_aggregate_is_per_second() {
+        // `data_received: ['rate>1000000']` on a 60 s run receiving 3 MB →
+        // 50 000 B/s — the OLD aggregate path returned the per-series mean
+        // (~1500) → permanently red, and sum/count degenerates to 1.0.
+        let mut metrics = make_metrics();
+        metrics.run_duration = Duration::from_secs(60);
+        metrics.metrics.push(MetricSummary {
+            key: "data_received".into(),
+            tags: vec![],
+            metric_type: MetricType::Counter,
+            count: 3_000_000,
+            sum: 3_000_000.0,
+            mean: 1.0,
+            min: 1,
+            max: 1,
+            p50: 1,
+            p90: 1,
+            p95: 1,
+            p99: 1,
+            last: 1.0,
+            rate: 0.0,
+            histogram: None,
+        });
+        let result = evaluate_single_threshold("data_received.rate > 10000", &metrics);
+        assert!(result.0, "50000 B/s should be > 10000");
+        let result = evaluate_single_threshold("data_received.avg > 10000", &metrics);
+        assert!(result.0, "avg on a counter is the per-second rate too");
+    }
+
+    #[test]
+    fn checks_unknown_stat_fails_closed() {
+        // `checks.bogus > 0` must fail, not resolve to the total (the old
+        // `_ => checks_total` arm passed any > 0 gate).
+        let metrics = make_metrics();
+        let result = evaluate_single_threshold("checks.bogus > 0", &metrics);
+        assert!(!result.0, "unknown checks stat must fail closed");
+        // Bare checks still resolves to the total.
+        let result = evaluate_single_threshold("checks > 40", &metrics);
+        assert!(result.0, "bare checks should resolve to the total (50)");
+    }
+
+    #[test]
+    fn validate_rejects_unknown_stat_at_startup() {
+        let mut thresholds = HashMap::new();
+        thresholds.insert(
+            "typo".to_string(),
+            abort_config("http_req_duration.p95th < 500", false, None),
+        );
+        assert!(
+            validate_thresholds(&thresholds).is_err(),
+            "a typo'd stat must abort at startup"
+        );
+        // Valid stats (incl. arbitrary percentiles) still pass.
+        let mut ok = HashMap::new();
+        ok.insert(
+            "a".to_string(),
+            abort_config("http_reqs.rate > 10", false, None),
+        );
+        ok.insert(
+            "b".to_string(),
+            abort_config("http_req_duration.p(99.9) < 1000", false, None),
+        );
+        ok.insert(
+            "c".to_string(),
+            abort_config("checks.pass_rate > 0.9", false, None),
+        );
+        ok.insert(
+            "d".to_string(),
+            abort_config("http_req_duration.value < 500", false, None),
+        );
+        assert!(validate_thresholds(&ok).is_ok());
+    }
+
+    #[test]
+    fn percentile_on_aggregate_counter_fails_closed() {
+        // Round-2 review catch: the top-level http_reqs arm fails closed on
+        // percentiles, but the aggregate/tag-scoped paths didn't — a Counter's
+        // p95 bucket is 1.0, so `data_received.p95 > 0.5` passed. Must fail.
+        let mut metrics = make_metrics();
+        metrics.run_duration = Duration::from_secs(60);
+        metrics.metrics.push(MetricSummary {
+            key: "data_received".into(),
+            tags: vec![],
+            metric_type: MetricType::Counter,
+            count: 3_000_000,
+            sum: 3_000_000.0,
+            mean: 1.0,
+            min: 1,
+            max: 1,
+            p50: 1,
+            p90: 1,
+            p95: 1,
+            p99: 1,
+            last: 1.0,
+            rate: 0.0,
+            histogram: None,
+        });
+        let result = evaluate_single_threshold("data_received.p95 > 0.5", &metrics);
+        assert!(!result.0, "p95 on an aggregated Counter must fail closed");
+
+        // Same via the tag-scoped path.
+        let result = evaluate_single_threshold("data_received{url=/x}.p95 > 0.5", &metrics);
+        assert!(!result.0, "tag-scoped p95 on a Counter must fail closed");
+    }
+
+    #[test]
+    fn trend_value_stat_resolves_to_last_sample() {
+        let metrics = make_metrics(); // fixture last = 0.0
+        let result = evaluate_single_threshold("http_req_duration.value < 500", &metrics);
+        assert!(result.0, "value maps to the last sample (0 < 500)");
     }
 
     // ── Arbitrary-percentile tests ──

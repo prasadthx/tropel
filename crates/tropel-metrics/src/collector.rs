@@ -399,10 +399,7 @@ impl MetricsCollector {
     /// recorded. `None` selects auto-resize (no ceiling). Best-effort.
     pub async fn set_histogram_max(&self, max_ms: Option<u64>) {
         self.ensure_aggregator();
-        let _ = self
-            .tx
-            .send(MetricsEvent::SetHistogramMax(max_ms))
-            .await;
+        let _ = self.tx.send(MetricsEvent::SetHistogramMax(max_ms)).await;
     }
 
     /// Configure summary presentation (trend stats + effective thresholds)

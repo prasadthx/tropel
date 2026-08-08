@@ -351,22 +351,8 @@ mod tests {
             checks_passed: 2,
             checks_failed: 0,
             run_duration: Duration::from_secs(10),
-            http_req_duration: Some(trend(
-                "http_req_duration",
-                134.89,
-                150,
-                268,
-                272,
-                338,
-            )),
-            iteration_duration: Some(trend(
-                "iteration_duration",
-                294.58,
-                262,
-                279,
-                321,
-                1_150,
-            )),
+            http_req_duration: Some(trend("http_req_duration", 134.89, 150, 268, 272, 338)),
+            iteration_duration: Some(trend("iteration_duration", 294.58, 262, 279, 321, 1_150)),
             summary_trend_stats: vec![],
             effective_thresholds: HashMap::new(),
             ..Default::default()
@@ -389,14 +375,7 @@ mod tests {
     #[test]
     fn render_trend_uses_ms_for_time_metrics_only() {
         let mut out = String::new();
-        let m = trend(
-            "http_req_duration",
-            134.89,
-            150,
-            268,
-            272,
-            338,
-        );
+        let m = trend("http_req_duration", 134.89, 150, 268, 272, 338);
         let stats = vec![
             "avg".to_string(),
             "min".to_string(),
@@ -464,22 +443,8 @@ mod tests {
     #[test]
     fn render_per_url_breakdown_when_multiple_urls() {
         let mut r = result_with();
-        let mut a = trend(
-            "http_req_duration{url=/a}",
-            100.0,
-            100,
-            150,
-            160,
-            200,
-        );
-        let mut b = trend(
-            "http_req_duration{url=/b}",
-            200.0,
-            200,
-            250,
-            260,
-            300,
-        );
+        let mut a = trend("http_req_duration{url=/a}", 100.0, 100, 150, 160, 200);
+        let mut b = trend("http_req_duration{url=/b}", 200.0, 200, 250, 260, 300);
         a.tags = vec![("url".to_string(), "/a".to_string())];
         b.tags = vec![("url".to_string(), "/b".to_string())];
         r.per_url = vec![a, b];
