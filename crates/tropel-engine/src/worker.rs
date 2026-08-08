@@ -32,7 +32,7 @@
 //!   if `JsContext` were made `!Send`
 
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -48,9 +48,17 @@ const JOIN_BOUND: Duration = Duration::from_secs(30);
 /// runtime. VU tasks are pinned to their own worker (`spawn_vu`), so a VU is
 /// never co-located with another VU on the same runtime.
 pub struct VUWorkerPool {
-    /// Workers created so far. Grown on demand by `spawn_vu` so each VU gets
-    /// its own OS thread. Mutex: growth is rare (once per VU id) and cheap.
+    /// Workers created so far. Grown on demand by `spawn_vu` so each live VU
+    /// gets its own OS thread. Mutex: growth is rare (once per concurrent
+    /// slot) and cheap.
     workers: Mutex<Vec<WorkerInner>>,
+    /// Parallel to `workers`: true while that worker hosts a LIVE VU task.
+    /// `spawn_vu` reuses a slot whose flag is false (the finished VU freed
+    /// it), so the pool sizes to PEAK CONCURRENCY — never to the cumulative
+    /// monotonic vu_id count, which never resets and used to leak one OS
+    /// thread + runtime + ~2 fds per id across ramp cycles (P0: fd
+    /// exhaustion at tiny peak concurrency → swallowed panic → green run).
+    busy: Mutex<Vec<Arc<AtomicBool>>>,
     next_idx: AtomicUsize,
     /// How long `Drop` waits for a worker to exit before detaching it. 30s by
     /// default (matching the engine's drain bound); short in tests.
@@ -70,6 +78,28 @@ struct WorkerInner {
     exited: Option<mpsc::Receiver<()>>,
 }
 
+/// How a `spawn_vu` slot was acquired.
+enum Slot {
+    /// Reused an existing worker whose previous VU had finished.
+    Idle(usize, Arc<AtomicBool>),
+    /// Grew the pool with a brand-new worker (busy from birth).
+    Grown(usize, Arc<AtomicBool>),
+    /// Past the hard cap — co-scheduled on a busy worker (isolation
+    /// traded away at extreme VU counts, as documented).
+    Wrapped(usize),
+}
+
+/// Clears a worker's busy flag on drop. The VU task's completion (or panic)
+/// releases the slot back to the pool for reuse — this is what keeps the pool
+/// sized to peak concurrency instead of cumulative ids.
+struct BusyGuard(Arc<AtomicBool>);
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 impl VUWorkerPool {
     /// Create a new pool with `count` workers (one per core).
     ///
@@ -84,8 +114,10 @@ impl VUWorkerPool {
         assert!(count > 0, "VUWorkerPool requires at least 1 worker");
 
         let workers = (0..count).map(Self::make_worker).collect();
+        let busy = (0..count).map(|_| Arc::new(AtomicBool::new(false))).collect();
         Self {
             workers: Mutex::new(workers),
+            busy: Mutex::new(busy),
             next_idx: AtomicUsize::new(0),
             join_bound,
         }
@@ -126,27 +158,49 @@ impl VUWorkerPool {
         }
     }
 
-    /// Ensure at least `n` workers exist, growing the pool on demand.
+    /// Find a worker slot with no live VU (its flag is false) and mark it
+    /// busy. Returns the slot and the flag (cloned) so the spawned task can
+    /// clear it on completion. `None` when every slot is busy.
+    fn find_idle_slot(&self) -> Option<(usize, Arc<AtomicBool>)> {
+        let busy = self.busy.lock().unwrap();
+        for (i, flag) in busy.iter().enumerate() {
+            if flag
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some((i, flag.clone()));
+            }
+        }
+        None
+    }
+
+    /// Claim a worker slot for one VU. Reuses an idle slot when one exists
+    /// (pool sizes to peak concurrency); grows by one only when every slot
+    /// is busy; wraps onto an existing worker only past `MAX_WORKERS`.
     ///
-    /// Workers (runtime + OS thread) are created OUTSIDE the pool mutex: this
-    /// is called from the async ramp loop, and creating a current-thread
-    /// runtime + spawning a thread can take milliseconds — holding a
-    /// `std::sync::Mutex` across that would stall the ramp loop and every
-    /// other pool operation. The lock is only held for the final insert.
-    fn ensure_workers(&self, n: usize) {
+    /// Workers (runtime and OS thread) are created OUTSIDE the mutex: this is
+    /// called from the async ramp loop, and creating a current-thread runtime
+    /// and spawning a thread can take milliseconds — holding the mutex across
+    /// that would stall the ramp loop and every other pool operation. The
+    /// lock is only held for the final insert.
+    fn acquire_slot(&self, vu_id: u32) -> Slot {
+        if let Some((idx, flag)) = self.find_idle_slot() {
+            return Slot::Idle(idx, flag);
+        }
         loop {
             let current = self.workers.lock().unwrap().len();
-            if current >= n {
-                return;
+            if current >= Self::MAX_WORKERS {
+                return Slot::Wrapped((vu_id as usize) % current);
             }
             // Build the worker outside the lock (runtime + thread creation).
             let worker = Self::make_worker(current);
+            let flag = Arc::new(AtomicBool::new(true)); // busy from birth
             let mut workers = self.workers.lock().unwrap();
             if workers.len() == current {
-                // No concurrent growth — commit, then continue growing until
-                // the pool reaches `n` (one worker per loop iteration).
+                // No concurrent growth — commit.
                 workers.push(worker);
-                continue;
+                self.busy.lock().unwrap().push(flag.clone());
+                return Slot::Grown(current, flag);
             }
             // Another thread grew the pool between our snapshot and lock
             // acquisition; the freshly-built worker is surplus. Signal it to
@@ -180,23 +234,25 @@ impl VUWorkerPool {
         handle.spawn(future)
     }
 
-    /// Maximum number of worker threads the pool will ever create. All
-    /// bounded executors (constant/ramping/shared/arrival/per-vu-iterations)
-    /// hand out vu_ids < max_vus and therefore stay far below this cap, so
-    /// `spawn_vu` is identity for them — strict 1-VU-per-thread isolation is
-    /// preserved. Only `externally_controlled` hands out a *monotonic* id
-    /// counter (ids are never reused while an old VU with the same id is
-    /// still exiting, to keep data-row rotation / JS-context naming unique);
-    /// a long churning run could otherwise leak one thread per regrow. Once
-    /// the cap is reached, ids wrap onto existing workers. The id passed to
-    /// `run_vu` is unaffected (naming stays unique) — only the worker slot
-    /// wraps.
+    /// Maximum number of worker threads the pool will ever create. `spawn_vu`
+    /// reuses idle slots (slots freed by finished/panicked VUs) before
+    /// growing, so for any realistic test the pool sizes to PEAK CONCURRENCY
+    /// and stays far below this cap — strict 1-VU-per-thread isolation is
+    /// preserved. The cap only bites when a single run is concurrently busy
+    /// beyond 4096 VUs; once reached, additional VUs wrap onto existing
+    /// workers (isolation traded away at extreme VU counts, as documented).
+    /// The vu_id passed to `run_vu` is unaffected (naming stays unique) —
+    /// only the worker slot may be shared.
     const MAX_WORKERS: usize = 4096;
 
-    /// Spawn a VU on its own dedicated worker thread, growing the pool on
-    /// demand so VU `vu_id` always gets worker `vu_id` — a 1-VU-per-task
-    /// mapping. This is what makes a blocking script `sleep()` safe: it only
-    /// blocks this VU's OS thread, never a co-located VU (there is none).
+    /// Spawn a VU on a dedicated worker thread. Reuses an idle slot (a
+    /// finished VU's worker) when one exists, grows the pool only when every
+    /// slot is busy, and wraps onto an existing worker only past
+    /// `MAX_WORKERS`. No two LIVE VUs ever share a worker, so a blocking
+    /// script `sleep()` still only blocks its own VU — while the pool sizes
+    /// to PEAK CONCURRENCY instead of the cumulative monotonic id count
+    /// (P0: ids grew the pool to thousands of threads/runtimes/fds at tiny
+    /// peak concurrency).
     ///
     /// Returns a `JoinHandle` that can be awaited from any runtime.
     pub fn spawn_vu<F>(&self, vu_id: u32, future: F) -> tokio::task::JoinHandle<F::Output>
@@ -204,12 +260,17 @@ impl VUWorkerPool {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        // Cap growth (see MAX_WORKERS): monotonic externally-controlled ids
-        // must not leak an OS thread per regrow. For any realistic test the
-        // id is below the cap, so this is the identity mapping.
-        let idx = (vu_id as usize) % Self::MAX_WORKERS;
-        self.ensure_workers(idx + 1);
-        self.spawn_on(idx, future)
+        match self.acquire_slot(vu_id) {
+            // Panic-safe release: the guard clears the busy flag on drop, so
+            // the slot returns to the pool even if the VU task panics
+            // mid-flight. The Slot pattern owns the only Arc — moved straight
+            // into the task, no clone.
+            Slot::Idle(idx, flag) | Slot::Grown(idx, flag) => self.spawn_on(idx, async move {
+                let _release = BusyGuard(flag);
+                future.await
+            }),
+            Slot::Wrapped(idx) => self.spawn_on(idx, future),
+        }
     }
 
     /// Spawn a future on the next worker (round-robin distribution).
@@ -349,13 +410,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_pool_grows_on_demand() {
+    async fn worker_pool_grows_only_for_concurrent_vus() {
+        // P0 (backlog): the pool sized on the process-wide MONOTONIC vu_id
+        // counter — spawn_vu(10) grew the pool to 11 workers even though a
+        // single VU at a time never needs more than one. Across 20 ramp
+        // cycles (ids ~2000) that leaked ~2000 OS threads + runtimes + ~4000
+        // fds at peak concurrency 100 → fd exhaustion → a swallowed panic
+        // inside the scenario task → green run on partial data. The pool now
+        // REUSES idle slots: sequential VUs (whatever their id) must not grow
+        // it; only genuinely CONCURRENT VUs do.
         let pool = VUWorkerPool::new(2);
         assert_eq!(pool.worker_count(), 2);
-        // spawn_vu(10) forces the pool to grow to 11 workers.
-        let h = pool.spawn_vu(10, async {});
+
+        // 2000 sequential VUs with monotonic ids (simulating many ramp
+        // cycles) must not grow the pool at all — each reuses a freed slot.
+        for vu_id in 0..2000u32 {
+            let h = pool.spawn_vu(vu_id, async {});
+            assert!(h.await.is_ok());
+            assert_eq!(pool.worker_count(), 2, "sequential VU {vu_id} grew the pool");
+        }
+
+        // Concurrent VUs DO grow it: 3 simultaneously-live VUs on a 2-worker
+        // pool must grow to 3 workers, then free slots back when they finish.
+        let (a, b, c) = tokio::join!(
+            pool.spawn_vu(0, async { std::thread::sleep(std::time::Duration::from_millis(50)); }),
+            pool.spawn_vu(1, async { std::thread::sleep(std::time::Duration::from_millis(50)); }),
+            pool.spawn_vu(2, async { std::thread::sleep(std::time::Duration::from_millis(50)); }),
+        );
+        assert!(a.is_ok() && b.is_ok() && c.is_ok());
+        assert_eq!(pool.worker_count(), 3, "3 concurrent VUs must grow the pool to 3");
+
+        // After they finish, the 3rd worker slot is idle again but the pool
+        // never shrinks below the peak — a later sequential VU reuses it.
+        let h = pool.spawn_vu(3, async {});
         assert!(h.await.is_ok());
-        assert_eq!(pool.worker_count(), 11);
+        assert_eq!(pool.worker_count(), 3);
+
         // spawn (round-robin) still works and does not shrink anything.
         let (idx, h) = pool.spawn(async {});
         assert!(h.await.is_ok());

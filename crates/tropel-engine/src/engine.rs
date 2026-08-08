@@ -559,9 +559,20 @@ impl Engine {
         let mut total_vu_init_failures = 0u32;
         let mut total_script_failures = 0u64;
         for handle in scenario_handles {
-            if let Ok((init_failures, script_failures)) = handle.await {
-                total_vu_init_failures += init_failures;
-                total_script_failures += script_failures;
+            match handle.await {
+                Ok((init_failures, script_failures)) => {
+                    total_vu_init_failures += init_failures;
+                    total_script_failures += script_failures;
+                }
+                // P0 (backlog): a PANICKED scenario task (e.g. worker-pool
+                // thread/runtime creation failing under fd exhaustion) used
+                // to be silently discarded by `if let Ok` — the run printed
+                // a green summary from partial data and exited 0. Count it
+                // as a VU init failure so the run fails loudly instead.
+                Err(join_err) => {
+                    tracing::error!("Scenario task panicked: {join_err}");
+                    total_vu_init_failures = total_vu_init_failures.saturating_add(1);
+                }
             }
         }
 
