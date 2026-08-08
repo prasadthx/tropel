@@ -247,7 +247,12 @@ mod tests {
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 4096];
                     let _ = sock.read(&mut buf).await;
-                    let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+                    // Connection: close — this handler serves ONE request then
+                    // drops the socket. Without it, reqwest pools the connection
+                    // and reusing it on a fast host (Linux/macOS CI) races the
+                    // close, causing a spurious transport error that drops a
+                    // sample and flakes the merge assertions.
+                    let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
                     let _ = sock.write_all(resp.as_bytes()).await;
                 });
             }

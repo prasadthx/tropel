@@ -570,6 +570,19 @@ impl VURunner {
                                     ("error", e.to_string()),
                                 ]));
                                 let now = std::time::SystemTime::now();
+                                // A failed request still counts as a request (k6
+                                // parity): the k6 driver's push_http_failure emits
+                                // http_reqs alongside http_req_failed. Without this,
+                                // a transport error silently drops the request from
+                                // the summary — the distributed merge undercounts
+                                // http_reqs by exactly the number of failed hops.
+                                result.samples.push(tropel_core::types::Sample {
+                                    metric: "http_reqs".into(),
+                                    value: 1.0,
+                                    tags: err_tags.clone(),
+                                    timestamp: now,
+                                    sample_type: SampleType::Counter,
+                                });
                                 result.samples.push(tropel_core::types::Sample {
                                     metric: "errors".into(),
                                     value: 1.0,
