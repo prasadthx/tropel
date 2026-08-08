@@ -438,8 +438,14 @@ pub fn build(config: &BuildConfig) -> Result<()> {
         );
     }
 
-    let workspace_root = resolve_workspace_root()?;
-    println!("Workspace root: {}", workspace_root.display());
+    let workspace_root = resolve_workspace_root();
+    match &workspace_root {
+        Some(root) => println!("Workspace root: {}", root.display()),
+        None => println!(
+            "No tropel workspace found (installed binary?) — using tropel-engine {} from crates.io",
+            env!("CARGO_PKG_VERSION")
+        ),
+    }
 
     // Create a temporary directory
     let temp_dir = tempfile::tempdir()
@@ -452,7 +458,7 @@ pub fn build(config: &BuildConfig) -> Result<()> {
         .map_err(|e| TropelError::Other(format!("Failed to create src dir: {}", e)))?;
 
     // Generate Cargo.toml
-    let cargo_toml = generate_cargo_toml(config, &workspace_root);
+    let cargo_toml = generate_cargo_toml(config, workspace_root.as_deref());
     std::fs::write(temp_path.join("Cargo.toml"), cargo_toml)
         .map_err(|e| TropelError::Other(format!("Failed to write Cargo.toml: {}", e)))?;
 
@@ -579,39 +585,116 @@ pub fn build(config: &BuildConfig) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the workspace root by walking up from the current directory
-/// looking for a Cargo.toml with [workspace].
-fn resolve_workspace_root() -> Result<PathBuf> {
-    let mut current = std::env::current_dir()
-        .map_err(|e| TropelError::Other(format!("Failed to get current dir: {}", e)))?;
+/// Resolve the tropel workspace root.
+///
+/// Walks up from the **build crate's own manifest directory** (baked in at
+/// compile time via `CARGO_MANIFEST_DIR`), NOT the user's current directory:
+/// `tropel build` can be invoked from anywhere, and walking the user's cwd
+/// can find a *different* workspace and emit a `tropel-engine` path that
+/// doesn't exist. Returns `None` when no workspace is found — e.g. a
+/// `cargo install`ed binary whose sources live in the cargo registry, or a
+/// stray `[workspace]` whose layout lacks `crates/tropel-engine` — and the
+/// caller then depends on `tropel-engine` from crates.io instead of a local
+/// path.
+fn resolve_workspace_root() -> Option<PathBuf> {
+    let mut current = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
     loop {
         let cargo_toml = current.join("Cargo.toml");
         if cargo_toml.exists() {
             if let Ok(content) = std::fs::read_to_string(&cargo_toml) {
-                if content.contains("[workspace]") {
-                    return Ok(current);
+                // A real `[workspace]` table header — a `# [workspace]`
+                // comment or a string literal cannot start a line with it.
+                // (`[workspace.dependencies]` etc. don't match: the char
+                // after `[workspace` is `.`, not `]`.)
+                let has_workspace = content
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("[workspace]"));
+                // Accept only if this is the TROPEL workspace: a stray
+                // `[workspace]` in an ancestor dir (e.g. under `~/.cargo` for
+                // a cargo-installed binary) must not produce a bogus engine
+                // path. The root's only use is locating `tropel-engine`.
+                if has_workspace && current.join("crates/tropel-engine/Cargo.toml").exists() {
+                    return Some(current);
                 }
             }
         }
         if !current.pop() {
-            return Err(TropelError::Other(
-                "Could not find workspace root (no Cargo.toml with [workspace] found)".into(),
-            ));
+            return None;
         }
     }
 }
 
-/// Generate the Cargo.toml content for the temporary build crate.
-fn generate_cargo_toml(config: &BuildConfig, workspace_root: &Path) -> String {
-    let mut deps_lines = String::new();
-    let root = workspace_root.to_string_lossy().replace('\\', "/");
+/// Expand a leading `~` to the user's home directory; any other input is
+/// returned unchanged. cargo does NOT expand `~` in path dependencies, so it
+/// must be resolved before the value lands in the generated Cargo.toml.
+fn expand_tilde(path: &str) -> String {
+    match path.strip_prefix('~') {
+        Some(rest) => {
+            if let Some(home) = std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(PathBuf::from)
+            {
+                let mut p = home;
+                let rest = rest.trim_start_matches(['/', '\\']);
+                if !rest.is_empty() {
+                    p.push(rest);
+                }
+                return p.to_string_lossy().into_owned();
+            }
+            path.to_string()
+        }
+        None => path.to_string(),
+    }
+}
 
-    // Always depend on tropel-engine (re-exports everything needed)
-    deps_lines.push_str(&format!(
-        "tropel-engine = {{ path = \"{}/crates/tropel-engine\" }}\n",
-        root
-    ));
+/// Resolve a `--with` path spec into an absolute, forward-slashed path for
+/// the generated Cargo.toml.
+///
+/// - `~` is expanded to the user's home directory.
+/// - `.`/`..`-relative paths resolve against the **current working
+///   directory** (where `tropel build` was invoked) — not the workspace
+///   root, which is unrelated to where the user actually keeps their
+///   extension.
+/// - absolute paths pass through (backslashes normalized to forward
+///   slashes).
+fn resolve_ext_path(path: &str) -> String {
+    let expanded = expand_tilde(path);
+    let joined = if expanded.starts_with('.') || expanded.starts_with("..") {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(&expanded)
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        expanded
+    };
+    joined.replace('\\', "/")
+}
+
+/// Generate the Cargo.toml content for the temporary build crate.
+fn generate_cargo_toml(config: &BuildConfig, workspace_root: Option<&Path>) -> String {
+    let mut deps_lines = String::new();
+
+    // Always depend on tropel-engine (re-exports everything needed). Use the
+    // local path when running from a source checkout; fall back to the
+    // crates.io release matching this build's version (a cargo-installed
+    // binary has no workspace to point at).
+    match workspace_root {
+        Some(root) => {
+            let root = root.to_string_lossy().replace('\\', "/");
+            deps_lines.push_str(&format!(
+                "tropel-engine = {{ path = \"{}/crates/tropel-engine\" }}\n",
+                root
+            ));
+        }
+        None => {
+            deps_lines.push_str(&format!(
+                "tropel-engine = \"{}\"\n",
+                env!("CARGO_PKG_VERSION")
+            ));
+        }
+    }
 
     // Add each extension as a dependency
     for ext in &config.extensions {
@@ -620,14 +703,7 @@ fn generate_cargo_toml(config: &BuildConfig, workspace_root: &Path) -> String {
                 deps_lines.push_str(&format!("{} = \"{}\"\n", name, version));
             }
             ExtensionDep::Path { name, path } => {
-                let resolved = if path.starts_with(".") || path.starts_with("..") {
-                    workspace_root
-                        .join(path)
-                        .to_string_lossy()
-                        .replace('\\', "/")
-                } else {
-                    path.replace('\\', "/")
-                };
+                let resolved = resolve_ext_path(path);
                 deps_lines.push_str(&format!("{} = {{ path = \"{}\" }}\n", name, resolved));
             }
             ExtensionDep::Git {
@@ -1103,5 +1179,134 @@ mod tests {
             format!("{:?}", dep),
             "repo = { git = \"https://github.com/user/repo\", tag = \"v1.2.3\" }"
         );
+    }
+
+    #[test]
+    fn workspace_root_walks_up_from_build_crate_manifest() {
+        // Backlog line 235: resolution walked the USER's cwd and matched any
+        // Cargo.toml whose text CONTAINS `[workspace]` (comments/strings
+        // included). It must instead walk up from the build crate's own
+        // manifest dir, so `tropel build` finds the real workspace no matter
+        // where it is invoked from.
+        let root = resolve_workspace_root().expect("tropel-build is compiled in a workspace");
+        assert!(
+            root.join("Cargo.toml").exists(),
+            "resolved root must contain a Cargo.toml: {}",
+            root.display()
+        );
+        // The engine source must actually live at the resolved location.
+        assert!(
+            root.join("crates/tropel-engine/Cargo.toml").exists(),
+            "crates/tropel-engine must exist under the resolved root"
+        );
+    }
+
+    #[test]
+    fn workspace_detection_ignores_comment_and_string_matches() {
+        // A `# [workspace]` comment or a string containing `[workspace]` must
+        // NOT count as a workspace table header (old `contains()` matched
+        // both). We probe the resolver indirectly: a Cargo.toml whose only
+        // occurrence is commented out must not be returned. Build a fake
+        // tree under a temp dir and check the line-aware predicate.
+        let dir = std::env::temp_dir().join(format!("tropel-build-ws-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("crates/tropel-engine")).unwrap();
+        // Comment-only "workspace" marker, plus a real one two levels down
+        // would be wrong — so the file is comment-only: must NOT resolve.
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"fake\"\n# [workspace]\n\"[workspace]\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("crates/tropel-engine/Cargo.toml"), "[package]\n").unwrap();
+
+        let content = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+        let has_workspace_table = content
+            .lines()
+            .any(|l| l.trim_start().starts_with("[workspace]"));
+        assert!(
+            !has_workspace_table,
+            "comment/string occurrences must not be treated as a [workspace] table"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generate_cargo_toml_falls_back_to_registry_engine_without_workspace() {
+        // cargo-installed binary: no workspace -> depend on the crates.io
+        // release matching this build instead of a nonexistent local path.
+        let config = BuildConfig {
+            extensions: vec![],
+            output: PathBuf::from("tropel.exe"),
+            release: false,
+        };
+        let toml = generate_cargo_toml(&config, None);
+        assert!(
+            toml.contains(&format!(
+                "tropel-engine = \"{}\"",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "engine must come from crates.io at the build version"
+        );
+        assert!(
+            !toml.contains("crates/tropel-engine"),
+            "no local path dependency may be emitted without a workspace"
+        );
+    }
+
+    #[test]
+    fn generate_cargo_toml_uses_local_engine_path_with_workspace() {
+        let config = BuildConfig {
+            extensions: vec![],
+            output: PathBuf::from("tropel.exe"),
+            release: false,
+        };
+        let root = resolve_workspace_root().unwrap();
+        let toml = generate_cargo_toml(&config, Some(&root));
+        let expected = format!(
+            "tropel-engine = {{ path = \"{}/crates/tropel-engine\" }}",
+            root.to_string_lossy().replace('\\', "/")
+        );
+        assert!(
+            toml.contains(&expected),
+            "expected local engine path dep, got:\n{toml}"
+        );
+    }
+
+    #[test]
+    fn expand_tilde_resolves_home() {
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .expect("HOME/USERPROFILE set in test env");
+        let expanded = expand_tilde("~/ext");
+        assert!(
+            expanded.starts_with(&home.to_string_lossy().into_owned()),
+            "'~/ext' must expand under the home dir, got {expanded}"
+        );
+        assert!(expanded.ends_with("ext"));
+        // Non-tilde input is untouched.
+        assert_eq!(expand_tilde("./rel"), "./rel");
+        assert_eq!(expand_tilde("/abs/path"), "/abs/path");
+    }
+
+    #[test]
+    fn relative_ext_path_resolves_against_cwd_not_workspace_root() {
+        // Backlog line 235: `--with ./my-ext` resolved against the workspace
+        // root; it must resolve against the user's cwd.
+        let resolved = resolve_ext_path("./my-ext");
+        let cwd = std::env::current_dir().unwrap();
+        assert!(
+            resolved.starts_with(&cwd.to_string_lossy().replace('\\', "/")),
+            "'./my-ext' must resolve under cwd, got {resolved}"
+        );
+        assert!(resolved.ends_with("my-ext"));
+        // ~-prefixed specs are expanded (cargo does not expand `~`).
+        let tilde = resolve_ext_path("~/ext");
+        assert!(
+            !tilde.starts_with('~'),
+            "'~/ext' must be expanded, got {tilde}"
+        );
+        // Absolute paths pass through unchanged.
+        assert_eq!(resolve_ext_path("/abs/path/ext"), "/abs/path/ext");
     }
 }
