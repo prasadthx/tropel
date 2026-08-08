@@ -54,6 +54,12 @@ use tropel_sdk::{Scenario, ScenarioInfo};
 /// Default per-call timeout for the subprocess. A child that outlives this
 /// is killed (DoS guard — a hanging adapter must not hang the host).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long to wait for the reader thread to drain after the child has been
+/// killed before giving up on joining it. Killing the child closes its stdout
+/// pipe for a well-behaved direct child, so the read unblocks almost
+/// immediately; a leaked grandchild holding the pipe open must never be
+/// allowed to hang the caller (regression: CI hung > 60s).
+const READER_JOIN_GRACE: Duration = Duration::from_secs(2);
 /// Cap on how many bytes we read from the subprocess stdout. Prevents a
 /// misbehaving adapter from exhausting host memory.
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -230,7 +236,7 @@ impl SubprocessAdapter {
             Err(e) => {
                 // Timeout / cap / I/O failure: stop the child, join both
                 // helper threads, and surface the error.
-                kill_and_join(&mut child, writer, reader);
+                kill_and_join(&mut child, writer, reader, &rx);
                 Err(e)
             }
             Ok(output) => {
@@ -240,7 +246,7 @@ impl SubprocessAdapter {
                         Ok(Some(status)) => break status,
                         Ok(None) => {
                             if Instant::now() >= deadline {
-                                kill_and_join(&mut child, writer, reader);
+                                kill_and_join(&mut child, writer, reader, &rx);
                                 return Err(TropelError::Other(format!(
                                     "Subprocess '{}' timed out after {:?}",
                                     self.command, self.timeout
@@ -249,7 +255,7 @@ impl SubprocessAdapter {
                             thread::sleep(Duration::from_millis(5));
                         }
                         Err(e) => {
-                            kill_and_join(&mut child, writer, reader);
+                            kill_and_join(&mut child, writer, reader, &rx);
                             return Err(TropelError::Other(format!(
                                 "Failed to wait for subprocess '{}': {}",
                                 self.command, e
@@ -279,11 +285,32 @@ fn kill_and_join(
     child: &mut std::process::Child,
     writer: std::thread::JoinHandle<()>,
     reader: std::thread::JoinHandle<()>,
+    reader_rx: &mpsc::Receiver<Result<Vec<u8>>>,
 ) {
     let _ = child.kill();
     let _ = child.wait();
+    // writer.join() is safe: killing the child closed its stdin read end, so
+    // a blocked write_all() fails with a broken pipe and the thread exits.
     let _ = writer.join();
-    let _ = reader.join();
+    // The reader thread is blocked in a pipe read. Killing the child closes
+    // its end of the pipe for a well-behaved direct child, so the read
+    // returns and the join is prompt. But if the command left a grandchild
+    // holding the pipe open (a shell wrapper that did not exec its payload,
+    // or a fork-emulated exec on MSYS/Windows), the read stays blocked and
+    // an unbounded join would hang the caller forever. Wait a bounded grace
+    // period instead, then detach the thread — it exits on its own whenever
+    // the pipe finally closes. (Regression: CI hung > 60s.)
+    match reader_rx.recv_timeout(READER_JOIN_GRACE) {
+        Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = reader.join();
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // Detach rather than hang: the thread and its pipe handle leak
+            // until the orphaned grandchild finally exits — acceptable for a
+            // short-lived CLI, and strictly better than blocking forever.
+            drop(reader);
+        }
+    }
 }
 
 impl InputAdapter for SubprocessAdapter {
@@ -516,6 +543,33 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(10),
             "timeout must kill the child promptly (took {:?})",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn test_timeout_bounded_when_grandchild_holds_stdout() {
+        // Regression (CI hang > 60s): killing the DIRECT child must not be
+        // allowed to hang the caller when a grandchild keeps the stdout pipe
+        // open. `sleep 5 &` backgrounds a long-lived child that inherits
+        // stdout, and `wait` keeps `sh` alive as the direct child — killing
+        // `sh` leaves `sleep` holding the pipe, so the reader thread stays
+        // blocked in read(). The kill path must still return promptly: it
+        // waits READER_JOIN_GRACE for the reader, then detaches it.
+        let adapter = script_adapter("orphan.sh", "#!/bin/sh\nsleep 5 &\nwait\n")
+            .with_timeout(Duration::from_millis(300));
+        let start = std::time::Instant::now();
+        let result = adapter.parse(b"hello");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("timed out"),
+            "expected timeout error, got: {}",
+            msg
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "kill path must not hang on a grandchild holding stdout (took {:?})",
             start.elapsed()
         );
     }
