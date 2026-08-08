@@ -41,3 +41,8 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 sha2.workspace = true
+# Keyed sidecar (P0): hmac authenticates the AOT `.cwasm` artifact under a
+# per-user key; rand generates that key. The bare sha256 self-hash was
+# integrity-only — a local attacker writes both halves.
+hmac.workspace = true
+rand.workspace = true

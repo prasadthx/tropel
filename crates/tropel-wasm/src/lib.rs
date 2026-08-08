@@ -452,10 +452,18 @@ impl WasmPlugin {
 /// - The cache lives in a **host-private `0700` dir** (`wasm_cache_dir()`),
 ///   keyed by `sha256(source)` — never beside third-party plugin files, so a
 ///   plugin tarball cannot plant a cache entry.
-/// - The sidecar authenticates the **artifact we deserialize**: it stores
-///   `sha256(.cwasm bytes)`, and the cache is only trusted when the file on
-///   disk re-hashes to it. A tampered/torn/foreign artifact fails the check
-///   and is recompiled from the trusted source bytes.
+/// - Privacy is **enforced, not asserted**: `wasm_cache_dir()` returns
+///   `None` (cache disabled, fresh compile) when the dir cannot be created
+///   or hardened to `0700`, when it is not owned by us (a local attacker who
+///   pre-created `/tmp/tropel` 0777 makes the chmod fail with `EPERM`), or
+///   when its parent is group/world writable. An unsecured dir is **never**
+///   read into `unsafe Module::deserialize`.
+/// - The sidecar **authenticates** the artifact we deserialize: it stores
+///   `HMAC-SHA256(per-user key, .cwasm bytes)` — the old unkeyed `sha256`
+///   self-hash was integrity-only (the attacker writes both halves). The key
+///   lives 0600 inside the hardened `0700` dir, unreadable by other users, so
+///   a forged/tampered artifact fails the check and is recompiled from the
+///   trusted source bytes.
 /// - Writes are **atomic** (`<tmp>.<pid>` + rename): concurrent `init()`s on
 ///   a cold cache can never hand `deserialize` torn bytes.
 /// - A process-global in-memory cache means each unique source is compiled
@@ -477,31 +485,44 @@ pub(crate) fn load_module_aot(path: &Path) -> std::result::Result<Module, anyhow
         return Ok(m);
     }
 
-    let cache_dir = wasm_cache_dir();
+    // Cache unavailable or un-hardenable (attacker pre-created the dir,
+    // permissions failed, /tmp fallback we could not secure): compile fresh.
+    // NEVER read an unsecured cache into `unsafe Module::deserialize`.
+    let Some(cache_dir) = wasm_cache_dir() else {
+        tracing::warn!("WASM AOT cache unavailable; compiling '{}' without cache", path.display());
+        return compile_uncached(engine, &wasm_bytes, key);
+    };
+    // No key means we cannot authenticate a cache entry — compile fresh too.
+    let Some(cache_key_bytes) = cache_key(&cache_dir) else {
+        tracing::warn!("WASM AOT cache key unavailable; compiling '{}' without cache", path.display());
+        return compile_uncached(engine, &wasm_bytes, key);
+    };
+
     let cache_path = cache_dir.join(format!("{key}.cwasm"));
     let hash_path = cache_dir.join(format!("{key}.sha256"));
 
-    // Cache is trusted ONLY if the artifact on disk re-hashes to the sidecar
-    // we wrote for it. A missing/mismatched cache falls through to compile.
+    // Cache is trusted ONLY if the artifact on disk re-authenticates to the
+    // keyed sidecar we wrote for it. A missing/mismatched/forged cache falls
+    // through to compile (and rewrites the entry with a valid sidecar).
     let cache_artifact = std::fs::read(&cache_path).ok();
     let cache_trusted = cache_artifact
         .as_ref()
         .zip(std::fs::read_to_string(&hash_path).ok())
-        .map(|(bytes, sidecar)| sidecar.trim() == sha256_hex(bytes))
+        .map(|(bytes, sidecar)| sidecar.trim() == hmac_hex(&cache_key_bytes, bytes))
         .unwrap_or(false);
 
     let module = if cache_trusted {
         let cached = cache_artifact.expect("cache_trusted implies artifact exists");
-        // SAFETY: `cached` re-hashes to the sidecar we wrote for this exact
-        // source, in a host-private dir, produced by this engine version.
-        // A cache from an incompatible engine fails deserialize and we
-        // recompile below.
+        // SAFETY: `cached` authenticates to the keyed sidecar we wrote for
+        // this exact source, in a host-private dir we hardened and own,
+        // produced by this engine version. A cache from an incompatible
+        // engine fails deserialize and we recompile below.
         match unsafe { Module::deserialize(engine, &cached) } {
             Ok(m) => m,
-            Err(_) => aot_compile(engine, &wasm_bytes, &cache_path, &hash_path)?,
+            Err(_) => aot_compile(engine, &wasm_bytes, &cache_path, &hash_path, &cache_key_bytes)?,
         }
     } else {
-        aot_compile(engine, &wasm_bytes, &cache_path, &hash_path)?
+        aot_compile(engine, &wasm_bytes, &cache_path, &hash_path, &cache_key_bytes)?
     };
 
     if let Ok(mut c) = module_cache().lock() {
@@ -511,10 +532,17 @@ pub(crate) fn load_module_aot(path: &Path) -> std::result::Result<Module, anyhow
 }
 
 /// Host-private AOT cache directory: `~/.cache/tropel/wasm-cache` (unix) /
-/// `%LOCALAPPDATA%\tropel\wasm-cache` (Windows), created with `0700`
-/// permissions. Never the plugin's own directory — a third-party plugin must
-/// not be able to plant a `.cwasm` next to its `.wasm`.
-fn wasm_cache_dir() -> PathBuf {
+/// `%LOCALAPPDATA%\tropel\wasm-cache` (Windows). Never the plugin's own
+/// directory — a third-party plugin must not be able to plant a `.cwasm`
+/// next to its `.wasm`.
+///
+/// Returns `None` when the directory cannot be created **and** hardened — the
+/// caller then compiles fresh and never reads an unsecured cache (P0: a local
+/// attacker who pre-creates the dir 0777 in `/tmp` must never get
+/// `unsafe Module::deserialize` to run their planted `.cwasm`; a failed
+/// `set_permissions(0o700)` is the `EPERM` fingerprint of exactly that
+/// attack).
+fn wasm_cache_dir() -> Option<PathBuf> {
     let base = if cfg!(windows) {
         std::env::var("LOCALAPPDATA")
             .map(PathBuf::from)
@@ -532,16 +560,78 @@ fn wasm_cache_dir() -> PathBuf {
             .unwrap_or_else(std::env::temp_dir)
     };
     let dir = base.join("tropel").join("wasm-cache");
-    let _ = std::fs::create_dir_all(&dir);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("WASM AOT cache: cannot create '{}': {}", dir.display(), e);
+        return None;
+    }
     // 0700 is load-bearing even on the temp_dir fallback (unix /tmp is
     // world-writable): another local user must not be able to pre-plant a
     // `.cwasm` + sidecar pair that matches a source hash we later load.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
+            // chmod fails with EPERM when a DIFFERENT local user pre-created
+            // the dir (the `/tmp` attack). Never trust it — compile fresh.
+            tracing::warn!(
+                "WASM AOT cache: cannot harden '{}' to 0700: {}; cache disabled",
+                dir.display(),
+                e
+            );
+            return None;
+        }
+        // Re-validate the enforced state (defense in depth): the dir must
+        // have no group/world bits, and its immediate parent must not be
+        // group/world WRITABLE — an attacker who pre-created `/tmp/tropel`
+        // 0777 could otherwise swap the whole cache out between our checks
+        // and the deserialize. 0755 parents pass (nobody else can write
+        // them); 1777/0777 parents disable the cache.
+        use std::os::unix::fs::MetadataExt;
+        // A stat failure means we could not VERIFY the enforced state — treat
+        // it like any other unverifiable dir and disable the cache (never
+        // trust what we cannot check).
+        let meta = match std::fs::metadata(&dir) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    "WASM AOT cache: cannot stat '{}': {}; cache disabled",
+                    dir.display(),
+                    e
+                );
+                return None;
+            }
+        };
+        if meta.mode() & 0o077 != 0 {
+            tracing::warn!(
+                "WASM AOT cache: '{}' has group/world bits ({:#o}); cache disabled",
+                dir.display(),
+                meta.mode()
+            );
+            return None;
+        }
+        if let Some(parent) = dir.parent() {
+            let pm = match std::fs::metadata(parent) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(
+                        "WASM AOT cache: cannot stat parent '{}': {}; cache disabled",
+                        parent.display(),
+                        e
+                    );
+                    return None;
+                }
+            };
+            if pm.mode() & 0o022 != 0 {
+                tracing::warn!(
+                    "WASM AOT cache: parent '{}' is group/world writable ({:#o}); cache disabled",
+                    parent.display(),
+                    pm.mode()
+                );
+                return None;
+            }
+        }
     }
-    dir
+    Some(dir)
 }
 
 /// Process-global compiled-module cache, keyed by `sha256(source)`. Lets all
@@ -575,13 +665,14 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// Precompile wasm bytes, persist the `.cwasm` cache + its artifact-hash
-/// sidecar atomically, and load it (shared by adapters and the driver).
+/// Precompile wasm bytes, persist the `.cwasm` cache + its keyed sidecar
+/// atomically, and load it (shared by adapters and the driver).
 pub(crate) fn aot_compile(
     engine: &Engine,
     wasm_bytes: &[u8],
     cache_path: &Path,
     hash_path: &Path,
+    key: &[u8; 32],
 ) -> std::result::Result<Module, anyhow::Error> {
     let compiled = engine.precompile_module(wasm_bytes)?;
     if let Err(e) = atomic_write(cache_path, &compiled) {
@@ -590,7 +681,7 @@ pub(crate) fn aot_compile(
             cache_path.display(),
             e
         );
-    } else if let Err(e) = atomic_write(hash_path, sha256_hex(&compiled).as_bytes()) {
+    } else if let Err(e) = atomic_write(hash_path, hmac_hex(key, &compiled).as_bytes()) {
         tracing::warn!(
             "Failed to write WASM cache hash '{}': {}",
             hash_path.display(),
@@ -600,6 +691,117 @@ pub(crate) fn aot_compile(
     // SAFETY: `compiled` was just produced by `Engine::precompile_module`
     // on this same engine.
     Ok(unsafe { Module::deserialize(engine, &compiled) }?)
+}
+
+/// Compile `wasm_bytes` in-memory (no cache I/O) and register it in the
+/// process-global module cache. Used when the AOT cache is unavailable or
+/// cannot be secured — the caller must never fall back to trusting a cache
+/// entry it could not authenticate.
+fn compile_uncached(
+    engine: &Engine,
+    wasm_bytes: &[u8],
+    key: String,
+) -> std::result::Result<Module, anyhow::Error> {
+    let compiled = engine.precompile_module(wasm_bytes)?;
+    // SAFETY: `compiled` was just produced by `Engine::precompile_module`
+    // on this same engine.
+    let module = unsafe { Module::deserialize(engine, &compiled) }?;
+    if let Ok(mut c) = module_cache().lock() {
+        c.insert(key, module.clone());
+    }
+    Ok(module)
+}
+
+/// Load (creating if absent) the per-user 32-byte key that authenticates the
+/// AOT sidecar. Stored 0600 inside the already-hardened 0700 cache dir, so a
+/// different local user — who can neither read nor write that dir — can
+/// neither read the key nor forge a valid sidecar (the old unkeyed `sha256`
+/// self-hash was integrity-only: the attacker wrote both halves).
+///
+/// Returns `None` when the key cannot be read or created; the caller must
+/// then compile fresh rather than trust any cache entry.
+fn cache_key(cache_dir: &Path) -> Option<[u8; 32]> {
+    use rand::RngExt;
+    let key_path = cache_dir.join(".cache-key");
+
+    // Pre-existing key: use it (fixing a lax file mode if present). The key
+    // file sits inside the already-hardened 0700 dir, so a hostile local
+    // user can never read or replace it.
+    if let Ok(bytes) = std::fs::read(&key_path) {
+        if let Ok(key) = <[u8; 32]>::try_from(bytes.as_slice()) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+            }
+            return Some(key);
+        }
+        // An EMPTY read is a concurrent writer mid-`create_new`+`write_all`
+        // (concurrent VU threads share the process): retry — NEVER unlink,
+        // since removing the winner's fresh key would make this thread mint
+        // its own, desyncing the sidecars the other writer just
+        // authenticated. If it is still empty after the retries, fall
+        // through to `create_new`, which fails on the existing file, and the
+        // Err arm below reads the winner's key.
+        if bytes.is_empty() {
+            for _ in 0..3 {
+                std::thread::yield_now();
+                if let Some(k) = std::fs::read(&key_path)
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                {
+                    return Some(k);
+                }
+            }
+        } else {
+            // Non-empty wrong length (foreign/corrupt file): replace it
+            // below via `create_new`, which will fail on the existing file,
+            // so remove the bad file first.
+            let _ = std::fs::remove_file(&key_path);
+        }
+    }
+
+    // Generate a fresh key. `create_new` never clobbers an existing file.
+    let key: [u8; 32] = rand::rng().random();
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&key_path)
+    {
+        Ok(mut f) => {
+            use std::io::Write;
+            f.write_all(&key).ok()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+            }
+            Some(key)
+        }
+        Err(_) => {
+            // Lost a race with a concurrent writer: read the winner's key.
+            std::fs::read(&key_path)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        }
+    }
+}
+
+/// Hex-encoded HMAC-SHA256 of `bytes` under the per-user cache key — the AOT
+/// sidecar format. Authenticity, not just integrity: a local attacker who
+/// cannot read the key cannot forge a valid sidecar.
+pub(crate) fn hmac_hex(key: &[u8; 32], bytes: &[u8]) -> String {
+    use hmac::{digest::KeyInit, Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(bytes);
+    let digest = mac.finalize().into_bytes();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        hex.push_str(&format!("{:02x}", b));
+    }
+    hex
 }
 
 /// Hex-encode the SHA-256 digest of `bytes` (cache sidecar format).
@@ -1160,25 +1362,102 @@ mod tests {
         // The cache lives in the host-private dir keyed by sha256(source),
         // never beside the plugin file (P0: an attacker-authored .cwasm next
         // to a benign .wasm must not be deserialized).
+        let cache_dir = wasm_cache_dir().expect("cache dir must be available");
         let key = sha256_hex(ECHO_WAT.as_bytes());
-        let cache_path = wasm_cache_dir().join(format!("{key}.cwasm"));
+        let cache_path = cache_dir.join(format!("{key}.cwasm"));
         assert!(cache_path.exists(), "AOT cache must be written");
         assert!(
             !temp.path().join("plugin.cwasm").exists(),
             "cache must NOT sit beside the plugin file"
         );
-        // Sidecar authenticates the ARTIFACT: it must equal the hash of the
-        // .cwasm bytes (not the source) — tampering with the artifact breaks
-        // the match and forces a recompile.
-        let sidecar =
-            std::fs::read_to_string(wasm_cache_dir().join(format!("{key}.sha256"))).unwrap();
+        // The per-user cache key is materialized beside the cache entries.
+        assert!(
+            cache_dir.join(".cache-key").exists(),
+            "cache key file must exist"
+        );
+        // Sidecar AUTHENTICATES the artifact under the per-user key: it must
+        // equal HMAC-SHA256(key, .cwasm bytes) (not the source) — a tampered
+        // or forged artifact breaks the match and forces a recompile.
+        let sidecar = std::fs::read_to_string(cache_dir.join(format!("{key}.sha256"))).unwrap();
         let artifact = std::fs::read(&cache_path).unwrap();
-        assert_eq!(sidecar.trim(), sha256_hex(&artifact));
+        let key_bytes = cache_key(&cache_dir).expect("cache key must load");
+        assert_eq!(sidecar.trim(), hmac_hex(&key_bytes, &artifact));
 
         // Second load reuses the .cwasm cache.
         let plugin2 = WasmInputAdapter::from_file(&wasm_path).expect("cached load must succeed");
         assert_eq!(plugin2.plugin_id(), "roundtrip-plugin");
         assert!(plugin2.detect(&[0x7f]));
+    }
+
+    /// Distinct source (unique bytes → unique cache key) so the in-memory
+    /// `module_cache` — keyed by sha256(source) and shared process-wide —
+    /// can never satisfy the load and mask a forged on-disk entry.
+    const FORGERY_SOURCE_WAT: &str = r#"
+(module
+  (memory (export "memory") 64 256)
+  (global $heap (mut i32) (i32.const 1024))
+  (data (i32.const 0) "forgery-source-plugin\00")
+  (data (i32.const 32) "{\"name\":\"wasm\",\"items\":[]}\00")
+  (func (export "malloc") (param $size i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (global.get $heap))
+    (global.set $heap (i32.add (global.get $heap) (local.get $size)))
+    (local.get $ptr))
+  (func (export "free") (param $ptr i32))
+  (func (export "adapter_id") (result i32) (i32.const 0))
+  (func (export "adapter_detect") (param $ptr i32) (param $len i32) (result i32)
+    (i32.const 1))
+  (func (export "adapter_parse") (param $in i32) (param $in_len i32) (param $out i32) (param $out_len i32) (result i32)
+    (i32.const 0))
+)
+"#;
+
+    #[test]
+    fn test_unkeyed_sidecar_forgery_rejected() {
+        // P0 regression: the OLD sidecar was an unkeyed sha256 self-hash — a
+        // local attacker who pre-creates the cache dir writes BOTH the
+        // `.cwasm` and its matching `.sha256`, so the check passed and
+        // `unsafe Module::deserialize` ran the attacker's native code. The
+        // keyed sidecar must reject exactly that forgery and recompile from
+        // the trusted source.
+        let cache_dir = wasm_cache_dir().expect("cache dir must be available");
+        let key_bytes = cache_key(&cache_dir).expect("cache key must load");
+
+        let temp = tempfile::tempdir().unwrap();
+        let wasm_path = temp.path().join("plugin.wasm");
+        std::fs::write(&wasm_path, FORGERY_SOURCE_WAT.as_bytes()).unwrap();
+        let key = sha256_hex(FORGERY_SOURCE_WAT.as_bytes());
+        let cache_path = cache_dir.join(format!("{key}.cwasm"));
+        let hash_path = cache_dir.join(format!("{key}.sha256"));
+
+        // Attacker plants a VALID precompiled module (so deserialize would
+        // succeed if trusted) plus the OLD unkeyed self-hash sidecar — the
+        // exact forgery the old check accepted.
+        let engine = global_engine();
+        let forged = engine.precompile_module(LOOP_WAT.as_bytes()).unwrap();
+        std::fs::write(&cache_path, &forged).unwrap();
+        std::fs::write(&hash_path, sha256_hex(&forged)).unwrap();
+
+        let plugin = WasmInputAdapter::from_file(&wasm_path).expect("load must succeed");
+        // The forged (loop-plugin) module must NOT have been deserialized —
+        // the source's identity wins, proving the unkeyed forgery was
+        // rejected and the module was recompiled from source bytes.
+        assert_eq!(
+            plugin.plugin_id(),
+            "forgery-source-plugin",
+            "forged cache entry must be rejected and recompiled from source"
+        );
+
+        // The rejected entry is rewritten with the genuine artifact under a
+        // VALID keyed sidecar — the forgery is gone from disk.
+        let artifact = std::fs::read(&cache_path).unwrap();
+        let sidecar = std::fs::read_to_string(&hash_path).unwrap();
+        assert_eq!(sidecar.trim(), hmac_hex(&key_bytes, &artifact));
+        assert_ne!(
+            sidecar.trim(),
+            sha256_hex(&artifact),
+            "sidecar must be keyed, not the unkeyed self-hash"
+        );
     }
 
     const OVER_MIN_MEMORY_WAT: &str = r#"
