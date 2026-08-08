@@ -109,6 +109,10 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories licenses bans sources
+          # Use the MSRV toolchain (already in the action image) instead of
+          # letting rust-toolchain.toml's "stable" override trigger a fresh
+          # toolchain download into the container on every run.
+          rust-version: 1.85.0
 
   smoke:
     name: e2e smoke (binary)

@@ -1,25 +1,44 @@
 [licenses]
 allow = [
+    # NOTE: the allow list only accepts `license-id [WITH exception]` — no
+    # compound expressions (spdx 0.13). Crates declaring `MIT OR Apache-2.0`
+    # still pass because both branches are allowed individually.
     "MIT",
     "Apache-2.0",
-    "MIT OR Apache-2.0",
+    # wasmtime's cranelift crates are Apache-2.0 WITH LLVM-exception.
+    "Apache-2.0 WITH LLVM-exception",
     "ISC",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "CC0-1.0",
+    # foldhash (wasmtime's hashing dependency) is Zlib-licensed.
+    "Zlib",
+    # webpki-roots / webpki-root-certs (Mozilla root bundle, via
+    # rustls-platform-verifier -> reqwest) are CDLA-Permissive-2.0.
+    "CDLA-Permissive-2.0",
     "Unicode-DFS-2016",
     "Unicode-3.0",
 ]
 
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-notice = "warn"
-unsound = "deny"
-
-[advisories.ignore]
-# Add temporary advisory ignores here with expiry dates
+# cargo-deny >= 0.16 removed the per-category severity keys
+# (vulnerability, notice, unmaintained, unsound, severity-threshold):
+# - vulnerability and notice advisories now fail the check by default; to
+#   ignore a specific one, add it to the `ignore` array below.
+# - `unmaintained` / `unsound` are now scope filters with no warn level:
+#     all        - fail if ANY crate in the graph matches
+#     workspace  - only fail for direct workspace dependencies
+#     transitive - only fail for non-workspace dependencies
+#     none       - ignore entirely
+# Preserving the old intent: unsound blocks everywhere ("deny" -> "all"),
+# unmaintained never blocks ("warn" -> "none").
+unmaintained = "none"
+unsound = "all"
+ignore = [
+    # Add temporary advisory ignores here with expiry dates.
+]
 
 [sources]
-allow-unknown-registries = false
-unknown-registry-fallback = "deny"
+# Old allow-unknown-registries = false + unknown-registry-fallback = "deny"
+# collapsed into a single severity key; crates.io stays allowed by default.
+unknown-registry = "deny"

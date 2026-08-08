@@ -33,6 +33,8 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories
+          # Same toolchain pin as ci.yml — avoids the per-run stable download.
+          rust-version: 1.85.0
 
   outdated:
     name: outdated dependencies (informational)

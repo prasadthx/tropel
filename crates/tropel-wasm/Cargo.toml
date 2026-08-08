@@ -26,7 +26,7 @@ tokio.workspace = true
 # /GS stack-cookie check (STATUS_STACK_BUFFER_OVERRUN). wasmtime 47
 # rewrote trap unwinding with a dedicated unwinder crate, which traps
 # cleanly on Windows (verified by the infinite-loop test).
-wasmtime = { version = "47.0.2", default-features = false, features = [
+wasmtime = { version = "47.0.3", default-features = false, features = [
     "anyhow",
     "cranelift",
     "wat",
