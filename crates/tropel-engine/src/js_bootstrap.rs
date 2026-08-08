@@ -104,14 +104,22 @@ pub(crate) async fn create_vu_js_context(
         tracing::warn!("VU {}: Failed to install PM bridge functions: {}", vu_id, e);
     }
 
+    // The sleep burns WALL time; the per-eval JS interrupt deadline must not
+    // count it against the JS execution budget, or a stock k6 pacing idiom
+    // like `sleep(Math.random()*10)` is interrupted on resume (backlog line
+    // 104). Re-arm the deadline after the blocking sleep, like the WS loop
+    // does per step.
+    let (deadline, max_exec) = ctx.interrupt_deadline_handle();
     ctx.with_ctx(|rq_ctx| {
         let globals = rq_ctx.globals();
+        let deadline_sleep = deadline.clone();
         let _ = globals.set(
             "__tropel_native_sleep",
             rquickjs::function::Func::from(move |ms: f64| {
                 if ms > 0.0 {
                     std::thread::sleep(Duration::from_secs_f64(ms / 1000.0));
                 }
+                tropel_js::rearm_deadline(&deadline_sleep, max_exec);
             }),
         );
     });

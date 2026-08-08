@@ -1061,6 +1061,22 @@ impl JsContext {
     }
 }
 
+/// Re-arm a shared interrupt deadline handle to `now + max_execution_time`.
+///
+/// Blocking host calls (`std::thread::sleep`, HTTP `execute_blocking`,
+/// WebSocket connect) consume wall-clock time that must NOT count against the
+/// per-eval JS execution deadline — the deadline is armed once per eval, so a
+/// stock k6 pacing idiom like `http.get(u); sleep(Math.random()*10);` used to
+/// be interrupted the moment JS resumed after the sleep (backlog line 104).
+/// The WS loop already re-arms per step; this is the shared helper for the
+/// other blocking bridges.
+pub fn rearm_deadline(deadline: &AtomicU64, max_execution_time: Duration) {
+    deadline.store(
+        now_nanos().saturating_add(max_execution_time.as_nanos() as u64),
+        Ordering::Relaxed,
+    );
+}
+
 /// Convert a rquickjs Value to a String representation.
 /// Stringify console.* arguments (backlog line 172): JSON for objects and
 /// arrays (so `console.log({a:1})` prints real data instead of throwing or

@@ -1145,6 +1145,7 @@ impl K6DriverInstance {
         // signatures (to return a native `Object<'js>`), which a closure
         // cannot declare — the registration lives in the generic free fn
         // below. Behavior is identical; only the marshalling changes.
+        let (deadline, max_exec) = self.js_ctx.interrupt_deadline_handle();
         self.js_ctx.with_ctx(|rq_ctx| {
             register_http_bridges(
                 rq_ctx,
@@ -1152,6 +1153,8 @@ impl K6DriverInstance {
                 sink.clone(),
                 &ctx.scenario_name,
                 self.group_stack.clone(),
+                deadline,
+                max_exec,
             );
         });
 
@@ -1172,6 +1175,8 @@ fn register_http_bridges<'js>(
     sink: Arc<Mutex<Vec<Sample>>>,
     scenario: &str,
     group_stack: Arc<Mutex<Vec<String>>>,
+    deadline: Arc<AtomicU64>,
+    max_exec: Duration,
 ) {
     let globals = rq_ctx.globals();
     let http_client_request = http_client.clone();
@@ -1186,6 +1191,10 @@ fn register_http_bridges<'js>(
     // group stack at REQUEST time, so http_req_* samples recorded inside a
     // group carry `group=::path` instead of the hardcoded `group=http`.
     let group_stack_req = group_stack.clone();
+    // The blocking HTTP call burns wall time; re-arm the per-eval JS
+    // deadline after it (backlog line 104).
+    let deadline_req = deadline.clone();
+    let max_exec_req = max_exec;
     let _ = globals.set(
         "__tropel_k6_http_request",
         Func::from(
@@ -1333,6 +1342,10 @@ fn register_http_bridges<'js>(
                 let result = tropel_http::blocking::execute_blocking(async move {
                     http_for_io.execute(&req_for_io).await
                 });
+                // The HTTP call burned wall time; re-arm the per-eval JS
+                // deadline so slow requests don't trip the interrupt on
+                // resume (backlog line 104).
+                tropel_js::rearm_deadline(&deadline_req, max_exec_req);
                 match result {
                     Ok(resp) => {
                         // Record the standard http_req_* samples so
@@ -1414,6 +1427,8 @@ fn register_http_bridges<'js>(
     let batch_sink = sink.clone();
     let scenario_batch = Arc::from(scenario);
     let group_stack_batch = group_stack.clone();
+    let deadline_batch = deadline.clone();
+    let max_exec_batch = max_exec;
     let _ = globals.set(
         "__tropel_k6_http_batch",
         Func::from(move |requests_json: String| -> String {
@@ -1560,6 +1575,9 @@ fn register_http_bridges<'js>(
                 let results = join_all(futures).await;
                 Ok(results)
             });
+            // The batch burned wall time; re-arm the per-eval JS deadline
+            // (backlog line 104).
+            tropel_js::rearm_deadline(&deadline_batch, max_exec_batch);
 
             let mut response_map = serde_json::Map::new();
             if let Ok(results) = responses {
@@ -1886,6 +1904,8 @@ impl K6DriverInstance {
             // ── ws.connect(url, headers_json) -> {id, error} ──
             let sessions_conn = sessions.clone();
             let next_id_conn = next_id.clone();
+            let deadline_conn = deadline.clone();
+            let max_exec_conn = max_exec;
             let _ = globals.set(
                 "__tropel_k6_ws_connect",
                 Func::from(
@@ -2037,6 +2057,10 @@ impl K6DriverInstance {
                             },
                         );
 
+                        // The connect burned wall time; re-arm the per-eval JS
+                        // deadline so a slow handshake doesn't trip the
+                        // interrupt on resume (backlog line 104).
+                        tropel_js::rearm_deadline(&deadline_conn, max_exec_conn);
                         match connect_result {
                             Ok(connecting) => {
                                 sessions_conn.lock().unwrap().insert(
@@ -2076,11 +2100,9 @@ impl K6DriverInstance {
                         // session isn't killed by the eval timeout mid-pump.
                         // Same MONOTONIC base as JsContext's interrupt handler
                         // (backlog P3: an NTP step must not kill a script).
-                        let now_ns = tropel_core::clock::monotonic_now_nanos();
-                        deadline_step.store(
-                            now_ns.saturating_add(max_exec.as_nanos() as u64),
-                            Ordering::Relaxed,
-                        );
+                        // Same arithmetic as the sleep/HTTP/WS-connect bridges
+                        // (shared monotonic-clock helper, backlog line 104).
+                        tropel_js::rearm_deadline(&deadline_step, max_exec);
 
                         let timeout = Duration::from_millis(timeout_ms.max(1.0) as u64);
                         let guard = sessions_step.lock().unwrap();
@@ -3118,15 +3140,22 @@ async fn bootstrap_js_libs(ctx: &mut JsContext) -> Result<()> {
         .bootstrap(ctx, K6_NATIVE_SHIM_BUNDLE)
         .await;
 
-    // Install __tropel_native_sleep (blocks the OS thread, safe under thread-per-core)
+    // Install __tropel_native_sleep (blocks the OS thread, safe under thread-per-core).
+    // The sleep burns WALL time; the per-eval JS interrupt deadline must not
+    // count it against the JS execution budget, or a stock k6 pacing idiom
+    // like `sleep(Math.random()*10)` is interrupted on resume (backlog line
+    // 104). Re-arm the deadline after the blocking sleep, like the WS loop.
+    let (deadline, max_exec) = ctx.interrupt_deadline_handle();
     ctx.with_ctx(|rq_ctx| {
         let globals = rq_ctx.globals();
+        let deadline_sleep = deadline.clone();
         let _ = globals.set(
             "__tropel_native_sleep",
             rquickjs::function::Func::from(move |ms: f64| {
                 if ms > 0.0 {
                     std::thread::sleep(Duration::from_secs_f64(ms / 1000.0));
                 }
+                tropel_js::rearm_deadline(&deadline_sleep, max_exec);
             }),
         );
     });
@@ -5188,6 +5217,29 @@ mod tests {
             .await
             .expect("shim bootstrap should succeed");
         js_ctx
+    }
+
+    /// Regression (backlog line 104): the per-iteration JS interrupt
+    /// deadline counted WALL time spent in blocking host calls, so a stock
+    /// k6 pacing idiom `http.get(u); sleep(Math.random()*10);` was
+    /// interrupted on resume and the run exited non-zero. The sleep bridge
+    /// re-arms the deadline, so a sleep LONGER than the eval budget must
+    /// still let the following JS run.
+    #[tokio::test]
+    async fn test_sleep_rearms_interrupt_deadline() {
+        // 1 s per-eval deadline; the sleep below is 2 s — longer than the
+        // whole budget. With the re-arm the eval must complete.
+        let mut js_ctx = JsContext::new(None, Some(Duration::from_secs(1)))
+            .await
+            .expect("context creation should succeed");
+        bootstrap_js_libs(&mut js_ctx)
+            .await
+            .expect("shim bootstrap should succeed");
+        let out = js_ctx
+            .eval("__tropel_native_sleep(2000); 1 + 1")
+            .await
+            .expect("sleep must not count against the JS execution deadline");
+        assert_eq!(out.trim(), "2");
     }
 
     #[tokio::test]
