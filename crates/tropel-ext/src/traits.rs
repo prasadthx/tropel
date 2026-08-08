@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tropel_core::config::{ExecutionConfig, OutputConfig, ScenarioConfig, ThresholdConfig};
 use tropel_core::scenario::Scenario;
 use tropel_core::types::{Request, Response, Sample};
@@ -277,11 +277,18 @@ pub trait Driver: Send + Sync {
     /// `__ENV` (a common k6 pattern).
     ///
     /// The default implementation declares no setup.
+    ///
+    /// `http_client` is the scenario's shared HTTP client, and `sink` a
+    /// buffer the driver appends HTTP/metric samples to (the engine drains
+    /// it into the run's metrics after setup — k6 counts setup()'s `http.*`
+    /// calls in the run totals). The default implementation ignores both.
     async fn setup(
         &self,
         _bytes: &[u8],
         _source_path: Option<&std::path::Path>,
         _env: &HashMap<String, String>,
+        _http_client: Arc<dyn DriverHttpClient + Send + Sync>,
+        _sink: Arc<Mutex<Vec<Sample>>>,
     ) -> Option<String> {
         None
     }
@@ -292,13 +299,17 @@ pub trait Driver: Send + Sync {
     /// value as `data`. Failures are logged by the driver (k6 parity: a
     /// throwing teardown warns but never changes the run's exit status).
     ///
-    /// The default implementation is a no-op.
+    /// `http_client` / `sink` are the same handles passed to [`Driver::setup`]
+    /// (teardown may also make HTTP calls, k6 §4). The default
+    /// implementation is a no-op.
     async fn teardown(
         &self,
         _bytes: &[u8],
         _source_path: Option<&std::path::Path>,
         _setup_data_json: Option<&str>,
         _env: &HashMap<String, String>,
+        _http_client: Arc<dyn DriverHttpClient + Send + Sync>,
+        _sink: Arc<Mutex<Vec<Sample>>>,
     ) {
     }
 }

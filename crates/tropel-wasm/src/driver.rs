@@ -989,7 +989,9 @@ fn read_mem_string(
 // Registration — compile-time discovery via inventory
 // ══════════════════════════════════════════════════════════════════
 
-inventory::submit!(DriverRegistration::new("wasm", || Box::new(WasmDriver::default())));
+inventory::submit!(DriverRegistration::new("wasm", || Box::new(
+    WasmDriver::default()
+)));
 
 // ══════════════════════════════════════════════════════════════════
 // Tests

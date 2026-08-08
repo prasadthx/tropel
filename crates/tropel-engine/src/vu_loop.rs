@@ -15,7 +15,7 @@ use crate::worker::VUWorkerPool;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tropel_core::config::{
     ExecutionConfig, HttpConfig, ThinkTimeConfig, ThresholdConfig, TlsConfig,
@@ -679,8 +679,34 @@ pub(crate) async fn run_driver_vus(
     // the same merged env the VUs run with (base + scenario overrides).
     let mut setup_env = base_env.clone();
     setup_env.extend(sc_env.clone());
-    let setup_data = driver.setup(&input_bytes, Some(&input_p), &setup_env).await;
+    // k6 §4 (backlog line 119): setup()/teardown() may make HTTP calls —
+    // the throwaway contexts need the shared client + a sink, and their
+    // samples must count in the run totals (k6 records setup http_reqs).
+    // Build ONE lifecycle client (shared_client is MOVED into the run_vus
+    // closure below, so this must be taken before it) and drain each sink
+    // into metrics right after its call.
+    let lifecycle_client: Arc<dyn DriverHttpClient + Send + Sync> =
+        Arc::new(DriverHttpClientImpl {
+            client: shared_client.as_ref().clone(),
+        });
+    let setup_sink: Arc<Mutex<Vec<Sample>>> = Arc::new(Mutex::new(Vec::new()));
+    let setup_data = driver
+        .setup(
+            &input_bytes,
+            Some(&input_p),
+            &setup_env,
+            lifecycle_client.clone(),
+            setup_sink.clone(),
+        )
+        .await;
+    let setup_samples = std::mem::take(&mut *setup_sink.lock().unwrap());
+    if !setup_samples.is_empty() {
+        metrics.record_batch(&setup_samples).await;
+    }
     let setup_data_c = setup_data.clone();
+    // metrics is moved into run_vus below — keep a handle so teardown()'s
+    // samples (also part of the run totals, k6 §4) can be drained after.
+    let metrics_after_run = metrics.clone();
 
     let run_vus_result = run_vus(
         sc_name,
@@ -787,14 +813,21 @@ pub(crate) async fn run_driver_vus(
     // finish, with the `setup()` return value as data. Failures are the
     // driver's to log (a throwing teardown never changes the run's exit
     // status — k6 parity).
+    let teardown_sink: Arc<Mutex<Vec<Sample>>> = Arc::new(Mutex::new(Vec::new()));
     driver
         .teardown(
             &input_bytes,
             Some(&input_p),
             setup_data.as_deref(),
             &setup_env,
+            lifecycle_client,
+            teardown_sink.clone(),
         )
         .await;
+    let teardown_samples = std::mem::take(&mut *teardown_sink.lock().unwrap());
+    if !teardown_samples.is_empty() {
+        metrics_after_run.record_batch(&teardown_samples).await;
+    }
 
     // `run_vus` returns (vu_init_failures, script_failures) — VUs that
     // failed to START and driver iterations that errored. Propagate them so

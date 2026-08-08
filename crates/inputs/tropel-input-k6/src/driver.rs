@@ -239,6 +239,8 @@ impl Driver for K6Driver {
         bytes: &[u8],
         source_path: Option<&Path>,
         env: &HashMap<String, String>,
+        http_client: Arc<dyn DriverHttpClient + Send + Sync>,
+        sink: Arc<Mutex<Vec<Sample>>>,
     ) -> Option<String> {
         // Run the script's `export function setup()` (k6) ONCE per scenario,
         // before any VU spawns. The engine threads the serialized return
@@ -250,14 +252,27 @@ impl Driver for K6Driver {
         // (never silently: a throwing setup is a broken artifact and must be
         // visible, even though the run proceeds with undefined data).
         //
-        // Note: the throwaway context registers the file/SharedArray bridges
-        // but not the HTTP bridges, so `http.get()` inside setup() throws →
-        // logged + data becomes undefined (k6 setup may use HTTP; a future
-        // iteration could register the http bridge here too).
+        // k6 §4 (backlog line 119): setup() may make HTTP calls — the
+        // throwaway context registers the HTTP bridges (via
+        // eval_module_call_export) against the scenario's shared client, and
+        // the samples land in `sink` for the engine to drain into the run's
+        // metrics (k6 counts setup http_reqs). The canonical
+        // login-in-setup pattern therefore works: `http.post(...)` resolves
+        // and its value can be returned as `data`.
         let original = std::str::from_utf8(bytes).ok()?;
         let module_source = prepare_module_source(original, source_path).ok()?;
         let script_dir = source_path.and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        match eval_module_call_export(&module_source, "setup", None, env, script_dir).await {
+        match eval_module_call_export(
+            &module_source,
+            "setup",
+            None,
+            env,
+            script_dir,
+            http_client,
+            sink,
+        )
+        .await
+        {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("k6 setup() failed: {}", e);
@@ -272,11 +287,15 @@ impl Driver for K6Driver {
         source_path: Option<&Path>,
         setup_data_json: Option<&str>,
         env: &HashMap<String, String>,
+        http_client: Arc<dyn DriverHttpClient + Send + Sync>,
+        sink: Arc<Mutex<Vec<Sample>>>,
     ) {
         // Run the script's `export function teardown(data)` (k6) ONCE after
         // all VUs finish, with the `setup()` return value as `data`. A
         // missing export is a silent no-op (k6); a throwing teardown is
         // logged but never affects the run's exit status (k6 parity).
+        // teardown() may also make HTTP calls (k6 §4) — same bridges +
+        // sink as setup(), drained by the engine after the call.
         let Some(original) = std::str::from_utf8(bytes).ok() else {
             return;
         };
@@ -284,9 +303,16 @@ impl Driver for K6Driver {
             return;
         };
         let script_dir = source_path.and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        if let Err(e) =
-            eval_module_call_export(&module_source, "teardown", setup_data_json, env, script_dir)
-                .await
+        if let Err(e) = eval_module_call_export(
+            &module_source,
+            "teardown",
+            setup_data_json,
+            env,
+            script_dir,
+            http_client,
+            sink,
+        )
+        .await
         {
             tracing::warn!("k6 teardown() failed: {}", e);
         }
@@ -2764,6 +2790,8 @@ async fn eval_module_call_export(
     arg_json: Option<&str>,
     env: &HashMap<String, String>,
     script_dir: Option<PathBuf>,
+    http_client: Arc<dyn DriverHttpClient + Send + Sync>,
+    sink: Arc<Mutex<Vec<Sample>>>,
 ) -> Result<Option<String>> {
     let mut js_ctx = JsContext::new(Some(10 * 1024 * 1024), Some(Duration::from_secs(10)))
         .await
@@ -2785,6 +2813,26 @@ async fn eval_module_call_export(
     bootstrap_js_libs(&mut js_ctx).await.map_err(|e| {
         TropelError::Other(format!("k6 shim bootstrap failed for {export} eval: {}", e))
     })?;
+
+    // k6 §4 (backlog line 119): setup()/teardown() may make HTTP calls —
+    // register the native HTTP bridges against the scenario's shared client
+    // so `http.*` resolves in the throwaway context (previously it threw and
+    // the login-in-setup pattern produced data === undefined). Samples land
+    // in `sink`, which the engine drains into the run's metrics. The
+    // blocking HTTP calls re-arm the per-eval deadline (backlog line 104).
+    let (deadline, max_exec) = js_ctx.interrupt_deadline_handle();
+    let group_stack: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    js_ctx.with_ctx(|rq_ctx| {
+        register_http_bridges(
+            rq_ctx,
+            http_client.clone(),
+            sink.clone(),
+            "", // no scenario tag in the lifecycle context
+            group_stack.clone(),
+            deadline,
+            max_exec,
+        );
+    });
 
     // Minimal globals a k6 script may reference at module top level while
     // defining setup()/teardown() (same set as the options/handleSummary
@@ -5923,6 +5971,40 @@ mod tests {
 
     // ── k6 lifecycle: setup() / teardown() (backlog line 127) ──
 
+    // k6 §4 (backlog line 119): setup()/teardown() may make HTTP calls.
+    // Stub client returning a canned 200 so the tests exercise the bridge
+    // wiring (registration + sink), not real I/O.
+    struct StubClient;
+
+    #[async_trait]
+    impl DriverHttpClient for StubClient {
+        async fn execute(&self, req: &Request) -> Result<Response> {
+            Ok(Response {
+                url: req.url.clone(),
+                status_code: 200,
+                status_text: "OK".into(),
+                headers: HashMap::new(),
+                body: b"ok".to_vec(),
+                text_cache: std::cell::OnceCell::new(),
+                json_cache: std::cell::OnceCell::new(),
+                response_time: std::time::Duration::from_millis(2),
+                timings: None,
+                cookies: vec![],
+                size: 2,
+                redirects: vec![],
+            })
+        }
+    }
+
+    async fn test_ctx() -> (
+        Arc<dyn DriverHttpClient + Send + Sync>,
+        Arc<Mutex<Vec<Sample>>>,
+    ) {
+        let client: Arc<dyn DriverHttpClient + Send + Sync> = Arc::new(StubClient);
+        let sink: Arc<Mutex<Vec<Sample>>> = Arc::new(Mutex::new(Vec::new()));
+        (client, sink)
+    }
+
     #[tokio::test]
     async fn test_setup_runs_and_serializes_return_value() {
         // K6Driver::setup must run the script's `export function setup()`
@@ -5933,7 +6015,10 @@ mod tests {
             export function setup() { return { token: "abc", n: 42 }; }
             export default function() {}
         "#;
-        let data = driver.setup(script, None, &HashMap::new()).await;
+        let (client, sink) = test_ctx().await;
+        let data = driver
+            .setup(script, None, &HashMap::new(), client, sink)
+            .await;
         let json = data.expect("setup() must return serialized data");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["token"], "abc");
@@ -5946,8 +6031,12 @@ mod tests {
         // see `undefined` data (k6 parity), never a hard error.
         let driver = K6Driver;
         let script = br#"export default function() {}"#;
+        let (client, sink) = test_ctx().await;
         assert!(
-            driver.setup(script, None, &HashMap::new()).await.is_none(),
+            driver
+                .setup(script, None, &HashMap::new(), client, sink)
+                .await
+                .is_none(),
             "no setup export must yield None"
         );
     }
@@ -5966,19 +6055,88 @@ mod tests {
             }
             export default function() {}
         "#;
-        let data = driver.setup(script, None, &HashMap::new()).await;
+        let (client, sink) = test_ctx().await;
+        let data = driver
+            .setup(script, None, &HashMap::new(), client.clone(), sink.clone())
+            .await;
         // Happy path: correct data — no panic, no error.
         driver
-            .teardown(script, None, data.as_deref(), &HashMap::new())
+            .teardown(
+                script,
+                None,
+                data.as_deref(),
+                &HashMap::new(),
+                client.clone(),
+                sink.clone(),
+            )
             .await;
         // Throwing path: wrong data — teardown throws internally, but the
         // driver only logs (warn) and returns; no panic, no error.
         driver
-            .teardown(script, None, Some("{\"token\":\"WRONG\"}"), &HashMap::new())
+            .teardown(
+                script,
+                None,
+                Some("{\"token\":\"WRONG\"}"),
+                &HashMap::new(),
+                client.clone(),
+                sink.clone(),
+            )
             .await;
         driver
-            .teardown(script, None, Some("not-json"), &HashMap::new())
+            .teardown(
+                script,
+                None,
+                Some("not-json"),
+                &HashMap::new(),
+                client,
+                sink,
+            )
             .await;
+    }
+
+    #[tokio::test]
+    async fn test_setup_can_make_http_calls() {
+        // k6 §4 (backlog line 119) regression: the throwaway setup() context
+        // previously registered ONLY the file/SharedArray bridges, so
+        // `http.get()` threw, the call was logged, and the canonical
+        // login-in-setup pattern gave every VU `data === undefined`. The
+        // HTTP bridges must now be registered: the call succeeds, its
+        // samples land in the sink (for the engine to drain into the run
+        // totals — k6 counts setup http_reqs), and its return value is
+        // serialized as data.
+        let driver = K6Driver;
+        let script = br#"
+            import http from 'k6/http';
+            export function setup() {
+                const res = http.get('http://example.com/');
+                return { status: res.status };
+            }
+            export default function() {}
+        "#;
+        let (client, sink) = test_ctx().await;
+        let data = driver
+            .setup(script, None, &HashMap::new(), client, sink.clone())
+            .await;
+        let json = data.expect("setup() with http.get must return data, not None");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            v["status"], 200,
+            "setup http response status must flow through"
+        );
+
+        // The http.get call must have recorded samples into the sink.
+        let samples = sink.lock().unwrap();
+        let names: Vec<&str> = samples.iter().map(|s| s.metric.as_ref()).collect();
+        assert!(
+            names.contains(&"http_req_duration"),
+            "setup http.get must record http_req_duration, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"http_reqs"),
+            "setup http.get must record http_reqs, got: {:?}",
+            names
+        );
     }
 
     #[tokio::test]
