@@ -30,7 +30,7 @@
 
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tropel_sdk::{ApiKeyLocation, AuthConfig, Body, Method, Request};
 use tropel_sdk::{InputAdapter, InputAdapterRegistration};
 use tropel_sdk::{Result, TropelError};
@@ -908,43 +908,127 @@ fn normalize_swagger2_operation(op: &mut Value) {
 // ── Intra-document $ref resolution ──────────────────────────────
 
 /// Resolve intra-document JSON References (`$ref: "#/components/..."`) by
-/// replacing the reference object with a deep copy of the target. External
-/// refs (`./other.yaml#/...`) are left untouched (they need file access).
-/// Cycle-safe: refs are resolved lazily and never inlined recursively.
+/// replacing the reference object with the target. External refs
+/// (`./other.yaml#/...`) are left untouched (they need file access).
+///
+/// P0: the old implementation inlined ref targets by recursive deep copy
+/// with a depth guard that incremented only when FOLLOWING a ref — never
+/// when descending — so a self-referential schema (`Category { parent,
+/// children[] }`) exploded k¹⁶ and OOM-killed the process, and the WHOLE
+/// document (including `components.schemas`/`responses`, which the typed
+/// model never reads) was resolved, so even an unreferenced recursive
+/// schema blew up.
+///
+/// Fix: only the subtrees the typed model actually CONSUMES are resolved
+/// (`paths`, `components.securitySchemes`) — dead sections are cloned
+/// untouched, but a ref INTO them from a consumed location still resolves
+/// lazily on demand. Each distinct ref is resolved ONCE and memoized, and
+/// an in-progress set cuts cycles with a bounded empty-object placeholder
+/// instead of recursing forever. A recursive body schema now yields a
+/// one-level, bounded example rather than megabytes or a kill.
 fn resolve_refs(doc: &Value) -> Value {
     // Clone the root once; each $ref lookup reads from it.
     let root = doc.clone();
+    let mut cache: HashMap<String, Value> = HashMap::new();
+    let mut in_progress: HashSet<String> = HashSet::new();
 
-    fn resolve(value: &Value, root: &Value, depth: usize) -> Value {
-        // Depth guard: never inline a ref chain deeper than this.
-        if depth > 16 {
-            return value.clone();
-        }
-        match value {
-            Value::Object(map) => {
-                // A pure `{"$ref": "..."}` object → replace with target.
-                if map.len() == 1 {
-                    if let Some(Value::String(ref_str)) = map.get("$ref") {
-                        if let Some(target) = resolve_pointer(root, ref_str) {
-                            return resolve(&target, root, depth + 1);
-                        }
+    let Some(map) = doc.as_object() else {
+        return doc.clone();
+    };
+    let mut out = serde_json::Map::with_capacity(map.len());
+    for (k, v) in map {
+        let resolved = match k.as_str() {
+            // paths → operations (params, requestBody, auth) are consumed.
+            "paths" => resolve_value(v, &root, &mut cache, &mut in_progress),
+            // components: only securitySchemes is read by resolve_auth;
+            // schemas / parameters / requestBodies are dead code but refs
+            // INTO them from paths resolve lazily via resolve_value. A
+            // non-object `components` is preserved verbatim (never dropped).
+            "components" => match v.as_object() {
+                Some(comp_map) => {
+                    let mut comp_out = serde_json::Map::with_capacity(comp_map.len());
+                    for (ck, cv) in comp_map {
+                        let cres = if ck == "securitySchemes" {
+                            resolve_value(cv, &root, &mut cache, &mut in_progress)
+                        } else {
+                            cv.clone()
+                        };
+                        comp_out.insert(ck.clone(), cres);
+                    }
+                    Value::Object(comp_out)
+                }
+                None => v.clone(),
+            },
+            _ => v.clone(),
+        };
+        out.insert(k.clone(), resolved);
+    }
+    Value::Object(out)
+}
+
+/// Resolve a value tree, replacing pure `{"$ref": "..."}` objects with
+/// their (memoized, cycle-cut) targets.
+fn resolve_value(
+    value: &Value,
+    root: &Value,
+    cache: &mut HashMap<String, Value>,
+    in_progress: &mut HashSet<String>,
+) -> Value {
+    match value {
+        Value::Object(map) => {
+            // A pure `{"$ref": "..."}` object → replace with target.
+            if map.len() == 1 {
+                if let Some(Value::String(ref_str)) = map.get("$ref") {
+                    if let Some(resolved) = resolve_ref(ref_str, root, cache, in_progress) {
+                        return resolved;
                     }
                 }
-                // Otherwise recurse into members.
-                let mut out = serde_json::Map::with_capacity(map.len());
-                for (k, v) in map {
-                    out.insert(k.clone(), resolve(v, root, depth));
-                }
-                Value::Object(out)
             }
-            Value::Array(arr) => {
-                Value::Array(arr.iter().map(|v| resolve(v, root, depth)).collect())
+            // Otherwise recurse into members.
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                out.insert(k.clone(), resolve_value(v, root, cache, in_progress));
             }
-            other => other.clone(),
+            Value::Object(out)
         }
+        Value::Array(arr) => Value::Array(
+            arr.iter()
+                .map(|v| resolve_value(v, root, cache, in_progress))
+                .collect(),
+        ),
+        other => other.clone(),
     }
+}
 
-    resolve(doc, &root, 0)
+/// Resolve ONE `$ref` string to its target, memoized and cycle-cut.
+///
+/// Returns `None` for external refs (no `#` prefix — left untouched) or a
+/// missing target. A ref already on the in-progress stack (a recursive
+/// schema pointing back at itself) resolves to an empty object so the
+/// recursion terminates with a bounded placeholder.
+fn resolve_ref(
+    ref_str: &str,
+    root: &Value,
+    cache: &mut HashMap<String, Value>,
+    in_progress: &mut HashSet<String>,
+) -> Option<Value> {
+    if !ref_str.starts_with('#') {
+        return None;
+    }
+    if let Some(cached) = cache.get(ref_str) {
+        return Some(cached.clone());
+    }
+    let target = resolve_pointer(root, ref_str)?;
+    if in_progress.contains(ref_str) {
+        // Cycle (recursive schema): cut the recursion with a bounded
+        // placeholder instead of inlining forever (P0: k¹⁶ explosion).
+        return Some(Value::Object(serde_json::Map::new()));
+    }
+    in_progress.insert(ref_str.to_string());
+    let resolved = resolve_value(&target, root, cache, in_progress);
+    in_progress.remove(ref_str);
+    cache.insert(ref_str.to_string(), resolved.clone());
+    Some(resolved)
 }
 
 /// Resolve a JSON Reference pointer (`#/components/schemas/Foo`) against a
@@ -1934,6 +2018,164 @@ components:
             "aaa-value",
             "sorted-first example must win"
         );
+    }
+
+    #[test]
+    fn test_recursive_schema_ref_resolves_bounded() {
+        // P0 (backlog): resolve_refs inlined ref targets by deep copy with a
+        // depth guard that incremented only when FOLLOWING a ref — a
+        // self-referential schema (`Category { parent, children[] }`) blew up
+        // k¹⁶ and OOM-killed the process. The resolver is now memoized and
+        // cycle-cut: a recursive body schema must parse to a bounded one-
+        // level body in negligible time.
+        let adapter = OpenApiInputAdapter;
+        let data = br##"{
+            "openapi": "3.0.0",
+            "info": {"title": "Recursive", "version": "1.0"},
+            "paths": {
+                "/categories": {
+                    "post": {
+                        "operationId": "createCategory",
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/Category"}
+                                }
+                            }
+                        },
+                        "responses": {"201": {"description": "Created"}}
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "Category": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "parent": {"$ref": "#/components/schemas/Category"},
+                            "children": {
+                                "type": "array",
+                                "items": {"$ref": "#/components/schemas/Category"}
+                            }
+                        }
+                    }
+                }
+            }
+        }"##;
+        let scenario = adapter.parse(data).unwrap();
+        assert_eq!(scenario.items.len(), 1);
+        let req = scenario.items[0].request.as_ref().unwrap();
+        let body = req.body.as_ref().expect("recursive body schema must generate a body");
+        let json = match body {
+            Body::Json(v) => v.to_string(),
+            other => panic!("expected Json body, got {:?}", other),
+        };
+        // Bounded: a recursive schema must produce a one-level example, not
+        // a k¹⁶ (→ megabyte / OOM) expansion. ~50 chars is a one-level
+        // object with parent/children placeholders.
+        assert!(
+            json.len() < 500,
+            "recursive schema must resolve bounded, got {} chars",
+            json.len()
+        );
+    }
+
+    #[test]
+    fn test_unreferenced_recursive_schema_does_not_blow_up() {
+        // P0 (backlog, compounded): the whole document was resolved
+        // INCLUDING components.schemas / responses, which are dead code — so
+        // a recursive schema no request references still OOM-killed the
+        // process. Only consumed subtrees (paths, securitySchemes) are now
+        // resolved; dead sections are cloned untouched, so an unreferenced
+        // recursive schema parses instantly.
+        let adapter = OpenApiInputAdapter;
+        let data = br##"{
+            "openapi": "3.0.0",
+            "info": {"title": "Dead", "version": "1.0"},
+            "paths": {
+                "/ping": {
+                    "get": {"operationId": "ping", "responses": {"200": {"description": "OK"}}}
+                }
+            },
+            "components": {
+                "schemas": {
+                    "Node": {
+                        "type": "object",
+                        "properties": {
+                            "next": {"$ref": "#/components/schemas/Node"},
+                            "children": {
+                                "type": "array",
+                                "items": {"$ref": "#/components/schemas/Node"}
+                            }
+                        }
+                    }
+                }
+            }
+        }"##;
+        let scenario = adapter.parse(data).unwrap();
+        assert_eq!(scenario.items.len(), 1);
+        assert_eq!(scenario.items[0].name, "ping");
+    }
+
+    #[test]
+    fn test_deep_ref_chain_still_resolves_fully() {
+        // The memoized resolver must NOT stop at the first hop: a non-cyclic
+        // A→B→C chain in a request body must inline all three levels (the
+        // old lazy resolve went ref-by-ref; the memoized one must cache the
+        // FULLY resolved target, not a partial one).
+        let adapter = OpenApiInputAdapter;
+        let data = br##"{
+            "openapi": "3.0.0",
+            "info": {"title": "Chain", "version": "1.0"},
+            "paths": {
+                "/pets": {
+                    "post": {
+                        "operationId": "createPet",
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/A"}
+                                }
+                            }
+                        },
+                        "responses": {"201": {"description": "Created"}}
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "A": {
+                        "type": "object",
+                        "properties": {
+                            "b": {"$ref": "#/components/schemas/B"}
+                        }
+                    },
+                    "B": {
+                        "type": "object",
+                        "properties": {
+                            "c": {"$ref": "#/components/schemas/C"}
+                        }
+                    },
+                    "C": {
+                        "type": "object",
+                        "properties": {"depth": {"type": "integer"}}
+                    }
+                }
+            }
+        }"##;
+        let scenario = adapter.parse(data).unwrap();
+        let req = scenario.items[0].request.as_ref().unwrap();
+        let json = match req.body.as_ref().expect("body must generate") {
+            Body::Json(v) => v.to_string(),
+            other => panic!("expected Json body, got {:?}", other),
+        };
+        // Fully inlined: {"b":{"c":{"depth":1}}}
+        assert!(
+            json.contains("\"depth\":1"),
+            "A→B→C chain must inline fully, got: {json}"
+        );
+        assert!(json.contains("\"c\":"), "B must be inlined inside A, got: {json}");
     }
 
     #[test]
