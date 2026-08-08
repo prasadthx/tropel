@@ -4098,6 +4098,122 @@ mod tests {
     }
 
     #[test]
+    fn test_unimplemented_assertion_properties_fail_closed() {
+        // Backlog §1 P0: unimplemented assertion PROPERTIES (pm.expect(false)
+        // .to.be.true, .to.be.null/.undefined/.ok/.empty, pm.expect(null)
+        // .to.exist, and chai .empty/.exist/.NaN/.finite) used to read as
+        // `undefined` and pm.test recorded GREEN — a silent pass. The Proxy
+        // guard now THROWS on unknown assertion names, and the common
+        // property getters are implemented for real.
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(include_str!("../../../../js/chai/chai-shim.js"))
+                .expect("chai shim should eval");
+            ctx.eval::<(), _>(include_str!("../../../../js/pm-api/pm.js"))
+                .expect("pm shim should eval");
+            ctx.eval::<(), _>(
+                r#"
+                // Implemented getters must WORK (pass silently is fine — no throw).
+                globalThis.__pm_true_ok = String((function () {
+                    try { pm.expect(true).to.be.true; return 'ok'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__pm_exist_ok = String((function () {
+                    try { pm.expect(1).to.exist; return 'ok'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__pm_empty_ok = String((function () {
+                    try { pm.expect([]).to.be.empty; return 'ok'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__pm_ok_fail = String((function () {
+                    // pm.expect(false).to.be.true must THROW (was silent pass).
+                    try { pm.expect(false).to.be.true; return 'passed'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__pm_null_exist_fail = String((function () {
+                    // pm.expect(null).to.exist must THROW.
+                    try { pm.expect(null).to.exist; return 'passed'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__pm_unknown_prop = String((function () {
+                    // A typo'd/unimplemented name must THROW, not pass silently.
+                    try { pm.expect(1).to.be.bogusAssertion; return 'passed'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__pm_not_true_fail = String((function () {
+                    // Negated: true IS true, so .not.to.be.true must THROW.
+                    try { pm.expect(true).not.to.be.true; return 'passed'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__pm_not_true_ok = String((function () {
+                    // Negated: false is NOT true, so .not.to.be.true passes.
+                    try { pm.expect(false).not.to.be.true; return 'ok'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__pm_not_exist_fail = String((function () {
+                    // Negated exist: 1 EXISTS, so .not.to.exist must THROW.
+                    // (chai: expect(null).not.to.exist PASSES — null doesn't
+                    // exist — so use a value that exists for the throw case.)
+                    try { pm.expect(1).not.to.exist; return 'passed'; }
+                    catch (e) { return 'threw'; }
+                })());
+                // chai side: implemented getters work, unknown throws.
+                globalThis.__chai_empty_ok = String((function () {
+                    try { chai.expect([]).to.be.empty; return 'ok'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__chai_nan_ok = String((function () {
+                    try { chai.expect(NaN).to.be.NaN; return 'ok'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__chai_exist_fail = String((function () {
+                    try { chai.expect(null).to.exist; return 'passed'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__chai_finite_fail = String((function () {
+                    try { chai.expect(Infinity).to.be.finite; return 'passed'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__chai_unknown_prop = String((function () {
+                    try { chai.expect(1).to.be.bogusAssertion; return 'passed'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__chai_inspect_ok = String((function () {
+                    // Inspection/promise-interop names must resolve normally
+                    // (the guard's allowlist) — JSON.stringify must not throw.
+                    try { JSON.stringify(chai.expect(1)); return 'ok'; }
+                    catch (e) { return 'threw'; }
+                })());
+                globalThis.__chai_true_fail = String((function () {
+                    try { chai.expect(false).to.be.true; return 'passed'; }
+                    catch (e) { return 'threw'; }
+                })());
+            "#,
+            )
+            .expect("script should eval");
+
+            assert_eq!(ctx.eval::<String, _>("__pm_true_ok").unwrap(), "ok", "pm true passes");
+            assert_eq!(ctx.eval::<String, _>("__pm_exist_ok").unwrap(), "ok", "pm exist passes");
+            assert_eq!(ctx.eval::<String, _>("__pm_empty_ok").unwrap(), "ok", "pm empty passes");
+            assert_eq!(ctx.eval::<String, _>("__pm_ok_fail").unwrap(), "threw", "pm false.to.be.true must throw");
+            assert_eq!(ctx.eval::<String, _>("__pm_null_exist_fail").unwrap(), "threw", "pm null.to.exist must throw");
+            assert_eq!(ctx.eval::<String, _>("__pm_unknown_prop").unwrap(), "threw", "pm unknown assertion prop must throw");
+            assert_eq!(ctx.eval::<String, _>("__pm_not_true_fail").unwrap(), "threw", "pm true.not.to.be.true must throw");
+            assert_eq!(ctx.eval::<String, _>("__pm_not_true_ok").unwrap(), "ok", "pm false.not.to.be.true passes");
+            assert_eq!(ctx.eval::<String, _>("__pm_not_exist_fail").unwrap(), "threw", "pm 1.not.to.exist must throw (1 exists)");
+            assert_eq!(ctx.eval::<String, _>("__chai_empty_ok").unwrap(), "ok", "chai empty passes");
+            assert_eq!(ctx.eval::<String, _>("__chai_nan_ok").unwrap(), "ok", "chai NaN passes");
+            assert_eq!(ctx.eval::<String, _>("__chai_exist_fail").unwrap(), "threw", "chai null.to.exist must throw");
+            assert_eq!(ctx.eval::<String, _>("__chai_finite_fail").unwrap(), "threw", "chai Infinity.to.be.finite must throw");
+            assert_eq!(ctx.eval::<String, _>("__chai_unknown_prop").unwrap(), "threw", "chai unknown assertion prop must throw");
+            assert_eq!(ctx.eval::<String, _>("__chai_inspect_ok").unwrap(), "ok", "chai JSON.stringify must not throw (allowlist)");
+            assert_eq!(ctx.eval::<String, _>("__chai_true_fail").unwrap(), "threw", "chai false.to.be.true must throw");
+        });
+    }
+
+    #[test]
     fn test_pm_collection_vars_globals_request_cookies() {
         // Backlog line 145: pm.collectionVariables / pm.globals / pm.request /
         // pm.cookies / pm.expect.fail / pm.test.skip / postman.setNextRequest

@@ -344,9 +344,104 @@ var chai = chai || {};
     };
 
     // ── chai.expect ──
+    // Backlog §1: unimplemented assertion PROPERTIES (e.g. `.to.be.empty`,
+    // `.to.exist`, `.NaN`, `.finite`) used to read as `undefined` and the
+    // enclosing pm.test/check recorded GREEN — a silent pass. The instance is
+    // wrapped in a Proxy whose `get` trap THROWS on unknown assertion names,
+    // so a typo'd or unimplemented assertion fails instead of passing
+    // silently. Known names resolve normally through the prototype chain.
     chai.expect = function (val, msg) {
-        return new Assertion(val, msg, chai.expect);
+        var assertion = new Assertion(val, msg, chai.expect);
+        return new Proxy(assertion, {
+            get: function (target, prop, receiver) {
+                // Symbols (Symbol.toPrimitive etc.) and the standard
+                // inspection/promise interop names must resolve normally — a
+                // `console.log(assertion)` or `JSON.stringify(assertion)`
+                // would otherwise hit the guard and throw spuriously.
+                if (
+                    typeof prop === 'symbol' ||
+                    prop === 'then' || prop === 'toJSON' || prop === 'inspect'
+                ) {
+                    return Reflect.get(target, prop, receiver);
+                }
+                if (prop in Assertion.prototype || prop in target) {
+                    return Reflect.get(target, prop, receiver);
+                }
+                throw new Error("unknown assertion property '" + String(prop) + "'");
+            }
+        });
     };
+
+    // .empty
+    Object.defineProperty(Assertion.prototype, 'empty', {
+        get: function () {
+            var negate = !!(this.__flags && this.__flags.negate);
+            var obj = this._obj;
+            var empty = (typeof obj === 'string' || Array.isArray(obj))
+                ? obj.length === 0
+                : (obj !== null && typeof obj === 'object') && Object.keys(obj).length === 0;
+            var passed = empty !== negate;
+            if (!passed) {
+                throw new Error(
+                    (this._msg ? this._msg + ': ' : '') +
+                    'expected ' + JSON.stringify(obj) + (negate ? ' not' : '') + ' to be empty'
+                );
+            }
+            return this;
+        },
+        enumerable: true
+    });
+
+    // .exist
+    Object.defineProperty(Assertion.prototype, 'exist', {
+        get: function () {
+            var negate = !!(this.__flags && this.__flags.negate);
+            var exists = this._obj !== null && this._obj !== undefined;
+            var passed = exists !== negate;
+            if (!passed) {
+                throw new Error(
+                    (this._msg ? this._msg + ': ' : '') +
+                    'expected ' + JSON.stringify(this._obj) + (negate ? ' not' : '') + ' to exist'
+                );
+            }
+            return this;
+        },
+        enumerable: true
+    });
+
+    // .NaN
+    Object.defineProperty(Assertion.prototype, 'NaN', {
+        get: function () {
+            var negate = !!(this.__flags && this.__flags.negate);
+            var nan = typeof this._obj === 'number' && isNaN(this._obj);
+            var passed = nan !== negate;
+            if (!passed) {
+                throw new Error(
+                    (this._msg ? this._msg + ': ' : '') +
+                    'expected ' + JSON.stringify(this._obj) + (negate ? ' not' : '') + ' to be NaN'
+                );
+            }
+            return this;
+        },
+        enumerable: true
+    });
+
+    // .finite
+    Object.defineProperty(Assertion.prototype, 'finite', {
+        get: function () {
+            var negate = !!(this.__flags && this.__flags.negate);
+            var finite = typeof this._obj === 'number' && isFinite(this._obj);
+            var passed = finite !== negate;
+            if (!passed) {
+                throw new Error(
+                    (this._msg ? this._msg + ': ' : '') +
+                    'expected ' + JSON.stringify(this._obj) + (negate ? ' not' : '') + ' to be finite'
+                );
+            }
+            return this;
+        },
+        enumerable: true
+    });
 
     // ── chai.assert ──
     chai.assert = {

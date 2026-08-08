@@ -430,8 +430,74 @@ pm.test.skip = function (name) {
 // expects surface as a script error and do NOT produce a checks-metric
 // entry — matching Postman, where check metrics come only from pm.test()
 // and check().
+//
+// Backlog §1: unimplemented assertion PROPERTIES (e.g. `pm.expect(false)
+// .to.be.true`, `pm.expect(null).to.exist`) used to read as `undefined` and
+// pm.test recorded GREEN — a silent pass. Every chain object is now wrapped
+// in a Proxy whose `get` trap THROWS on unknown assertion names, so a typo'd
+// or unimplemented assertion fails the check instead of passing silently.
+// The common chai-postman property assertions are implemented below.
+function guardChain(target) {
+    return new Proxy(target, {
+        get: function (t, prop, receiver) {
+            if (
+                typeof prop === 'symbol' ||
+                prop === 'then' || prop === 'toJSON' || prop === 'inspect'
+            ) {
+                return Reflect.get(t, prop, receiver);
+            }
+            if (prop in t) {
+                var v = Reflect.get(t, prop, receiver);
+                // Recurse into nested chain objects so `to.be.true` etc. are
+                // guarded one level deeper.
+                return v !== null && typeof v === 'object' ? guardChain(v) : v;
+            }
+            throw new Error("unknown assertion property '" + String(prop) + "'");
+        }
+    });
+}
+
+// chai-postman property assertions. Each getter THROWS on mismatch so the
+// enclosing pm.test records a failed check (a bare boolean would leave the
+// callback's `undefined` statement result recorded as passed).
+function addPropAssertions(chain, actual, negated) {
+    var checks = {
+        true: function () { return actual === true; },
+        false: function () { return actual === false; },
+        null: function () { return actual === null; },
+        undefined: function () { return actual === undefined; },
+        ok: function () { return !!actual; },
+        empty: function () {
+            if (typeof actual === 'string' || Array.isArray(actual)) return actual.length === 0;
+            if (actual !== null && typeof actual === 'object') return Object.keys(actual).length === 0;
+            return false;
+        },
+        exist: function () { return actual !== null && actual !== undefined; },
+        NaN: function () { return typeof actual === 'number' && isNaN(actual); },
+        finite: function () { return typeof actual === 'number' && isFinite(actual); }
+    };
+    Object.keys(checks).forEach(function (name) {
+        Object.defineProperty(chain, name, {
+            get: function () {
+                // Negated chain: the positive holding means the assertion
+                // FAILS — throw when the check passes, not when it fails.
+                var holds = checks[name]();
+                var passed = negated ? !holds : holds;
+                if (!passed) {
+                    var label = name === 'ok' ? 'be truthy' : name === 'exist' ? 'exist' : 'be ' + name;
+                    throw new Error(
+                        'expected ' + shortJson(actual) + (negated ? ' not' : '') + ' to ' + label
+                    );
+                }
+                return this;
+            },
+            enumerable: true
+        });
+    });
+}
+
 pm.expect = function (actual) {
-    return {
+    var chain = {
         to: {
             // Backlog line 144: chai semantics — .eql is DEEP equality,
             // .equal is strict (===). The old mapping was inverted: eql used
@@ -529,10 +595,33 @@ pm.expect = function (actual) {
                             'expected ' + shortJson(actual) + ' not to equal ' + shortJson(expected)
                         );
                     }
+                },
+                be: {
+                    // Negated property/type assertions:
+                    // `pm.expect(x).not.to.be.true` must THROW when the
+                    // positive holds (the guard applies here too).
+                    an: function (type) {
+                        if (typeOf(actual) === type) {
+                            throw new Error('expected value not to be an ' + type);
+                        }
+                    },
+                    a: function (type) {
+                        return this.an(type);
+                    }
                 }
             }
         }
     };
+    // Install the property assertions on the chain levels where chai-postman
+    // exposes them, then guard the whole chain so ANY unknown name throws.
+    addPropAssertions(chain.to, actual);
+    addPropAssertions(chain.to.be, actual);
+    // Negated chain: both `not.to.true` and the canonical `not.to.be.true`
+    // must be guarded (the getters live on the `be` object, which is a
+    // SEPARATE literal from `not.to`).
+    addPropAssertions(chain.not.to, actual, true);
+    addPropAssertions(chain.not.to.be, actual, true);
+    return guardChain(chain);
 };
 
 // ── pm.request ──
