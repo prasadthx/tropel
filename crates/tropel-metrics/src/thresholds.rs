@@ -1310,7 +1310,11 @@ mod tests {
             "dur".to_string(),
             abort_config("http_req_duration.p95 < 1000", true, None),
         );
-        assert!(check_abort_on_fail(&thresholds, &make_metrics(), Duration::from_secs(5)));
+        assert!(check_abort_on_fail(
+            &thresholds,
+            &make_metrics(),
+            Duration::from_secs(5)
+        ));
     }
 
     #[test]
@@ -1322,7 +1326,11 @@ mod tests {
             "dur".to_string(),
             abort_config("http_req_duration.p95 < 1000", false, None),
         );
-        assert!(!check_abort_on_fail(&thresholds, &make_metrics(), Duration::from_secs(5)));
+        assert!(!check_abort_on_fail(
+            &thresholds,
+            &make_metrics(),
+            Duration::from_secs(5)
+        ));
     }
 
     #[test]
@@ -1357,7 +1365,11 @@ mod tests {
             abort_config("http_req_duration.p95 < 1000", true, None),
         );
         let empty = MetricsResult::default(); // no http_req_duration series
-        assert!(!check_abort_on_fail(&thresholds, &empty, Duration::from_secs(5)));
+        assert!(!check_abort_on_fail(
+            &thresholds,
+            &empty,
+            Duration::from_secs(5)
+        ));
     }
 
     #[test]
@@ -1368,6 +1380,10 @@ mod tests {
             "dur".to_string(),
             abort_config("http_req_duration.p95 < 1500", true, None),
         );
-        assert!(!check_abort_on_fail(&thresholds, &make_metrics(), Duration::from_secs(5)));
+        assert!(!check_abort_on_fail(
+            &thresholds,
+            &make_metrics(),
+            Duration::from_secs(5)
+        ));
     }
 }

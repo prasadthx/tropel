@@ -3,6 +3,7 @@ use rquickjs::function::Func;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tropel_core::error::TropelError;
 use tropel_core::types::{AuthConfig, Body, Method, Request};
 use tropel_core::Result;
 use tropel_http::client::HttpClient;
@@ -285,8 +286,20 @@ impl PmBridge {
     pub fn install(&self, ctx: &mut JsContext) -> Result<()> {
         let state = self.state.clone();
 
-        ctx.with_ctx(|rq_ctx| {
+        let failures: Vec<String> = ctx.with_ctx(|rq_ctx| {
             let globals = rq_ctx.globals();
+            let mut failures: Vec<String> = Vec::new();
+
+            // A failed registration must NOT degrade silently into pm.js's
+            // `typeof` fallbacks (`pm.response.code()` -> 0). Collect every
+            // failing `globals.set` and surface them as an Err below.
+            macro_rules! set_global {
+                ($name:expr, $func:expr $(,)?) => {
+                    if let Err(e) = globals.set($name, $func) {
+                        failures.push(format!("{}: {}", $name, e));
+                    }
+                };
+            }
 
             // ── Environment ──
             // NOTE: environment values are returned RAW (not JSON-encoded) on
@@ -295,7 +308,7 @@ impl PmBridge {
             // JSON.parse). Do NOT "harmonize" this with variables_get's JSON
             // encoding, or env vars like "123" would round-trip as numbers.
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_environment_get",
                 Func::from(move |key: String| -> Option<String> {
                     let st = state_clone.lock().unwrap();
@@ -304,7 +317,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_environment_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
@@ -313,7 +326,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_environment_unset",
                 Func::from(move |key: String| {
                     let mut st = state_clone.lock().unwrap();
@@ -322,7 +335,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_environment_clear",
                 Func::from(move || {
                     let mut st = state_clone.lock().unwrap();
@@ -336,7 +349,7 @@ impl PmBridge {
             // JS type. Without encoding, an env var like "123" would be parsed
             // as the number 123 instead of the string "123".
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_variables_get",
                 Func::from(move |key: String| -> Option<String> {
                     let st = state_clone.lock().unwrap();
@@ -351,7 +364,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_variables_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
@@ -361,7 +374,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_variables_unset",
                 Func::from(move |key: String| {
                     let mut st = state_clone.lock().unwrap();
@@ -375,7 +388,7 @@ impl PmBridge {
             // Backlog line 145: Postman's pm.environment exposes has() and
             // toObject() alongside get/set/unset.
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_environment_has",
                 Func::from(move |key: String| -> bool {
                     let st = state_clone.lock().unwrap();
@@ -384,7 +397,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_environment_to_object",
                 Func::from(move || -> HashMap<String, String> {
                     let st = state_clone.lock().unwrap();
@@ -397,7 +410,7 @@ impl PmBridge {
             // entirely missing. Values are JSON-encoded for type-safe
             // round-tripping, same as variables.
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_collection_vars_get",
                 Func::from(move |key: String| -> Option<String> {
                     let st = state_clone.lock().unwrap();
@@ -406,7 +419,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_collection_vars_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
@@ -416,7 +429,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_collection_vars_unset",
                 Func::from(move |key: String| {
                     let mut st = state_clone.lock().unwrap();
@@ -425,7 +438,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_collection_vars_has",
                 Func::from(move |key: String| -> bool {
                     let st = state_clone.lock().unwrap();
@@ -434,7 +447,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_collection_vars_to_object",
                 Func::from(move || -> HashMap<String, String> {
                     let st = state_clone.lock().unwrap();
@@ -447,7 +460,7 @@ impl PmBridge {
 
             // ── Global Variables (pm.globals) ──
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_globals_get",
                 Func::from(move |key: String| -> Option<String> {
                     let st = state_clone.lock().unwrap();
@@ -456,7 +469,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_globals_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
@@ -465,7 +478,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_globals_unset",
                 Func::from(move |key: String| {
                     let mut st = state_clone.lock().unwrap();
@@ -474,7 +487,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_globals_has",
                 Func::from(move |key: String| -> bool {
                     let st = state_clone.lock().unwrap();
@@ -483,7 +496,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_globals_to_object",
                 Func::from(move || -> HashMap<String, String> {
                     let st = state_clone.lock().unwrap();
@@ -503,7 +516,7 @@ impl PmBridge {
             // when building the outgoing request, so these bridges actually
             // change what goes out on the wire.
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_request_url",
                 Func::from(move || -> String {
                     let st = state_clone.lock().unwrap();
@@ -515,7 +528,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_request_url_set",
                 Func::from(move |url: String| {
                     let mut st = state_clone.lock().unwrap();
@@ -526,7 +539,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_request_method",
                 Func::from(move || -> String {
                     let st = state_clone.lock().unwrap();
@@ -538,7 +551,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_request_method_set",
                 Func::from(move |method: String| {
                     let mut st = state_clone.lock().unwrap();
@@ -549,7 +562,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_request_headers",
                 Func::from(move || -> HashMap<String, String> {
                     let st = state_clone.lock().unwrap();
@@ -562,7 +575,7 @@ impl PmBridge {
 
             // Case-insensitive read (Postman's HeaderList.get is case-insensitive).
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_request_header_get",
                 Func::from(move |key: String| -> Option<String> {
                     let st = state_clone.lock().unwrap();
@@ -578,7 +591,7 @@ impl PmBridge {
             // Upsert case-insensitively: replace an existing differently-cased
             // header rather than creating a duplicate (Postman HeaderList.add).
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_request_header_set",
                 Func::from(move |key: String, value: String| {
                     let mut st = state_clone.lock().unwrap();
@@ -601,7 +614,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_request_header_unset",
                 Func::from(move |key: String| {
                     let mut st = state_clone.lock().unwrap();
@@ -613,7 +626,7 @@ impl PmBridge {
 
             // Body as raw text (get) / raw text (set).
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_request_body",
                 Func::from(move || -> Option<String> {
                     let st = state_clone.lock().unwrap();
@@ -626,7 +639,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_request_body_set",
                 Func::from(move |body: String| {
                     let mut st = state_clone.lock().unwrap();
@@ -641,7 +654,7 @@ impl PmBridge {
             // postman/k6 inputs produce. A prerequest script can therefore
             // sign the outgoing request (the primary purpose of pm.request).
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_request_auth_set",
                 Func::from(move |auth_json: String| {
                     let parsed = serde_json::from_str::<AuthConfig>(&auth_json);
@@ -666,7 +679,7 @@ impl PmBridge {
             // "pm.test.skip is not a function" and fail the whole run. Skipped
             // tests are not pass/fail checks, so nothing is recorded.
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_test_skip",
                 Func::from(move |name: String| {
                     let mut st = state_clone.lock().unwrap();
@@ -677,7 +690,7 @@ impl PmBridge {
 
             // ── Response ──
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_response_code",
                 Func::from(move || -> u16 {
                     let st = state_clone.lock().unwrap();
@@ -686,7 +699,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_response_status",
                 Func::from(move || -> String {
                     let st = state_clone.lock().unwrap();
@@ -698,7 +711,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_response_body",
                 Func::from(move || -> Option<String> {
                     let st = state_clone.lock().unwrap();
@@ -707,7 +720,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_response_time",
                 Func::from(move || -> f64 {
                     let st = state_clone.lock().unwrap();
@@ -721,7 +734,7 @@ impl PmBridge {
             // ── Response Headers (full map) ──
             // rquickjs 0.12+ supports HashMap<String,String> as IntoJs -> JS object
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_response_headers",
                 Func::from(move || -> HashMap<String, String> {
                     let st = state_clone.lock().unwrap();
@@ -734,7 +747,7 @@ impl PmBridge {
 
             // ── Response Header (individual header access, widely used) ──
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_response_header",
                 Func::from(move |key: String| -> Option<String> {
                     let st = state_clone.lock().unwrap();
@@ -755,7 +768,7 @@ impl PmBridge {
             // ── Response Cookies (name → value map)
             // rquickjs 0.12+ supports HashMap<String,String> as IntoJs -> JS object
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_response_cookies",
                 Func::from(move || -> HashMap<String, String> {
                     let st = state_clone.lock().unwrap();
@@ -779,7 +792,7 @@ impl PmBridge {
             // before returning, so the JS shim can throw a descriptive error on
             // invalid JSON.
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_response_json",
                 Func::from(move || -> Option<String> {
                     let st = state_clone.lock().unwrap();
@@ -793,7 +806,7 @@ impl PmBridge {
             // Returns Option<String>: JSON-encoded value so the JS shim can
             // JSON.parse() to restore the correct type.
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_iteration_data_get",
                 Func::from(move |key: String| -> Option<String> {
                     let st = state_clone.lock().unwrap();
@@ -805,7 +818,7 @@ impl PmBridge {
 
             // ── Test ──
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_test",
                 // 3rd arg: optional k6 check() tags JSON (backlog line 149).
                 Func::from(
@@ -826,7 +839,7 @@ impl PmBridge {
             // index directly. Otherwise, look up the name in request_names
             // (populated from scenario items by the runner).
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_set_next_request",
                 Func::from(move |request_id: Option<String>| {
                     let mut st = state_clone.lock().unwrap();
@@ -857,7 +870,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_skip_tests",
                 Func::from(move || {
                     let mut st = state_clone.lock().unwrap();
@@ -872,7 +885,7 @@ impl PmBridge {
             // AND semantically "stopped the whole run". The runner reads this
             // flag after the prerequest script and skips send + test script.
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_skip_request",
                 Func::from(move || {
                     let mut st = state_clone.lock().unwrap();
@@ -882,7 +895,7 @@ impl PmBridge {
 
             // ── Group (for nesting groups with group_duration metric) ──
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_group_start",
                 Func::from(move |name: String| {
                     let mut st = state_clone.lock().unwrap();
@@ -897,7 +910,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_group_end",
                 Func::from(move |name: String, duration_ms: f64| {
                     let mut st = state_clone.lock().unwrap();
@@ -932,7 +945,7 @@ impl PmBridge {
             // ── Custom Metrics ──
             // Add a custom metric sample (Postman-style, no tags).
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_metrics_add",
                 Func::from(move |name: String, value: f64, metric_type_str: String| {
                     let mut st = state_clone.lock().unwrap();
@@ -956,7 +969,7 @@ impl PmBridge {
             );
 
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_metrics_get",
                 Func::from(move |name: String| -> Option<f64> {
                     let st = state_clone.lock().unwrap();
@@ -968,7 +981,7 @@ impl PmBridge {
             // Called by Counter/Gauge/Rate/Trend JS constructors.
             // tags_json is a JSON-encoded object like '{"status":"200","method":"GET"}'.
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_custom_metric_add",
                 Func::from(
                     move |name: String, value: f64, tags_json: String, metric_type_str: String| {
@@ -1009,14 +1022,14 @@ impl PmBridge {
             // ═══════════════════════════════════════════════════
             // exec.vu.idInTest — VU ID
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_exec_vu_id",
                 Func::from(move || -> u32 { state_clone.lock().unwrap().vu_id }),
             );
 
             // exec.scenario.name — scenario name
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_exec_scenario_name",
                 Func::from(move || -> String { state_clone.lock().unwrap().scenario_name.clone() }),
             );
@@ -1026,14 +1039,14 @@ impl PmBridge {
             // via VURunner::with_exec_context. Falls back to "" when the
             // engine hasn't attached it (e.g. script-only test harnesses).
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_exec_scenario_executor",
                 Func::from(move || -> String { state_clone.lock().unwrap().executor_name.clone() }),
             );
 
             // exec.vu.iterationInScenario — current iteration index
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_exec_iteration",
                 Func::from(move || -> u64 { state_clone.lock().unwrap().iteration_index }),
             );
@@ -1043,7 +1056,7 @@ impl PmBridge {
             // PmState; the closure reads it live (lock-free). Falls back to the
             // per-VU iteration index when no handle is attached.
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_exec_iterations_completed",
                 Func::from(move || -> u64 {
                     let st = state_clone.lock().unwrap();
@@ -1058,7 +1071,7 @@ impl PmBridge {
             // the scheduler's shared atomic counter (lock-free). Falls back to
             // 0 when no handle is attached.
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_exec_vus_active",
                 Func::from(move || -> u32 {
                     let st = state_clone.lock().unwrap();
@@ -1071,7 +1084,7 @@ impl PmBridge {
 
             // test.abort(message) — requests engine to abort the test
             let state_clone = state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_test_abort",
                 Func::from(move |message: String| {
                     let mut st = state_clone.lock().unwrap();
@@ -1106,7 +1119,7 @@ impl PmBridge {
             // Returns: JSON-encoded response with code, statusText, body, headers, responseTime
             let http = self.http_client.clone();
             let state_for_send = self.state.clone();
-            let _ = globals.set(
+            set_global!(
                 "__tropel_pm_send_request",
                 Func::from(
                     move |method: String,
@@ -1208,7 +1221,15 @@ impl PmBridge {
                     },
                 ),
             );
+            failures
         });
+
+        if !failures.is_empty() {
+            return Err(TropelError::Js(format!(
+                "PM bridge registration failed: {}",
+                failures.join("; ")
+            )));
+        }
 
         Ok(())
     }

@@ -35,7 +35,9 @@ use tropel_metrics::thresholds::evaluate_thresholds;
 /// `AtomicUsize` guard (returned alongside the address) so the test can
 /// assert REAL concurrency — `http_reqs >= vus` only proves requests fired,
 /// not that `vus` were actually concurrent.
-async fn start_echo_server(seen: Arc<Mutex<Vec<String>>>) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+async fn start_echo_server(
+    seen: Arc<Mutex<Vec<String>>>,
+) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let active = Arc::new(AtomicUsize::new(0));
@@ -333,7 +335,10 @@ async fn prerequest_pm_request_header_reaches_the_wire() -> Result<()> {
     let srv = start_auth_capture_server(seen.clone()).await;
 
     let dir = std::env::temp_dir();
-    let path = dir.join(format!("tropel-e2e-prereq-hdr-{}-prereq.json", std::process::id()));
+    let path = dir.join(format!(
+        "tropel-e2e-prereq-hdr-{}-prereq.json",
+        std::process::id()
+    ));
     let url = format!("http://{srv}/");
     let collection = serde_json::json!({
         "info": {

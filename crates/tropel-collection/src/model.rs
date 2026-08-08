@@ -707,8 +707,7 @@ mod tests {
         // UrlDetail has derived Serialize — a string-form URL re-serializes
         // as the object form with `raw` carrying the original string.
         assert_eq!(
-            item["request"]["url"]["raw"],
-            "https://x.test/submit",
+            item["request"]["url"]["raw"], "https://x.test/submit",
             "url must round-trip (object form, raw preserved)"
         );
         // And it re-parses.

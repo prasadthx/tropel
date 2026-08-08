@@ -284,7 +284,9 @@ mod tests {
             bytes.starts_with(self.detect_prefix)
         }
         fn parse(&self, _bytes: &[u8]) -> tropel_core::Result<Scenario> {
-            Err(TropelError::Other("stub adapter parse not implemented".into()))
+            Err(TropelError::Other(
+                "stub adapter parse not implemented".into(),
+            ))
         }
     }
 
@@ -305,7 +307,9 @@ mod tests {
             _source_path: Option<&std::path::Path>,
             _exec: Option<&str>,
         ) -> tropel_core::Result<Box<dyn DriverInstance>> {
-            Err(TropelError::Other("stub driver init not implemented".into()))
+            Err(TropelError::Other(
+                "stub driver init not implemented".into(),
+            ))
         }
     }
 
@@ -322,7 +326,9 @@ mod tests {
             _req: &Request,
             _config: Option<&Value>,
         ) -> tropel_core::Result<ProtocolOutcome> {
-            Err(TropelError::Other("stub protocol execute not implemented".into()))
+            Err(TropelError::Other(
+                "stub protocol execute not implemented".into(),
+            ))
         }
     }
 
@@ -363,7 +369,10 @@ mod tests {
         let mut reg = ExtensionRegistry::default();
         reg.register_protocol(ProtocolRegistration::new("grpc", stub_protocol));
         reg.register_output("stdout", OutputRegistration::new("stdout", stub_output));
-        reg.register_input_adapter("postman", InputAdapterRegistration::new("postman", stub_adapter));
+        reg.register_input_adapter(
+            "postman",
+            InputAdapterRegistration::new("postman", stub_adapter),
+        );
         reg.register_driver("k6", DriverRegistration::new("k6", stub_driver));
 
         assert!(reg.get_protocol("grpc").is_some());
@@ -380,12 +389,15 @@ mod tests {
     fn factory_registration_takes_precedence_over_adapter_registration() {
         let mut reg = ExtensionRegistry::default();
         reg.register_input_adapter("dup", InputAdapterRegistration::new("dup", stub_adapter));
-        reg.register_adapter_factory("dup", Arc::new(|| -> Box<dyn InputAdapter> {
-            Box::new(StubAdapter {
-                id: "factory-wins",
-                detect_prefix: b"F",
-            })
-        }));
+        reg.register_adapter_factory(
+            "dup",
+            Arc::new(|| -> Box<dyn InputAdapter> {
+                Box::new(StubAdapter {
+                    id: "factory-wins",
+                    detect_prefix: b"F",
+                })
+            }),
+        );
         // Factories are checked first (runtime config overrides static).
         let got = reg.get_input_adapter("dup").unwrap();
         assert_eq!(got.id(), "factory-wins");
@@ -394,18 +406,24 @@ mod tests {
     #[test]
     fn resolve_input_claims_by_content_prefix() {
         let mut reg = ExtensionRegistry::default();
-        reg.register_input_adapter("json", InputAdapterRegistration::new("json", || {
-            Box::new(StubAdapter {
-                id: "json",
-                detect_prefix: b"{",
-            })
-        }));
-        reg.register_input_adapter("xml", InputAdapterRegistration::new("xml", || {
-            Box::new(StubAdapter {
-                id: "xml",
-                detect_prefix: b"<",
-            })
-        }));
+        reg.register_input_adapter(
+            "json",
+            InputAdapterRegistration::new("json", || {
+                Box::new(StubAdapter {
+                    id: "json",
+                    detect_prefix: b"{",
+                })
+            }),
+        );
+        reg.register_input_adapter(
+            "xml",
+            InputAdapterRegistration::new("xml", || {
+                Box::new(StubAdapter {
+                    id: "xml",
+                    detect_prefix: b"<",
+                })
+            }),
+        );
 
         assert_eq!(reg.resolve_input(b"{...}").unwrap().id(), "json");
         assert_eq!(reg.resolve_input(b"<x/>").unwrap().id(), "xml");
@@ -419,12 +437,15 @@ mod tests {
     fn resolve_input_priority_wins_over_registration_order() {
         let mut reg = ExtensionRegistry::default();
         // Both detect `b"{` — the LOWER-priority one is registered first.
-        reg.register_input_adapter("generic", InputAdapterRegistration::new("generic", || {
-            Box::new(StubAdapter {
-                id: "generic",
-                detect_prefix: b"{",
-            })
-        }));
+        reg.register_input_adapter(
+            "generic",
+            InputAdapterRegistration::new("generic", || {
+                Box::new(StubAdapter {
+                    id: "generic",
+                    detect_prefix: b"{",
+                })
+            }),
+        );
         reg.register_input_adapter(
             "specific",
             InputAdapterRegistration::new("specific", || {

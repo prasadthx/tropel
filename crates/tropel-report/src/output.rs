@@ -392,7 +392,11 @@ mod tests {
             allowlist: vec!["url".into(), "method".into()],
             max_tags: None,
         };
-        let out = policy.apply(&tagmap(&[("url", "/a"), ("method", "GET"), ("status", "200")]));
+        let out = policy.apply(&tagmap(&[
+            ("url", "/a"),
+            ("method", "GET"),
+            ("status", "200"),
+        ]));
         assert_eq!(out.len(), 2);
         assert_eq!(out.get("url"), Some("/a"));
         assert_eq!(out.get("method"), Some("GET"));
@@ -489,9 +493,6 @@ mod tests {
         let (line1, _) = state.render(&start);
         assert!(line1.contains("2/2 VUs"), "line1: {line1}");
         let (_, line2) = state.render(&start);
-        assert!(
-            line2.contains("(no fixed duration)"),
-            "line2: {line2}"
-        );
+        assert!(line2.contains("(no fixed duration)"), "line2: {line2}");
     }
 }

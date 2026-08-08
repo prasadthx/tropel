@@ -580,7 +580,10 @@ mod tests {
     fn registration_builders_default_priority_zero() {
         assert_eq!(ProtocolRegistration::new("grpc", stub_protocol).priority, 0);
         assert_eq!(OutputRegistration::new("stdout", stub_output).priority, 0);
-        assert_eq!(InputAdapterRegistration::new("postman", stub_adapter).priority, 0);
+        assert_eq!(
+            InputAdapterRegistration::new("postman", stub_adapter).priority,
+            0
+        );
         assert_eq!(DriverRegistration::new("k6", stub_driver).priority, 0);
     }
 

@@ -357,8 +357,6 @@ fn paren_expr_stmt<'a>(
     ))
 }
 
-
-
 /// Strip k6 virtual-module imports / re-exports from a module source using the
 /// oxc AST (NOT regex).
 ///
@@ -751,10 +749,7 @@ mod tests {
             !js.contains("export default class {") && !js.contains("export default class{"),
             "got: {js}"
         );
-        assert!(
-            js.contains("(class") || js.contains("class {"),
-            "got: {js}"
-        );
+        assert!(js.contains("(class") || js.contains("class {"), "got: {js}");
         assert!(js.contains("method()"), "got: {js}");
     }
 
@@ -804,8 +799,7 @@ mod tests {
         assert!(js.contains("export default function"), "got: {js}");
         // The keep-exports output must still re-parse as a module.
         let allocator = Allocator::default();
-        let ret =
-            Parser::new(&allocator, &js, SourceType::default().with_module(true)).parse();
+        let ret = Parser::new(&allocator, &js, SourceType::default().with_module(true)).parse();
         assert!(
             ret.errors
                 .iter()

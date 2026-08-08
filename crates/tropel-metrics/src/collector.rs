@@ -859,26 +859,15 @@ impl Aggregator {
                     rate: 0.0,
                     histogram: None,
                 },
-                MetricType::Trend => {
-                    let stats = set.trend_stats();
-                    MetricSummary {
-                        key: key_str,
-                        tags: summary_tags,
-                        metric_type: MetricType::Trend,
-                        count: set.count as u64,
-                        sum: set.sum,
-                        mean: set.mean(),
-                        min: stats.min,
-                        max: stats.max,
-                        p50: stats.p50,
-                        p90: stats.p90,
-                        p95: stats.p95,
-                        p99: stats.p99,
-                        last: 0.0,
-                        rate: 0.0,
-                        histogram: retain_histograms.then(|| set.histogram.clone()).flatten(),
-                    }
-                }
+                MetricType::Trend => trend_summary(
+                    key_str,
+                    summary_tags,
+                    set.count as u64,
+                    set.sum,
+                    set.mean(),
+                    &set.trend_stats(),
+                    retain_histograms.then(|| set.histogram.clone()).flatten(),
+                ),
             };
 
             // Derive headline values from the metric key — EXACT base-name
@@ -954,26 +943,17 @@ impl Aggregator {
         // never double-counts samples that also exist as raw series.
         let mut per_url = Vec::with_capacity(self.merged_per_url.len());
         for (url, merged) in &self.merged_per_url {
-            let stats = merged.trend_stats();
-            per_url.push(MetricSummary {
-                key: format!("http_req_duration{{url={}}}", url),
-                tags: vec![("url".to_string(), url.clone())],
-                metric_type: MetricType::Trend,
-                count: merged.count as u64,
-                sum: merged.sum,
-                mean: merged.mean(),
-                min: stats.min,
-                max: stats.max,
-                p50: stats.p50,
-                p90: stats.p90,
-                p95: stats.p95,
-                p99: stats.p99,
-                last: 0.0,
-                rate: 0.0,
-                histogram: retain_histograms
+            per_url.push(trend_summary(
+                format!("http_req_duration{{url={}}}", url),
+                vec![("url".to_string(), url.clone())],
+                merged.count as u64,
+                merged.sum,
+                merged.mean(),
+                &merged.trend_stats(),
+                retain_histograms
                     .then(|| merged.histogram.clone())
                     .flatten(),
-            });
+            ));
         }
 
         // Build per-group summaries (merged histograms per (metric, group))
@@ -982,28 +962,17 @@ impl Aggregator {
         let mut per_group = Vec::with_capacity(self.merged_per_group.len());
         for ((fam, group), merged) in &self.merged_per_group {
             let summary = match merged.metric_type {
-                MetricType::Trend => {
-                    let stats = merged.trend_stats();
-                    MetricSummary {
-                        key: format!("{fam}{{group={group}}}"),
-                        tags: vec![("group".to_string(), group.clone())],
-                        metric_type: MetricType::Trend,
-                        count: merged.count as u64,
-                        sum: merged.sum,
-                        mean: merged.mean(),
-                        min: stats.min,
-                        max: stats.max,
-                        p50: stats.p50,
-                        p90: stats.p90,
-                        p95: stats.p95,
-                        p99: stats.p99,
-                        last: 0.0,
-                        rate: 0.0,
-                        histogram: retain_histograms
-                            .then(|| merged.histogram.clone())
-                            .flatten(),
-                    }
-                }
+                MetricType::Trend => trend_summary(
+                    format!("{fam}{{group={group}}}"),
+                    vec![("group".to_string(), group.clone())],
+                    merged.count as u64,
+                    merged.sum,
+                    merged.mean(),
+                    &merged.trend_stats(),
+                    retain_histograms
+                        .then(|| merged.histogram.clone())
+                        .flatten(),
+                ),
                 MetricType::Counter => MetricSummary {
                     key: format!("{fam}{{group={group}}}"),
                     tags: vec![("group".to_string(), group.clone())],
@@ -1070,50 +1039,32 @@ impl Aggregator {
 
         // Build headline iteration_duration from the incremental accumulator
         if let Some(merged) = self.merged_iter_dur.as_ref() {
-            let stats = merged.trend_stats();
-            iteration_duration = Some(MetricSummary {
-                key: "iteration_duration".to_string(),
-                tags: vec![],
-                metric_type: MetricType::Trend,
-                count: merged.count as u64,
-                sum: merged.sum,
-                mean: merged.mean(),
-                min: stats.min,
-                max: stats.max,
-                p50: stats.p50,
-                p90: stats.p90,
-                p95: stats.p95,
-                p99: stats.p99,
-                last: 0.0,
-                rate: 0.0,
-                histogram: retain_histograms
+            iteration_duration = Some(trend_summary(
+                "iteration_duration".to_string(),
+                vec![],
+                merged.count as u64,
+                merged.sum,
+                merged.mean(),
+                &merged.trend_stats(),
+                retain_histograms
                     .then(|| merged.histogram.clone())
                     .flatten(),
-            });
+            ));
         }
 
         // Build headline http_req_duration from the incremental accumulator
         if let Some(merged) = self.merged_http_dur.as_ref() {
-            let stats = merged.trend_stats();
-            http_req_duration = Some(MetricSummary {
-                key: "http_req_duration".to_string(),
-                tags: vec![],
-                metric_type: MetricType::Trend,
-                count: merged.count as u64,
-                sum: merged.sum,
-                mean: merged.mean(),
-                min: stats.min,
-                max: stats.max,
-                p50: stats.p50,
-                p90: stats.p90,
-                p95: stats.p95,
-                p99: stats.p99,
-                last: 0.0,
-                rate: 0.0,
-                histogram: retain_histograms
+            http_req_duration = Some(trend_summary(
+                "http_req_duration".to_string(),
+                vec![],
+                merged.count as u64,
+                merged.sum,
+                merged.mean(),
+                &merged.trend_stats(),
+                retain_histograms
                     .then(|| merged.histogram.clone())
                     .flatten(),
-            });
+            ));
         }
 
         // Headline counters: take the MAX of the surviving series and the
@@ -1378,6 +1329,39 @@ pub fn merge_snapshots(
         agg.absorb_snapshot(snap)?;
     }
     Ok(agg.build_results())
+}
+
+/// Build the Trend-typed `MetricSummary` shared by all five construction
+/// sites in `build_results` (raw series, per-URL, per-group,
+/// iteration_duration headline, http_req_duration headline). Trend is the
+/// only type that reads histogram-derived percentiles, so the other four
+/// `MetricSummary` constructions stay inline.
+fn trend_summary(
+    key: String,
+    tags: Vec<(String, String)>,
+    count: u64,
+    sum: f64,
+    mean: f64,
+    stats: &HistogramStats,
+    histogram: Option<LatencyHistogram>,
+) -> MetricSummary {
+    MetricSummary {
+        key,
+        tags,
+        metric_type: MetricType::Trend,
+        count,
+        sum,
+        mean,
+        min: stats.min,
+        max: stats.max,
+        p50: stats.p50,
+        p90: stats.p90,
+        p95: stats.p95,
+        p99: stats.p99,
+        last: 0.0,
+        rate: 0.0,
+        histogram,
+    }
 }
 
 /// Summary of a single metric, with type-aware statistics.
@@ -1906,7 +1890,11 @@ mod tests {
         // be).
         let ts = std::time::SystemTime::now();
         let mut agg = Aggregator::new();
-        let rec = |agg: &mut Aggregator, metric: &str, value: f64, st: SampleType, tags: Vec<(&str, &str)>| {
+        let rec = |agg: &mut Aggregator,
+                   metric: &str,
+                   value: f64,
+                   st: SampleType,
+                   tags: Vec<(&str, &str)>| {
             let mut t = tropel_core::types::TagMap::new();
             for (k, v) in tags {
                 t.insert(k, v);
@@ -1940,13 +1928,37 @@ mod tests {
                     ("name", *url),
                     ("group", "http"),
                 ];
-                rec(&mut agg, "http_req_duration", d as f64, SampleType::Trend, tags);
-                rec(&mut agg, "http_reqs", 1.0, SampleType::Counter, vec![("url", *url), ("status", *status), ("method", "GET")]);
+                rec(
+                    &mut agg,
+                    "http_req_duration",
+                    d as f64,
+                    SampleType::Trend,
+                    tags,
+                );
+                rec(
+                    &mut agg,
+                    "http_reqs",
+                    1.0,
+                    SampleType::Counter,
+                    vec![("url", *url), ("status", *status), ("method", "GET")],
+                );
                 // Failures: the 500 responses fail; 200s succeed.
                 let failed = if *status == "500" { 1.0 } else { 0.0 };
-                rec(&mut agg, "http_req_failed", failed, SampleType::Rate, vec![("url", *url), ("status", *status)]);
+                rec(
+                    &mut agg,
+                    "http_req_failed",
+                    failed,
+                    SampleType::Rate,
+                    vec![("url", *url), ("status", *status)],
+                );
                 // Per-request data: 100 B received, 20 B sent.
-                rec(&mut agg, "data_received", 100.0, SampleType::Counter, vec![]);
+                rec(
+                    &mut agg,
+                    "data_received",
+                    100.0,
+                    SampleType::Counter,
+                    vec![],
+                );
                 rec(&mut agg, "data_sent", 20.0, SampleType::Counter, vec![]);
             }
         }
@@ -1957,15 +1969,30 @@ mod tests {
         // 2 iterations (iteration_duration Trend).
         rec(&mut agg, "iterations", 1.0, SampleType::Counter, vec![]);
         rec(&mut agg, "iterations", 1.0, SampleType::Counter, vec![]);
-        rec(&mut agg, "iteration_duration", 500_000.0, SampleType::Trend, vec![]);
-        rec(&mut agg, "iteration_duration", 900_000.0, SampleType::Trend, vec![]);
+        rec(
+            &mut agg,
+            "iteration_duration",
+            500_000.0,
+            SampleType::Trend,
+            vec![],
+        );
+        rec(
+            &mut agg,
+            "iteration_duration",
+            900_000.0,
+            SampleType::Trend,
+            vec![],
+        );
         // 1 error.
         rec(&mut agg, "errors", 1.0, SampleType::Counter, vec![]);
 
         let res = agg.build_results();
 
         // ── Exact headline numbers ──
-        assert_eq!(res.http_reqs, 8, "8 requests total (2 per url×status combo)");
+        assert_eq!(
+            res.http_reqs, 8,
+            "8 requests total (2 per url×status combo)"
+        );
         assert_eq!(res.checks_total, 3);
         assert_eq!(res.checks_passed, 2);
         assert_eq!(res.checks_failed, 1);
@@ -1977,17 +2004,31 @@ mod tests {
         assert_eq!(res.http_req_failed, 0.5);
 
         // ── Exact trend stats (µs) for the merged http_req_duration ──
-        let dur = res.http_req_duration.as_ref().expect("headline http_req_duration");
+        let dur = res
+            .http_req_duration
+            .as_ref()
+            .expect("headline http_req_duration");
         assert_eq!(dur.count, 8);
         assert_eq!(dur.sum, 52_000.0); // 1k+2k+4k+8k+3k+6k+12k+16k
         assert_eq!(dur.mean, 6500.0);
         // min/max come from hdr-histogram, whose max() reports the bucket
         // UPPER EDGE (16007 for 16000 at sigfig 3), so assert coverage not
         // exact equality — the sample must never be excluded.
-        assert!(dur.min <= 1000 && dur.min >= 990, "min={} covers 1000", dur.min);
-        assert!(dur.max >= 16000 && dur.max <= 16150, "max={} covers 16000", dur.max);
+        assert!(
+            dur.min <= 1000 && dur.min >= 990,
+            "min={} covers 1000",
+            dur.min
+        );
+        assert!(
+            dur.max >= 16000 && dur.max <= 16150,
+            "max={} covers 16000",
+            dur.max
+        );
 
-        let iter = res.iteration_duration.as_ref().expect("headline iteration_duration");
+        let iter = res
+            .iteration_duration
+            .as_ref()
+            .expect("headline iteration_duration");
         assert_eq!(iter.count, 2);
         assert_eq!(iter.sum, 1_400_000.0);
         assert_eq!(iter.mean, 700_000.0);
@@ -1997,7 +2038,9 @@ mod tests {
         let dur_series: Vec<_> = res
             .metrics
             .iter()
-            .filter(|m| m.metric_type == MetricType::Trend && m.key.starts_with("http_req_duration{"))
+            .filter(|m| {
+                m.metric_type == MetricType::Trend && m.key.starts_with("http_req_duration{")
+            })
             .collect();
         assert_eq!(dur_series.len(), 4, "4 url×status duration series");
         for s in &dur_series {
@@ -2013,7 +2056,13 @@ mod tests {
             ]);
         for s in &dur_series {
             let url = s.tags.iter().find(|(k, _)| k == "url").unwrap().1.as_str();
-            let status = s.tags.iter().find(|(k, _)| k == "status").unwrap().1.as_str();
+            let status = s
+                .tags
+                .iter()
+                .find(|(k, _)| k == "status")
+                .unwrap()
+                .1
+                .as_str();
             let (want_min, want_max) = expect_min_max[&(url, status)];
             // Bucket-quantized min/max: assert coverage, not exact equality.
             assert!(
@@ -2028,7 +2077,9 @@ mod tests {
             );
         }
         // The url tag is present on every duration series.
-        assert!(dur_series.iter().all(|m| m.tags.iter().any(|(k, _)| k == "url")));
+        assert!(dur_series
+            .iter()
+            .all(|m| m.tags.iter().any(|(k, _)| k == "url")));
 
         // ── Checks headline counts survive per-tag splits ──
         assert!(res.metrics.iter().any(|m| m.key == "checks"));

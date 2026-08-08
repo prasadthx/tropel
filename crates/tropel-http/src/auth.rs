@@ -1729,8 +1729,7 @@ mod tests {
             "MD5",
         );
         assert_eq!(
-            response,
-            "6629fae49393a05397450978507c4ef1",
+            response, "6629fae49393a05397450978507c4ef1",
             "RFC 2617 §3.5 published response"
         );
     }

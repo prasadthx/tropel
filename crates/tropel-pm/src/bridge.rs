@@ -246,10 +246,28 @@ mod tests {
         st.attach_exec_context("constant-vus".into(), active.clone(), total.clone());
         assert_eq!(st.executor_name, "constant-vus");
         // Reads go through the SAME Arc as the caller's — live updates visible.
-        assert_eq!(st.active_vus.as_ref().unwrap().load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(
+            st.active_vus
+                .as_ref()
+                .unwrap()
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
         active.store(9, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(st.active_vus.as_ref().unwrap().load(std::sync::atomic::Ordering::Relaxed), 9);
+        assert_eq!(
+            st.active_vus
+                .as_ref()
+                .unwrap()
+                .load(std::sync::atomic::Ordering::Relaxed),
+            9
+        );
         total.store(42, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(st.global_iterations.as_ref().unwrap().load(std::sync::atomic::Ordering::Relaxed), 42);
+        assert_eq!(
+            st.global_iterations
+                .as_ref()
+                .unwrap()
+                .load(std::sync::atomic::Ordering::Relaxed),
+            42
+        );
     }
 }

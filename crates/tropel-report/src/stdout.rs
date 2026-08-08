@@ -367,8 +367,22 @@ mod tests {
             checks_passed: 2,
             checks_failed: 0,
             run_duration: Duration::from_secs(10),
-            http_req_duration: Some(trend("http_req_duration", 134_890.0, 150_040, 268_230, 272_420, 337_910)),
-            iteration_duration: Some(trend("iteration_duration", 294_580.0, 262_280, 278_660, 321_420, 1_150_000)),
+            http_req_duration: Some(trend(
+                "http_req_duration",
+                134_890.0,
+                150_040,
+                268_230,
+                272_420,
+                337_910,
+            )),
+            iteration_duration: Some(trend(
+                "iteration_duration",
+                294_580.0,
+                262_280,
+                278_660,
+                321_420,
+                1_150_000,
+            )),
             summary_trend_stats: vec![],
             effective_thresholds: HashMap::new(),
             ..Default::default()
@@ -391,7 +405,14 @@ mod tests {
     #[test]
     fn render_trend_uses_ms_for_time_metrics_only() {
         let mut out = String::new();
-        let m = trend("http_req_duration", 134_890.0, 150_040, 268_230, 272_420, 337_910);
+        let m = trend(
+            "http_req_duration",
+            134_890.0,
+            150_040,
+            268_230,
+            272_420,
+            337_910,
+        );
         let stats = vec![
             "avg".to_string(),
             "min".to_string(),
@@ -412,7 +433,14 @@ mod tests {
         // A custom byte-count trend is NOT a time metric — values render raw
         // with no ms suffix (regression: old code stamped ms on everything).
         let mut out = String::new();
-        let m = trend("http_response_body_size", 2_500_000.0, 2_400_000, 3_000_000, 3_200_000, 3_500_000);
+        let m = trend(
+            "http_response_body_size",
+            2_500_000.0,
+            2_400_000,
+            3_000_000,
+            3_200_000,
+            3_500_000,
+        );
         let stats = vec!["avg".to_string(), "med".to_string()];
         StdoutReporter::render_trend(&mut out, "", &m, &stats);
         assert!(out.contains("avg=2500000.00"), "{out}");
@@ -451,8 +479,22 @@ mod tests {
     #[test]
     fn render_per_url_breakdown_when_multiple_urls() {
         let mut r = result_with();
-        let mut a = trend("http_req_duration{url=/a}", 100_000.0, 100_000, 150_000, 160_000, 200_000);
-        let mut b = trend("http_req_duration{url=/b}", 200_000.0, 200_000, 250_000, 260_000, 300_000);
+        let mut a = trend(
+            "http_req_duration{url=/a}",
+            100_000.0,
+            100_000,
+            150_000,
+            160_000,
+            200_000,
+        );
+        let mut b = trend(
+            "http_req_duration{url=/b}",
+            200_000.0,
+            200_000,
+            250_000,
+            260_000,
+            300_000,
+        );
         a.tags = vec![("url".to_string(), "/a".to_string())];
         b.tags = vec![("url".to_string(), "/b".to_string())];
         r.per_url = vec![a, b];

@@ -9,9 +9,10 @@
 //! per-iteration source ([`VuIterationSource`]).
 
 use crate::js_bootstrap::create_vu_js_context;
+use crate::pacing::{apply_think_time, extract_think_time};
+use crate::vu_sources::{DriverVuSource, ScenarioVuSource};
 use crate::worker::VUWorkerPool;
 use async_trait::async_trait;
-use rand::RngExt;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -25,28 +26,27 @@ use tropel_core::Result;
 use tropel_executor::runner::VURunner;
 use tropel_executor::scheduler::{VUScheduler, VuLease};
 use tropel_ext::registry::ExtensionRegistry;
-use tropel_ext::traits::{Driver, DriverHttpClient, DriverInstance, Protocol, VuContext};
+use tropel_ext::traits::{Driver, DriverHttpClient, Protocol};
 use tropel_http::client::HttpClient;
 use tropel_metrics::collector::MetricsCollector;
 use tropel_metrics::thresholds::{check_abort_on_fail, evaluate_thresholds};
-use tropel_pm::bridge::SharedPmState;
 
 /// Outcome of one VU iteration, normalized across scenario runners and
 /// driver instances so the shared loop can drive either.
-struct VuIterationOutcome {
-    samples: Vec<Sample>,
-    abort_message: Option<String>,
+pub(crate) struct VuIterationOutcome {
+    pub(crate) samples: Vec<Sample>,
+    pub(crate) abort_message: Option<String>,
     /// Number of script executions (prerequest/test/driver iteration) that
     /// errored this iteration. Aggregated into the run-wide counter so a run
     /// where scripts keep throwing exits non-zero (backlog line 98). `u64`
     /// matches the run-wide counter type (no cast noise).
-    script_failures: u64,
+    pub(crate) script_failures: u64,
 }
 
 /// A per-iteration execution source. The shared VU loop calls this once per
 /// iteration; scenario runners and driver instances each implement it.
 #[async_trait]
-trait VuIterationSource: Send {
+pub(crate) trait VuIterationSource: Send {
     async fn run_iteration(
         &mut self,
         iteration_index: u64,
@@ -55,154 +55,6 @@ trait VuIterationSource: Send {
     ) -> VuIterationOutcome;
 }
 
-// ── Scenario source: VURunner (Postman pm.* declarative execution) ──
-
-struct ScenarioVuSource {
-    runner: VURunner,
-    pm_state: SharedPmState,
-}
-
-#[async_trait]
-impl VuIterationSource for ScenarioVuSource {
-    async fn run_iteration(
-        &mut self,
-        iteration_index: u64,
-        data_row: Option<HashMap<String, serde_json::Value>>,
-        vu_env: &HashMap<String, String>,
-    ) -> VuIterationOutcome {
-        let iter_result = self
-            .runner
-            .run_iteration(iteration_index, data_row, vu_env)
-            .await;
-        let abort_message = {
-            let state = self.pm_state.lock().unwrap();
-            if state.abort_requested {
-                Some(
-                    state
-                        .abort_message
-                        .clone()
-                        .unwrap_or_else(|| "Test aborted by script".to_string()),
-                )
-            } else {
-                None
-            }
-        };
-        VuIterationOutcome {
-            samples: iter_result.samples,
-            abort_message,
-            // Backlog line 98: prerequest/test script errors now surface as
-            // failed checks inside samples AND count here so the run exits
-            // non-zero when scripts keep failing.
-            script_failures: iter_result.script_failures,
-        }
-    }
-}
-
-// ── Driver source: k6-style imperative driver instance ──
-
-struct DriverVuSource {
-    instance: Box<dyn DriverInstance>,
-    http_client: Arc<dyn DriverHttpClient + Send + Sync>,
-    executor_name: String,
-    driver_id: String,
-    vu_id: u32,
-    sc_name: String,
-    sched: Arc<VUScheduler>,
-    /// The merged run env, cloned ONCE at construction. `VuContext.env` is
-    /// only consumed by the k6 driver's sync_globals() to seed
-    /// __ENV/__tropel_env, which happens on the FIRST iteration only — so
-    /// ctx.env is populated exactly once and never deep-cloned per iteration.
-    env: HashMap<String, String>,
-    env_attached: bool,
-    /// The script's `setup()` return value (serialized JSON), computed once
-    /// per scenario by `Driver::setup` before VUs spawn and threaded into
-    /// every VU's `VuContext.setup_data` so `export default function (data)`
-    /// receives it (k6 lifecycle). `None` when the script declares no setup.
-    setup_data: Option<String>,
-    /// Registered protocols keyed by URL scheme (backlog line 230) — the
-    /// driver-path twin of `VURunner.protocols`, so imperative scripts can
-    /// reach third-party protocols, not just the declarative runner.
-    protocols: Arc<HashMap<String, Arc<dyn Protocol>>>,
-}
-
-#[async_trait]
-impl VuIterationSource for DriverVuSource {
-    async fn run_iteration(
-        &mut self,
-        iteration_index: u64,
-        data_row: Option<HashMap<String, serde_json::Value>>,
-        _vu_env: &HashMap<String, String>,
-    ) -> VuIterationOutcome {
-        let mut ctx = VuContext::new(self.vu_id, iteration_index, self.sc_name.clone());
-        // Env is immutable for the whole run; sync_globals only reads it on the
-        // first iteration (to seed __ENV/__tropel_env once). Attach the cached
-        // copy once and skip the per-iteration deep clone. `_vu_env` is the
-        // same map every call, so this is a strict optimization — not a
-        // semantics change.
-        if !self.env_attached {
-            ctx.env = self.env.clone();
-        }
-        ctx.data_row = data_row;
-        ctx.http_client = Some(self.http_client.clone());
-        ctx.setup_data = self.setup_data.clone();
-        ctx.protocols = self.protocols.clone();
-        ctx.set_exec_context(
-            self.executor_name.clone(),
-            self.sched.total_iterations().await,
-            self.sched.active_vus().await,
-        );
-        let result = self.instance.run_iteration(&mut ctx).await;
-        // Latch `env_attached` ONLY after a successful iteration: if the first
-        // run_iteration fails BEFORE sync_globals seeds __ENV/__tropel_env
-        // (e.g. a bridge-registration error), the env must be re-attached on
-        // the next attempt so the seed reads the real env — otherwise iteration
-        // 2 would seed __ENV from an empty ctx.env for the whole run.
-        if !self.env_attached && result.is_ok() {
-            self.env_attached = true;
-        }
-        let mut script_failures = 0u64;
-        if let Err(e) = result {
-            tracing::warn!(
-                "VU {} iteration {} failed: {}",
-                self.vu_id,
-                iteration_index,
-                e
-            );
-            // Backlog line 98: a driver iteration that errored was only
-            // warned — iterations still counted it and the run exited 0.
-            // Record a failed check + count so the failure is visible and
-            // drives a non-zero exit. Tag prefix matches the runner's
-            // `script: <name>` convention (a driver iteration is a script
-            // execution too).
-            script_failures = 1;
-            let mut tags = TagMap::with_capacity(1);
-            tags.insert("check", format!("script: driver {} iteration", self.vu_id));
-            ctx.samples.push(Sample {
-                metric: "checks".into(),
-                value: 0.0,
-                tags: Arc::new(tags),
-                timestamp: std::time::SystemTime::now(),
-                sample_type: tropel_core::types::SampleType::Rate,
-            });
-        }
-        let abort_message = if ctx.abort_requested {
-            Some(format!(
-                "Driver '{}' requested abort: {}",
-                self.driver_id,
-                ctx.abort_message
-                    .clone()
-                    .unwrap_or_else(|| "Test aborted by driver".to_string())
-            ))
-        } else {
-            None
-        };
-        VuIterationOutcome {
-            samples: std::mem::take(&mut ctx.samples),
-            abort_message,
-            script_failures,
-        }
-    }
-}
 // ── Shared per-VU iteration loop ──
 
 /// The shared VU iteration loop, identical for scenarios and drivers.
@@ -1021,18 +873,6 @@ fn merge_scenario_tags(samples: &mut [Sample], tags: &HashMap<String, String>) {
     }
 }
 
-fn extract_think_time(exec_cfg: &ExecutionConfig) -> ThinkTimeConfig {
-    match exec_cfg {
-        ExecutionConfig::ConstantVus { think_time, .. } => think_time.clone(),
-        ExecutionConfig::RampingVus { think_time, .. } => think_time.clone(),
-        ExecutionConfig::ConstantArrivalRate { think_time, .. } => think_time.clone(),
-        ExecutionConfig::SharedIterations { think_time, .. } => think_time.clone(),
-        ExecutionConfig::PerVUIterations { think_time, .. } => think_time.clone(),
-        ExecutionConfig::RampingArrivalRate { think_time, .. } => think_time.clone(),
-        ExecutionConfig::ExternallyControlled { think_time, .. } => think_time.clone(),
-    }
-}
-
 async fn utils_emit_vus_metrics(
     metrics: &MetricsCollector,
     active: u32,
@@ -1068,146 +908,4 @@ async fn utils_emit_vus_metrics(
             },
         ])
         .await;
-}
-
-// ── Duration parsing (from old engine.rs) ──
-
-pub(crate) fn parse_duration_str(s: &str) -> Result<Duration> {
-    let s = s.trim();
-    if s.is_empty() || s == "0" || s == "0s" {
-        return Ok(Duration::ZERO);
-    }
-    tropel_core::parse_duration(s)
-}
-
-// ── Think time ──
-
-async fn apply_think_time(config: &ThinkTimeConfig, iter_duration: Option<Duration>) {
-    if let Some(pacing_str) = &config.iteration_pacing {
-        if let Ok(pacing) = parse_duration_str(pacing_str) {
-            if let Some(actual_dur) = iter_duration {
-                if actual_dur < pacing {
-                    let remaining = pacing - actual_dur;
-                    if remaining > Duration::from_millis(1) {
-                        tokio::time::sleep(remaining).await;
-                    }
-                }
-            }
-            return;
-        }
-    }
-
-    if let Some(delay_str) = &config.delay {
-        if let Ok(delay) = parse_duration_str(delay_str) {
-            if delay > Duration::from_millis(1) {
-                tokio::time::sleep(delay).await;
-                return;
-            }
-        }
-    }
-
-    if let (Some(min_str), Some(max_str)) = (&config.min_delay, &config.max_delay) {
-        if let (Ok(min), Ok(max)) = (parse_duration_str(min_str), parse_duration_str(max_str)) {
-            if max > Duration::ZERO && max > min {
-                let range_ms = (max - min).as_millis() as u64;
-                let rand_ms = rand::rng().random_range(0..=range_ms);
-                tokio::time::sleep(min + Duration::from_millis(rand_ms)).await;
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    /// Stub protocol whose presence in the context proves the driver path
-    /// received the registry's protocol map (backlog line 230).
-    struct StubProtocol;
-    #[async_trait]
-    impl Protocol for StubProtocol {
-        fn scheme(&self) -> &str {
-            "stub"
-        }
-        async fn execute(
-            &self,
-            _req: &Request,
-            _config: Option<&serde_json::Value>,
-        ) -> Result<tropel_ext::traits::ProtocolOutcome> {
-            Ok(tropel_ext::traits::ProtocolOutcome {
-                samples: vec![],
-                response: None,
-            })
-        }
-    }
-
-    /// Stub driver instance that records whether the VuContext it was handed
-    /// carried the protocols map (backlog line 230).
-    struct RecordingInstance {
-        saw_protocols: Arc<AtomicBool>,
-    }
-    #[async_trait]
-    impl DriverInstance for RecordingInstance {
-        async fn run_iteration(&mut self, ctx: &mut VuContext) -> Result<()> {
-            // Check the SPECIFIC scheme, not just non-empty: a wrong-but-
-            // populated map would slip past a `!is_empty()` assertion.
-            self.saw_protocols.store(
-                ctx.protocols.get("stub").is_some(),
-                Ordering::SeqCst,
-            );
-            Ok(())
-        }
-    }
-
-    struct StubHttpClient;
-    #[async_trait]
-    impl DriverHttpClient for StubHttpClient {
-        async fn execute(&self, _req: &Request) -> Result<Response> {
-            Err(tropel_core::TropelError::Other("stub".into()))
-        }
-    }
-
-    /// Backlog line 230: `run_driver_vus` used to take NO `protocols`
-    /// argument, so a k6/WASM/third-party driver could never reach a
-    /// registered protocol — only the declarative runner got the registry's
-    /// scheme dispatch. The engine now threads the protocol map into every
-    /// driver VU's `VuContext`; this pins that wiring at the `DriverVuSource`
-    /// level (no full engine run needed).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn driver_source_threads_protocols_into_vu_context() {
-        let mut protocols: HashMap<String, Arc<dyn Protocol>> = HashMap::new();
-        protocols.insert("stub".to_string(), Arc::new(StubProtocol));
-        let protocols = Arc::new(protocols);
-
-        let saw = Arc::new(AtomicBool::new(false));
-        let sched = Arc::new(VUScheduler::new(&ExecutionConfig::ConstantVus {
-            vus: 1,
-            duration: "1s".to_string(),
-            graceful_stop: None,
-            think_time: ThinkTimeConfig::default(),
-        }));
-
-        let mut source = DriverVuSource {
-            instance: Box::new(RecordingInstance {
-                saw_protocols: saw.clone(),
-            }),
-            http_client: Arc::new(StubHttpClient),
-            executor_name: "constant-vus".to_string(),
-            driver_id: "stub".to_string(),
-            vu_id: 0,
-            sc_name: "scenario".to_string(),
-            sched,
-            env: HashMap::new(),
-            env_attached: false,
-            setup_data: None,
-            protocols,
-        };
-
-        source.run_iteration(0, None, &HashMap::new()).await;
-        assert!(
-            saw.load(Ordering::SeqCst),
-            "driver VuContext must receive the registry's protocol map (scheme 'stub')"
-        );
-    }
 }

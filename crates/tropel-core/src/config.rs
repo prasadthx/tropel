@@ -788,7 +788,10 @@ mod tests {
         assert!(!status_is_expected(200, &[]));
         assert!(!status_is_expected(500, &[]));
         // Any-of semantics.
-        let set = [ExpectedStatus::Single(200), ExpectedStatus::Range("4xx".into())];
+        let set = [
+            ExpectedStatus::Single(200),
+            ExpectedStatus::Range("4xx".into()),
+        ];
         assert!(status_is_expected(200, &set));
         assert!(status_is_expected(404, &set));
         assert!(!status_is_expected(500, &set));
@@ -797,13 +800,86 @@ mod tests {
     #[test]
     fn executor_names_match_serde_tags() {
         use ExecutionConfig::*;
-        assert_eq!(ConstantVus { vus: 1, duration: "1s".into(), graceful_stop: None, think_time: Default::default() }.executor_name(), "constant-vus");
-        assert_eq!(RampingVus { stages: vec![], start_vus: 1, graceful_ramp_down: None, graceful_stop: None, think_time: Default::default() }.executor_name(), "ramping-vus");
-        assert_eq!(ConstantArrivalRate { rate: 1.0, time_unit: "1s".into(), duration: "1s".into(), pre_alloc_vus: 1, max_vus: 10, graceful_stop: None, think_time: Default::default() }.executor_name(), "constant-arrival-rate");
-        assert_eq!(SharedIterations { iterations: 10, max_duration: None, vus: 1, graceful_stop: None, think_time: Default::default() }.executor_name(), "shared-iterations");
-        assert_eq!(RampingArrivalRate { start_rate: 1.0, stages: vec![], time_unit: "1s".into(), pre_alloc_vus: 1, max_vus: 10, graceful_stop: None, think_time: Default::default() }.executor_name(), "ramping-arrival-rate");
-        assert_eq!(PerVUIterations { vus: 1, iterations: 10, max_duration: None, graceful_stop: None, think_time: Default::default() }.executor_name(), "per-vu-iterations");
-        assert_eq!(ExternallyControlled { vus: 1, max_vus: 10, duration: None, graceful_stop: None, think_time: Default::default() }.executor_name(), "externally-controlled");
+        assert_eq!(
+            ConstantVus {
+                vus: 1,
+                duration: "1s".into(),
+                graceful_stop: None,
+                think_time: Default::default()
+            }
+            .executor_name(),
+            "constant-vus"
+        );
+        assert_eq!(
+            RampingVus {
+                stages: vec![],
+                start_vus: 1,
+                graceful_ramp_down: None,
+                graceful_stop: None,
+                think_time: Default::default()
+            }
+            .executor_name(),
+            "ramping-vus"
+        );
+        assert_eq!(
+            ConstantArrivalRate {
+                rate: 1.0,
+                time_unit: "1s".into(),
+                duration: "1s".into(),
+                pre_alloc_vus: 1,
+                max_vus: 10,
+                graceful_stop: None,
+                think_time: Default::default()
+            }
+            .executor_name(),
+            "constant-arrival-rate"
+        );
+        assert_eq!(
+            SharedIterations {
+                iterations: 10,
+                max_duration: None,
+                vus: 1,
+                graceful_stop: None,
+                think_time: Default::default()
+            }
+            .executor_name(),
+            "shared-iterations"
+        );
+        assert_eq!(
+            RampingArrivalRate {
+                start_rate: 1.0,
+                stages: vec![],
+                time_unit: "1s".into(),
+                pre_alloc_vus: 1,
+                max_vus: 10,
+                graceful_stop: None,
+                think_time: Default::default()
+            }
+            .executor_name(),
+            "ramping-arrival-rate"
+        );
+        assert_eq!(
+            PerVUIterations {
+                vus: 1,
+                iterations: 10,
+                max_duration: None,
+                graceful_stop: None,
+                think_time: Default::default()
+            }
+            .executor_name(),
+            "per-vu-iterations"
+        );
+        assert_eq!(
+            ExternallyControlled {
+                vus: 1,
+                max_vus: 10,
+                duration: None,
+                graceful_stop: None,
+                think_time: Default::default()
+            }
+            .executor_name(),
+            "externally-controlled"
+        );
     }
 
     #[test]
@@ -821,8 +897,14 @@ mod tests {
         // Ramping-vus sums stage durations.
         let rv = ExecutionConfig::RampingVus {
             stages: vec![
-                Stage { duration: "5s".into(), target: 1 },
-                Stage { duration: "3s".into(), target: 5 },
+                Stage {
+                    duration: "5s".into(),
+                    target: 1,
+                },
+                Stage {
+                    duration: "3s".into(),
+                    target: 5,
+                },
             ],
             start_vus: 1,
             graceful_ramp_down: Some("30s".into()),
@@ -857,7 +939,10 @@ mod tests {
         // constant-vus (unknown modes fall back here).
         let cv = ExecutionConfig::from_mode("constant-vus", Some(5), None, None, None);
         assert_eq!(cv.executor_name(), "constant-vus");
-        assert_eq!(cv.total_duration(), Some(std::time::Duration::from_secs(30)));
+        assert_eq!(
+            cv.total_duration(),
+            Some(std::time::Duration::from_secs(30))
+        );
 
         // ramping-vus: stages JSON wins when present; start_vus defaults to 1.
         let rv = ExecutionConfig::from_mode(
@@ -868,7 +953,9 @@ mod tests {
             Some(r#"[{"duration":"10s","target":50}]"#.into()),
         );
         match &rv {
-            ExecutionConfig::RampingVus { stages, start_vus, .. } => {
+            ExecutionConfig::RampingVus {
+                stages, start_vus, ..
+            } => {
                 assert_eq!(stages.len(), 1);
                 assert_eq!(stages[0].target, 50);
                 assert_eq!(*start_vus, 3);
@@ -889,7 +976,9 @@ mod tests {
         // shared-iterations: iterations default 100, vus default 1.
         let si = ExecutionConfig::from_mode("shared-iterations", None, None, Some(500), None);
         match &si {
-            ExecutionConfig::SharedIterations { iterations, vus, .. } => {
+            ExecutionConfig::SharedIterations {
+                iterations, vus, ..
+            } => {
                 assert_eq!(*iterations, 500);
                 assert_eq!(*vus, 1);
             }

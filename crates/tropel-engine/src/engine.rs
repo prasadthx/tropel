@@ -1,7 +1,8 @@
 use crate::input::{resolve_input_or_driver, ResolvedInput};
 use crate::outputs::spawn_extension_output;
+use crate::pacing::parse_duration_str;
 use crate::summary::build_summary_data;
-use crate::vu_loop::{parse_duration_str, run_driver_vus, run_scenario_vus};
+use crate::vu_loop::{run_driver_vus, run_scenario_vus};
 use crate::worker::VUWorkerPool;
 
 /// One entry of the per-scenario config list threaded into `run_scenario_vus`.

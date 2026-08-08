@@ -5,6 +5,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tropel_core::error::TropelError;
+use tropel_core::Result;
 use tropel_http::client::HttpClient;
 use tropel_pm::bridge::SharedPmState;
 
@@ -55,8 +57,9 @@ static SHIM_BYTECODE_RUN_FAILED: AtomicBool = AtomicBool::new(false);
 /// (pm-api, chai, lodash, crypto, exec), install the native modules and PM
 /// bridge functions, and wire a blocking `sleep(seconds)` helper.
 ///
-/// Returns `None` (with a logged warning) if context creation fails — the
-/// VU still runs, just without scripts.
+/// Returns `None` if context creation fails — context-creation failures log
+/// a warning, but a shim bootstrap failure is logged at ERROR level (the VU
+/// still runs, just without scripts).
 pub(crate) async fn create_vu_js_context(
     vu_id: u32,
     pm_state: &SharedPmState,
@@ -79,7 +82,18 @@ pub(crate) async fn create_vu_js_context(
         }
     };
 
-    bootstrap_shims(&mut ctx, vu_id).await;
+    if let Err(e) = bootstrap_shims(&mut ctx, vu_id).await {
+        // Backlog line 238: a shim-eval failure must be LOUD — warn-only left
+        // every script throwing `ReferenceError: pm is not defined`. Fail the
+        // VU's JS context (scripts are skipped) and log at error level so the
+        // run can't silently degrade into broken scripts.
+        tracing::error!(
+            "VU {}: JS shim bootstrap FAILED: {} — scripts will be skipped",
+            vu_id,
+            e
+        );
+        return None;
+    }
 
     if let Err(e) = tropel_native::install_all(&mut ctx).await {
         tracing::warn!("VU {}: Failed to install native modules: {}", vu_id, e);
@@ -123,7 +137,12 @@ pub(crate) async fn create_vu_js_context(
 /// bytecode (compiled once by the first VU) and run it in this context —
 /// no per-VU parse/compile. Fallback: if bytecode compilation failed or the
 /// load/run errored, evaluate the source directly (the pre-bytecode path).
-async fn bootstrap_shims(ctx: &mut tropel_js::JsContext, vu_id: u32) {
+///
+/// Returns `Err` ONLY when the shim bundle could not be evaluated by ANY
+/// path (bytecode compile failed + source eval failed, or bytecode run
+/// failed + source eval failed) — a true `pm is not defined` condition that
+/// the caller must surface loudly.
+async fn bootstrap_shims(ctx: &mut tropel_js::JsContext, vu_id: u32) -> Result<()> {
     let bytecode = SHIM_BYTECODE.get_or_init(|| {
         if SHIM_BYTECODE_FAILED.load(Ordering::Relaxed) {
             return None;
@@ -155,11 +174,16 @@ async fn bootstrap_shims(ctx: &mut tropel_js::JsContext, vu_id: u32) {
                 vu_id,
                 e
             );
-            if let Err(e2) = ctx.bootstrap_library(JS_SHIM_BUNDLE).await {
-                tracing::warn!("VU {}: Failed to bootstrap JS shim bundle: {}", vu_id, e2);
-            }
+            return ctx.bootstrap_library(JS_SHIM_BUNDLE).await.map_err(|e2| {
+                TropelError::Js(format!(
+                    "VU {vu_id}: shim source eval failed after bytecode run error: {e2}"
+                ))
+            });
         }
-    } else if let Err(e) = ctx.bootstrap_library(JS_SHIM_BUNDLE).await {
-        tracing::warn!("VU {}: Failed to bootstrap JS shim bundle: {}", vu_id, e);
+        Ok(())
+    } else {
+        ctx.bootstrap_library(JS_SHIM_BUNDLE)
+            .await
+            .map_err(|e| TropelError::Js(format!("VU {vu_id}: shim source eval failed: {e}")))
     }
 }
