@@ -1140,6 +1140,7 @@ impl Aggregator {
             series,
             totals: self.totals.clone(),
             summary_trend_stats: self.summary_trend_stats.clone(),
+            thresholds: self.effective_thresholds.clone(),
         }
     }
 
@@ -1233,6 +1234,9 @@ impl Aggregator {
         if self.summary_trend_stats.is_empty() && !snap.summary_trend_stats.is_empty() {
             self.summary_trend_stats = snap.summary_trend_stats.clone();
         }
+        if self.effective_thresholds.is_empty() && !snap.thresholds.is_empty() {
+            self.effective_thresholds = snap.thresholds.clone();
+        }
         // Series arrive pre-aggregated here (not through `record()`), so the
         // incremental merged accumulators must be rebuilt from `self.data` to
         // keep `build_results`' pre-merged headlines correct.
@@ -1309,21 +1313,37 @@ pub struct MetricsSnapshot {
     pub series: Vec<SeriesSnapshot>,
     pub totals: HashMap<String, f64>,
     pub summary_trend_stats: Vec<String>,
+    /// The worker's effective threshold set (job + script-declared, e.g. k6
+    /// `options.thresholds`). Shipped back so a controller's merge preserves
+    /// script-declared thresholds instead of discarding them.
+    pub thresholds: HashMap<String, tropel_core::config::ThresholdConfig>,
 }
 
 /// Merge worker snapshots into a single `MetricsResult` (🦀 Rust-opt: the
 /// hdr-histogram V2 merge is lossless — the controller's buckets are exactly
 /// the sum of the workers', so percentiles/means are exact, not estimated).
 ///
-/// The effective threshold set is taken from the `thresholds` argument (the
-/// controller's job config); trend stats are inherited from the workers.
+/// The effective threshold set starts from the `thresholds` argument (the
+/// controller's job config) and is overlaid with each worker's
+/// script-declared thresholds shipped in the snapshot (e.g. k6
+/// `options.thresholds`); the job config wins on key collisions. Trend stats
+/// are inherited from the workers.
 pub fn merge_snapshots(
     snapshots: Vec<MetricsSnapshot>,
     thresholds: std::collections::HashMap<String, tropel_core::config::ThresholdConfig>,
 ) -> Result<MetricsResult> {
+    // Script-declared thresholds ride back in each worker's snapshot; overlay
+    // them on the controller's job-level set so they are not discarded.
+    // `entry().or_insert` keeps the job config's definition on collisions.
+    let mut effective = thresholds;
+    for snap in &snapshots {
+        for (k, v) in &snap.thresholds {
+            effective.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
     let mut agg = Aggregator::new();
-    agg.retain_histograms = config_needs_histograms(&agg.summary_trend_stats, &thresholds);
-    agg.effective_thresholds = thresholds;
+    agg.retain_histograms = config_needs_histograms(&agg.summary_trend_stats, &effective);
+    agg.effective_thresholds = effective;
     for snap in &snapshots {
         agg.absorb_snapshot(snap)?;
     }
@@ -2290,6 +2310,7 @@ mod tests {
             }],
             totals: std::collections::HashMap::new(),
             summary_trend_stats: k6_default_trend_stats(),
+            thresholds: HashMap::new(),
         };
         let err = merge_snapshots(vec![snap], std::collections::HashMap::new()).unwrap_err();
         assert!(
@@ -2322,6 +2343,7 @@ mod tests {
             }],
             totals: std::collections::HashMap::new(),
             summary_trend_stats: k6_default_trend_stats(),
+            thresholds: HashMap::new(),
         };
         let err = merge_snapshots(vec![snap], std::collections::HashMap::new()).unwrap_err();
         assert!(
@@ -2331,6 +2353,91 @@ mod tests {
         assert!(
             err.to_string().contains("hdr-histogram V2"),
             "error must explain: {err}"
+        );
+    }
+
+    /// Regression (backlog line 89): `merge_snapshots` fell back to the
+    /// controller's job thresholds alone, discarding script-declared ones
+    /// (k6 `options.thresholds`) that each worker merged into its own
+    /// collector. The snapshot now carries the worker's effective set and the
+    /// merge overlays it — with the job config winning on collisions.
+    #[test]
+    fn merge_snapshots_preserves_script_declared_thresholds() {
+        use tropel_core::config::ThresholdConfig;
+
+        let mut snap_thresholds = HashMap::new();
+        snap_thresholds.insert(
+            "http_req_duration".to_string(),
+            ThresholdConfig {
+                expression: "http_req_duration{expected_response:true} < 400".to_string(),
+                abort_on_fail: false,
+                delay_abort_eval: None,
+            },
+        );
+        let snap = MetricsSnapshot {
+            series: vec![],
+            totals: HashMap::new(),
+            summary_trend_stats: k6_default_trend_stats(),
+            thresholds: snap_thresholds,
+        };
+
+        // Job config declares a different metric AND collides on
+        // http_req_duration with a weaker bound — both must survive, and the
+        // job's definition must win the collision.
+        let mut job = HashMap::new();
+        job.insert(
+            "http_req_failed".to_string(),
+            ThresholdConfig {
+                expression: "http_req_failed < 0.01".to_string(),
+                abort_on_fail: true,
+                delay_abort_eval: None,
+            },
+        );
+        job.insert(
+            "http_req_duration".to_string(),
+            ThresholdConfig {
+                expression: "http_req_duration < 1000".to_string(),
+                abort_on_fail: false,
+                delay_abort_eval: None,
+            },
+        );
+
+        let result = merge_snapshots(vec![snap], job).expect("merge succeeds");
+        // Script-declared metric survives alongside the job's.
+        assert!(result.effective_thresholds.contains_key("http_req_failed"));
+        // Job config wins the collision, script-declared expression is dropped.
+        assert_eq!(
+            result.effective_thresholds["http_req_duration"].expression,
+            "http_req_duration < 1000"
+        );
+
+        // Without any job config at all, the script-declared set still ships.
+        let snap2 = MetricsSnapshot {
+            series: vec![],
+            totals: HashMap::new(),
+            summary_trend_stats: k6_default_trend_stats(),
+            thresholds: HashMap::new(),
+        };
+        let mut only_script = HashMap::new();
+        only_script.insert(
+            "iterations".to_string(),
+            ThresholdConfig {
+                expression: "iterations > 100".to_string(),
+                abort_on_fail: true,
+                delay_abort_eval: None,
+            },
+        );
+        let result2 = merge_snapshots(
+            vec![MetricsSnapshot {
+                thresholds: only_script,
+                ..snap2
+            }],
+            std::collections::HashMap::new(),
+        )
+        .expect("merge succeeds");
+        assert_eq!(
+            result2.effective_thresholds["iterations"].expression,
+            "iterations > 100"
         );
     }
 
