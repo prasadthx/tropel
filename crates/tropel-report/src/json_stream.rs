@@ -311,7 +311,10 @@ mod tests {
                     assert!(data["metric"].is_string());
                     assert!(data["time"].is_string());
                     assert!(data["value"].is_number());
-                    assert!(data.get("measurement").is_none(), "no InfluxDB measurement key");
+                    assert!(
+                        data.get("measurement").is_none(),
+                        "no InfluxDB measurement key"
+                    );
                     assert!(data.get("fields").is_none(), "no InfluxDB fields wrapper");
                     assert!(data["tags"]["status"] == "200");
                     if data["metric"] == "http_req_duration" {
@@ -346,7 +349,10 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            output.emit(&[sample("http_req_duration", 12.5)]).await.unwrap();
+            output
+                .emit(&[sample("http_req_duration", 12.5)])
+                .await
+                .unwrap();
             output.flush().await.unwrap();
         });
 
@@ -378,7 +384,10 @@ mod tests {
         let data = &v["data"];
         assert_eq!(data["metric"], "http_req_duration");
         assert_eq!(data["value"], 12.5);
-        assert!(data["time"].as_str().unwrap().ends_with('Z'), "RFC 3339 UTC");
+        assert!(
+            data["time"].as_str().unwrap().ends_with('Z'),
+            "RFC 3339 UTC"
+        );
         assert_eq!(data["tags"]["status"], "200");
         // The InfluxDB shape must be gone — this is what every consumer reads.
         assert!(data.get("measurement").is_none());

@@ -489,12 +489,18 @@ pub(crate) fn load_module_aot(path: &Path) -> std::result::Result<Module, anyhow
     // permissions failed, /tmp fallback we could not secure): compile fresh.
     // NEVER read an unsecured cache into `unsafe Module::deserialize`.
     let Some(cache_dir) = wasm_cache_dir() else {
-        tracing::warn!("WASM AOT cache unavailable; compiling '{}' without cache", path.display());
+        tracing::warn!(
+            "WASM AOT cache unavailable; compiling '{}' without cache",
+            path.display()
+        );
         return compile_uncached(engine, &wasm_bytes, key);
     };
     // No key means we cannot authenticate a cache entry — compile fresh too.
     let Some(cache_key_bytes) = cache_key(&cache_dir) else {
-        tracing::warn!("WASM AOT cache key unavailable; compiling '{}' without cache", path.display());
+        tracing::warn!(
+            "WASM AOT cache key unavailable; compiling '{}' without cache",
+            path.display()
+        );
         return compile_uncached(engine, &wasm_bytes, key);
     };
 
@@ -519,10 +525,22 @@ pub(crate) fn load_module_aot(path: &Path) -> std::result::Result<Module, anyhow
         // engine fails deserialize and we recompile below.
         match unsafe { Module::deserialize(engine, &cached) } {
             Ok(m) => m,
-            Err(_) => aot_compile(engine, &wasm_bytes, &cache_path, &hash_path, &cache_key_bytes)?,
+            Err(_) => aot_compile(
+                engine,
+                &wasm_bytes,
+                &cache_path,
+                &hash_path,
+                &cache_key_bytes,
+            )?,
         }
     } else {
-        aot_compile(engine, &wasm_bytes, &cache_path, &hash_path, &cache_key_bytes)?
+        aot_compile(
+            engine,
+            &wasm_bytes,
+            &cache_path,
+            &hash_path,
+            &cache_key_bytes,
+        )?
     };
 
     if let Ok(mut c) = module_cache().lock() {
