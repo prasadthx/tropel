@@ -110,13 +110,26 @@ fn convert_items(
                     Some(a) => Some(a),
                     None => inherited_auth,
                 };
+                // P0 (backlog): folder events used to REPLACE the inherited
+                // chain, so a collection-level prerequest that mints a token
+                // ran ZERO times for requests inside folders. Postman is
+                // additive — the folder's events APPEND after the inherited
+                // collection/parent-folder chain and ALL of them run,
+                // outer→inner.
+                let mut events = parent_events.to_vec();
+                events.extend(folder.event.iter().cloned());
                 let scenario_item = ScenarioItem {
                     name: folder.name.clone(),
                     request: None,
+                    // The folder's own scripts are ALSO folded into every
+                    // descendant leaf below, so they run before/after each
+                    // request in the folder (Postman's per-request folder
+                    // script semantics). `flatten_execution_items` drops a
+                    // folder container, so these fields never run directly.
                     prerequest: find_prerequest_script(&folder.event),
                     test: find_test_script(&folder.event),
                     assertions: vec![],
-                    items: convert_items(&folder.item, &folder.event, folder_auth),
+                    items: convert_items(&folder.item, &events, folder_auth),
                 };
                 result.push(scenario_item);
             }
@@ -137,17 +150,19 @@ fn convert_request_item(
     // fall back to the legacy one.
     let request_auth = req.request.auth.as_ref().or(req.auth.as_ref());
     let request = convert_request(&req.request, request_auth, inherited_auth);
-    let events = if req.event.is_empty() {
-        parent_events
-    } else {
-        &req.event
-    };
+
+    // P0 (backlog): request events were EITHER/OR with parent events — a
+    // request with its own script dropped the collection/folder scripts
+    // entirely. Postman is additive: the request's events concatenate AFTER
+    // the inherited chain, outer→inner, and ALL of them run.
+    let mut events = parent_events.to_vec();
+    events.extend(req.event.iter().cloned());
 
     ScenarioItem {
         name: req.name.clone(),
         request: Some(request),
-        prerequest: find_prerequest_script(events),
-        test: find_test_script(events),
+        prerequest: find_prerequest_script(&events),
+        test: find_test_script(&events),
         assertions: vec![],
         items: vec![],
     }
@@ -417,22 +432,42 @@ fn get_auth_attr(attrs: &[AuthAttribute], key: &str) -> Option<String> {
     attrs.iter().find(|a| a.key == key).map(|a| a.value.clone())
 }
 
+/// ALL prerequest scripts in the event chain, outer (collection) → inner
+/// (request), concatenated into one script string. Postman is additive: a
+/// collection, each enclosing folder, and the request itself may each
+/// contribute a prerequest script and EVERY one runs, before the request,
+/// in that order. The old find-first behavior silently dropped outer
+/// scripts the moment a deeper level had its own (P0).
 fn find_prerequest_script(events: &[Event]) -> Option<String> {
-    events
+    let scripts: Vec<String> = events
         .iter()
-        .find(|e| e.listen == "prerequest")
-        .and_then(|e| e.script.as_ref())
+        .filter(|e| e.listen == "prerequest")
+        .filter_map(|e| e.script.as_ref())
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
+        .collect();
+    if scripts.is_empty() {
+        None
+    } else {
+        Some(scripts.join("\n;\n"))
+    }
 }
 
+/// ALL test scripts in the event chain, outer → inner, concatenated into
+/// one script string (see `find_prerequest_script`).
 fn find_test_script(events: &[Event]) -> Option<String> {
-    events
+    let scripts: Vec<String> = events
         .iter()
-        .find(|e| e.listen == "test")
-        .and_then(|e| e.script.as_ref())
+        .filter(|e| e.listen == "test")
+        .filter_map(|e| e.script.as_ref())
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
+        .collect();
+    if scripts.is_empty() {
+        None
+    } else {
+        Some(scripts.join("\n;\n"))
+    }
 }
 
 #[cfg(test)]
@@ -617,6 +652,92 @@ mod tests {
         assert!(scenario.items[0].prerequest.is_some());
         assert!(scenario.items[0].test.is_some());
         assert!(scenario.items[0].test.as_ref().unwrap().contains("pm.test"));
+    }
+
+    #[test]
+    fn test_collection_and_folder_scripts_reach_leaves_in_order() {
+        // P0 (backlog): collection- and folder-level scripts never ran for
+        // folder-organized collections. Three interacting facts: folder
+        // events REPLACED collection events; request events were either/or
+        // with parent events (Postman is additive); and
+        // flatten_execution_items discards a folder that has children, so
+        // its script was dead. A top-level prerequest that mints a token
+        // ran zero times → every request sent literal `Bearer {{token}}`.
+        //
+        // Fix: the inherited event chain (collection → folder → request)
+        // is folded into each leaf at convert time, outer→inner, ALL of
+        // them concatenated — so per-request scripts run exactly the way
+        // Postman runs them.
+        let json = r#"{
+            "info": {"name": "Scripts", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "event": [
+                {"listen": "prerequest", "script": {"exec": ["COLLECTION_PREREQUEST"], "type": "text/javascript"}},
+                {"listen": "test", "script": {"exec": ["COLLECTION_TEST"], "type": "text/javascript"}}
+            ],
+            "item": [{
+                "name": "Folder",
+                "event": [
+                    {"listen": "prerequest", "script": {"exec": ["FOLDER_PREREQUEST"], "type": "text/javascript"}},
+                    {"listen": "test", "script": {"exec": ["FOLDER_TEST"], "type": "text/javascript"}}
+                ],
+                "item": [{
+                    "name": "Inner Req",
+                    "request": {"method": "GET", "url": {"raw": "https://api.example.com/inner"}},
+                    "event": [
+                        {"listen": "prerequest", "script": {"exec": ["INNER_PREREQUEST"], "type": "text/javascript"}},
+                        {"listen": "test", "script": {"exec": ["INNER_TEST"], "type": "text/javascript"}}
+                    ]
+                }]
+            }]
+        }"#;
+
+        let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
+        let folder = &scenario.items[0];
+        assert_eq!(folder.name, "Folder");
+        let inner = &folder.items[0];
+
+        // Prerequest: ALL three levels concatenated, outer→inner.
+        let pre = inner.prerequest.as_ref().expect("leaf must carry prerequest");
+        let c = pre.find("COLLECTION_PREREQUEST").expect("collection script folded");
+        let f = pre.find("FOLDER_PREREQUEST").expect("folder script folded");
+        let i = pre.find("INNER_PREREQUEST").expect("request script kept");
+        assert!(c < f && f < i, "prerequest must be outer→inner, got: {pre}");
+
+        // Test: ALL three levels concatenated, outer→inner.
+        let t = inner.test.as_ref().expect("leaf must carry test");
+        let c = t.find("COLLECTION_TEST").expect("collection test folded");
+        let f = t.find("FOLDER_TEST").expect("folder test folded");
+        let i = t.find("INNER_TEST").expect("request test kept");
+        assert!(c < f && f < i, "test must be outer→inner, got: {t}");
+    }
+
+    #[test]
+    fn test_request_scripts_append_to_inherited_not_replace() {
+        // P0 (backlog): a request with its OWN event dropped the inherited
+        // collection/folder scripts (either/or). Postman is additive — the
+        // request's script must run IN ADDITION to the outer chain.
+        let json = r#"{
+            "info": {"name": "Additive", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "event": [
+                {"listen": "prerequest", "script": {"exec": ["COLL_PRE"], "type": "text/javascript"}}
+            ],
+            "item": [{
+                "name": "Req",
+                "request": {"method": "GET", "url": {"raw": "https://api.example.com/x"}},
+                "event": [
+                    {"listen": "prerequest", "script": {"exec": ["REQ_PRE"], "type": "text/javascript"}}
+                ]
+            }]
+        }"#;
+
+        let scenario = collection_to_scenario(parse_collection_str(json).unwrap(), HashMap::new());
+        let pre = scenario.items[0]
+            .prerequest
+            .as_ref()
+            .expect("leaf must carry prerequest");
+        let c = pre.find("COLL_PRE").expect("collection script must be inherited");
+        let r = pre.find("REQ_PRE").expect("request script must be present");
+        assert!(c < r, "inherited script must run before the request's own: {pre}");
     }
 
     #[test]

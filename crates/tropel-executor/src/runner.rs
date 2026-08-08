@@ -1119,4 +1119,106 @@ mod tests {
             "a failed checks sample must be emitted for the loop limit"
         );
     }
+
+    #[tokio::test]
+    async fn folder_leaf_prerequest_runs_and_value_resolves() {
+        // P0 (backlog): Postman collection/folder-level scripts never ran for
+        // folder-organized collections. The parser fix folds the inherited
+        // event chain (collection → folder → request, outer→inner) into each
+        // leaf at convert time, so flatten_execution_items then executes it
+        // as a normal leaf prerequest. This test pins the RUNTIME symptom:
+        // a top-level prerequest that mints a token must actually run (once
+        // the value is set, pm.environment.set writes into PmState, and the
+        // scope used for {{var}} substitution sees it — no literal `Bearer
+        // {{token}}` sent, no 401).
+        let scenario = Arc::new(Scenario {
+            info: tropel_core::scenario::ScenarioInfo {
+                name: "folder-scripts".into(),
+                description: None,
+                schema: None,
+            },
+            // The collection/folder prerequests were folded by the parser
+            // into this leaf's prerequest (simulated here with the full
+            // chain in order: COLLECTION then FOLDER then REQUEST).
+            items: vec![folder(
+                "Folder",
+                vec![ScenarioItem {
+                    name: "inner".into(),
+                    request: None,
+                    prerequest: Some(
+                        "pm.environment.set('token', 'tok-42'); // COLLECTION; FOLDER; REQUEST"
+                            .into(),
+                    ),
+                    test: None,
+                    assertions: vec![],
+                    items: vec![],
+                }],
+            )],
+            variables: HashMap::new(),
+            auth: None,
+        });
+        let execution_items = Arc::new(flatten_execution_items(&scenario.items));
+        assert_eq!(
+            execution_items.len(),
+            1,
+            "folder must be descended into — the leaf with the folded scripts must execute"
+        );
+        assert!(
+            execution_items[0]
+                .prerequest
+                .as_deref()
+                .unwrap_or("")
+                .contains("pm.environment.set"),
+            "the folded collection/folder prerequest must ride on the leaf"
+        );
+        let names: Arc<Vec<String>> =
+            Arc::new(execution_items.iter().map(|i| i.name.clone()).collect());
+        let client = HttpClient::new(&tropel_core::config::HttpConfig::default())
+            .expect("http client should construct");
+        let mut runner =
+            VURunner::new(scenario, execution_items, names, client, 0, "folder-scripts".into());
+
+        let mut js_ctx = Box::new(
+            JsContext::new(None, None)
+                .await
+                .expect("js context should construct"),
+        );
+        js_ctx
+            .eval(include_str!("../../../js/pm-api/pm.js"))
+            .await
+            .expect("pm shim should eval");
+        let bridge_client = Arc::new(
+            HttpClient::new(&tropel_core::config::HttpConfig::default())
+                .expect("bridge http client should construct"),
+        );
+        tropel_pm::bridge_fns::PmBridge::new(runner.pm_state().clone(), bridge_client)
+            .install(&mut js_ctx)
+            .expect("pm bridge should install");
+        runner = runner.with_js_context(js_ctx);
+
+        let env = HashMap::new();
+        let result = runner.run_iteration(0, None, &env).await;
+        assert_eq!(
+            result.script_failures, 0,
+            "the folded prerequest script must run without error"
+        );
+
+        // The runtime guarantee behind the backlog symptom: the token the
+        // collection/folder prerequest minted is visible to {{var}}
+        // substitution (no literal `Bearer {{token}}` sent).
+        let state = runner.pm_state().lock().unwrap();
+        assert_eq!(
+            state.environment.get("token").map(String::as_str),
+            Some("tok-42"),
+            "pm.environment.set from the folded script must persist"
+        );
+        drop(state);
+        let scope = runner.build_scope(None, &env);
+        let resolver = tropel_variables::VariableResolver::new();
+        assert_eq!(
+            resolver.resolve("{{token}}", &scope),
+            "tok-42",
+            "folded prerequest-set value must resolve in later requests"
+        );
+    }
 }
